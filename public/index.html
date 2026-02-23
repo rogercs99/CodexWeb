@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Codex Mobile Web</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="header">
+        <h1>Codex Mobile</h1>
+        <button id="logoutBtn" class="ghost hidden">Salir</button>
+      </header>
+
+      <section id="authCard" class="card">
+        <h2>Acceso</h2>
+        <p>Inicia sesión o crea una cuenta para usar Codex desde esta web.</p>
+        <div class="tabs">
+          <button id="loginTab" class="active">Login</button>
+          <button id="registerTab">Registro</button>
+        </div>
+
+        <form id="authForm" class="form">
+          <input id="username" placeholder="Usuario" required />
+          <input id="password" type="password" placeholder="Contraseña (mínimo 8)" required />
+          <button type="submit" class="primary" id="authSubmit">Entrar</button>
+        </form>
+      </section>
+
+      <section id="keysCard" class="card hidden">
+        <h2>Configurar API keys</h2>
+        <p>Se cifran en servidor y se guardan en SQLite para usar Codex local.</p>
+        <form id="keysForm" class="form">
+          <input id="openaiKey" placeholder="OPENAI_API_KEY" required />
+          <input id="anthropicKey" placeholder="ANTHROPIC_API_KEY (opcional)" />
+          <button type="submit" class="primary">Guardar keys</button>
+        </form>
+      </section>
+
+      <section id="chatCard" class="card hidden">
+        <h2>Chat con Codex local</h2>
+        <div id="chatLog" class="chat-log"></div>
+        <form id="chatForm" class="chat-input-row">
+          <textarea id="chatInput" rows="2" placeholder="Escribe tu prompt..."></textarea>
+          <button type="submit" class="primary">Enviar</button>
+        </form>
+      </section>
+
+      <p id="status" class="status"></p>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>
