@@ -1,0 +1,31 @@
+{
+  "attemptId": "1772110471984-876d40ea",
+  "active": false,
+  "phase": "completed",
+  "requestedBy": "roger",
+  "startedAt": "2026-02-26T12:54:31.984Z",
+  "finishedAt": "2026-02-26T12:54:33.586Z",
+  "updatedAt": "2026-02-26T12:54:33.586Z",
+  "logs": [
+    {
+      "at": "2026-02-26T12:54:31.984Z",
+      "message": "Reinicio solicitado por roger"
+    },
+    {
+      "at": "2026-02-26T12:54:31.987Z",
+      "message": "Preparando helper de reinicio"
+    },
+    {
+      "at": "2026-02-26T12:54:31.993Z",
+      "message": "Helper de reinicio lanzado"
+    },
+    {
+      "at": "2026-02-26T12:54:32.001Z",
+      "message": "Respuesta enviada. Cerrando proceso actual"
+    },
+    {
+      "at": "2026-02-26T12:54:33.572Z",
+      "message": "Nuevo proceso iniciado (pid 1193552)"
+    }
+  ]
+}

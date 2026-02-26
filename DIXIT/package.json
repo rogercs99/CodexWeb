@@ -1,0 +1,29 @@
+{
+  "name": "dixit",
+  "version": "1.0.0",
+  "description": "Dixit multiplayer web app using provided frontend mockups and sample cards.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "NODE_ENV=development nodemon server.js",
+    "test": "node --test tests/server.integration.test.js",
+    "test:e2e": "playwright test"
+  },
+  "keywords": [
+    "dixit",
+    "websocket",
+    "multiplayer"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "nodemon": "^3.0.1"
+  }
+}
