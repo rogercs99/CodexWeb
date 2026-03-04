@@ -235,6 +235,64 @@ test('solo con bots completa una ronda y permite pasar a la siguiente', async (t
   assert.ok(['clue', 'submit', 'vote'].includes(nextRound.phase));
 });
 
+test('cuando el narrador es bot genera pista realista con motivo y se identifica como bot', async (t) => {
+  const { port } = await startServer(t);
+  const host = await createClient(t, port);
+  host.send({ type: 'join', name: 'Solo' });
+  await waitForMessage(host, (m) => m.type === 'joined', 'solo joined');
+
+  host.send({ type: 'start_with_bots', difficulty: 'smart' });
+  const initialClue = await waitForMessage(
+    host,
+    (m) => m.type === 'state' && m.phase === 'clue' && m.you?.isStoryteller === true && m.hand?.length >= 1,
+    'first storyteller clue'
+  );
+
+  host.send({ type: 'submit_clue', clue: 'pista test', card: initialClue.hand[0] });
+  const reveal = await waitForMessage(
+    host,
+    (m) => m.type === 'state' && m.phase === 'reveal' && m.summary?.results?.length >= 3,
+    'first reveal'
+  );
+  host.send({ type: 'next_round' });
+
+  const botNarratorSubmit = await waitForMessage(
+    host,
+    (m) => m.type === 'state'
+      && m.round >= reveal.round + 1
+      && m.storytellerId !== m.you?.id
+      && typeof m.clue === 'string'
+      && m.clue.trim().split(/\s+/).length >= 2
+      && m.phase === 'submit'
+      && Array.isArray(m.hand)
+      && m.hand.length >= 1,
+    'bot storyteller submit state',
+    8000
+  );
+
+  const botNarrator = botNarratorSubmit.players.find((player) => player.id === botNarratorSubmit.storytellerId);
+  assert.ok(botNarrator?.isBot);
+  assert.ok(botNarratorSubmit.clue.length >= 8);
+  assert.notEqual(botNarratorSubmit.clue.toLowerCase(), 'pista test');
+
+  host.send({ type: 'submit_card', card: botNarratorSubmit.hand[0] });
+  const voteState = await waitForMessage(
+    host,
+    (m) => m.type === 'state' && m.phase === 'vote' && Array.isArray(m.board) && m.board.length === 3,
+    'bot narrator vote phase'
+  );
+  const choice = voteState.board.find((card) => !card.isYours);
+  assert.ok(choice?.id);
+  host.send({ type: 'vote', submissionId: choice.id });
+
+  const botNarratorReveal = await waitForMessage(
+    host,
+    (m) => m.type === 'state' && m.phase === 'reveal' && m.summary?.storytellerId === botNarratorSubmit.storytellerId,
+    'bot narrator reveal'
+  );
+  assert.ok((botNarratorReveal.summary?.clueReason || '').trim().length >= 20);
+});
+
 test('flujo multijugador: start, submit, vote, reveal y rotación de narrador', async (t) => {
   const { port } = await startServer(t);
   const a = await createClient(t, port);

@@ -49,33 +49,218 @@ const MIN_PLAYERS = 3;
 const BOT_NOUNS = ['sueño', 'isla', 'bosque', 'espejo', 'torre', 'puente', 'luz', 'lluvia', 'silencio', 'laberinto', 'cometa', 'oleaje', 'teatro', 'círculo', 'jardín'];
 const BOT_ADJ = ['eterno', 'roto', 'brillante', 'suspendido', 'secreto', 'infinito', 'oculto', 'violeta', 'cálido', 'helado', 'eléctrico', 'sombrío', 'lúcido', 'flotante', 'quieto'];
 const BOT_TWIST = ['sin salida', 'que respira', 'invertido', 'que recuerda', 'que canta', 'a contraluz', 'al revés', 'que espera', 'en espiral', 'bajo el agua'];
-const BOT_REASONS = [
-  'por el tono onírico de la ilustración',
-  'porque se ve un personaje que encaja',
-  'por el contraste de luces y sombras',
-  'porque transmite calma y misterio',
-  'por el movimiento que sugiere la imagen',
-  'ya que tiene elementos repetidos',
-  'por el detalle central destacado',
-  'porque parece una escena de teatro',
-  'por la geometría que recuerda a un laberinto',
-  'por los colores fríos y el ambiente húmedo'
-];
+const BOT_SCENES = ['domingo sin reloj', 'pasillo de museo vacío', 'fiesta que ya terminó', 'cuento antes de dormir', 'fotograma perdido', 'postal sin remitente'];
+const BOT_LINKERS = ['entre', 'bajo', 'tras', 'contra', 'sobre'];
 const BOT_NAMES = ['Iris', 'Lumen', 'Atlas', 'Vela', 'Echo', 'Nova', 'Pixel', 'Sombra', 'Lago', 'Bruma', 'Cobalto', 'Arcilla', 'Aura', 'Cometa', 'Niebla'];
 const BOT_LEVELS = ['easy', 'normal', 'smart'];
 const MAX_ROUNDS = 10;
 const DRINK_LEVELS = ['light', 'medium', 'heavy'];
 
-// Pseudo-semantic tags to give bots/context more coherent reasons
+// Pseudo-semantic tags to give bots/context more coherent reasons.
 const CARD_THEMES = ['bosque', 'océano', 'cielo', 'ciudad', 'desierto', 'montaña', 'invierno', 'verano', 'sueño', 'espacio'];
 const CARD_MOODS = ['sereno', 'caótico', 'melancólico', 'luminoso', 'oscuro', 'festivo', 'dramático', 'surreal', 'juguetón', 'épico'];
 const CARD_ELEMENTS = ['animales', 'personas', 'puentes', 'torres', 'nubes', 'olas', 'escaleras', 'relojes', 'máscaras', 'flores'];
 const CARD_COLORS = ['azules', 'dorados', 'rojos', 'violetas', 'verdes', 'cálidos', 'fríos', 'pastel', 'contrastados', 'monocromáticos'];
+const CARD_WEATHER = ['niebla', 'lluvia', 'brisa', 'tormenta', 'sequía', 'rocío', 'viento', 'calma'];
+const CARD_LIGHT = ['amanecer', 'mediodía', 'atardecer', 'noche', 'crepúsculo', 'luz de luna'];
+const CARD_RHYTHM = ['quieto', 'en fuga', 'suspendido', 'circular', 'frágil', 'eléctrico', 'lento', 'nervioso'];
+
+const BOT_PERSONALITIES = [
+  { id: 'poeta', openers: ['huele a', 'me suena a', 'parece un'], cadence: ['a media voz', 'sin avisar', 'como un recuerdo'], riskBias: 0.55 },
+  { id: 'cineasta', openers: ['si fuera una película sería', 'fotograma de', 'escena de'], cadence: ['con cámara lenta', 'con zoom al fondo', 'sin diálogo'], riskBias: 0.45 },
+  { id: 'narrador', openers: ['me recuerda a', 'es casi', 'diría que es'], cadence: ['al final del cuento', 'justo antes del giro', 'en el capítulo dos'], riskBias: 0.35 },
+];
+const BOT_PERSONALITY_BY_ID = Object.fromEntries(BOT_PERSONALITIES.map((persona) => [persona.id, persona]));
+
+const BOT_DIFFICULTY_PROFILE = {
+  easy: {
+    storyTemperature: 1.35,
+    submitTemperature: 1.6,
+    voteTemperature: 1.5,
+    randomSubmitChance: 0.45,
+    randomVoteChance: 0.4,
+    targetAmbiguity: 0.25,
+    desiredLead: 0.42,
+    minOwnScore: 0.8,
+    decoyThreshold: 0.62,
+  },
+  normal: {
+    storyTemperature: 0.85,
+    submitTemperature: 1.0,
+    voteTemperature: 0.95,
+    randomSubmitChance: 0.14,
+    randomVoteChance: 0.18,
+    targetAmbiguity: 0.5,
+    desiredLead: 0.24,
+    minOwnScore: 1.05,
+    decoyThreshold: 0.72,
+  },
+  smart: {
+    storyTemperature: 0.45,
+    submitTemperature: 0.55,
+    voteTemperature: 0.5,
+    randomSubmitChance: 0.05,
+    randomVoteChance: 0.08,
+    targetAmbiguity: 0.65,
+    desiredLead: 0.12,
+    minOwnScore: 1.15,
+    decoyThreshold: 0.78,
+  },
+};
+
+const BOT_THEME_LEXICON = {
+  bosque: ['arboleda', 'raíces', 'hojarasca'],
+  océano: ['marea', 'sal', 'profundidad'],
+  cielo: ['altura', 'nubes', 'horizonte'],
+  ciudad: ['asfalto', 'ventanas', 'semáforo'],
+  desierto: ['arena', 'sed', 'duna'],
+  montaña: ['cumbre', 'piedra', 'eco'],
+  invierno: ['escarcha', 'frío', 'aliento'],
+  verano: ['calor', 'siesta', 'sol'],
+  sueño: ['insomnio', 'fantasía', 'subconsciente'],
+  espacio: ['órbita', 'vacío', 'gravedad'],
+};
+const BOT_MOOD_LEXICON = {
+  sereno: ['calma', 'susurro', 'pausa'],
+  caótico: ['ruido', 'choque', 'vértigo'],
+  melancólico: ['nostalgia', 'ausencia', 'distancia'],
+  luminoso: ['resplandor', 'destello', 'brillo'],
+  oscuro: ['sombra', 'noche', 'secreto'],
+  festivo: ['baile', 'brindis', 'fuegos'],
+  dramático: ['tensión', 'teatro', 'final'],
+  surreal: ['extraño', 'imposible', 'onírico'],
+  juguetón: ['travieso', 'risa', 'juego'],
+  épico: ['hazaña', 'leyenda', 'proeza'],
+};
+const BOT_ELEMENT_LEXICON = {
+  animales: ['bestias', 'plumas', 'huellas'],
+  personas: ['rostros', 'miradas', 'sombras humanas'],
+  puentes: ['arcos', 'tránsito', 'pasarela'],
+  torres: ['altura', 'vigilancia', 'aguja'],
+  nubes: ['niebla alta', 'algodón', 'vapor'],
+  olas: ['espuma', 'oleaje', 'marejada'],
+  escaleras: ['peldaños', 'ascenso', 'bajada'],
+  relojes: ['tiempo', 'tic tac', 'minutos'],
+  máscaras: ['identidad', 'disfraz', 'teatro'],
+  flores: ['pétalos', 'perfume', 'jardín'],
+};
+const BOT_COLOR_LEXICON = {
+  azules: ['azul', 'cobalto', 'ultramar'],
+  dorados: ['oro', 'ámbar', 'latón'],
+  rojos: ['carmesí', 'granate', 'escarlata'],
+  violetas: ['malva', 'lila', 'púrpura'],
+  verdes: ['esmeralda', 'musgo', 'jade'],
+  cálidos: ['fuego', 'brasas', 'ocre'],
+  fríos: ['hielo', 'acero', 'gris'],
+  pastel: ['algodón', 'crema', 'tiza'],
+  contrastados: ['choque', 'duelo', 'contraluz'],
+  monocromáticos: ['sombra única', 'escala', 'tono plano'],
+};
+
+const SPANISH_STOPWORDS = new Set([
+  'de', 'la', 'el', 'los', 'las', 'un', 'una', 'unos', 'unas', 'y', 'o', 'en', 'con',
+  'por', 'para', 'del', 'al', 'que', 'se', 'es', 'como', 'sin', 'sobre', 'entre', 'tras',
+  'muy', 'más', 'menos', 'mi', 'tu', 'su', 'sus', 'nos', 'os', 'lo', 'le', 'les',
+]);
+
+const CARD_PROFILE_CACHE = new Map();
 
 function hashString(str) {
   let h = 0;
   for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
   return h;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function pickRandom(items) {
+  if (!items || items.length === 0) return null;
+  return items[Math.floor(Math.random() * items.length)] || null;
+}
+
+function stripAccents(value = '') {
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+function normalizeText(value = '') {
+  return stripAccents(value.toLowerCase())
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function tokenize(value = '') {
+  return normalizeText(value)
+    .split(' ')
+    .filter((token) => token.length > 2 && !SPANISH_STOPWORDS.has(token));
+}
+
+function uniqueByNormalized(values = []) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    const normalized = normalizeText(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(value.trim());
+  }
+  return result;
+}
+
+function cleanClue(value = '') {
+  const compact = value.replace(/\s+/g, ' ').trim().slice(0, 80);
+  if (!compact) return '';
+  return compact.charAt(0).toUpperCase() + compact.slice(1);
+}
+
+function singularize(value = '') {
+  if (value.endsWith('es')) return value.slice(0, -2);
+  if (value.endsWith('s')) return value.slice(0, -1);
+  return value;
+}
+
+function createBotBrain() {
+  return {
+    usedClues: [],
+    botPersonaById: {},
+    recentVotesByOwner: {},
+    recentCardsByBot: {},
+  };
+}
+
+function getBotDifficulty(level = 'normal') {
+  return BOT_DIFFICULTY_PROFILE[level] || BOT_DIFFICULTY_PROFILE.normal;
+}
+
+function ensureBotBrain(room) {
+  if (!room.botBrain || typeof room.botBrain !== 'object') {
+    room.botBrain = createBotBrain();
+  }
+  if (!room.botBrain.usedClues) room.botBrain.usedClues = [];
+  if (!room.botBrain.botPersonaById) room.botBrain.botPersonaById = {};
+  if (!room.botBrain.recentVotesByOwner) room.botBrain.recentVotesByOwner = {};
+  if (!room.botBrain.recentCardsByBot) room.botBrain.recentCardsByBot = {};
+  return room.botBrain;
+}
+
+function resolveBotPersona(room, player) {
+  const brain = ensureBotBrain(room);
+  const predefined = player?.persona;
+  if (predefined && BOT_PERSONALITY_BY_ID[predefined]) return BOT_PERSONALITY_BY_ID[predefined];
+
+  const current = brain.botPersonaById[player?.id];
+  if (current && BOT_PERSONALITY_BY_ID[current]) {
+    if (player) player.persona = current;
+    return BOT_PERSONALITY_BY_ID[current];
+  }
+
+  const index = hashString(`${room.code}:${player?.id || 'bot'}`) % BOT_PERSONALITIES.length;
+  const selected = BOT_PERSONALITIES[index];
+  brain.botPersonaById[player?.id] = selected.id;
+  if (player) player.persona = selected.id;
+  return selected;
 }
 
 function getCardTags(card) {
@@ -89,12 +274,355 @@ function getCardTags(card) {
   };
 }
 
-function buildBotClue(tags) {
-  const twist = BOT_TWIST[Math.floor(Math.random() * BOT_TWIST.length)];
-  const noun = tags.element || 'escena';
-  const clue = `${tags.theme} ${tags.mood} ${twist}`;
-  const reason = `La carta muestra ${noun} con tonos ${tags.colors}, vibra ${tags.mood} y un fondo que recuerda a ${tags.theme}.`;
-  return { clue, reason };
+function getCardProfile(card) {
+  const key = card || 'card';
+  if (CARD_PROFILE_CACHE.has(key)) return CARD_PROFILE_CACHE.get(key);
+
+  const base = card ? path.basename(card) : 'card';
+  const h = hashString(base);
+  const tags = getCardTags(card);
+  const profile = {
+    ...tags,
+    weather: CARD_WEATHER[(h >>> 12) % CARD_WEATHER.length],
+    light: CARD_LIGHT[(h >>> 15) % CARD_LIGHT.length],
+    rhythm: CARD_RHYTHM[(h >>> 18) % CARD_RHYTHM.length],
+  };
+
+  const concepts = uniqueByNormalized([
+    profile.theme,
+    profile.mood,
+    profile.element,
+    singularize(profile.element),
+    profile.colors,
+    profile.weather,
+    profile.light,
+    profile.rhythm,
+    ...(BOT_THEME_LEXICON[profile.theme] || []),
+    ...(BOT_MOOD_LEXICON[profile.mood] || []),
+    ...(BOT_ELEMENT_LEXICON[profile.element] || []),
+    ...(BOT_COLOR_LEXICON[profile.colors] || []),
+  ]);
+  const tokens = new Set(concepts.flatMap((concept) => tokenize(concept)));
+  const data = { ...profile, concepts, tokens };
+  CARD_PROFILE_CACHE.set(key, data);
+  return data;
+}
+
+function tokenOverlapScore(clueTokens, profileTokens) {
+  let total = 0;
+  for (const clueToken of clueTokens) {
+    if (profileTokens.has(clueToken)) {
+      total += 1;
+      continue;
+    }
+    for (const profileToken of profileTokens) {
+      if (profileToken.startsWith(clueToken) || clueToken.startsWith(profileToken)) {
+        total += 0.55;
+        break;
+      }
+    }
+  }
+  return total;
+}
+
+function scoreCardForClue(clue, cardPath) {
+  const clueTokens = tokenize(clue);
+  if (clueTokens.length === 0) return 0;
+  const profile = getCardProfile(cardPath);
+  const overlap = tokenOverlapScore(clueTokens, profile.tokens);
+  const normalizedClue = normalizeText(clue);
+
+  let semantic = 0;
+  if (normalizedClue.includes(normalizeText(profile.theme))) semantic += 0.45;
+  if (normalizedClue.includes(normalizeText(profile.mood))) semantic += 0.4;
+  if (normalizedClue.includes(normalizeText(singularize(profile.element)))) semantic += 0.3;
+
+  const lengthFactor = clamp(1 - Math.abs(clueTokens.length - 4) * 0.08, 0.72, 1.08);
+  return (overlap + semantic) * lengthFactor;
+}
+
+function clueNoveltyPenalty(room, clue) {
+  const brain = ensureBotBrain(room);
+  const normalized = normalizeText(clue);
+  if (!normalized) return 0;
+  if (brain.usedClues.includes(normalized)) return 2.4;
+
+  const clueTokens = new Set(tokenize(normalized));
+  if (clueTokens.size === 0) return 0;
+
+  let penalty = 0;
+  for (let i = brain.usedClues.length - 1, age = 0; i >= 0 && age < 14; i -= 1, age += 1) {
+    const prev = brain.usedClues[i];
+    const prevTokens = tokenize(prev);
+    if (prevTokens.length === 0) continue;
+    let shared = 0;
+    for (const token of prevTokens) {
+      if (clueTokens.has(token)) shared += 1;
+    }
+    const overlap = shared / Math.max(clueTokens.size, prevTokens.length);
+    penalty = Math.max(penalty, overlap * (1 - age * 0.06));
+  }
+  return penalty;
+}
+
+function softmaxPick(items, scoreSelector, temperature = 1) {
+  if (!items || items.length === 0) return null;
+  const safeTemp = Math.max(0.05, temperature);
+  const maxScore = Math.max(...items.map(scoreSelector));
+
+  const weighted = [];
+  let total = 0;
+  for (const item of items) {
+    const score = scoreSelector(item);
+    const weight = Math.exp((score - maxScore) / safeTemp);
+    total += weight;
+    weighted.push({ item, weight });
+  }
+  if (total <= 0) return items[0];
+
+  let cursor = Math.random() * total;
+  for (const entry of weighted) {
+    cursor -= entry.weight;
+    if (cursor <= 0) return entry.item;
+  }
+  return weighted[weighted.length - 1].item;
+}
+
+function buildBotReason(profile, persona, clue) {
+  const templates = [
+    `La elegí por el contraste ${profile.mood} y el aire de ${profile.theme}; suena clara sin ser obvia.`,
+    `Me apoyé en ${profile.element}, tonos ${profile.colors} y ritmo ${profile.rhythm} para dejar una duda razonable.`,
+    `La pista "${clue}" apunta a ${profile.theme}, pero también permite que otra carta compita.`,
+    `Con estilo ${persona.id}, busqué sugerir ${profile.mood} y ${profile.light} sin regalar la respuesta.`,
+  ];
+  return pickRandom(templates) || templates[0];
+}
+
+function buildBotClueCandidates(room, storyteller, cardPath) {
+  const profile = getCardProfile(cardPath);
+  const persona = storyteller?.isBot ? resolveBotPersona(room, storyteller) : BOT_PERSONALITIES[2];
+  const themeWords = [profile.theme, ...(BOT_THEME_LEXICON[profile.theme] || [])];
+  const moodWords = [profile.mood, ...(BOT_MOOD_LEXICON[profile.mood] || [])];
+  const elementWords = [singularize(profile.element), ...(BOT_ELEMENT_LEXICON[profile.element] || [])];
+  const colorWords = [profile.colors, ...(BOT_COLOR_LEXICON[profile.colors] || [])];
+  const opener = pickRandom(persona.openers) || 'me recuerda a';
+  const cadence = pickRandom(persona.cadence) || 'sin aviso';
+  const noun = pickRandom(BOT_NOUNS) || profile.theme;
+  const adj = pickRandom(BOT_ADJ) || profile.mood;
+  const twist = pickRandom(BOT_TWIST) || 'a contraluz';
+  const scene = pickRandom(BOT_SCENES) || `${profile.light} sin reloj`;
+  const anchorTheme = pickRandom(themeWords) || profile.theme;
+  const anchorMood = pickRandom(moodWords) || profile.mood;
+  const anchorElement = pickRandom(elementWords) || singularize(profile.element);
+  const anchorColor = pickRandom(colorWords) || profile.colors;
+  const linker = pickRandom(BOT_LINKERS) || 'entre';
+
+  const clues = uniqueByNormalized([
+    cleanClue(`${anchorTheme} ${anchorMood} ${twist}`),
+    cleanClue(`${opener} ${anchorElement} ${cadence}`),
+    cleanClue(`${scene}: ${anchorTheme} ${twist}`),
+    cleanClue(`${anchorElement} ${linker} ${anchorMood}`),
+    cleanClue(`${anchorColor} y ${anchorMood}`),
+    cleanClue(`${noun} ${adj} ${twist}`),
+    cleanClue(`${profile.light} ${linker} ${anchorTheme}`),
+    cleanClue(`${opener} ${noun} ${pickRandom(['sin mapa', 'en cámara lenta', 'sin final'])}`),
+  ]).filter((clue) => clue.length >= 8 && clue.split(' ').length >= 2 && clue.length <= 80);
+
+  if (clues.length === 0) {
+    clues.push(cleanClue(`${profile.theme} ${profile.mood} ${twist}`));
+  }
+
+  return clues.map((clue) => ({
+    clue,
+    reason: buildBotReason(profile, persona, clue),
+    profile,
+  }));
+}
+
+function evaluateStoryCandidate(room, storyteller, cardPath, clue, level = 'normal') {
+  const config = getBotDifficulty(level);
+  const ownScore = scoreCardForClue(clue, cardPath);
+  const opponents = Array.from(room.players.values()).filter((player) => player.id !== storyteller.id);
+
+  let bestOpponentScore = -Infinity;
+  let strongOpponents = 0;
+
+  for (const opponent of opponents) {
+    let bestForOpponent = -Infinity;
+    for (const card of opponent.hand || []) {
+      bestForOpponent = Math.max(bestForOpponent, scoreCardForClue(clue, card));
+    }
+    if (bestForOpponent !== -Infinity) {
+      bestOpponentScore = Math.max(bestOpponentScore, bestForOpponent);
+      if (bestForOpponent >= ownScore * config.decoyThreshold) {
+        strongOpponents += 1;
+      }
+    }
+  }
+  if (bestOpponentScore === -Infinity) bestOpponentScore = 0;
+
+  const targetAmbiguity = clamp(
+    Math.round(opponents.length * config.targetAmbiguity),
+    opponents.length > 1 ? 1 : 0,
+    Math.max(opponents.length - 1, 0),
+  );
+  const ambiguityPenalty = Math.abs(strongOpponents - targetAmbiguity) * 1.25;
+
+  const lead = ownScore - bestOpponentScore;
+  const leadPenalty = Math.abs(lead - config.desiredLead) * 1.85;
+
+  const noveltyPenalty = clueNoveltyPenalty(room, clue);
+  const clarityPenalty = ownScore < config.minOwnScore ? (config.minOwnScore - ownScore) * 2.3 : 0;
+
+  const wordCount = tokenize(clue).length;
+  let naturalBonus = 0.15;
+  if (wordCount >= 2 && wordCount <= 6) naturalBonus += 0.35;
+  if (clue.length >= 12 && clue.length <= 46) naturalBonus += 0.2;
+
+  const quality = ownScore * 2.2
+    - ambiguityPenalty
+    - leadPenalty
+    - noveltyPenalty
+    - clarityPenalty
+    + naturalBonus
+    + Math.random() * 0.04;
+
+  return { quality };
+}
+
+function selectStorytellerPlan(room, storyteller, level = storyteller?.difficulty || 'normal') {
+  if (!storyteller || !Array.isArray(storyteller.hand) || storyteller.hand.length === 0) return null;
+
+  const options = [];
+  for (const card of storyteller.hand) {
+    const candidates = buildBotClueCandidates(room, storyteller, card);
+    for (const candidate of candidates) {
+      const { quality } = evaluateStoryCandidate(room, storyteller, card, candidate.clue, level);
+      options.push({
+        card,
+        clue: candidate.clue,
+        reason: candidate.reason,
+        quality,
+      });
+    }
+  }
+  if (options.length === 0) return null;
+
+  const config = getBotDifficulty(level);
+  const shortlist = options
+    .sort((a, b) => b.quality - a.quality)
+    .slice(0, 8);
+  return softmaxPick(shortlist, (option) => option.quality, config.storyTemperature) || shortlist[0];
+}
+
+function chooseBotSubmissionCard(room, bot, level = bot?.difficulty || 'normal') {
+  if (!bot || !Array.isArray(bot.hand) || bot.hand.length === 0) return null;
+  const config = getBotDifficulty(level);
+  const brain = ensureBotBrain(room);
+  const recentCards = brain.recentCardsByBot[bot.id] || [];
+
+  const scored = bot.hand.map((card) => {
+    const similarity = scoreCardForClue(room.clue, card);
+    const repeatPenalty = recentCards.includes(card) ? 0.45 : 0;
+    return {
+      card,
+      score: similarity - repeatPenalty + Math.random() * 0.05,
+    };
+  });
+
+  if (Math.random() < config.randomSubmitChance) {
+    return pickRandom(bot.hand) || bot.hand[0];
+  }
+
+  const selected = softmaxPick(scored, (entry) => entry.score, config.submitTemperature) || scored[0];
+  return selected.card;
+}
+
+function chooseBotVote(room, bot, level = bot?.difficulty || 'normal') {
+  const choices = room.shuffledSubmissions.filter((submission) => submission.playerId !== bot.id);
+  if (choices.length === 0) return null;
+  const config = getBotDifficulty(level);
+
+  if (Math.random() < config.randomVoteChance) {
+    return pickRandom(choices) || choices[0];
+  }
+
+  const scored = choices.map((choice) => ({
+    choice,
+    score: scoreCardForClue(room.clue, choice.card) + Math.random() * 0.05,
+  }));
+  const selected = softmaxPick(scored, (entry) => entry.score, config.voteTemperature) || scored[0];
+  return selected.choice;
+}
+
+function rememberClueMemory(room, storytellerId, clue) {
+  const normalized = normalizeText(clue);
+  if (!normalized) return;
+  const brain = ensureBotBrain(room);
+  const last = brain.usedClues[brain.usedClues.length - 1];
+  if (last === normalized) return;
+  brain.usedClues.push(normalized);
+  if (brain.usedClues.length > 60) {
+    brain.usedClues = brain.usedClues.slice(-60);
+  }
+  if (storytellerId && brain.botPersonaById[storytellerId] === undefined) {
+    brain.botPersonaById[storytellerId] = null;
+  }
+}
+
+function rememberRoundOutcome(room) {
+  const brain = ensureBotBrain(room);
+  const votesBySubmission = new Map();
+  for (const vote of room.votes) {
+    votesBySubmission.set(vote.submissionId, (votesBySubmission.get(vote.submissionId) || 0) + 1);
+  }
+  for (const submission of room.submissions) {
+    const votes = votesBySubmission.get(submission.id) || 0;
+    const current = brain.recentVotesByOwner[submission.playerId];
+    const next = current === undefined ? votes : current * 0.65 + votes * 0.35;
+    brain.recentVotesByOwner[submission.playerId] = next;
+  }
+}
+
+function applyStorytellerPlan(room, storyteller, plan) {
+  if (!storyteller || !plan?.card || !plan?.clue) return false;
+  if (!storyteller.hand.includes(plan.card)) return false;
+
+  storyteller.hand = storyteller.hand.filter((card) => card !== plan.card);
+  const submissionId = crypto.randomUUID();
+  storyteller.submittedCardId = submissionId;
+  room.clue = cleanClue(plan.clue);
+  room.clueReason = plan.reason || '';
+  room.submissions = [{ id: submissionId, playerId: storyteller.id, card: plan.card }];
+  room.shuffledSubmissions = [];
+  room.votes = [];
+  room.phase = 'submit';
+  room.phaseStartedAt = Date.now();
+  rememberClueMemory(room, storyteller.id, room.clue);
+  return true;
+}
+
+function moveToVotePhase(room) {
+  const expected = room.players.size;
+  if (expected <= 0 || room.submissions.length < expected) return false;
+  room.shuffledSubmissions = shuffle(room.submissions);
+  room.phase = 'vote';
+  room.phaseStartedAt = Date.now();
+  for (const player of room.players.values()) player.votedFor = null;
+  return true;
+}
+
+function moveToRevealPhase(room) {
+  const votesNeeded = room.players.size - 1;
+  if (votesNeeded <= 0 || room.votes.length < votesNeeded) return false;
+  computeScores(room);
+  room.phase = 'reveal';
+  room.phaseStartedAt = Date.now();
+  room.discard.push(...room.submissions.map((submission) => submission.card));
+  if (room.summary) {
+    room.summary.votesDetail = room.votes.map((vote) => ({ playerId: vote.playerId, submissionId: vote.submissionId }));
+  }
+  return true;
 }
 
 function buildDrinkPrompt(tags, level = 'light') {
@@ -126,7 +654,8 @@ function roomToJSON(room) {
       votedFor: p.votedFor,
       connected: p.connected,
       isBot: p.isBot || false,
-      difficulty: p.difficulty || 'normal'
+      difficulty: p.difficulty || 'normal',
+      persona: p.persona || null,
     })),
     order: room.order,
     hostId: room.hostId,
@@ -168,11 +697,15 @@ function loadRooms() {
         ...r,
         players: new Map(),
         mode: r.mode || 'classic',
-        drinkLevel: r.drinkLevel || 'light'
+        drinkLevel: r.drinkLevel || 'light',
+        botBrain: createBotBrain(),
       };
       r.players.forEach(p => {
         room.players.set(p.id, { ...p, ws: null });
       });
+      for (const player of room.players.values()) {
+        if (player.isBot) resolveBotPersona(room, player);
+      }
       rooms.set(room.code, room);
     });
   } catch (e) {
@@ -233,7 +766,8 @@ function createRoom(code) {
     phaseStartedAt: Date.now(),
     active: true,
     mode: 'classic',
-    drinkLevel: 'light'
+    drinkLevel: 'light',
+    botBrain: createBotBrain(),
   };
   rooms.set(roomCode, room);
   return room;
@@ -290,6 +824,7 @@ function resetRound(room) {
 
 function startGame(room) {
   room.round = 0;
+  room.botBrain = createBotBrain();
   resetRound(room);
   room.phase = 'clue';
   room.phaseStartedAt = Date.now();
@@ -297,6 +832,7 @@ function startGame(room) {
 
 function ensureBotActions(room) {
   if (room.players.size === 0) return;
+  ensureBotBrain(room);
   if (!room.storytellerId || !room.players.has(room.storytellerId)) {
     room.storytellerId = rotateStoryteller(room);
   }
@@ -304,150 +840,100 @@ function ensureBotActions(room) {
   const elapsed = Date.now() - (room.phaseStartedAt || Date.now());
   const expired = elapsed > room.turnSeconds * 1000;
 
-  // storyteller bot submits clue automatically
+  // Storyteller bot submits clue automatically.
   const storyteller = room.players.get(room.storytellerId);
   if (room.phase === 'clue' && storyteller?.isBot) {
-    const pickCardForClue = () => {
-      if (storyteller.hand.length === 0) return null;
-      const scores = storyteller.hand.map((c) => {
-        const tags = getCardTags(c);
-        const entropy = Math.random() * 0.2;
-        const thematic = tags.theme.length * 0.01;
-        return { card: c, score: thematic + entropy };
-      });
-      return scores.sort((a, b) => a.score - b.score)[0].card;
-    };
-    const card = pickCardForClue();
-    if (card) {
-      storyteller.hand = storyteller.hand.filter(c => c !== card);
-      const submissionId = crypto.randomUUID();
-      storyteller.submittedCardId = submissionId;
-      const tags = getCardTags(card);
-      const { clue, reason } = buildBotClue(tags);
-      room.clue = clue;
-      room.clueReason = reason;
-      room.submissions = [{ id: submissionId, playerId: storyteller.id, card }];
-      room.shuffledSubmissions = [];
-      room.votes = [];
-      room.phase = 'submit';
+    const plan = selectStorytellerPlan(room, storyteller, storyteller.difficulty || 'normal');
+    if (plan) {
+      applyStorytellerPlan(room, storyteller, plan);
     }
   }
 
-  // bots submit cards in submit phase
+  // Bots submit cards in submit phase.
   if (room.phase === 'submit') {
     for (const p of room.players.values()) {
       if (p.isBot && p.id !== room.storytellerId && !p.submittedCardId) {
-        const card = p.hand[0];
+        const card = chooseBotSubmissionCard(room, p, p.difficulty || 'normal');
         if (card) {
           p.hand = p.hand.filter(c => c !== card);
           const submissionId = crypto.randomUUID();
           p.submittedCardId = submissionId;
           room.submissions.push({ id: submissionId, playerId: p.id, card });
+          const brain = ensureBotBrain(room);
+          const history = brain.recentCardsByBot[p.id] || [];
+          history.push(card);
+          brain.recentCardsByBot[p.id] = history.slice(-8);
         }
       }
     }
-    const submittedPlayers = room.submissions.length;
-    const expected = room.players.size;
-    if (submittedPlayers >= expected && expected > 0) {
-      room.shuffledSubmissions = shuffle(room.submissions);
-      room.phase = 'vote';
-      room.phaseStartedAt = Date.now();
-      for (const p of room.players.values()) p.votedFor = null;
-    }
+    moveToVotePhase(room);
   }
 
-  // bots vote in vote phase
+  // Bots vote in vote phase.
   if (room.phase === 'vote') {
     for (const p of room.players.values()) {
       if (p.isBot && p.id !== room.storytellerId && !p.votedFor) {
-        const choices = room.shuffledSubmissions.filter(s => s.playerId !== p.id);
-        let choice = choices[0];
-        const clueWords = room.clue.split(/\s+/);
-        const scoreCard = (cardPath) => {
-          const tags = getCardTags(cardPath);
-          const text = `${tags.theme} ${tags.mood} ${tags.element} ${tags.colors}`.toLowerCase();
-          const match = clueWords.reduce((acc, w) => acc + (text.includes(w.toLowerCase()) ? 1 : 0), 0);
-          return -(match * 2) + Math.random() * 0.2;
-        };
-        if (p.difficulty === 'easy') {
-          choice = choices[Math.floor(Math.random() * choices.length)] || choice;
-        } else if (p.difficulty === 'smart' && choices.length > 1) {
-          choice = choices.sort((a, b) => scoreCard(a.card) - scoreCard(b.card))[0];
-        } else if (choices.length > 1) {
-          choice = choices.sort((a, b) => scoreCard(a.card) - scoreCard(b.card))[0];
-        }
+        const choice = chooseBotVote(room, p, p.difficulty || 'normal');
         if (choice) {
           p.votedFor = choice.id;
           room.votes.push({ playerId: p.id, submissionId: choice.id });
         }
       }
     }
-    const votesNeeded = room.players.size - 1;
-    if (room.votes.length >= votesNeeded && votesNeeded > 0) {
-      computeScores(room);
-      room.phase = 'reveal';
-      room.phaseStartedAt = Date.now();
-      room.discard.push(...room.submissions.map(s => s.card));
-      // enrich summary with who voted what for UI
-      if (room.summary) {
-        room.summary.votesDetail = room.votes.map(v => ({ playerId: v.playerId, submissionId: v.submissionId }));
-      }
-    }
+    moveToRevealPhase(room);
   }
 
-  // auto-advance on timer expiry
+  // Auto-advance on timer expiry.
   if (expired) {
     if (room.phase === 'clue' && room.submissions.length === 0) {
-      // force bot-like clue for storyteller
       const st = room.players.get(room.storytellerId);
       if (st && st.hand.length > 0) {
-        const card = st.hand[0];
-        st.hand = st.hand.filter(c => c !== card);
-        const submissionId = crypto.randomUUID();
-        st.submittedCardId = submissionId;
-        const tags = getCardTags(card);
-        const { clue, reason } = buildBotClue(tags);
-        room.clue = clue;
-        room.clueReason = reason;
-        room.submissions = [{ id: submissionId, playerId: st.id, card }];
-        room.phase = 'submit';
-        room.phaseStartedAt = Date.now();
+        const timeoutLevel = st.isBot ? (st.difficulty || 'normal') : 'normal';
+        const plan = selectStorytellerPlan(room, st, timeoutLevel);
+        if (plan) {
+          applyStorytellerPlan(room, st, plan);
+        }
       }
     } else if (room.phase === 'submit') {
-      // auto-submit random for pending humans
       for (const p of room.players.values()) {
-        if (!p.submittedCardId) {
-          const card = p.hand[0];
-          if (card) {
-            p.hand = p.hand.filter(c => c !== card);
-            const submissionId = crypto.randomUUID();
-            p.submittedCardId = submissionId;
-            room.submissions.push({ id: submissionId, playerId: p.id, card });
-          }
+        if (p.id === room.storytellerId || p.submittedCardId) continue;
+        let card = null;
+        if (p.isBot) {
+          card = chooseBotSubmissionCard(room, p, p.difficulty || 'normal');
+        } else if (p.hand.length > 0) {
+          const scored = p.hand
+            .map((candidate) => ({ card: candidate, score: scoreCardForClue(room.clue, candidate) }))
+            .sort((a, b) => b.score - a.score);
+          card = scored[0]?.card || p.hand[0];
+        }
+        if (card) {
+          p.hand = p.hand.filter((candidate) => candidate !== card);
+          const submissionId = crypto.randomUUID();
+          p.submittedCardId = submissionId;
+          room.submissions.push({ id: submissionId, playerId: p.id, card });
         }
       }
-      room.shuffledSubmissions = shuffle(room.submissions);
-      room.phase = 'vote';
-      room.phaseStartedAt = Date.now();
-      for (const p of room.players.values()) p.votedFor = null;
+      moveToVotePhase(room);
     } else if (room.phase === 'vote') {
       for (const p of room.players.values()) {
-        if (!p.votedFor) {
+        if (p.id === room.storytellerId || p.votedFor) continue;
+        let choice = null;
+        if (p.isBot) {
+          choice = chooseBotVote(room, p, p.difficulty || 'normal');
+        } else {
           const choices = room.shuffledSubmissions.filter(s => s.playerId !== p.id);
-          const choice = choices[Math.floor(Math.random() * choices.length)];
-          if (choice) {
-            p.votedFor = choice.id;
-            room.votes.push({ playerId: p.id, submissionId: choice.id });
-          }
+          const scored = choices.map((candidate) => ({
+            choice: candidate,
+            score: scoreCardForClue(room.clue, candidate.card),
+          }));
+          choice = softmaxPick(scored, (entry) => entry.score, 1.2)?.choice || pickRandom(choices);
+        }
+        if (choice) {
+          p.votedFor = choice.id;
+          room.votes.push({ playerId: p.id, submissionId: choice.id });
         }
       }
-      computeScores(room);
-      room.phase = 'reveal';
-      room.phaseStartedAt = Date.now();
-      room.discard.push(...room.submissions.map(s => s.card));
-      if (room.summary) {
-        room.summary.votesDetail = room.votes.map(v => ({ playerId: v.playerId, submissionId: v.submissionId }));
-      }
+      moveToRevealPhase(room);
     }
   }
 }
@@ -474,6 +960,7 @@ function addPlayer(room, name, ws, difficulty = 'normal') {
 
 function addBot(room, name = 'Bot', difficulty = 'normal') {
   const id = `bot-${crypto.randomBytes(4).toString('hex')}`;
+  const persona = BOT_PERSONALITIES[hashString(`${room.code}:${id}`) % BOT_PERSONALITIES.length].id;
   const player = {
     id,
     name: `${name} (bot)`,
@@ -485,10 +972,12 @@ function addBot(room, name = 'Bot', difficulty = 'normal') {
     ws: null,
     connected: false,
     isBot: true,
-    difficulty: BOT_LEVELS.includes(difficulty) ? difficulty : 'normal'
+    difficulty: BOT_LEVELS.includes(difficulty) ? difficulty : 'normal',
+    persona,
   };
   room.players.set(id, player);
   room.order.push(id);
+  ensureBotBrain(room).botPersonaById[id] = persona;
   if (!room.hostId) room.hostId = id;
   return player;
 }
@@ -516,6 +1005,11 @@ function removePlayer(room, playerId, reason = 'left') {
   room.submissions = room.submissions.filter((s) => s.playerId !== playerId);
   room.shuffledSubmissions = room.shuffledSubmissions.filter((s) => s.playerId !== playerId);
   room.votes = room.votes.filter((v) => v.playerId !== playerId && !removedSubmissionIds.has(v.submissionId));
+  if (room.botBrain) {
+    delete room.botBrain.botPersonaById?.[playerId];
+    delete room.botBrain.recentVotesByOwner?.[playerId];
+    delete room.botBrain.recentCardsByBot?.[playerId];
+  }
 
   if (room.players.size === 0) {
     rooms.delete(room.code);
@@ -603,6 +1097,8 @@ function computeScores(room) {
     room.summary.drinkPrompt = buildDrinkPrompt(tags, room.drinkLevel);
     room.summary.tags = tags;
   }
+  rememberClueMemory(room, storytellerId, room.clue);
+  rememberRoundOutcome(room);
 }
 
 function send(ws, payload) {
@@ -645,6 +1141,8 @@ function toClientState(room, playerId) {
       score: p.score,
       ready: p.ready,
       connected: p.connected,
+      isBot: p.isBot || false,
+      difficulty: p.difficulty || 'normal',
       isHost: room.hostId === p.id,
       isStoryteller: room.storytellerId === p.id
     })),
@@ -819,6 +1317,7 @@ wss.on('connection', (ws) => {
         room.storytellerId = room.order[0];
         room.phase = 'clue';
         room.phaseStartedAt = Date.now();
+        room.botBrain = createBotBrain();
         refillHands(room);
         broadcast(room);
         break;
@@ -853,6 +1352,12 @@ wss.on('connection', (ws) => {
         room.storytellerId = room.order[0];
         room.phase = 'clue';
         room.phaseStartedAt = Date.now();
+        room.botBrain = createBotBrain();
+        for (const participant of room.players.values()) {
+          if (participant.isBot) {
+            resolveBotPersona(room, participant);
+          }
+        }
         refillHands(room);
         broadcast(room);
         break;
@@ -866,11 +1371,14 @@ wss.on('connection', (ws) => {
         player.hand = player.hand.filter(c => c !== card);
         const submissionId = crypto.randomUUID();
         player.submittedCardId = submissionId;
-        room.clue = clue;
+        room.clue = cleanClue(clue);
+        room.clueReason = '';
         room.submissions = [{ id: submissionId, playerId: player.id, card }];
         room.shuffledSubmissions = [];
         room.votes = [];
         room.phase = 'submit';
+        room.phaseStartedAt = Date.now();
+        rememberClueMemory(room, player.id, room.clue);
         broadcast(room);
         break;
       }
@@ -884,14 +1392,7 @@ wss.on('connection', (ws) => {
         const submissionId = crypto.randomUUID();
         player.submittedCardId = submissionId;
         room.submissions.push({ id: submissionId, playerId: player.id, card });
-        // move to vote if all submitted
-        const submittedPlayers = room.submissions.length;
-        const expected = room.players.size; // storyteller + resto
-        if (submittedPlayers >= expected) {
-          room.shuffledSubmissions = shuffle(room.submissions);
-          room.phase = 'vote';
-          for (const p of room.players.values()) p.votedFor = null;
-        }
+        moveToVotePhase(room);
         broadcast(room);
         break;
       }
@@ -905,13 +1406,7 @@ wss.on('connection', (ws) => {
         if (submission.playerId === player.id) return; // no votar propia
         player.votedFor = submissionId;
         room.votes.push({ playerId: player.id, submissionId });
-        const votesNeeded = room.players.size - 1;
-        if (room.votes.length >= votesNeeded) {
-          computeScores(room);
-          room.phase = 'reveal';
-          // submitted cards go to discard
-          room.discard.push(...room.submissions.map(s => s.card));
-        }
+        moveToRevealPhase(room);
         broadcast(room);
         break;
       }
