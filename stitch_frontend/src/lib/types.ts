@@ -45,12 +45,22 @@ export interface AttachmentItem {
 export interface TerminalEntry {
   id: string;
   itemId: string;
+  conversationId: number | null;
   kind: 'running' | 'success' | 'error' | 'notice';
   command: string;
   output: string;
   statusText: string;
   timestamp: string;
   durationMs: number;
+}
+
+export interface CodexBackgroundRun {
+  conversationId: number;
+  title: string;
+  startedAt: string;
+  pid: number | null;
+  status: 'running' | 'stopping';
+  killRequested: boolean;
 }
 
 export interface ChatOptions {
@@ -102,4 +112,24 @@ export interface CodexQuota {
   primary: CodexQuotaWindow | null;
   secondary: CodexQuotaWindow | null;
   credits: CodexQuotaCredits;
+}
+
+export interface CodexDeviceLogin {
+  startedAt: string;
+  verificationUri: string;
+  userCode: string;
+  expiresAt: string;
+  inProgress: boolean;
+  completed: boolean;
+  failed: boolean;
+  cancelled: boolean;
+  statusText: string;
+  error: string;
+}
+
+export interface CodexAuthStatus {
+  loggedIn: boolean;
+  statusText: string;
+  loginInProgress: boolean;
+  login: CodexDeviceLogin | null;
 }

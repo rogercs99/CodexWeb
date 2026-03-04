@@ -1,4 +1,5 @@
 import { Plus, Search, RotateCcw, LogOut, Power, Trash2 } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
 import BottomNav from './BottomNav';
 import type { Conversation, Screen, User } from '../lib/types';
 
@@ -28,6 +29,7 @@ export default function ChatHubScreen({
   onOpenChat,
   onCreateChat,
   onDeleteChat,
+  onDeleteChats,
   onLogout,
   onRefresh,
   onRestart,
@@ -40,11 +42,57 @@ export default function ChatHubScreen({
   onOpenChat: (id: number) => void;
   onCreateChat: () => void;
   onDeleteChat: (id: number) => void;
+  onDeleteChats: (ids: number[]) => void;
   onLogout: () => void;
   onRefresh: () => void;
   onRestart: () => void;
   onNavigate: (screen: Screen) => void;
 }) {
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedChatIds, setSelectedChatIds] = useState<number[]>([]);
+
+  useEffect(() => {
+    const existingIds = new Set(conversations.map((item) => item.id));
+    setSelectedChatIds((prev) => prev.filter((id) => existingIds.has(id)));
+  }, [conversations]);
+
+  useEffect(() => {
+    if (!selectionMode) {
+      setSelectedChatIds([]);
+    }
+  }, [selectionMode]);
+
+  const selectedCount = selectedChatIds.length;
+  const allSelected = useMemo(
+    () => conversations.length > 0 && selectedCount === conversations.length,
+    [conversations.length, selectedCount]
+  );
+
+  const toggleSelection = (conversationId: number) => {
+    setSelectedChatIds((prev) =>
+      prev.includes(conversationId) ? prev.filter((id) => id !== conversationId) : [...prev, conversationId]
+    );
+  };
+
+  const handleSelectAllToggle = () => {
+    if (allSelected) {
+      setSelectedChatIds([]);
+      return;
+    }
+    setSelectedChatIds(conversations.map((item) => item.id));
+  };
+
+  const handleDeleteSelected = () => {
+    if (selectedCount === 0) return;
+    const chatLabel = selectedCount === 1 ? 'chat' : 'chats';
+    if (!window.confirm(`¿Eliminar ${selectedCount} ${chatLabel} definitivamente?`)) {
+      return;
+    }
+    onDeleteChats(selectedChatIds);
+    setSelectionMode(false);
+    setSelectedChatIds([]);
+  };
+
   return (
     <div className="min-h-screen bg-black flex flex-col">
       <header className="sticky top-0 z-50 bg-black/80 backdrop-blur-xl border-b border-zinc-900 px-4 py-3 flex items-center justify-between">
@@ -70,9 +118,46 @@ export default function ChatHubScreen({
           <button onClick={onCreateChat} className="w-full bg-white text-black py-3 rounded-xl font-medium flex items-center justify-center gap-2" type="button">
             <Plus size={18} /> Nuevo chat
           </button>
-          <button onClick={() => onNavigate('search')} className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-3 text-zinc-400 text-left flex items-center gap-2" type="button">
-            <Search size={18} /> Search chats...
-          </button>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              onClick={() => setSelectionMode((prev) => !prev)}
+              className={`w-full border rounded-xl px-3 py-2.5 text-sm ${
+                selectionMode
+                  ? 'bg-blue-600/20 border-blue-500/40 text-blue-200'
+                  : 'bg-zinc-900 border-zinc-800 text-zinc-300'
+              }`}
+              type="button"
+            >
+              {selectionMode ? 'Cancelar selección' : 'Seleccionar chats'}
+            </button>
+            {selectionMode ? (
+              <button
+                onClick={handleSelectAllToggle}
+                className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-2.5 text-sm text-zinc-300"
+                type="button"
+              >
+                {allSelected ? 'Deseleccionar todo' : 'Seleccionar todo'}
+              </button>
+            ) : (
+              <button onClick={() => onNavigate('search')} className="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-3 py-2.5 text-zinc-400 text-left flex items-center justify-center gap-2" type="button">
+                <Search size={18} /> Search chats...
+              </button>
+            )}
+          </div>
+          {selectionMode ? (
+            <button
+              onClick={handleDeleteSelected}
+              disabled={selectedCount === 0}
+              className={`w-full rounded-xl px-3 py-2.5 text-sm font-medium border ${
+                selectedCount > 0
+                  ? 'bg-red-600/20 border-red-500/40 text-red-200'
+                  : 'bg-zinc-900 border-zinc-800 text-zinc-500'
+              }`}
+              type="button"
+            >
+              Eliminar seleccionados ({selectedCount})
+            </button>
+          ) : null}
         </div>
 
         <div className="px-4 py-2 space-y-2">
@@ -93,7 +178,27 @@ export default function ChatHubScreen({
                   }`}
                 >
                   <div className="flex items-center justify-between gap-2">
-                    <button onClick={() => onOpenChat(conversation.id)} className="min-w-0 flex items-center gap-2 text-left flex-1" type="button">
+                    <button
+                      onClick={() => {
+                        if (selectionMode) {
+                          toggleSelection(conversation.id);
+                          return;
+                        }
+                        onOpenChat(conversation.id);
+                      }}
+                      className="min-w-0 flex items-center gap-2 text-left flex-1"
+                      type="button"
+                    >
+                      {selectionMode ? (
+                        <span
+                          className={`h-4 w-4 rounded border shrink-0 ${
+                            selectedChatIds.includes(conversation.id)
+                              ? 'bg-blue-500 border-blue-400'
+                              : 'border-zinc-600'
+                          }`}
+                          aria-label={selectedChatIds.includes(conversation.id) ? 'Seleccionado' : 'No seleccionado'}
+                        />
+                      ) : null}
                       {isRunning ? (
                         <span
                           className="h-3.5 w-3.5 rounded-full border-2 border-blue-400 border-t-transparent animate-spin shrink-0"
@@ -106,18 +211,20 @@ export default function ChatHubScreen({
                     </button>
                     <div className="flex items-center gap-2">
                       <span className="text-xs text-zinc-500 whitespace-nowrap">{formatDate(conversation.last_message_at || conversation.created_at)}</span>
-                      <button
-                        onClick={() => {
-                          if (window.confirm('¿Eliminar este chat definitivamente?')) {
-                            onDeleteChat(conversation.id);
-                          }
-                        }}
-                        className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-400 hover:text-red-300 hover:border-red-400/60"
-                        type="button"
-                        aria-label="Eliminar chat"
-                      >
-                        <Trash2 size={14} />
-                      </button>
+                      {!selectionMode ? (
+                        <button
+                          onClick={() => {
+                            if (window.confirm('¿Eliminar este chat definitivamente?')) {
+                              onDeleteChat(conversation.id);
+                            }
+                          }}
+                          className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-400 hover:text-red-300 hover:border-red-400/60"
+                          type="button"
+                          aria-label="Eliminar chat"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      ) : null}
                     </div>
                   </div>
                 </div>

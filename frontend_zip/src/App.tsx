@@ -101,6 +101,10 @@ export default function App() {
     }
   }, []);
 
+  const clearTerminalForPrompt = useCallback(() => {
+    persistTerminal([]);
+  }, [persistTerminal]);
+
   const upsertTerminal = useCallback(
     (itemId: string, patch: Partial<TerminalEntry>) => {
       setTerminalEntries((prev) => {
@@ -336,6 +340,7 @@ export default function App() {
         created_at: new Date().toISOString()
       };
 
+      clearTerminalForPrompt();
       setMessages((prev) => [...prev, userMessage]);
       setLiveReasoning('');
       assistantDraftRef.current = '';
@@ -479,6 +484,7 @@ export default function App() {
       selectedFiles,
       sending,
       terminalEntries,
+      clearTerminalForPrompt,
       upsertTerminal
     ]
   );

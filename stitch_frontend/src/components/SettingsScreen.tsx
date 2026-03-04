@@ -1,8 +1,21 @@
 import { useCallback, useEffect, useState } from 'react';
 import { ExternalLink } from 'lucide-react';
 import BottomNav from './BottomNav';
-import { getCodexQuota } from '../lib/api';
-import type { Capabilities, ChatOptions, CodexQuota, CodexQuotaWindow, Screen } from '../lib/types';
+import {
+  cancelCodexDeviceLogin,
+  getCodexAuthStatus,
+  getCodexQuota,
+  logoutCodexAuth,
+  startCodexDeviceLogin
+} from '../lib/api';
+import type {
+  Capabilities,
+  ChatOptions,
+  CodexAuthStatus,
+  CodexQuota,
+  CodexQuotaWindow,
+  Screen
+} from '../lib/types';
 
 export default function SettingsScreen({
   options,
@@ -26,6 +39,10 @@ export default function SettingsScreen({
   const [quota, setQuota] = useState<CodexQuota | null>(null);
   const [quotaLoading, setQuotaLoading] = useState(true);
   const [quotaError, setQuotaError] = useState('');
+  const [auth, setAuth] = useState<CodexAuthStatus | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState('');
+  const [authActionBusy, setAuthActionBusy] = useState(false);
 
   const loadQuota = useCallback(async () => {
     setQuotaLoading(true);
@@ -40,9 +57,37 @@ export default function SettingsScreen({
     }
   }, []);
 
+  const loadAuth = useCallback(async (silent = false) => {
+    if (!silent) {
+      setAuthLoading(true);
+    }
+    setAuthError('');
+    try {
+      const nextAuth = await getCodexAuthStatus();
+      setAuth(nextAuth);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'No se pudo leer estado de Codex CLI');
+    } finally {
+      if (!silent) {
+        setAuthLoading(false);
+      }
+    }
+  }, []);
+
   useEffect(() => {
     loadQuota();
-  }, [loadQuota]);
+    loadAuth();
+  }, [loadAuth, loadQuota]);
+
+  useEffect(() => {
+    if (!auth?.loginInProgress) return undefined;
+    const pollId = window.setInterval(() => {
+      void loadAuth(true);
+    }, 3000);
+    return () => {
+      window.clearInterval(pollId);
+    };
+  }, [auth?.loginInProgress, loadAuth]);
 
   const formatPercent = (value: number) => `${Math.max(0, Math.round(Number(value || 0)))}%`;
   const formatDate = (value: string) => {
@@ -56,6 +101,62 @@ export default function SettingsScreen({
       hour: '2-digit',
       minute: '2-digit'
     });
+  };
+
+  const copyText = async (value: string) => {
+    const text = String(value || '').trim();
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (_error) {
+      // ignore clipboard errors
+    }
+  };
+
+  const startDeviceAuth = async () => {
+    setAuthActionBusy(true);
+    setAuthError('');
+    try {
+      const login = await startCodexDeviceLogin();
+      setAuth((prev) => ({
+        loggedIn: prev?.loggedIn || false,
+        statusText: prev?.statusText || '',
+        loginInProgress: Boolean(login && login.inProgress),
+        login: login || null
+      }));
+      await loadAuth(true);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'No se pudo iniciar login de Codex');
+    } finally {
+      setAuthActionBusy(false);
+    }
+  };
+
+  const cancelDeviceAuth = async () => {
+    setAuthActionBusy(true);
+    setAuthError('');
+    try {
+      await cancelCodexDeviceLogin();
+      await loadAuth(true);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'No se pudo cancelar login de Codex');
+    } finally {
+      setAuthActionBusy(false);
+    }
+  };
+
+  const logoutDeviceAuth = async () => {
+    setAuthActionBusy(true);
+    setAuthError('');
+    try {
+      await logoutCodexAuth();
+      await loadAuth(true);
+      await loadQuota();
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'No se pudo cerrar sesión de Codex');
+    } finally {
+      setAuthActionBusy(false);
+    }
   };
 
   const formatWindowLabel = (windowData: CodexQuotaWindow | null, fallback: string) => {
@@ -177,6 +278,102 @@ export default function SettingsScreen({
               onChange={(event) => onCapsChange({ ...caps, memory: event.target.checked })}
             />
           </label>
+        </section>
+
+        <section className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4 space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-xs uppercase text-zinc-500">Codex CLI (cuenta por usuario)</h3>
+            <button
+              type="button"
+              onClick={() => loadAuth()}
+              disabled={authLoading || authActionBusy}
+              className="text-xs px-2.5 py-1 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-50"
+            >
+              {authLoading ? 'Cargando...' : 'Refrescar'}
+            </button>
+          </div>
+
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 p-3 space-y-3">
+            <p className="text-sm text-zinc-200">
+              Estado:{' '}
+              {auth?.loggedIn ? (
+                <span className="text-emerald-300">Conectado</span>
+              ) : auth?.loginInProgress ? (
+                <span className="text-amber-300">Esperando verificación</span>
+              ) : (
+                <span className="text-zinc-400">Sin conectar</span>
+              )}
+            </p>
+
+            {auth?.statusText ? (
+              <p className="text-xs text-zinc-500 whitespace-pre-wrap break-words">{auth.statusText}</p>
+            ) : null}
+
+            {authError ? <p className="text-xs text-red-300">{authError}</p> : null}
+
+            {auth?.loginInProgress && auth.login ? (
+              <div className="space-y-2 rounded-lg border border-zinc-800 bg-black/40 p-3">
+                <p className="text-xs text-zinc-400">1) Abre este enlace y autentícate con ChatGPT:</p>
+                <div className="flex items-center gap-2">
+                  <p className="text-xs text-blue-300 break-all flex-1">{auth.login.verificationUri || '-'}</p>
+                  <button
+                    type="button"
+                    onClick={() => copyText(auth.login?.verificationUri || '')}
+                    className="text-[11px] px-2 py-1 rounded border border-zinc-700 text-zinc-300 hover:text-white"
+                  >
+                    Copiar
+                  </button>
+                </div>
+                <p className="text-xs text-zinc-400">2) Introduce este código:</p>
+                <div className="flex items-center gap-2">
+                  <p className="text-sm font-semibold tracking-wide text-amber-200 flex-1">{auth.login.userCode || '-'}</p>
+                  <button
+                    type="button"
+                    onClick={() => copyText(auth.login?.userCode || '')}
+                    className="text-[11px] px-2 py-1 rounded border border-zinc-700 text-zinc-300 hover:text-white"
+                  >
+                    Copiar
+                  </button>
+                </div>
+                {auth.login.expiresAt ? (
+                  <p className="text-[11px] text-zinc-500">Expira: {formatDate(auth.login.expiresAt)}</p>
+                ) : null}
+              </div>
+            ) : null}
+
+            <div className="flex flex-wrap gap-2">
+              {!auth?.loggedIn ? (
+                <button
+                  type="button"
+                  onClick={startDeviceAuth}
+                  disabled={authActionBusy || authLoading}
+                  className="text-xs px-3 py-1.5 rounded-lg border border-blue-500/40 bg-blue-600/20 text-blue-200 hover:bg-blue-600/30 disabled:opacity-50"
+                >
+                  Iniciar sesión con ChatGPT
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={logoutDeviceAuth}
+                  disabled={authActionBusy || authLoading}
+                  className="text-xs px-3 py-1.5 rounded-lg border border-red-500/40 bg-red-600/20 text-red-200 hover:bg-red-600/30 disabled:opacity-50"
+                >
+                  Desvincular cuenta
+                </button>
+              )}
+
+              {auth?.loginInProgress ? (
+                <button
+                  type="button"
+                  onClick={cancelDeviceAuth}
+                  disabled={authActionBusy}
+                  className="text-xs px-3 py-1.5 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-50"
+                >
+                  Cancelar login
+                </button>
+              ) : null}
+            </div>
+          </div>
         </section>
 
         <section className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4 space-y-3">

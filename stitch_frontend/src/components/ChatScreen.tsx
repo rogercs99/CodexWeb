@@ -226,13 +226,14 @@ export default function ChatScreen({
   }, [terminalFingerprint, terminalEntries.length, sending, isRunning]);
 
   const sendCurrent = () => {
-    if (sending) return;
+    if (sending || isRunning) return;
     if (!input.trim() && selectedFiles.length === 0) return;
     onSend(input);
     setInput('');
   };
 
   const canSend = input.trim().length > 0 || selectedFiles.length > 0;
+  const canStop = sending || isRunning;
   const headerStatus = sending ? `Generando · ${formatElapsed(sendElapsedSeconds)}` : status || 'Sesion activa';
 
   return (
@@ -457,20 +458,20 @@ export default function ChatScreen({
           />
 
           <button
-            key={sending ? 'chat-stop' : 'chat-send'}
-            onClick={sending ? onStop : undefined}
-            type={sending ? 'button' : 'submit'}
-            disabled={!sending && !canSend}
+            key={canStop ? 'chat-stop' : 'chat-send'}
+            onClick={canStop ? onStop : undefined}
+            type={canStop ? 'button' : 'submit'}
+            disabled={!canStop && !canSend}
             className={`chat-send-btn w-10 h-10 shrink-0 rounded-xl border flex items-center justify-center transition-colors ${
-              sending
+              canStop
                 ? 'bg-red-600 border-red-500 text-white'
                 : canSend
                 ? 'bg-blue-600 border-blue-500/30 text-white'
                 : 'bg-zinc-800 border-zinc-700 text-zinc-500'
             }`}
-            aria-label={sending ? 'Detener respuesta' : 'Enviar mensaje'}
+            aria-label={canStop ? 'Detener sesión activa' : 'Enviar mensaje'}
           >
-            {sending ? <Square size={16} /> : <Send size={18} />}
+            {canStop ? <Square size={16} /> : <Send size={18} />}
           </button>
         </form>
       </div>

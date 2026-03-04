@@ -40,7 +40,7 @@ const chatGptModelOptions = [
 const allowedReasoningEfforts = new Set(['minimal', 'low', 'medium', 'high', 'xhigh']);
 const uploadsDir = path.join(__dirname, 'uploads');
 const pendingUploadsDir = path.join(uploadsDir, 'pending');
-const codexSessionsDir = path.join(os.homedir(), '.codex', 'sessions');
+const codexUsersRootDir = path.join(__dirname, '.codex_users');
 const restartStatePath = path.join(__dirname, 'restart-state.json');
 const restartLogLimit = 200;
 const maxAttachments = 5;
@@ -92,12 +92,9 @@ const pendingUploadTtlMs = 1000 * 60 * 60;
 const pendingUploads = new Map();
 let restartScheduled = false;
 let restartState = null;
-let lastCodexQuotaSnapshot = null;
-let codexQuotaCache = {
-  fetchedAtMs: 0,
-  payload: null
-};
+const codexQuotaStateByUser = new Map();
 const activeChatRuns = new Map();
+const activeCodexLoginFlows = new Map();
 let activeChatRunClientSeq = 0;
 
 const sessionSecret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
@@ -109,6 +106,7 @@ db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 fs.mkdirSync(uploadsDir, { recursive: true });
 fs.mkdirSync(pendingUploadsDir, { recursive: true });
+fs.mkdirSync(codexUsersRootDir, { recursive: true });
 
 function truncateForNotify(text, maxLen = 300) {
   const value = String(text || '').replace(/\s+/g, ' ').trim();
@@ -120,6 +118,298 @@ function truncateForNotify(text, maxLen = 300) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function stripAnsi(text) {
+  return String(text || '').replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
+}
+
+function getSafeUserId(value) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+}
+
+function getUserCodexHome(userId) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) {
+    throw new Error('INVALID_USER_ID');
+  }
+  const target = path.join(codexUsersRootDir, `user_${safeUserId}`);
+  fs.mkdirSync(target, { recursive: true });
+  return target;
+}
+
+function getUserCodexSessionsDir(userId) {
+  return path.join(getUserCodexHome(userId), 'sessions');
+}
+
+function getCodexEnvForUser(userId) {
+  return {
+    ...process.env,
+    CODEX_HOME: getUserCodexHome(userId)
+  };
+}
+
+function getCodexQuotaStateForUser(userId) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) {
+    return {
+      fetchedAtMs: 0,
+      payload: null,
+      lastSnapshot: null
+    };
+  }
+  if (!codexQuotaStateByUser.has(safeUserId)) {
+    codexQuotaStateByUser.set(safeUserId, {
+      fetchedAtMs: 0,
+      payload: null,
+      lastSnapshot: null
+    });
+  }
+  return codexQuotaStateByUser.get(safeUserId);
+}
+
+function updateCodexQuotaStateForUser(userId, snapshot) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) return;
+  const state = getCodexQuotaStateForUser(safeUserId);
+  state.fetchedAtMs = Date.now();
+  state.payload = snapshot || null;
+  if (snapshot) {
+    state.lastSnapshot = snapshot;
+  }
+  codexQuotaStateByUser.set(safeUserId, state);
+}
+
+function normalizeCodexStatusText(rawValue, fallback = '') {
+  const cleaned = stripAnsi(rawValue)
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (cleaned) return cleaned;
+  return String(fallback || '').trim();
+}
+
+function buildActiveChatRunKey(userId, conversationId) {
+  return `${Number(userId)}:${Number(conversationId)}`;
+}
+
+function terminateActiveChatRun(activeRun, reason = 'killed_by_user') {
+  if (!activeRun || !activeRun.process) return false;
+  activeRun.killRequested = true;
+  activeRun.killReason = String(reason || 'killed_by_user');
+  const proc = activeRun.process;
+  if (proc.exitCode !== null || proc.killed) {
+    return false;
+  }
+  let terminated = false;
+  try {
+    terminated = proc.kill('SIGTERM');
+  } catch (_error) {
+    terminated = false;
+  }
+  if (terminated) {
+    const forceKillTimer = setTimeout(() => {
+      if (proc.exitCode !== null || proc.killed) return;
+      try {
+        proc.kill('SIGKILL');
+      } catch (_error) {
+        // best effort
+      }
+    }, 2500);
+    if (forceKillTimer && typeof forceKillTimer.unref === 'function') {
+      forceKillTimer.unref();
+    }
+  }
+  return terminated;
+}
+
+function registerActiveChatRun(userId, conversationId, processHandle) {
+  const key = buildActiveChatRunKey(userId, conversationId);
+  const existing = activeChatRuns.get(key);
+  if (existing && existing.process && existing.process.exitCode === null && !existing.process.killed) {
+    terminateActiveChatRun(existing, 'superseded_by_new_request');
+  }
+  const activeRun = {
+    key,
+    id: ++activeChatRunClientSeq,
+    userId: Number(userId),
+    conversationId: Number(conversationId),
+    process: processHandle,
+    startedAtMs: Date.now(),
+    killRequested: false,
+    killReason: ''
+  };
+  activeChatRuns.set(key, activeRun);
+  return activeRun;
+}
+
+function clearActiveChatRun(activeRun) {
+  if (!activeRun) return;
+  const current = activeChatRuns.get(activeRun.key);
+  if (current && current.id === activeRun.id) {
+    activeChatRuns.delete(activeRun.key);
+  }
+}
+
+function notifyCodexLoginFlowWaiters(flow) {
+  if (!flow || !Array.isArray(flow.waiters) || flow.waiters.length === 0) return;
+  const waiters = flow.waiters.splice(0);
+  waiters.forEach((fn) => {
+    try {
+      fn();
+    } catch (_error) {
+      // no-op
+    }
+  });
+}
+
+function serializeCodexLoginFlow(flow) {
+  if (!flow || typeof flow !== 'object') return null;
+  return {
+    startedAt: flow.startedAt || '',
+    verificationUri: flow.verificationUri || '',
+    userCode: flow.userCode || '',
+    expiresAt: flow.expiresAt || '',
+    inProgress: Boolean(flow.inProgress),
+    completed: Boolean(flow.completed),
+    failed: Boolean(flow.failed),
+    cancelled: Boolean(flow.cancelled),
+    statusText: normalizeCodexStatusText(flow.statusText || ''),
+    error: normalizeCodexStatusText(flow.error || '')
+  };
+}
+
+function parseCodexDeviceAuthHints(flow, chunkText) {
+  if (!flow) return;
+  const text = stripAnsi(chunkText);
+  if (!text.trim()) return;
+
+  if (!flow.verificationUri) {
+    const urlMatch = text.match(/https?:\/\/[^\s)]+/i);
+    if (urlMatch) {
+      flow.verificationUri = String(urlMatch[0]).trim();
+    }
+  }
+
+  if (!flow.userCode) {
+    const codeMatch = text.match(/\b[A-Z0-9]{4,6}-[A-Z0-9]{4,8}\b/);
+    if (codeMatch) {
+      flow.userCode = String(codeMatch[0]).trim();
+      if (!flow.expiresAt) {
+        flow.expiresAt = new Date(flow.startedAtMs + 15 * 60 * 1000).toISOString();
+      }
+    }
+  }
+
+  const lowered = text.toLowerCase();
+  if (!flow.completed && (lowered.includes('logged in using chatgpt') || lowered.includes('logged in'))) {
+    flow.completed = true;
+    flow.inProgress = false;
+    flow.statusText = normalizeCodexStatusText(text, 'Sesión iniciada en Codex CLI.');
+  }
+}
+
+function terminateCodexLoginFlow(flow, reason = 'cancelled_by_user') {
+  if (!flow || !flow.process) return false;
+  flow.inProgress = false;
+  flow.cancelled = true;
+  flow.statusText = reason;
+  const proc = flow.process;
+  if (proc.exitCode !== null || proc.killed) {
+    return false;
+  }
+  let terminated = false;
+  try {
+    terminated = proc.kill('SIGTERM');
+  } catch (_error) {
+    terminated = false;
+  }
+  if (terminated) {
+    const forceKillTimer = setTimeout(() => {
+      if (proc.exitCode !== null || proc.killed) return;
+      try {
+        proc.kill('SIGKILL');
+      } catch (_error) {
+        // best effort
+      }
+    }, 2500);
+    if (forceKillTimer && typeof forceKillTimer.unref === 'function') {
+      forceKillTimer.unref();
+    }
+  }
+  return terminated;
+}
+
+function getActiveCodexLoginFlow(userId) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) return null;
+  const flow = activeCodexLoginFlows.get(safeUserId);
+  if (!flow) return null;
+  if (!flow.process || flow.process.exitCode !== null || flow.process.killed || !flow.inProgress) {
+    activeCodexLoginFlows.delete(safeUserId);
+    return null;
+  }
+  return flow;
+}
+
+async function getCodexAuthStatusForUser(userId) {
+  const codexPath = await resolveCodexPath();
+  const env = getCodexEnvForUser(userId);
+  try {
+    const result = await execFileAsync(codexPath, ['login', 'status'], {
+      env,
+      cwd: process.cwd(),
+      timeout: 15000,
+      maxBuffer: 128 * 1024
+    });
+    const statusText = normalizeCodexStatusText(result && result.stdout, 'Logged in using ChatGPT');
+    return {
+      loggedIn: true,
+      statusText
+    };
+  } catch (error) {
+    const outText = normalizeCodexStatusText(
+      `${error && error.stdout ? error.stdout : ''}\n${error && error.stderr ? error.stderr : ''}`
+    );
+    const fallback = normalizeCodexStatusText(error && error.message ? error.message : '', 'Not logged in');
+    const statusText = outText || fallback || 'Not logged in';
+    const notLogged =
+      statusText.toLowerCase().includes('not logged in') ||
+      statusText.toLowerCase().includes('no auth') ||
+      statusText.toLowerCase().includes('not authenticated');
+    return {
+      loggedIn: !notLogged && !String(statusText).toLowerCase().includes('error'),
+      statusText
+    };
+  }
+}
+
+function waitForCodexLoginBootstrap(flow, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    if (!flow || typeof flow !== 'object') {
+      resolve();
+      return;
+    }
+    if (flow.userCode || flow.verificationUri || flow.completed || flow.failed || !flow.inProgress) {
+      resolve();
+      return;
+    }
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      const idx = flow.waiters.indexOf(done);
+      if (idx >= 0) {
+        flow.waiters.splice(idx, 1);
+      }
+      resolve();
+    }, timeoutMs);
+    flow.waiters.push(done);
+  });
 }
 
 function readNumberField(value) {
@@ -313,8 +603,8 @@ function findLatestRateLimitsInSessionFile(filePath) {
   return null;
 }
 
-function findLatestRateLimitsFromSessions() {
-  const files = listRecentSessionFiles(codexSessionsDir, 24);
+function findLatestRateLimitsFromSessions(sessionsDir) {
+  const files = listRecentSessionFiles(sessionsDir, 24);
   for (const filePath of files) {
     const found = findLatestRateLimitsInSessionFile(filePath);
     if (found) {
@@ -324,25 +614,30 @@ function findLatestRateLimitsFromSessions() {
   return null;
 }
 
-function getCodexQuotaSnapshot() {
+function getCodexQuotaSnapshotForUser(userId) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) {
+    return null;
+  }
+  const quotaState = getCodexQuotaStateForUser(safeUserId);
   const now = Date.now();
-  if (codexQuotaCache.payload && now - codexQuotaCache.fetchedAtMs < codexQuotaCacheTtlMs) {
-    return codexQuotaCache.payload;
+  if (quotaState.payload && now - quotaState.fetchedAtMs < codexQuotaCacheTtlMs) {
+    return quotaState.payload;
   }
 
   let snapshot = null;
-  if (lastCodexQuotaSnapshot && lastCodexQuotaSnapshot.observedAt) {
-    const observedMs = Date.parse(lastCodexQuotaSnapshot.observedAt);
+  if (quotaState.lastSnapshot && quotaState.lastSnapshot.observedAt) {
+    const observedMs = Date.parse(quotaState.lastSnapshot.observedAt);
     if (Number.isFinite(observedMs) && now - observedMs < 1000 * 60 * 60) {
       snapshot = {
-        ...lastCodexQuotaSnapshot,
+        ...quotaState.lastSnapshot,
         fetchedAt: nowIso()
       };
     }
   }
 
   if (!snapshot) {
-    const latest = findLatestRateLimitsFromSessions();
+    const latest = findLatestRateLimitsFromSessions(getUserCodexSessionsDir(safeUserId));
     if (latest && latest.rateLimits) {
       snapshot = buildCodexQuotaSnapshot(
         latest.rateLimits,
@@ -352,10 +647,12 @@ function getCodexQuotaSnapshot() {
     }
   }
 
-  codexQuotaCache = {
-    fetchedAtMs: now,
-    payload: snapshot
-  };
+  quotaState.fetchedAtMs = now;
+  quotaState.payload = snapshot || null;
+  if (snapshot) {
+    quotaState.lastSnapshot = snapshot;
+  }
+  codexQuotaStateByUser.set(safeUserId, quotaState);
   return snapshot;
 }
 
@@ -1693,6 +1990,41 @@ app.patch('/api/conversations/:id/settings', requireAuth, (req, res) => {
   });
 });
 
+app.post('/api/conversations/:id/kill', requireAuth, (req, res) => {
+  const conversationId = Number(req.params.id);
+  if (!Number.isInteger(conversationId) || conversationId <= 0) {
+    return res.status(400).json({ error: 'conversation_id inválido' });
+  }
+
+  const conversation = getOwnedConversationOrNull(conversationId, req.session.userId);
+  if (!conversation) {
+    return res.status(404).json({ error: 'Conversación no encontrada' });
+  }
+
+  const activeRunKey = buildActiveChatRunKey(req.session.userId, conversationId);
+  const activeRun = activeChatRuns.get(activeRunKey);
+  if (!activeRun || !activeRun.process) {
+    return res.json({ ok: true, killed: false, reason: 'no_active_run' });
+  }
+
+  if (activeRun.process.exitCode !== null || activeRun.process.killed) {
+    clearActiveChatRun(activeRun);
+    return res.json({ ok: true, killed: false, reason: 'already_finished' });
+  }
+
+  const wasTerminated = terminateActiveChatRun(activeRun, 'killed_by_user');
+  const username = truncateForNotify(req.session && req.session.username ? req.session.username : 'anon');
+  void notify(
+    `Chat kill request user=${username} conv=${conversationId} accepted=${wasTerminated ? 'yes' : 'no'}`
+  );
+
+  return res.json({
+    ok: true,
+    killed: wasTerminated,
+    reason: wasTerminated ? 'terminated' : 'not_running'
+  });
+});
+
 app.delete('/api/conversations/:id', requireAuth, (req, res) => {
   const conversationId = Number(req.params.id);
   if (!Number.isInteger(conversationId) || conversationId <= 0) {
@@ -1738,12 +2070,240 @@ app.get('/api/chat/options', requireAuth, (_req, res) => {
   });
 });
 
-app.get('/api/codex/quota', requireAuth, (_req, res) => {
-  const quota = getCodexQuotaSnapshot();
+app.get('/api/codex/quota', requireAuth, (req, res) => {
+  const quota = getCodexQuotaSnapshotForUser(req.session.userId);
   return res.json({
     ok: true,
     quota
   });
+});
+
+app.get('/api/codex/runs', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+
+  const runs = Array.from(activeChatRuns.values())
+    .filter((run) => run && Number(run.userId) === safeUserId)
+    .filter((run) => run.process && run.process.exitCode === null && !run.process.killed)
+    .map((run) => {
+      const conversation = getOwnedConversationOrNull(run.conversationId, safeUserId);
+      const parsedStart = Number(run.startedAtMs);
+      const startedAt = Number.isFinite(parsedStart) ? new Date(parsedStart).toISOString() : nowIso();
+      const pid = Number(run.process && run.process.pid);
+      return {
+        conversationId: Number(run.conversationId),
+        title: conversation ? String(conversation.title || 'Chat') : `Chat ${run.conversationId}`,
+        startedAt,
+        pid: Number.isInteger(pid) && pid > 0 ? pid : null,
+        status: run.killRequested ? 'stopping' : 'running',
+        killRequested: Boolean(run.killRequested)
+      };
+    })
+    .sort((a, b) => Date.parse(b.startedAt || '') - Date.parse(a.startedAt || ''));
+
+  return res.json({
+    ok: true,
+    runs
+  });
+});
+
+app.post('/api/codex/runs/kill-all', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+
+  const activeRuns = Array.from(activeChatRuns.values()).filter((run) => {
+    return (
+      run &&
+      Number(run.userId) === safeUserId &&
+      run.process &&
+      run.process.exitCode === null &&
+      !run.process.killed
+    );
+  });
+
+  let stopped = 0;
+  activeRuns.forEach((run) => {
+    if (terminateActiveChatRun(run, 'killed_by_user_bulk')) {
+      stopped += 1;
+    }
+  });
+
+  const username = truncateForNotify(req.session && req.session.username ? req.session.username : 'anon');
+  void notify(`Chat kill-all request user=${username} active=${activeRuns.length} stopped=${stopped}`);
+
+  return res.json({
+    ok: true,
+    active: activeRuns.length,
+    stopped
+  });
+});
+
+app.get('/api/codex/auth/status', requireAuth, async (req, res) => {
+  try {
+    const auth = await getCodexAuthStatusForUser(req.session.userId);
+    const activeFlow = getActiveCodexLoginFlow(req.session.userId);
+    return res.json({
+      ok: true,
+      auth: {
+        loggedIn: Boolean(auth.loggedIn),
+        statusText: String(auth.statusText || ''),
+        loginInProgress: Boolean(activeFlow),
+        login: serializeCodexLoginFlow(activeFlow)
+      }
+    });
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'codex_auth_status_error', 180);
+    return res.status(500).json({ error: `No se pudo leer estado de Codex CLI: ${reason}` });
+  }
+});
+
+app.post('/api/codex/auth/device/start', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+
+  const existing = getActiveCodexLoginFlow(safeUserId);
+  if (existing) {
+    return res.json({
+      ok: true,
+      login: serializeCodexLoginFlow(existing)
+    });
+  }
+
+  try {
+    const codexPath = await resolveCodexPath();
+    const codexHome = getUserCodexHome(safeUserId);
+    const loginProcess = spawn(codexPath, ['login', '--device-auth'], {
+      cwd: process.cwd(),
+      env: getCodexEnvForUser(safeUserId),
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    const loginFlow = {
+      userId: safeUserId,
+      codexHome,
+      process: loginProcess,
+      startedAt: nowIso(),
+      startedAtMs: Date.now(),
+      verificationUri: '',
+      userCode: '',
+      expiresAt: '',
+      inProgress: true,
+      completed: false,
+      failed: false,
+      cancelled: false,
+      statusText: '',
+      error: '',
+      waiters: []
+    };
+    activeCodexLoginFlows.set(safeUserId, loginFlow);
+
+    const captureOutput = (chunk) => {
+      const raw = String(chunk || '');
+      if (!raw) return;
+      parseCodexDeviceAuthHints(loginFlow, raw);
+      const text = normalizeCodexStatusText(raw);
+      if (text) {
+        loginFlow.statusText = text;
+      }
+      notifyCodexLoginFlowWaiters(loginFlow);
+    };
+
+    if (loginProcess.stdout) {
+      loginProcess.stdout.on('data', captureOutput);
+    }
+    if (loginProcess.stderr) {
+      loginProcess.stderr.on('data', captureOutput);
+    }
+
+    loginProcess.on('error', (error) => {
+      loginFlow.inProgress = false;
+      loginFlow.failed = true;
+      loginFlow.error = normalizeCodexStatusText(error && error.message ? error.message : 'login_spawn_error');
+      loginFlow.statusText = loginFlow.error;
+      notifyCodexLoginFlowWaiters(loginFlow);
+      activeCodexLoginFlows.delete(safeUserId);
+    });
+
+    loginProcess.on('close', (code, signal) => {
+      if (loginFlow.cancelled) {
+        loginFlow.inProgress = false;
+        loginFlow.statusText = loginFlow.statusText || 'Login cancelado.';
+      } else if (Number.isInteger(code) && code === 0) {
+        loginFlow.inProgress = false;
+        loginFlow.completed = true;
+        loginFlow.statusText = loginFlow.statusText || 'Sesión iniciada en Codex CLI.';
+      } else {
+        loginFlow.inProgress = false;
+        loginFlow.failed = true;
+        loginFlow.error = loginFlow.error || `El login de Codex finalizó con error (${code ?? signal ?? 'n/a'}).`;
+        loginFlow.statusText = loginFlow.error;
+      }
+      notifyCodexLoginFlowWaiters(loginFlow);
+      activeCodexLoginFlows.delete(safeUserId);
+    });
+
+    await waitForCodexLoginBootstrap(loginFlow, 1800);
+    return res.json({
+      ok: true,
+      login: serializeCodexLoginFlow(loginFlow)
+    });
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'codex_device_login_error', 180);
+    return res.status(500).json({ error: `No se pudo iniciar login de Codex: ${reason}` });
+  }
+});
+
+app.post('/api/codex/auth/device/cancel', requireAuth, (req, res) => {
+  const activeFlow = getActiveCodexLoginFlow(req.session.userId);
+  if (!activeFlow) {
+    return res.json({ ok: true, cancelled: false, reason: 'no_active_login' });
+  }
+  const cancelled = terminateCodexLoginFlow(activeFlow, 'cancelled_by_user');
+  notifyCodexLoginFlowWaiters(activeFlow);
+  return res.json({
+    ok: true,
+    cancelled,
+    reason: cancelled ? 'cancelled' : 'already_stopped'
+  });
+});
+
+app.post('/api/codex/auth/logout', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+
+  const activeFlow = getActiveCodexLoginFlow(safeUserId);
+  if (activeFlow) {
+    terminateCodexLoginFlow(activeFlow, 'cancelled_by_logout');
+  }
+
+  try {
+    const codexPath = await resolveCodexPath();
+    await execFileAsync(codexPath, ['logout'], {
+      env: getCodexEnvForUser(safeUserId),
+      cwd: process.cwd(),
+      timeout: 15000,
+      maxBuffer: 128 * 1024
+    });
+  } catch (error) {
+    const detail = normalizeCodexStatusText(
+      `${error && error.stdout ? error.stdout : ''}\n${error && error.stderr ? error.stderr : ''}`
+    );
+    const notLogged = detail.toLowerCase().includes('not logged in');
+    if (!notLogged) {
+      const reason = truncateForNotify(detail || (error && error.message ? error.message : 'logout_error'), 180);
+      return res.status(500).json({ error: `No se pudo cerrar sesión de Codex: ${reason}` });
+    }
+  }
+
+  codexQuotaStateByUser.delete(safeUserId);
+  return res.json({ ok: true });
 });
 
 app.get('/api/attachments', requireAuth, (req, res) => {
@@ -2007,6 +2567,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     }
     res.flushHeaders();
     let codexProcess = null;
+    let activeRun = null;
     let clientDisconnected = false;
     const sseWriteQueue = [];
     let sseBlocked = false;
@@ -2512,11 +3073,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           getStringField(eventObj, ['timestamp']) || nowIso()
         );
         if (snapshot) {
-          lastCodexQuotaSnapshot = snapshot;
-          codexQuotaCache = {
-            fetchedAtMs: Date.now(),
-            payload: snapshot
-          };
+          updateCodexQuotaStateForUser(req.session.userId, snapshot);
           sendSseSafe('codex_quota', { quota: snapshot });
         }
         return true;
@@ -2595,9 +3152,10 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     };
 
     codexProcess = execFile(codexPath, args, {
-      env: process.env,
+      env: getCodexEnvForUser(req.session.userId),
       cwd: process.cwd()
     });
+    activeRun = registerActiveChatRun(req.session.userId, conversationId, codexProcess);
     notifyMilestone('execfile_stdio_fixed', 'FIX aplicado: execFile invocado sin opción stdio');
 
     const flushStderrPending = () => {
@@ -2611,6 +3169,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     const finalizeResponse = (exitCode, closeReason) => {
       if (finished) return;
       finished = true;
+      clearActiveChatRun(activeRun);
       stopHeartbeat();
       flushStdoutPending();
       flushStderrPending();
@@ -2745,11 +3304,15 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     codexProcess.on('close', (code, signal) => {
       processClosed = true;
       pendingExitCode = Number.isInteger(code) ? code : 0;
-      pendingCloseReason = clientDisconnected
-        ? 'client_closed'
-        : signal
-          ? `signal ${signal}`
-          : null;
+      if (activeRun && activeRun.killRequested && activeRun.killReason) {
+        pendingCloseReason = activeRun.killReason;
+      } else {
+        pendingCloseReason = clientDisconnected
+          ? 'client_closed'
+          : signal
+            ? `signal ${signal}`
+            : null;
+      }
       finalizeWhenDrained();
     });
 

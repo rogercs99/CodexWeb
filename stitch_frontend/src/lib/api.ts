@@ -1,5 +1,7 @@
 import type {
   AttachmentItem,
+  CodexBackgroundRun,
+  CodexAuthStatus,
   ChatOptions,
   CodexQuota,
   Conversation,
@@ -59,6 +61,12 @@ export async function deleteConversation(conversationId: number): Promise<void> 
   await api(`/api/conversations/${conversationId}`, { method: 'DELETE' });
 }
 
+export async function killConversationSession(
+  conversationId: number
+): Promise<{ ok: true; killed: boolean; reason?: string }> {
+  return api(`/api/conversations/${conversationId}/kill`, { method: 'POST' });
+}
+
 export async function listMessages(conversationId: number): Promise<{
   conversation: { id: number; title: string; model: string; reasoningEffort: string };
   messages: Message[];
@@ -100,6 +108,35 @@ export async function getChatOptions(): Promise<ChatOptions> {
 export async function getCodexQuota(): Promise<CodexQuota | null> {
   const data = await api<{ quota: CodexQuota | null }>('/api/codex/quota');
   return data.quota ?? null;
+}
+
+export async function getCodexRuns(): Promise<CodexBackgroundRun[]> {
+  const data = await api<{ runs: CodexBackgroundRun[] }>('/api/codex/runs');
+  return Array.isArray(data.runs) ? data.runs : [];
+}
+
+export async function killAllCodexRuns(): Promise<{ active: number; stopped: number }> {
+  return api('/api/codex/runs/kill-all', { method: 'POST' });
+}
+
+export async function getCodexAuthStatus(): Promise<CodexAuthStatus> {
+  const data = await api<{ auth: CodexAuthStatus }>('/api/codex/auth/status');
+  return data.auth;
+}
+
+export async function startCodexDeviceLogin(): Promise<CodexAuthStatus['login']> {
+  const data = await api<{ login: CodexAuthStatus['login'] }>('/api/codex/auth/device/start', {
+    method: 'POST'
+  });
+  return data.login ?? null;
+}
+
+export async function cancelCodexDeviceLogin(): Promise<{ cancelled: boolean; reason?: string }> {
+  return api('/api/codex/auth/device/cancel', { method: 'POST' });
+}
+
+export async function logoutCodexAuth(): Promise<void> {
+  await api('/api/codex/auth/logout', { method: 'POST' });
 }
 
 export async function listAttachments(limit = 200): Promise<AttachmentItem[]> {

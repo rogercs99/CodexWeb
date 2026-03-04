@@ -14,6 +14,7 @@ import {
   getChatOptions,
   getMe,
   getRestartStatus,
+  killConversationSession,
   listAttachments,
   listConversations,
   listMessages,
@@ -215,19 +216,25 @@ function sanitizeTerminalEntries(raw: unknown): TerminalEntry[] {
   if (!Array.isArray(raw)) return [];
   return raw
     .filter((entry) => entry && typeof entry === 'object')
-    .map((entry: any) => ({
-      id: String(entry.id || ''),
-      itemId: String(entry.itemId || ''),
-      kind:
-        entry.kind === 'running' || entry.kind === 'success' || entry.kind === 'error' || entry.kind === 'notice'
-          ? entry.kind
-          : 'notice',
-      command: String(entry.command || ''),
-      output: String(entry.output || ''),
-      statusText: String(entry.statusText || ''),
-      timestamp: String(entry.timestamp || ''),
-      durationMs: Number.isFinite(Number(entry.durationMs)) ? Number(entry.durationMs) : 0
-    }))
+    .map((entry: any) => {
+      const parsedConversationId = Number(entry.conversationId);
+      const conversationId =
+        Number.isInteger(parsedConversationId) && parsedConversationId > 0 ? parsedConversationId : null;
+      return {
+        id: String(entry.id || ''),
+        itemId: String(entry.itemId || ''),
+        conversationId,
+        kind:
+          entry.kind === 'running' || entry.kind === 'success' || entry.kind === 'error' || entry.kind === 'notice'
+            ? entry.kind
+            : 'notice',
+        command: String(entry.command || ''),
+        output: String(entry.output || ''),
+        statusText: String(entry.statusText || ''),
+        timestamp: String(entry.timestamp || ''),
+        durationMs: Number.isFinite(Number(entry.durationMs)) ? Number(entry.durationMs) : 0
+      };
+    })
     .filter((entry) => entry.id);
 }
 
@@ -273,6 +280,11 @@ export default function App() {
   const draftPersistTimerRef = useRef<number | null>(null);
   const previousScreenRef = useRef<Screen>('hub');
   const hydrateInFlightRef = useRef<Promise<void> | null>(null);
+  const activeConversationIdRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    activeConversationIdRef.current = activeConversationId;
+  }, [activeConversationId]);
 
   const resetTransientStreamState = useCallback(() => {
     if (draftPersistTimerRef.current !== null) {
@@ -458,6 +470,21 @@ export default function App() {
     [persistActiveDraftNow, resetTransientStreamState]
   );
 
+  const detachActiveStream = useCallback(
+    (statusMessage?: string) => {
+      if (liveAssistantMessageIdRef.current !== null) {
+        persistActiveDraftNow(false);
+      }
+      if (streamAbortRef.current) {
+        streamAbortRef.current.abort();
+      }
+      if (statusMessage) {
+        setStatus(statusMessage);
+      }
+    },
+    [persistActiveDraftNow]
+  );
+
   const persistTerminal = useCallback((next: TerminalEntry[]) => {
     setTerminalEntries(next);
     try {
@@ -465,6 +492,24 @@ export default function App() {
     } catch (_error) {
       // ignore
     }
+  }, []);
+
+  const clearTerminalForPrompt = useCallback((conversationId: number | null) => {
+    setTerminalEntries((prev) => {
+      const next = prev.filter((entry) => {
+        const parsedConversationId = Number(entry.conversationId);
+        const normalizedConversationId =
+          Number.isInteger(parsedConversationId) && parsedConversationId > 0 ? parsedConversationId : null;
+        if (conversationId === null) return normalizedConversationId !== null;
+        return normalizedConversationId !== conversationId;
+      });
+      try {
+        localStorage.setItem(TERMINAL_KEY, JSON.stringify(next));
+      } catch (_error) {
+        // ignore
+      }
+      return next;
+    });
   }, []);
 
   const upsertTerminal = useCallback(
@@ -475,6 +520,10 @@ export default function App() {
           const created: TerminalEntry = {
             id: itemId || `cmd_${Date.now()}`,
             itemId,
+            conversationId:
+              Number.isInteger(Number(patch.conversationId)) && Number(patch.conversationId) > 0
+                ? Number(patch.conversationId)
+                : null,
             kind: patch.kind || 'notice',
             command: patch.command || '(comando)',
             output: patch.output || '',
@@ -512,11 +561,15 @@ export default function App() {
   const appendTerminalNotice = useCallback((text: string) => {
     if (!text.trim()) return;
     setTerminalEntries((prev) => {
+      const parsedConversationId = Number(activeStreamConversationRef.current);
+      const conversationId =
+        Number.isInteger(parsedConversationId) && parsedConversationId > 0 ? parsedConversationId : null;
       const next = [
         ...prev,
         {
           id: `note_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`,
           itemId: '',
+          conversationId,
           kind: 'notice',
           command: text,
           output: '',
@@ -735,7 +788,7 @@ export default function App() {
         sending &&
         (next !== 'chat' || !targetChatId || targetChatId !== activeConversationId)
       ) {
-        cancelActiveStream('Stream detenido por cambio de chat.');
+        detachActiveStream('Ejecución en segundo plano para el chat anterior.');
       }
 
       if (next === 'chat' && targetChatId) {
@@ -778,7 +831,7 @@ export default function App() {
 
       setScreen(next);
     },
-    [activeConversationId, cancelActiveStream, conversations, getLiveDraftForConversation, sending]
+    [activeConversationId, conversations, detachActiveStream, getLiveDraftForConversation, sending]
   );
 
   const handleLogin = useCallback(
@@ -810,7 +863,7 @@ export default function App() {
 
   const handleCreateChat = useCallback(async () => {
     if (sending) {
-      cancelActiveStream('Stream detenido para crear un chat nuevo.');
+      detachActiveStream('Ejecución en segundo plano para el chat anterior.');
     }
     setActiveConversationId(null);
     setChatTitle('Nuevo chat');
@@ -818,7 +871,7 @@ export default function App() {
     setChatModel(defaultModel);
     setChatReasoningEffort(defaultReasoningEffort);
     setScreen('chat');
-  }, [cancelActiveStream, defaultModel, defaultReasoningEffort, sending]);
+  }, [defaultModel, defaultReasoningEffort, detachActiveStream, sending]);
 
   const handleRefresh = useCallback(async () => {
     try {
@@ -829,26 +882,63 @@ export default function App() {
     }
   }, [activeConversationId, loadConversationsAndPick]);
 
-  const handleDeleteConversation = useCallback(
-    async (conversationId: number) => {
+  const handleDeleteConversations = useCallback(
+    async (conversationIds: number[]) => {
+      const uniqueIds = Array.from(
+        new Set(
+          (conversationIds || []).filter((id) => Number.isInteger(id) && id > 0)
+        )
+      );
+      if (uniqueIds.length === 0) return;
       try {
-        if (sending && activeConversationId === conversationId) {
+        const deletingActiveConversation =
+          activeConversationId !== null && uniqueIds.includes(activeConversationId);
+        if (sending && deletingActiveConversation) {
           cancelActiveStream('Stream detenido porque el chat fue eliminado.');
         }
-        await deleteConversation(conversationId);
-        setRunningConversationIds((prev) => prev.filter((id) => id !== conversationId));
-        const preferredId = activeConversationId === conversationId ? null : activeConversationId;
+
+        const failedIds: number[] = [];
+        for (const conversationId of uniqueIds) {
+          try {
+            await deleteConversation(conversationId);
+          } catch (_error) {
+            failedIds.push(conversationId);
+          }
+        }
+
+        const deletedIds = uniqueIds.filter((id) => !failedIds.includes(id));
+        if (deletedIds.length > 0) {
+          setRunningConversationIds((prev) => prev.filter((id) => !deletedIds.includes(id)));
+        }
+
+        const preferredId = deletingActiveConversation ? null : activeConversationId;
         await loadConversationsAndPick(preferredId);
         setAttachments(await listAttachments(200));
-        if (activeConversationId === conversationId && screen === 'chat') {
+        if (deletingActiveConversation && screen === 'chat') {
           setScreen('hub');
         }
-        setStatus('Chat eliminado.');
+
+        if (failedIds.length === 0) {
+          setStatus(deletedIds.length === 1 ? 'Chat eliminado.' : `${deletedIds.length} chats eliminados.`);
+        } else if (deletedIds.length > 0) {
+          setStatus(
+            `${deletedIds.length} eliminados, ${failedIds.length} no se pudieron eliminar.`
+          );
+        } else {
+          setStatus('No se pudo eliminar ninguno de los chats seleccionados.');
+        }
       } catch (error: any) {
-        setStatus(error?.message || 'No se pudo eliminar el chat.');
+        setStatus(error?.message || 'No se pudieron eliminar los chats seleccionados.');
       }
     },
     [activeConversationId, cancelActiveStream, loadConversationsAndPick, screen, sending]
+  );
+
+  const handleDeleteConversation = useCallback(
+    async (conversationId: number) => {
+      await handleDeleteConversations([conversationId]);
+    },
+    [handleDeleteConversations]
   );
 
   const handleDeleteAttachment = useCallback(async (attachmentId: string) => {
@@ -899,9 +989,24 @@ export default function App() {
     [activeConversationId]
   );
 
-  const handleStop = useCallback(() => {
-    cancelActiveStream('Solicitud detenida.');
-  }, [cancelActiveStream]);
+  const handleStop = useCallback(async () => {
+    if (!activeConversationId || activeConversationId <= 0) {
+      cancelActiveStream('Solicitud detenida.');
+      return;
+    }
+    setStatus('Deteniendo sesión activa...');
+    try {
+      const result = await killConversationSession(activeConversationId);
+      cancelActiveStream();
+      if (result?.killed) {
+        setRunningConversationIds((prev) => prev.filter((id) => id !== activeConversationId));
+      }
+      await loadConversationsAndPick(activeConversationId);
+      setStatus(result?.killed ? 'Sesión detenida.' : 'No había una sesión activa en este chat.');
+    } catch (error: any) {
+      setStatus(error?.message || 'No se pudo detener la sesión activa.');
+    }
+  }, [activeConversationId, cancelActiveStream, loadConversationsAndPick]);
 
   const handleSend = useCallback(
     async (inputText: string) => {
@@ -929,6 +1034,7 @@ export default function App() {
       streamSessionRef.current = streamSessionId;
       const isCurrentSession = () => streamSessionRef.current === streamSessionId;
 
+      clearTerminalForPrompt(activeConversationId);
       setMessages((prev) => [...prev, userMessage, assistantMessage]);
       setLiveReasoning('');
       assistantDraftRef.current = '';
@@ -973,6 +1079,16 @@ export default function App() {
         reasoningByItemRef.current = byItem;
         setLiveReasoning(serializeReasoning(byItem));
         scheduleDraftPersist(false);
+      };
+
+      const resolveStreamConversationId = (): number | null => {
+        const fromStream = Number(conversationFromStream);
+        if (Number.isInteger(fromStream) && fromStream > 0) return fromStream;
+        const fromTracked = Number(trackedRunningConversationId);
+        if (Number.isInteger(fromTracked) && fromTracked > 0) return fromTracked;
+        const fromActive = Number(activeConversationIdRef.current);
+        if (Number.isInteger(fromActive) && fromActive > 0) return fromActive;
+        return null;
       };
 
       const trackRunningConversation = (nextId: number) => {
@@ -1065,6 +1181,10 @@ export default function App() {
             if (!isCurrentSession()) return;
             const text = String(payload?.text || '').trim();
             if (text) {
+              const streamConversationId = resolveStreamConversationId();
+              if (Number.isInteger(streamConversationId) && streamConversationId > 0) {
+                activeStreamConversationRef.current = streamConversationId;
+              }
               appendTerminalNotice(text);
             }
           },
@@ -1072,8 +1192,10 @@ export default function App() {
             if (!isCurrentSession()) return;
             const itemId = String(payload?.itemId || `cmd_${Date.now()}`);
             const statusText = String(payload?.status || 'running');
+            const streamConversationId = resolveStreamConversationId();
             upsertTerminal(itemId, {
               itemId,
+              conversationId: streamConversationId,
               command: String(payload?.command || '(comando)'),
               statusText,
               kind: classifyTerminalStatus(statusText, null),
@@ -1085,6 +1207,7 @@ export default function App() {
             const itemId = String(payload?.itemId || '');
             const delta = String(payload?.text || '');
             if (!itemId || !delta) return;
+            const streamConversationId = resolveStreamConversationId();
             setTerminalEntries((prev) => {
               const idx = prev.findIndex((entry) => entry.itemId === itemId);
               if (idx === -1) {
@@ -1093,6 +1216,7 @@ export default function App() {
                   {
                     id: itemId,
                     itemId,
+                    conversationId: streamConversationId,
                     kind: 'running',
                     command: '(comando)',
                     output: delta,
@@ -1109,8 +1233,14 @@ export default function App() {
                 return next;
               }
               const next = [...prev];
+              const existingConversationId = Number(next[idx].conversationId);
+              const resolvedConversationId =
+                Number.isInteger(existingConversationId) && existingConversationId > 0
+                  ? existingConversationId
+                  : streamConversationId;
               next[idx] = {
                 ...next[idx],
+                conversationId: resolvedConversationId,
                 output: `${next[idx].output || ''}${delta}`
               };
               try {
@@ -1126,13 +1256,20 @@ export default function App() {
             const itemId = String(payload?.itemId || `cmd_${Date.now()}`);
             const statusText = String(payload?.status || 'completed');
             const exitCode = Number.isFinite(Number(payload?.exitCode)) ? Number(payload?.exitCode) : null;
+            const streamConversationId = resolveStreamConversationId();
             setTerminalEntries((prev) => {
               const started = prev.find((entry) => entry.itemId === itemId)?.timestamp;
               const startedAt = started ? Date.parse(started) : NaN;
               const idx = prev.findIndex((entry) => entry.itemId === itemId);
+              const existingConversationId = idx >= 0 ? Number(prev[idx].conversationId) : NaN;
+              const resolvedConversationId =
+                Number.isInteger(existingConversationId) && existingConversationId > 0
+                  ? existingConversationId
+                  : streamConversationId;
               const entry: TerminalEntry = {
                 id: itemId,
                 itemId,
+                conversationId: resolvedConversationId,
                 kind: classifyTerminalStatus(statusText, exitCode),
                 command: String(payload?.command || '(comando)'),
                 output: String(payload?.output || ''),
@@ -1159,6 +1296,10 @@ export default function App() {
             streamCompleted = true;
             scheduleDraftPersist(true);
             if (!payload?.ok) {
+              const streamConversationId = resolveStreamConversationId();
+              if (Number.isInteger(streamConversationId) && streamConversationId > 0) {
+                activeStreamConversationRef.current = streamConversationId;
+              }
               appendTerminalNotice(`Solicitud finalizó con error (${payload?.exitCode ?? 'n/a'})`);
             }
           }
@@ -1168,7 +1309,11 @@ export default function App() {
         if (!streamCompleted) {
           keepRunningIndicator = true;
           persistActiveDraftNow(false);
-          if (conversationFromStream && conversationFromStream > 0) {
+          if (
+            conversationFromStream &&
+            conversationFromStream > 0 &&
+            activeConversationIdRef.current === conversationFromStream
+          ) {
             void loadConversationsAndPick(conversationFromStream).catch(() => {
               // ignore refresh errors in detached mode
             });
@@ -1186,7 +1331,11 @@ export default function App() {
         if (aborted && streamRequestStarted) {
           keepRunningIndicator = true;
           persistActiveDraftNow(false);
-          if (conversationFromStream && conversationFromStream > 0) {
+          if (
+            conversationFromStream &&
+            conversationFromStream > 0 &&
+            activeConversationIdRef.current === conversationFromStream
+          ) {
             void loadConversationsAndPick(conversationFromStream).catch(() => {
               // ignore refresh errors in detached mode
             });
@@ -1231,6 +1380,7 @@ export default function App() {
       scheduleDraftPersist,
       selectedFiles,
       sending,
+      clearTerminalForPrompt,
       updateActiveDraft,
       upsertTerminal
     ]
@@ -1284,6 +1434,10 @@ export default function App() {
   }, [activeConversationId, loadConversationsAndPick, screen]);
 
   const filteredConversations = useMemo(() => byDateDesc(conversations), [conversations]);
+  const activeChatTerminalEntries = useMemo(() => {
+    if (!activeConversationId || activeConversationId <= 0) return [];
+    return terminalEntries.filter((entry) => Number(entry.conversationId) === activeConversationId);
+  }, [activeConversationId, terminalEntries]);
 
   if (screen === 'login') {
     return <LoginScreen onLogin={handleLogin} status={status} />;
@@ -1313,6 +1467,7 @@ export default function App() {
           onOpenChat={(id) => navigate('chat', { chatId: id })}
           onCreateChat={handleCreateChat}
           onDeleteChat={handleDeleteConversation}
+          onDeleteChats={handleDeleteConversations}
           onLogout={handleLogout}
           onRefresh={handleRefresh}
           onRestart={handleRequestRestart}
@@ -1326,7 +1481,7 @@ export default function App() {
           conversationId={activeConversationId}
           messages={messages}
           liveReasoning={liveReasoning}
-          terminalEntries={terminalEntries}
+          terminalEntries={activeChatTerminalEntries}
           sending={sending}
           sendElapsedSeconds={sendElapsedSeconds}
           isRunning={
@@ -1366,6 +1521,9 @@ export default function App() {
         <TerminalLogScreen
           entries={terminalEntries}
           onClear={() => persistTerminal([])}
+          onRunsChanged={() => {
+            void handleRefresh();
+          }}
           onNavigate={navigate}
         />
       )}
