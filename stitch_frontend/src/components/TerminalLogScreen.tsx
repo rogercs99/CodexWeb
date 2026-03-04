@@ -2,7 +2,7 @@ import { ChevronLeft, RefreshCw, Square, Trash2 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { getCodexRuns, killAllCodexRuns, killConversationSession } from '../lib/api';
 import BottomNav from './BottomNav';
-import type { CodexBackgroundRun, Screen, TerminalEntry } from '../lib/types';
+import type { CodexBackgroundRun, Conversation, Screen, TerminalEntry } from '../lib/types';
 
 function formatTime(value: string) {
   const date = value ? new Date(value) : null;
@@ -24,15 +24,38 @@ function formatElapsed(startedAt: string) {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
 
+function toTimestamp(value: string): number {
+  const parsed = Date.parse(String(value || ''));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizeConversationId(value: unknown): number | null {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+interface TerminalGroup {
+  key: string;
+  conversationId: number | null;
+  title: string;
+  entries: TerminalEntry[];
+  latestAt: number;
+}
+
 export default function TerminalLogScreen({
   entries,
+  conversations,
   onClear,
+  onClearConversation,
   onNavigate,
   onRunsChanged
 }: {
   entries: TerminalEntry[];
+  conversations: Conversation[];
   onClear: () => void;
-  onNavigate: (screen: Screen) => void;
+  onClearConversation: (conversationId: number | null) => void;
+  onNavigate: (screen: Screen, data?: { chatId?: number }) => void;
   onRunsChanged?: () => void;
 }) {
   const [filter, setFilter] = useState<'all' | 'running' | 'success' | 'error' | 'notice'>('all');
@@ -73,9 +96,43 @@ export default function TerminalLogScreen({
   }, [loadRuns]);
 
   const filtered = useMemo(
-    () => entries.filter((entry) => (filter === 'all' ? true : entry.kind === filter)).slice().reverse(),
+    () => entries.filter((entry) => (filter === 'all' ? true : entry.kind === filter)),
     [entries, filter]
   );
+
+  const groupedByChat = useMemo(() => {
+    const conversationById = new Map<number, Conversation>();
+    for (const conversation of conversations) {
+      conversationById.set(conversation.id, conversation);
+    }
+
+    const groups = new Map<string, TerminalGroup>();
+    for (const entry of filtered) {
+      const conversationId = normalizeConversationId(entry.conversationId);
+      const key = conversationId === null ? 'draft' : `chat_${conversationId}`;
+      const existing = groups.get(key);
+      if (existing) {
+        existing.entries.push(entry);
+        existing.latestAt = Math.max(existing.latestAt, toTimestamp(entry.timestamp));
+        continue;
+      }
+      const conversation = conversationId === null ? null : conversationById.get(conversationId) || null;
+      groups.set(key, {
+        key,
+        conversationId,
+        title: conversation?.title || (conversationId === null ? 'Sin chat asignado' : `Chat ${conversationId}`),
+        entries: [entry],
+        latestAt: toTimestamp(entry.timestamp)
+      });
+    }
+
+    return Array.from(groups.values())
+      .map((group) => ({
+        ...group,
+        entries: group.entries.slice().sort((a, b) => toTimestamp(b.timestamp) - toTimestamp(a.timestamp))
+      }))
+      .sort((a, b) => b.latestAt - a.latestAt);
+  }, [conversations, filtered]);
 
   const stopOneRun = async (conversationId: number) => {
     setStoppingConversationId(conversationId);
@@ -191,8 +248,8 @@ export default function TerminalLogScreen({
         <section className="rounded-2xl border border-zinc-800 bg-zinc-900/30 p-4 space-y-3">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <h2 className="text-sm font-semibold text-zinc-100">Historial de terminal</h2>
-              <p className="text-xs text-zinc-500">Eventos y salida de comandos de tus chats.</p>
+              <h2 className="text-sm font-semibold text-zinc-100">Historial de terminal por chat</h2>
+              <p className="text-xs text-zinc-500">Las salidas se agrupan por conversación.</p>
             </div>
             <button onClick={onClear} className="p-2 text-zinc-400 hover:text-white" type="button" aria-label="Limpiar historial terminal">
               <Trash2 size={18} />
@@ -214,33 +271,66 @@ export default function TerminalLogScreen({
             ))}
           </div>
 
-          <div className="space-y-3">
-            {filtered.length === 0 ? <div className="text-sm text-zinc-500">Sin eventos para este filtro.</div> : null}
-            {filtered.map((entry) => (
-              <div
-                key={entry.id}
-                className={`rounded-xl border p-3 ${
-                  entry.kind === 'error'
-                    ? 'border-red-500/30 bg-red-500/5'
-                    : entry.kind === 'success'
-                    ? 'border-emerald-500/30 bg-emerald-500/5'
-                    : entry.kind === 'running'
-                    ? 'border-blue-500/30 bg-blue-500/5'
-                    : 'border-zinc-800 bg-zinc-900/30'
-                }`}
-              >
-                <div className="flex items-center justify-between mb-2 text-xs">
-                  <span className="uppercase text-zinc-400">{entry.statusText || entry.kind}</span>
-                  <span className="text-zinc-600">{formatTime(entry.timestamp)}</span>
+          <div className="space-y-4">
+            {groupedByChat.length === 0 ? <div className="text-sm text-zinc-500">Sin eventos para este filtro.</div> : null}
+            {groupedByChat.map((group) => (
+              <article key={group.key} className="rounded-xl border border-zinc-800 bg-black/30 p-3 space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-zinc-100 truncate" title={group.title}>{group.title}</p>
+                    <p className="text-xs text-zinc-500 mt-1">
+                      {group.conversationId === null ? 'sin chat' : `chat #${group.conversationId}`} · {group.entries.length} evento{group.entries.length === 1 ? '' : 's'}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {group.conversationId !== null ? (
+                      <button
+                        type="button"
+                        onClick={() => onNavigate('chat', { chatId: group.conversationId as number })}
+                        className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500"
+                      >
+                        Abrir chat
+                      </button>
+                    ) : null}
+                    <button
+                      type="button"
+                      onClick={() => onClearConversation(group.conversationId)}
+                      className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500"
+                    >
+                      Limpiar
+                    </button>
+                  </div>
                 </div>
-                <pre className="text-xs text-zinc-200 whitespace-pre-wrap break-all">{entry.command}</pre>
-                {entry.output ? (
-                  <pre className="text-xs text-zinc-400 whitespace-pre-wrap break-all mt-2">{entry.output}</pre>
-                ) : null}
-                {entry.durationMs > 0 ? (
-                  <p className="text-[10px] text-zinc-600 mt-2">{Math.round(entry.durationMs)} ms</p>
-                ) : null}
-              </div>
+
+                <div className="space-y-2">
+                  {group.entries.map((entry) => (
+                    <div
+                      key={`${group.key}:${entry.id}:${entry.timestamp}`}
+                      className={`rounded-xl border p-3 ${
+                        entry.kind === 'error'
+                          ? 'border-red-500/30 bg-red-500/5'
+                          : entry.kind === 'success'
+                          ? 'border-emerald-500/30 bg-emerald-500/5'
+                          : entry.kind === 'running'
+                          ? 'border-blue-500/30 bg-blue-500/5'
+                          : 'border-zinc-800 bg-zinc-900/30'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between mb-2 text-xs">
+                        <span className="uppercase text-zinc-400">{entry.statusText || entry.kind}</span>
+                        <span className="text-zinc-600">{formatTime(entry.timestamp)}</span>
+                      </div>
+                      <pre className="text-xs text-zinc-200 whitespace-pre-wrap break-all">{entry.command}</pre>
+                      {entry.output ? (
+                        <pre className="text-xs text-zinc-400 whitespace-pre-wrap break-all mt-2">{entry.output}</pre>
+                      ) : null}
+                      {entry.durationMs > 0 ? (
+                        <p className="text-[10px] text-zinc-600 mt-2">{Math.round(entry.durationMs)} ms</p>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              </article>
             ))}
           </div>
         </section>
