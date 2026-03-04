@@ -404,6 +404,46 @@ test('end_room desde fuera de la sala funciona con roomCode + password', async (
   assert.equal(rooms.find((room) => room.code === joined.roomCode), undefined);
 });
 
+test('DELETE /api/rooms/:roomCode elimina la sala con password admin', async (t) => {
+  const { port } = await startServer(t);
+  const host = await createClient(t, port);
+  host.send({ type: 'join', name: 'Host' });
+  const joined = await waitForMessage(host, (m) => m.type === 'joined', 'host joined');
+
+  const response = await fetch(`http://127.0.0.1:${port}/api/rooms/${joined.roomCode}`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'hola123' }),
+  });
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(payload.ok, true);
+  assert.equal(payload.roomCode, joined.roomCode);
+
+  await waitForMessage(host, (m) => m.type === 'ended' && m.roomCode === joined.roomCode, 'host ended event');
+  const rooms = await fetch(`http://127.0.0.1:${port}/api/rooms`).then((r) => r.json());
+  assert.equal(rooms.find((room) => room.code === joined.roomCode), undefined);
+});
+
+test('DELETE /api/rooms/:roomCode rechaza password inválido', async (t) => {
+  const { port } = await startServer(t);
+  const host = await createClient(t, port);
+  host.send({ type: 'join', name: 'Host' });
+  const joined = await waitForMessage(host, (m) => m.type === 'joined', 'host joined');
+
+  const response = await fetch(`http://127.0.0.1:${port}/api/rooms/${joined.roomCode}`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: 'incorrecta' }),
+  });
+  assert.equal(response.status, 401);
+  const payload = await response.json();
+  assert.equal(payload.error, 'No autorizado para eliminar la sala.');
+
+  const rooms = await fetch(`http://127.0.0.1:${port}/api/rooms`).then((r) => r.json());
+  assert.notEqual(rooms.find((room) => room.code === joined.roomCode), undefined);
+});
+
 test('reconexión con playerId recupera el mismo jugador', async (t) => {
   const { port } = await startServer(t);
   const first = await createClient(t, port);

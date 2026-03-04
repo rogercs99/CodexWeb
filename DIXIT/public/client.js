@@ -20,6 +20,7 @@ const elements = {
   readyBar: document.getElementById('ready-bar'),
   readyCount: document.getElementById('ready-count'),
   leaveBtn: document.getElementById('leave-btn'),
+  endRoomBtn: document.getElementById('end-room-btn'),
   // Clue
   clueHand: document.getElementById('clue-hand'),
   clueSelected: document.getElementById('clue-selected-card'),
@@ -83,6 +84,12 @@ function connectSocket() {
     }
     if (data.type === 'error') {
       toast(data.message, 'error');
+      return;
+    }
+    if (data.type === 'ended') {
+      toast('La sala fue eliminada.');
+      currentState = null;
+      show('landing');
       return;
     }
     if (data.type === 'state') {
@@ -198,6 +205,13 @@ function renderLobby(state) {
     elements.startBtn.disabled = !state.canStart;
     elements.startBtn.textContent = state.canStart ? 'Empezar' : 'Esperando jugadores (min 3)';
     elements.startBtn.onclick = () => send({ type: 'start' });
+
+    elements.endRoomBtn.classList.toggle('hidden', you.isHost !== true);
+    elements.endRoomBtn.onclick = () => {
+      if (!you.isHost) return;
+      if (!window.confirm('¿Seguro que quieres eliminar la sala?')) return;
+      send({ type: 'end_room' });
+    };
   }
 }
 

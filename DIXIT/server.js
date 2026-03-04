@@ -43,6 +43,7 @@ const wss = new WebSocketServer({ server, path: '/ws' });
 
 const rooms = new Map();
 const ROOMS_FILE = process.env.ROOMS_FILE || path.join(__dirname, 'rooms.json');
+const ROOM_ADMIN_PASSWORD = process.env.ROOM_ADMIN_PASSWORD || 'hola123';
 
 const MAX_HAND = 6;
 const MIN_PLAYERS = 3;
@@ -777,6 +778,22 @@ function getRoom(code) {
   return rooms.get(code);
 }
 
+function endRoom(room, endedBy = 'host') {
+  if (!room || !rooms.has(room.code)) return false;
+  room.active = false;
+  const payload = { type: 'ended', roomCode: room.code, endedBy };
+  for (const participant of room.players.values()) {
+    if (participant.ws) {
+      send(participant.ws, payload);
+    }
+    participant.connected = false;
+    participant.ws = null;
+  }
+  rooms.delete(room.code);
+  saveRooms();
+  return true;
+}
+
 function drawCard(room) {
   if (room.deck.length === 0) {
     // recycle discard
@@ -1238,7 +1255,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    if (type === 'end_room') {
+    if (type === 'end_room' || type === 'delete_room') {
       const targetCode = msg.roomCode ? normalizeRoomCode(msg.roomCode) : currentRoom?.code || null;
       const target = targetCode ? rooms.get(targetCode) : null;
       if (!target) {
@@ -1247,20 +1264,15 @@ wss.on('connection', (ws) => {
       }
 
       const player = currentRoom && currentPlayerId ? currentRoom.players.get(currentPlayerId) : null;
-      const canEnd = (player && target.hostId === player.id) || msg.password === 'hola123';
+      const canEndAsHost = Boolean(player && target.hostId === player.id);
+      const canEndAsAdmin = msg.password?.toString() === ROOM_ADMIN_PASSWORD;
+      const canEnd = canEndAsHost || canEndAsAdmin;
       if (!canEnd) {
         send(ws, { type: 'error', message: 'No autorizado para eliminar la sala.' });
         return;
       }
 
-      target.active = false;
-      for (const p of target.players.values()) {
-        if (p.ws && p.ws.readyState === p.ws.OPEN) {
-          p.ws.send(JSON.stringify({ type: 'ended', roomCode: target.code }));
-        }
-      }
-      rooms.delete(target.code);
-      saveRooms();
+      endRoom(target, canEndAsHost ? 'host' : 'admin');
 
       if (currentRoom?.code === target.code) {
         currentRoom = null;
@@ -1465,4 +1477,28 @@ app.get('/api/rooms', (req, res) => {
     players: Array.from(r.players.values()).map(p => ({ id: p.id, name: p.name, score: p.score, connected: p.connected }))
   }));
   res.json(list);
+});
+
+app.delete('/api/rooms/:roomCode', (req, res) => {
+  const roomCode = normalizeRoomCode(req.params.roomCode);
+  if (!roomCode) {
+    return res.status(400).json({ error: 'Código de sala inválido.' });
+  }
+
+  const room = rooms.get(roomCode);
+  if (!room) {
+    return res.status(404).json({ error: 'Sala no encontrada.' });
+  }
+
+  const bodyPassword = typeof req.body?.password === 'string' ? req.body.password : null;
+  const queryPassword = typeof req.query?.password === 'string' ? req.query.password : null;
+  const headerPassword = typeof req.headers['x-room-password'] === 'string' ? req.headers['x-room-password'] : null;
+  const providedPassword = bodyPassword || queryPassword || headerPassword;
+
+  if (providedPassword !== ROOM_ADMIN_PASSWORD) {
+    return res.status(401).json({ error: 'No autorizado para eliminar la sala.' });
+  }
+
+  endRoom(room, 'admin_api');
+  return res.json({ ok: true, roomCode });
 });
