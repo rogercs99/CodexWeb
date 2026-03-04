@@ -2150,6 +2150,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     let lastPersistedDraftSignature = '';
     let assistantPersistErrorLogged = false;
     let lastCodexError = '';
+    let latestAssistantMessage = '';
     let finished = false;
 
     const toSnakeCase = (value) =>
@@ -2312,19 +2313,13 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       const itemId = getStringField(item, ['id', 'itemId']);
       const nextText = getStringField(item, ['text', 'message']);
       if (!nextText) return;
-      const previousText = itemId ? assistantItemTexts.get(itemId) || '' : '';
+      const safeProgressItemId = itemId ? `agent_${itemId}` : 'agent_progress';
       if (itemId) {
         assistantItemTexts.set(itemId, nextText);
       }
-
-      if (!previousText) {
-        pushAssistantMessage(nextText);
-        return;
-      }
-
-      if (nextText === previousText) return;
-      const delta = nextText.startsWith(previousText) ? nextText.slice(previousText.length) : `\n${nextText}`;
-      pushAssistantDelta(delta);
+      latestAssistantMessage = nextText;
+      upsertReasoningLine(nextText, safeProgressItemId);
+      sendSseSafe('reasoning_step', { itemId: safeProgressItemId, text: nextText });
     };
 
     const handleReasoningCompleted = (item) => {
@@ -2438,14 +2433,21 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       if (!delta) return;
 
       if (eventType.includes('agent_message') || eventType.includes('assistant_message')) {
+        const safeProgressItemId = itemId ? `agent_${itemId}` : 'agent_progress';
         if (itemId) {
           const previous = assistantItemTexts.get(itemId) || '';
-          if (!previous && assistantOutput) {
-            pushAssistantDelta('\n\n');
-          }
-          assistantItemTexts.set(itemId, previous + delta);
+          const nextText = `${previous}${delta}`;
+          assistantItemTexts.set(itemId, nextText);
+          latestAssistantMessage = nextText;
+          upsertReasoningLine(nextText, safeProgressItemId);
+        } else {
+          const previous = assistantItemTexts.get(safeProgressItemId) || '';
+          const nextText = `${previous}${delta}`;
+          assistantItemTexts.set(safeProgressItemId, nextText);
+          latestAssistantMessage = nextText;
+          upsertReasoningLine(nextText, safeProgressItemId);
         }
-        pushAssistantDelta(delta);
+        sendSseSafe('reasoning_delta', { itemId: safeProgressItemId, text: delta });
         return;
       }
 
@@ -2612,6 +2614,9 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       stopHeartbeat();
       flushStdoutPending();
       flushStderrPending();
+      if (!assistantOutput.trim() && latestAssistantMessage.trim()) {
+        assistantOutput = latestAssistantMessage.trim();
+      }
       if (!assistantOutput.trim()) {
         const latestNotice = codexNotices.length > 0 ? codexNotices[codexNotices.length - 1] : '';
         const latestStderr = stderrLines.length > 0 ? stderrLines[stderrLines.length - 1] : '';

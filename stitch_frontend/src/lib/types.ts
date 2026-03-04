@@ -21,6 +21,8 @@ export interface Conversation {
   reasoningEffort: string;
   created_at: string;
   last_message_at: string;
+  liveDraftOpen?: boolean;
+  liveDraftUpdatedAt?: string;
 }
 
 export interface Message {

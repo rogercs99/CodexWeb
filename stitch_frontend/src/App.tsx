@@ -134,21 +134,63 @@ function readAllDrafts(username: string): Array<{ storageKey: string; draft: Liv
   return result;
 }
 
-function mergeMessagesWithDraft(serverMessages: Message[], draft: LiveChatDraft | null): Message[] {
-  if (!draft || draft.completed) return serverMessages;
+function mergeMessagesWithDraft(
+  serverMessages: Message[],
+  draft: LiveChatDraft | null,
+  options?: { hideAssistantContentWhileRunning?: boolean }
+): Message[] {
   const next = [...serverMessages];
+  if (!draft || draft.completed) return next;
+
+  const hideAssistantContentWhileRunning = Boolean(options?.hideAssistantContentWhileRunning);
+  const draftAssistantIdRaw = Number.isInteger(draft.assistantMessage?.id)
+    ? Number(draft.assistantMessage.id)
+    : Number(draft.messageId);
+  const draftAssistantId = Number.isInteger(draftAssistantIdRaw) ? draftAssistantIdRaw : null;
+
+  const findAssistantIndex = () => {
+    if (draftAssistantId !== null) {
+      const byIdIndex = next.findIndex(
+        (item) => item.role === 'assistant' && Number(item.id) === draftAssistantId
+      );
+      if (byIdIndex >= 0) return byIdIndex;
+    }
+    return next.reduce((acc, item, index) => (item.role === 'assistant' ? index : acc), -1);
+  };
+
+  const targetAssistantIndex = findAssistantIndex();
+
+  if (hideAssistantContentWhileRunning) {
+    if (targetAssistantIndex >= 0) {
+      next[targetAssistantIndex] = {
+        ...next[targetAssistantIndex],
+        content: ''
+      };
+      return next;
+    }
+    next.push({
+      id: draftAssistantId !== null ? draftAssistantId : draft.messageId,
+      role: 'assistant',
+      content: '',
+      created_at:
+        String(draft.assistantMessage?.created_at || '') ||
+        String(draft.userMessage?.created_at || '') ||
+        new Date().toISOString()
+    });
+    return next;
+  }
+
   const draftAssistant = String(draft.assistantMessage?.content || '');
   if (!draftAssistant) return next;
 
-  const lastAssistantIndex = next.reduce((acc, item, index) => (item.role === 'assistant' ? index : acc), -1);
-  if (lastAssistantIndex >= 0) {
-    const current = String(next[lastAssistantIndex].content || '');
+  if (targetAssistantIndex >= 0) {
+    const current = String(next[targetAssistantIndex].content || '');
     if (current === draftAssistant || current.startsWith(draftAssistant)) {
       return next;
     }
     if (draftAssistant.startsWith(current)) {
-      next[lastAssistantIndex] = {
-        ...next[lastAssistantIndex],
+      next[targetAssistantIndex] = {
+        ...next[targetAssistantIndex],
         content: draftAssistant
       };
       return next;
@@ -497,6 +539,11 @@ export default function App() {
       const rows = await listConversations();
       const sorted = byDateDesc(rows);
       setConversations(sorted);
+      setRunningConversationIds(
+        sorted
+          .filter((item) => Boolean(item.liveDraftOpen))
+          .map((item) => item.id)
+      );
 
       const chosenId =
         preferredId && sorted.some((item) => item.id === preferredId)
@@ -509,7 +556,13 @@ export default function App() {
         const draftOnly = getLiveDraftForConversation(null, usernameOverride);
         setActiveConversationId(null);
         setChatTitle('Nuevo chat');
-        setMessages(draftOnly ? mergeMessagesWithDraft([], draftOnly.draft) : []);
+        setMessages(
+          draftOnly
+            ? mergeMessagesWithDraft([], draftOnly.draft, {
+                hideAssistantContentWhileRunning: true
+              })
+            : []
+        );
         setLiveReasoning(
           draftOnly ? serializeReasoning(new Map(Object.entries(draftOnly.draft.reasoningByItem || {}))) : ''
         );
@@ -526,9 +579,17 @@ export default function App() {
         serverDraft && !serverDraft.completed
           ? { storageKey: '', draft: serverDraft }
           : localDraft;
+      const chosenConversation = sorted.find((item) => item.id === chosenId) || null;
+      const hideAssistantWhileRunning =
+        Boolean(chosenConversation && chosenConversation.liveDraftOpen) ||
+        Boolean(liveDraft && !liveDraft.draft.completed);
       setActiveConversationId(chosenId);
       setChatTitle(detail.conversation.title || 'Chat');
-      setMessages(mergeMessagesWithDraft(detail.messages || [], liveDraft ? liveDraft.draft : null));
+      setMessages(
+        mergeMessagesWithDraft(detail.messages || [], liveDraft ? liveDraft.draft : null, {
+          hideAssistantContentWhileRunning: hideAssistantWhileRunning
+        })
+      );
       setLiveReasoning(
         liveDraft ? serializeReasoning(new Map(Object.entries(liveDraft.draft.reasoningByItem || {}))) : ''
       );
@@ -688,9 +749,18 @@ export default function App() {
               serverDraft && !serverDraft.completed
                 ? { storageKey: '', draft: serverDraft }
                 : localDraft;
+            const hasServerRunningFlag = conversations.some(
+              (item) => item.id === targetChatId && Boolean(item.liveDraftOpen)
+            );
+            const hideAssistantWhileRunning =
+              hasServerRunningFlag || Boolean(liveDraft && !liveDraft.draft.completed);
             setActiveConversationId(targetChatId);
             setChatTitle(detail.conversation.title || 'Chat');
-            setMessages(mergeMessagesWithDraft(detail.messages || [], liveDraft ? liveDraft.draft : null));
+            setMessages(
+              mergeMessagesWithDraft(detail.messages || [], liveDraft ? liveDraft.draft : null, {
+                hideAssistantContentWhileRunning: hideAssistantWhileRunning
+              })
+            );
             setLiveReasoning(
               liveDraft ? serializeReasoning(new Map(Object.entries(liveDraft.draft.reasoningByItem || {}))) : ''
             );
@@ -708,7 +778,7 @@ export default function App() {
 
       setScreen(next);
     },
-    [activeConversationId, cancelActiveStream, getLiveDraftForConversation, sending]
+    [activeConversationId, cancelActiveStream, conversations, getLiveDraftForConversation, sending]
   );
 
   const handleLogin = useCallback(
@@ -892,6 +962,7 @@ export default function App() {
       let conversationFromStream: number | null = activeConversationId;
       let streamCompleted = false;
       let streamRequestStarted = false;
+      let keepRunningIndicator = false;
 
       const patchReasoningCache = (itemId: string, value: string, mode: 'append' | 'replace') => {
         if (!value) return;
@@ -968,19 +1039,6 @@ export default function App() {
             if (!delta) return;
             assistantDraftRef.current = `${assistantDraftRef.current}${delta}`;
             scheduleDraftPersist(false);
-            const draftId = liveAssistantMessageIdRef.current;
-            if (draftId === null) return;
-            const nextContent = assistantDraftRef.current;
-            setMessages((prev) => {
-              const idx = prev.findIndex((entry) => entry.id === draftId);
-              if (idx === -1) return prev;
-              const next = [...prev];
-              next[idx] = {
-                ...next[idx],
-                content: nextContent
-              };
-              return next;
-            });
           },
           reasoning_delta: (payload) => {
             if (!isCurrentSession()) return;
@@ -1108,6 +1166,7 @@ export default function App() {
         if (!isCurrentSession()) return;
 
         if (!streamCompleted) {
+          keepRunningIndicator = true;
           persistActiveDraftNow(false);
           if (conversationFromStream && conversationFromStream > 0) {
             void loadConversationsAndPick(conversationFromStream).catch(() => {
@@ -1125,6 +1184,7 @@ export default function App() {
         if (!isCurrentSession()) return;
         const aborted = error?.name === 'AbortError';
         if (aborted && streamRequestStarted) {
+          keepRunningIndicator = true;
           persistActiveDraftNow(false);
           if (conversationFromStream && conversationFromStream > 0) {
             void loadConversationsAndPick(conversationFromStream).catch(() => {
@@ -1136,7 +1196,11 @@ export default function App() {
           setStatus(aborted ? 'Solicitud detenida.' : error?.message || 'Error en el envío.');
         }
       } finally {
-        if (trackedRunningConversationId && trackedRunningConversationId > 0) {
+        if (
+          trackedRunningConversationId &&
+          trackedRunningConversationId > 0 &&
+          !keepRunningIndicator
+        ) {
           setRunningConversationIds((prev) => prev.filter((id) => id !== trackedRunningConversationId));
         }
         if (!isCurrentSession()) return;
@@ -1259,6 +1323,7 @@ export default function App() {
       {screen === 'chat' && (
         <ChatScreen
           chatTitle={chatTitle}
+          conversationId={activeConversationId}
           messages={messages}
           liveReasoning={liveReasoning}
           terminalEntries={terminalEntries}

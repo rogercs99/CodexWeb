@@ -60,14 +60,14 @@ function CodeBlock({ text, language }: { text: string; language: string }) {
 
 function MarkdownMessage({ content }: { content: string }) {
   return (
-    <div className="prose prose-invert prose-sm max-w-none break-words [overflow-wrap:anywhere]">
+    <div className="prose prose-invert prose-sm max-w-none break-words [overflow-wrap:anywhere] leading-relaxed">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          p: ({ children }) => <p className="my-0 whitespace-pre-wrap">{children}</p>,
-          ul: ({ children }) => <ul className="my-1 list-disc pl-5">{children}</ul>,
-          ol: ({ children }) => <ol className="my-1 list-decimal pl-5">{children}</ol>,
-          li: ({ children }) => <li className="my-0.5">{children}</li>,
+          p: ({ children }) => <p className="my-2 whitespace-pre-wrap leading-relaxed">{children}</p>,
+          ul: ({ children }) => <ul className="my-2 list-disc pl-5 space-y-1">{children}</ul>,
+          ol: ({ children }) => <ol className="my-2 list-decimal pl-5 space-y-1">{children}</ol>,
+          li: ({ children }) => <li className="my-0 leading-relaxed">{children}</li>,
           a: ({ href, children }) => (
             <a
               href={href}
@@ -78,13 +78,18 @@ function MarkdownMessage({ content }: { content: string }) {
               {children}
             </a>
           ),
-          code: ({ inline, className, children }) => {
-            const raw = String(children || '');
-            if (inline) {
-              return <code className="px-1 py-0.5 rounded bg-zinc-800 text-zinc-100">{raw}</code>;
-            }
+          code: ({ className, children }) => {
+            const raw = String(children || '').replace(/\n$/, '');
             const langMatch = /language-([a-zA-Z0-9_-]+)/.exec(String(className || ''));
-            return <CodeBlock text={raw.replace(/\n$/, '')} language={langMatch ? langMatch[1] : ''} />;
+            const isInlineCode = !langMatch && !raw.includes('\n');
+            if (isInlineCode) {
+              return (
+                <code className="inline-block align-baseline px-1.5 py-0.5 rounded-md bg-zinc-800/90 text-zinc-100 text-[0.92em]">
+                  {raw}
+                </code>
+              );
+            }
+            return <CodeBlock text={raw} language={langMatch ? langMatch[1] : ''} />;
           }
         }}
       >
@@ -96,6 +101,7 @@ function MarkdownMessage({ content }: { content: string }) {
 
 export default function ChatScreen({
   chatTitle,
+  conversationId,
   messages,
   liveReasoning,
   terminalEntries,
@@ -118,6 +124,7 @@ export default function ChatScreen({
   onReasoningChange
 }: {
   chatTitle: string;
+  conversationId: number | null;
   messages: Message[];
   liveReasoning: string;
   terminalEntries: TerminalEntry[];
@@ -140,8 +147,9 @@ export default function ChatScreen({
   onReasoningChange: (value: string) => void;
 }) {
   const [input, setInput] = useState('');
-  const [showReasoning, setShowReasoning] = useState(true);
-  const [showTerminal, setShowTerminal] = useState(true);
+  const [showReasoning, setShowReasoning] = useState(false);
+  const [showTerminal, setShowTerminal] = useState(false);
+  const [hasTerminalActivity, setHasTerminalActivity] = useState(false);
   const [showTitleModal, setShowTitleModal] = useState(false);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const messagesRef = useRef<HTMLElement | null>(null);
@@ -157,6 +165,11 @@ export default function ChatScreen({
     lastTerminalEntry && typeof lastTerminalEntry === 'object'
       ? `${terminalEntries.length}:${String(lastTerminalEntry.id || '')}:${String(lastTerminalEntry.output || '').length}`
       : '0';
+  const hasReasoningActivity = liveReasoning.trim().length > 0;
+  const showReasoningPanel = hasReasoningActivity || sending || isRunning;
+  const hadReasoningRef = useRef(liveReasoning.trim().length > 0);
+  const terminalFingerprintRef = useRef(terminalFingerprint);
+  const wasSendingRef = useRef(sending);
 
   useEffect(() => {
     if (!showTitleModal) return undefined;
@@ -174,6 +187,43 @@ export default function ChatScreen({
     if (!node) return;
     node.scrollTo({ top: node.scrollHeight, behavior: 'auto' });
   }, [chatTitle, grouped.length, lastMessageFingerprint, liveReasoning.length, terminalFingerprint]);
+
+  useEffect(() => {
+    setShowReasoning(false);
+    setShowTerminal(false);
+    setHasTerminalActivity(Boolean((sending || isRunning) && terminalEntries.length > 0));
+    hadReasoningRef.current = liveReasoning.trim().length > 0;
+    terminalFingerprintRef.current = terminalFingerprint;
+    wasSendingRef.current = sending;
+  }, [conversationId, liveReasoning, terminalFingerprint, sending, isRunning, terminalEntries.length]);
+
+  useEffect(() => {
+    if (!wasSendingRef.current && sending) {
+      setShowReasoning(true);
+      setShowTerminal(false);
+      setHasTerminalActivity(false);
+      hadReasoningRef.current = false;
+      terminalFingerprintRef.current = terminalFingerprint;
+    }
+    wasSendingRef.current = sending;
+  }, [sending, terminalFingerprint]);
+
+  useEffect(() => {
+    const hasReasoning = liveReasoning.trim().length > 0;
+    if (!hadReasoningRef.current && hasReasoning) {
+      setShowReasoning(true);
+    }
+    hadReasoningRef.current = hasReasoning;
+  }, [liveReasoning]);
+
+  useEffect(() => {
+    const changed = terminalFingerprintRef.current !== terminalFingerprint;
+    terminalFingerprintRef.current = terminalFingerprint;
+    if (changed && terminalEntries.length > 0 && (sending || isRunning)) {
+      setHasTerminalActivity(true);
+      setShowTerminal(true);
+    }
+  }, [terminalFingerprint, terminalEntries.length, sending, isRunning]);
 
   const sendCurrent = () => {
     if (sending) return;
@@ -266,7 +316,7 @@ export default function ChatScreen({
         {grouped.map((message) => {
           const rawContent = String(message.content || '');
           const hasVisibleContent = rawContent.trim().length > 0;
-          const showThinking = sending && message.role === 'assistant' && !hasVisibleContent;
+          const showThinking = (sending || isRunning) && message.role === 'assistant' && !hasVisibleContent;
           const fallbackText =
             message.role === 'assistant'
               ? '(Sin respuesta visible del modelo. Revisa terminal para el detalle del error.)'
@@ -291,35 +341,35 @@ export default function ChatScreen({
           );
         })}
 
-        <section className="rounded-2xl border border-zinc-800 bg-zinc-900/50">
-          <button
-            type="button"
-            className="w-full px-3 py-2 text-left text-xs uppercase tracking-wide text-zinc-300"
-            onClick={() => setShowReasoning((prev) => !prev)}
-          >
-            {showReasoning ? '▾' : '▸'} Reasoning live
-          </button>
-          {showReasoning ? (
-            <pre className="max-h-72 overflow-auto border-t border-zinc-800 px-3 py-2 text-xs text-zinc-200 whitespace-pre-wrap break-words">
-              {liveReasoning || 'Sin razonamiento recibido todavia.'}
-            </pre>
-          ) : null}
-        </section>
+        {showReasoningPanel ? (
+          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/50">
+            <button
+              type="button"
+              className="w-full px-3 py-2 text-left text-xs uppercase tracking-wide text-zinc-300"
+              onClick={() => setShowReasoning((prev) => !prev)}
+            >
+              {showReasoning ? '▾' : '▸'} Reasoning live
+            </button>
+            {showReasoning ? (
+              <pre className="max-h-72 overflow-auto border-t border-zinc-800 px-3 py-2 text-xs text-zinc-200 whitespace-pre-wrap break-words">
+                {liveReasoning || 'Pensando...'}
+              </pre>
+            ) : null}
+          </section>
+        ) : null}
 
-        <section className="rounded-2xl border border-zinc-800 bg-zinc-900/50">
-          <button
-            type="button"
-            className="w-full px-3 py-2 text-left text-xs uppercase tracking-wide text-zinc-300"
-            onClick={() => setShowTerminal((prev) => !prev)}
-          >
-            {showTerminal ? '▾' : '▸'} Terminal live ({terminalEntries.length})
-          </button>
-          {showTerminal ? (
-            <div className="max-h-80 overflow-auto border-t border-zinc-800 px-3 py-2 space-y-2">
-              {terminalEntries.length === 0 ? (
-                <p className="text-xs text-zinc-500">Sin comandos todavia.</p>
-              ) : (
-                terminalEntries.map((entry) => (
+        {hasTerminalActivity ? (
+          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/50">
+            <button
+              type="button"
+              className="w-full px-3 py-2 text-left text-xs uppercase tracking-wide text-zinc-300"
+              onClick={() => setShowTerminal((prev) => !prev)}
+            >
+              {showTerminal ? '▾' : '▸'} Terminal live ({terminalEntries.length})
+            </button>
+            {showTerminal ? (
+              <div className="max-h-80 overflow-auto border-t border-zinc-800 px-3 py-2 space-y-2">
+                {terminalEntries.map((entry) => (
                   <article key={entry.id} className="rounded-lg border border-zinc-800 bg-black/50 p-2">
                     <div className="text-[10px] text-zinc-400 uppercase">{entry.statusText || entry.kind}</div>
                     <pre className="text-xs text-zinc-200 whitespace-pre-wrap break-words mt-1">{entry.command}</pre>
@@ -327,11 +377,11 @@ export default function ChatScreen({
                       <pre className="text-xs text-zinc-400 whitespace-pre-wrap break-words mt-1">{entry.output}</pre>
                     ) : null}
                   </article>
-                ))
-              )}
-            </div>
-          ) : null}
-        </section>
+                ))}
+              </div>
+            ) : null}
+          </section>
+        ) : null}
       </main>
 
       <div className="fixed bottom-[74px] left-0 right-0 p-4 bg-gradient-to-t from-black via-black/90 to-transparent z-[60] pointer-events-none">

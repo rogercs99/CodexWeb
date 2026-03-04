@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { ExternalLink } from 'lucide-react';
 import BottomNav from './BottomNav';
 import { getCodexQuota } from '../lib/api';
 import type { Capabilities, ChatOptions, CodexQuota, CodexQuotaWindow, Screen } from '../lib/types';
@@ -43,7 +44,7 @@ export default function SettingsScreen({
     loadQuota();
   }, [loadQuota]);
 
-  const formatPercent = (value: number) => `${Number(value || 0).toFixed(1)}%`;
+  const formatPercent = (value: number) => `${Math.max(0, Math.round(Number(value || 0)))}%`;
   const formatDate = (value: string) => {
     if (!value) return '-';
     const parsed = new Date(value);
@@ -57,17 +58,58 @@ export default function SettingsScreen({
     });
   };
 
-  const renderQuotaWindow = (title: string, windowData: CodexQuotaWindow | null) => {
-    if (!windowData) return null;
-    return (
-      <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-3 space-y-1">
-        <p className="text-xs uppercase text-zinc-500">{title}</p>
-        <p className="text-sm text-zinc-300">Quota total: {formatPercent(windowData.totalPercent)}</p>
-        <p className="text-sm text-zinc-300">Quota usada: {formatPercent(windowData.usedPercent)}</p>
-        <p className="text-sm text-zinc-300">Quota restante: {formatPercent(windowData.remainingPercent)}</p>
-        <p className="text-sm text-zinc-300">Fecha de reseteo: {formatDate(windowData.resetAt)}</p>
-      </div>
-    );
+  const formatWindowLabel = (windowData: CodexQuotaWindow | null, fallback: string) => {
+    if (!windowData) return fallback;
+    const minutes = Number(windowData.windowMinutes || 0);
+    if (!Number.isFinite(minutes) || minutes <= 0) return fallback;
+    if (minutes >= 7 * 24 * 60) return 'Weekly';
+    if (minutes >= 24 * 60 && minutes % (24 * 60) === 0) return `${Math.round(minutes / (24 * 60))}d`;
+    if (minutes >= 60 && minutes % 60 === 0) return `${Math.round(minutes / 60)}h`;
+    if (minutes >= 60) return `${(minutes / 60).toFixed(1)}h`;
+    return `${Math.round(minutes)}m`;
+  };
+
+  const formatResetCompact = (value: string, windowData: CodexQuotaWindow | null) => {
+    if (!value) return '-';
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return '-';
+    const minutes = Number(windowData?.windowMinutes || 0);
+    if (Number.isFinite(minutes) && minutes >= 24 * 60) {
+      return parsed.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    }
+    return parsed.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  };
+
+  const quotaRows: Array<{
+    id: string;
+    label: string;
+    remainingPercent: number;
+    resetAt: string;
+    windowData: CodexQuotaWindow | null;
+  }> = [];
+  if (quota?.primary) {
+    quotaRows.push({
+      id: 'primary',
+      label: formatWindowLabel(quota.primary, 'Primary'),
+      remainingPercent: quota.primary.remainingPercent,
+      resetAt: quota.primary.resetAt,
+      windowData: quota.primary
+    });
+  }
+  if (quota?.secondary) {
+    quotaRows.push({
+      id: 'secondary',
+      label: formatWindowLabel(quota.secondary, 'Secondary'),
+      remainingPercent: quota.secondary.remainingPercent,
+      resetAt: quota.secondary.resetAt,
+      windowData: quota.secondary
+    });
+  }
+
+  const getRemainingColorClass = (remainingPercent: number) => {
+    if (remainingPercent <= 20) return 'text-red-300';
+    if (remainingPercent <= 50) return 'text-amber-300';
+    return 'text-emerald-300';
   };
 
   return (
@@ -150,24 +192,70 @@ export default function SettingsScreen({
             </button>
           </div>
 
-          {quotaError ? (
-            <p className="text-sm text-red-300">{quotaError}</p>
-          ) : null}
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/80 overflow-hidden">
+            <div className="px-3 py-2 border-b border-zinc-800">
+              <p className="text-sm text-zinc-200">Rate limits remaining</p>
+            </div>
 
-          {!quotaLoading && !quotaError && !quota ? (
-            <p className="text-sm text-zinc-400">
-              Sin datos de quota todavia. Envia un mensaje a Codex para generar `token_count`.
-            </p>
-          ) : null}
+            {quotaError ? (
+              <p className="px-3 py-3 text-sm text-red-300">{quotaError}</p>
+            ) : null}
+
+            {!quotaLoading && !quotaError && quotaRows.length === 0 ? (
+              <p className="px-3 py-3 text-sm text-zinc-400">
+                Sin datos de quota todavia. Envia un mensaje a Codex para generar `token_count`.
+              </p>
+            ) : null}
+
+            {quotaRows.map((row, index) => (
+              <div
+                key={row.id}
+                className={`px-3 py-2 flex items-center justify-between gap-3 ${
+                  index < quotaRows.length - 1 ? 'border-b border-zinc-800' : ''
+                }`}
+              >
+                <span className="text-sm text-zinc-200">{row.label}</span>
+                <div className="flex items-center gap-3">
+                  <span className={`text-sm font-medium ${getRemainingColorClass(row.remainingPercent)}`}>
+                    {formatPercent(row.remainingPercent)}
+                  </span>
+                  <span className="text-sm text-zinc-400 min-w-[4.5rem] text-right">
+                    {formatResetCompact(row.resetAt, row.windowData)}
+                  </span>
+                </div>
+              </div>
+            ))}
+
+            <a
+              href="https://openai.com/chatgpt/pricing/"
+              target="_blank"
+              rel="noreferrer"
+              className="px-3 py-2 border-t border-zinc-800 flex items-center justify-between text-sm text-zinc-300 hover:text-white"
+            >
+              <span>Upgrade to Pro</span>
+              <ExternalLink size={14} />
+            </a>
+
+            <a
+              href="https://platform.openai.com/docs/guides/rate-limits"
+              target="_blank"
+              rel="noreferrer"
+              className="px-3 py-2 border-t border-zinc-800 flex items-center justify-between text-sm text-zinc-300 hover:text-white"
+            >
+              <span>Learn more</span>
+              <ExternalLink size={14} />
+            </a>
+          </div>
 
           {quota ? (
-            <div className="space-y-2">
-              {renderQuotaWindow('Ventana primaria', quota.primary)}
-              {renderQuotaWindow('Ventana secundaria', quota.secondary)}
-              <p className="text-xs text-zinc-500">
-                Fuente: {quota.source || '-'} · Actualizado: {formatDate(quota.fetchedAt)}
-              </p>
-            </div>
+            <p className="text-xs text-zinc-500">
+              Fuente: {quota.source || '-'} · Actualizado: {formatDate(quota.fetchedAt)}
+            </p>
+          ) : null}
+          {quota && quota.planType ? (
+            <p className="text-xs text-zinc-500">
+              Plan: {quota.planType}
+            </p>
           ) : null}
         </section>
       </main>
