@@ -62,16 +62,19 @@ export async function deleteConversation(conversationId: number): Promise<void> 
 export async function listMessages(conversationId: number): Promise<{
   conversation: { id: number; title: string; model: string; reasoningEffort: string };
   messages: Message[];
+  liveDraft?: any;
 }> {
   const data = await api<{
     conversation: { id: number; title: string; model: string; reasoningEffort: string };
     messages: Message[];
+    liveDraft?: any;
   }>(
     `/api/conversations/${conversationId}/messages`
   );
   return {
     conversation: data.conversation,
-    messages: Array.isArray(data.messages) ? data.messages : []
+    messages: Array.isArray(data.messages) ? data.messages : [],
+    liveDraft: data.liveDraft && typeof data.liveDraft === 'object' ? data.liveDraft : null
   };
 }
 

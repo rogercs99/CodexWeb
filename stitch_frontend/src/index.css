@@ -29,6 +29,13 @@ svg {
   height: auto;
 }
 
+button,
+[role="button"],
+input[type="button"],
+input[type="submit"] {
+  touch-action: manipulation;
+}
+
 @keyframes chat-enter {
   from {
     opacity: 0;

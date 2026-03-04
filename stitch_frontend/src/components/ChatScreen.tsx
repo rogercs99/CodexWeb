@@ -1,9 +1,12 @@
 import { ChevronLeft, Clipboard, Paperclip, RefreshCw, Send, Settings, Square, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import BottomNav from './BottomNav';
-import type { ChatOptions, Message, Screen } from '../lib/types';
+import type { ChatOptions, Message, Screen, TerminalEntry } from '../lib/types';
 
 const TITLE_MAX_LENGTH = 40;
+const COLLAPSED_CODE_LINES = 20;
 
 function formatDate(value: string) {
   const date = value ? new Date(value) : null;
@@ -28,10 +31,74 @@ function truncateTitle(value: string, maxLength = TITLE_MAX_LENGTH) {
   return `${value.slice(0, maxLength - 1).trimEnd()}…`;
 }
 
+function CodeBlock({ text, language }: { text: string; language: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const lines = String(text || '').split('\n');
+  const canCollapse = lines.length > COLLAPSED_CODE_LINES;
+  const shown = !canCollapse || expanded ? lines : lines.slice(0, COLLAPSED_CODE_LINES);
+
+  return (
+    <div className="rounded-xl border border-zinc-700 bg-zinc-950/90 overflow-hidden">
+      <div className="flex items-center justify-between px-3 py-2 border-b border-zinc-800 bg-zinc-900/70">
+        <span className="text-[11px] uppercase tracking-wide text-zinc-400">{language || 'code'}</span>
+        {canCollapse ? (
+          <button
+            type="button"
+            onClick={() => setExpanded((prev) => !prev)}
+            className="text-[11px] text-blue-300 hover:text-blue-200"
+          >
+            {expanded ? 'Ver menos' : `Ver mas (${lines.length - COLLAPSED_CODE_LINES} lineas)`}
+          </button>
+        ) : null}
+      </div>
+      <pre className="text-xs text-zinc-200 p-3 overflow-x-auto whitespace-pre">
+        <code>{shown.join('\n')}{!expanded && canCollapse ? '\n...' : ''}</code>
+      </pre>
+    </div>
+  );
+}
+
+function MarkdownMessage({ content }: { content: string }) {
+  return (
+    <div className="prose prose-invert prose-sm max-w-none break-words [overflow-wrap:anywhere]">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          p: ({ children }) => <p className="my-0 whitespace-pre-wrap">{children}</p>,
+          ul: ({ children }) => <ul className="my-1 list-disc pl-5">{children}</ul>,
+          ol: ({ children }) => <ol className="my-1 list-decimal pl-5">{children}</ol>,
+          li: ({ children }) => <li className="my-0.5">{children}</li>,
+          a: ({ href, children }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+              className="text-blue-300 underline underline-offset-2 break-all"
+            >
+              {children}
+            </a>
+          ),
+          code: ({ inline, className, children }) => {
+            const raw = String(children || '');
+            if (inline) {
+              return <code className="px-1 py-0.5 rounded bg-zinc-800 text-zinc-100">{raw}</code>;
+            }
+            const langMatch = /language-([a-zA-Z0-9_-]+)/.exec(String(className || ''));
+            return <CodeBlock text={raw.replace(/\n$/, '')} language={langMatch ? langMatch[1] : ''} />;
+          }
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 export default function ChatScreen({
   chatTitle,
   messages,
   liveReasoning,
+  terminalEntries,
   sending,
   sendElapsedSeconds,
   isRunning,
@@ -53,6 +120,7 @@ export default function ChatScreen({
   chatTitle: string;
   messages: Message[];
   liveReasoning: string;
+  terminalEntries: TerminalEntry[];
   sending: boolean;
   sendElapsedSeconds: number;
   isRunning: boolean;
@@ -72,7 +140,8 @@ export default function ChatScreen({
   onReasoningChange: (value: string) => void;
 }) {
   const [input, setInput] = useState('');
-  const [reasoningExpanded, setReasoningExpanded] = useState(false);
+  const [showReasoning, setShowReasoning] = useState(true);
+  const [showTerminal, setShowTerminal] = useState(true);
   const [showTitleModal, setShowTitleModal] = useState(false);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const messagesRef = useRef<HTMLElement | null>(null);
@@ -81,6 +150,13 @@ export default function ChatScreen({
   const fullTitle = normalizeTitle(chatTitle);
   const shortTitle = truncateTitle(fullTitle);
   const isLongTitle = fullTitle.length > TITLE_MAX_LENGTH;
+
+  const lastMessageFingerprint = grouped.length > 0 ? `${grouped[grouped.length - 1].id}:${String(grouped[grouped.length - 1].content || '').length}` : 'none';
+  const lastTerminalEntry = terminalEntries.length > 0 ? terminalEntries[terminalEntries.length - 1] : null;
+  const terminalFingerprint =
+    lastTerminalEntry && typeof lastTerminalEntry === 'object'
+      ? `${terminalEntries.length}:${String(lastTerminalEntry.id || '')}:${String(lastTerminalEntry.output || '').length}`
+      : '0';
 
   useEffect(() => {
     if (!showTitleModal) return undefined;
@@ -94,16 +170,10 @@ export default function ChatScreen({
   }, [showTitleModal]);
 
   useEffect(() => {
-    if (!sending) {
-      setReasoningExpanded(false);
-    }
-  }, [sending]);
-
-  useEffect(() => {
     const node = messagesRef.current;
     if (!node) return;
     node.scrollTo({ top: node.scrollHeight, behavior: 'auto' });
-  }, [chatTitle, grouped.length]);
+  }, [chatTitle, grouped.length, lastMessageFingerprint, liveReasoning.length, terminalFingerprint]);
 
   const sendCurrent = () => {
     if (sending) return;
@@ -113,56 +183,56 @@ export default function ChatScreen({
   };
 
   const canSend = input.trim().length > 0 || selectedFiles.length > 0;
-  const headerStatus = sending ? `Generando · ${formatElapsed(sendElapsedSeconds)}` : status || 'Sesión activa';
+  const headerStatus = sending ? `Generando · ${formatElapsed(sendElapsedSeconds)}` : status || 'Sesion activa';
 
   return (
     <div className="h-screen bg-black flex flex-col relative overflow-hidden overflow-x-hidden">
       <header className="fixed top-0 left-0 right-0 z-[70] bg-black/85 backdrop-blur-xl border-b border-zinc-900 px-3 py-3">
         <div className="flex items-center gap-1">
-        <button onClick={onBack} className="w-9 h-9 shrink-0 flex items-center justify-center rounded-full hover:bg-white/10 transition-colors" type="button" aria-label="Volver al hub">
-          <ChevronLeft size={24} />
-        </button>
-        <div className="min-w-0 flex-1 text-center px-1">
-          <button
-            type="button"
-            onClick={() => {
-              if (!isLongTitle) return;
-              setShowTitleModal(true);
-            }}
-            className={`mx-auto max-w-full text-[16px] font-semibold tracking-tight flex items-center justify-center gap-2 ${
-              isLongTitle ? 'cursor-help' : ''
-            }`}
-            title={isLongTitle ? fullTitle : undefined}
-            aria-label={fullTitle}
-          >
-            {sending || isRunning ? (
-              <span
-                className="h-3.5 w-3.5 rounded-full border-2 border-blue-400 border-t-transparent animate-spin shrink-0"
-                aria-label="Chat en ejecución"
-              />
-            ) : null}
-            <span className="truncate">{shortTitle}</span>
+          <button onClick={onBack} className="w-9 h-9 shrink-0 flex items-center justify-center rounded-full hover:bg-white/10 transition-colors" type="button" aria-label="Volver al hub">
+            <ChevronLeft size={24} />
           </button>
-          <p className="text-xs text-zinc-500">{headerStatus}</p>
-        </div>
-        <div className="flex items-center gap-1 shrink-0">
-          <button
-            onClick={onRefresh}
-            className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-300 hover:text-white hover:border-zinc-500"
-            type="button"
-            aria-label="Refrescar chat"
-          >
-            <RefreshCw size={15} />
-          </button>
-          <button
-            onClick={() => onNavigate('settings')}
-            className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-300 hover:text-white hover:border-zinc-500"
-            type="button"
-            aria-label="Abrir opciones"
-          >
-            <Settings size={15} />
-          </button>
-        </div>
+          <div className="min-w-0 flex-1 text-center px-1">
+            <button
+              type="button"
+              onClick={() => {
+                if (!isLongTitle) return;
+                setShowTitleModal(true);
+              }}
+              className={`mx-auto max-w-full text-[16px] font-semibold tracking-tight flex items-center justify-center gap-2 ${
+                isLongTitle ? 'cursor-help' : ''
+              }`}
+              title={isLongTitle ? fullTitle : undefined}
+              aria-label={fullTitle}
+            >
+              {sending || isRunning ? (
+                <span
+                  className="h-3.5 w-3.5 rounded-full border-2 border-blue-400 border-t-transparent animate-spin shrink-0"
+                  aria-label="Chat en ejecucion"
+                />
+              ) : null}
+              <span className="truncate">{shortTitle}</span>
+            </button>
+            <p className="text-xs text-zinc-500">{headerStatus}</p>
+          </div>
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              onClick={onRefresh}
+              className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-300 hover:text-white hover:border-zinc-500"
+              type="button"
+              aria-label="Refrescar chat"
+            >
+              <RefreshCw size={15} />
+            </button>
+            <button
+              onClick={() => onNavigate('settings')}
+              className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-300 hover:text-white hover:border-zinc-500"
+              type="button"
+              aria-label="Abrir opciones"
+            >
+              <Settings size={15} />
+            </button>
+          </div>
         </div>
         <div className="mt-2 grid grid-cols-2 gap-2">
           <select
@@ -189,9 +259,9 @@ export default function ChatScreen({
         </div>
       </header>
 
-      <main ref={messagesRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4 pt-32 pb-64 space-y-4">
+      <main ref={messagesRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4 pt-32 pb-72 space-y-4">
         {grouped.length === 0 ? (
-          <div className="text-center text-zinc-500 text-sm py-10">Escribe un mensaje para iniciar la conversación.</div>
+          <div className="text-center text-zinc-500 text-sm py-10">Escribe un mensaje para iniciar la conversacion.</div>
         ) : null}
         {grouped.map((message) => {
           const rawContent = String(message.content || '');
@@ -199,32 +269,74 @@ export default function ChatScreen({
           const showThinking = sending && message.role === 'assistant' && !hasVisibleContent;
           const fallbackText =
             message.role === 'assistant'
-              ? '(Sin respuesta visible del modelo. Revisa Terminal para el detalle del error.)'
+              ? '(Sin respuesta visible del modelo. Revisa terminal para el detalle del error.)'
               : '';
           const visibleContent = hasVisibleContent ? rawContent : fallbackText;
 
           return (
             <div key={message.id} className={`chat-enter flex min-w-0 ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`min-w-0 max-w-[86%] rounded-3xl px-4 py-3 border ${message.role === 'user' ? 'bg-blue-600/20 border-blue-500/30 text-white rounded-br-sm' : 'bg-zinc-900/80 border-zinc-800 text-zinc-100 rounded-tl-sm'}`}>
+              <div className={`min-w-0 max-w-[92%] rounded-3xl px-4 py-3 border ${message.role === 'user' ? 'bg-blue-600/20 border-blue-500/30 text-white rounded-br-sm' : 'bg-zinc-900/80 border-zinc-800 text-zinc-100 rounded-tl-sm'}`}>
                 {showThinking ? (
-                  <div className="inline-flex items-center gap-1.5 py-1" aria-label="Codex está pensando">
+                  <div className="inline-flex items-center gap-1.5 py-1" aria-label="Codex esta pensando">
                     <span className="thinking-dot" />
                     <span className="thinking-dot" />
                     <span className="thinking-dot" />
                   </div>
                 ) : (
-                  <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-sm leading-relaxed">{visibleContent}</p>
+                  <MarkdownMessage content={visibleContent} />
                 )}
                 <p className="text-[10px] text-zinc-500 mt-2">{formatDate(message.created_at)}</p>
               </div>
             </div>
           );
         })}
+
+        <section className="rounded-2xl border border-zinc-800 bg-zinc-900/50">
+          <button
+            type="button"
+            className="w-full px-3 py-2 text-left text-xs uppercase tracking-wide text-zinc-300"
+            onClick={() => setShowReasoning((prev) => !prev)}
+          >
+            {showReasoning ? '▾' : '▸'} Reasoning live
+          </button>
+          {showReasoning ? (
+            <pre className="max-h-72 overflow-auto border-t border-zinc-800 px-3 py-2 text-xs text-zinc-200 whitespace-pre-wrap break-words">
+              {liveReasoning || 'Sin razonamiento recibido todavia.'}
+            </pre>
+          ) : null}
+        </section>
+
+        <section className="rounded-2xl border border-zinc-800 bg-zinc-900/50">
+          <button
+            type="button"
+            className="w-full px-3 py-2 text-left text-xs uppercase tracking-wide text-zinc-300"
+            onClick={() => setShowTerminal((prev) => !prev)}
+          >
+            {showTerminal ? '▾' : '▸'} Terminal live ({terminalEntries.length})
+          </button>
+          {showTerminal ? (
+            <div className="max-h-80 overflow-auto border-t border-zinc-800 px-3 py-2 space-y-2">
+              {terminalEntries.length === 0 ? (
+                <p className="text-xs text-zinc-500">Sin comandos todavia.</p>
+              ) : (
+                terminalEntries.map((entry) => (
+                  <article key={entry.id} className="rounded-lg border border-zinc-800 bg-black/50 p-2">
+                    <div className="text-[10px] text-zinc-400 uppercase">{entry.statusText || entry.kind}</div>
+                    <pre className="text-xs text-zinc-200 whitespace-pre-wrap break-words mt-1">{entry.command}</pre>
+                    {entry.output ? (
+                      <pre className="text-xs text-zinc-400 whitespace-pre-wrap break-words mt-1">{entry.output}</pre>
+                    ) : null}
+                  </article>
+                ))
+              )}
+            </div>
+          ) : null}
+        </section>
       </main>
 
-      <div className="fixed bottom-[74px] left-0 right-0 p-4 bg-gradient-to-t from-black via-black/90 to-transparent z-[60]">
+      <div className="fixed bottom-[74px] left-0 right-0 p-4 bg-gradient-to-t from-black via-black/90 to-transparent z-[60] pointer-events-none">
         {selectedFiles.length > 0 ? (
-          <div className="mb-2 flex flex-wrap gap-2 overflow-x-hidden">
+          <div className="mb-2 flex flex-wrap gap-2 overflow-x-hidden pointer-events-auto">
             {selectedFiles.map((file) => (
               <span key={file.name + file.size} className="max-w-full truncate text-xs bg-zinc-900 border border-zinc-800 px-2 py-1 rounded-lg text-zinc-300">
                 {file.name}
@@ -236,25 +348,8 @@ export default function ChatScreen({
           </div>
         ) : null}
 
-        {sending ? (
-          <div className="mb-2 rounded-2xl px-4 py-3 border bg-zinc-900/80 border-zinc-800 text-zinc-100">
-            <button
-              type="button"
-              className="text-xs uppercase tracking-wide text-zinc-300"
-              onClick={() => setReasoningExpanded((prev) => !prev)}
-            >
-              {reasoningExpanded ? '▾' : '▸'} Razonando
-            </button>
-            {reasoningExpanded ? (
-              <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-sm leading-relaxed mt-2">
-                {liveReasoning || 'Analizando...'}
-              </p>
-            ) : null}
-          </div>
-        ) : null}
-
         <form
-          className="min-w-0 bg-zinc-900/80 backdrop-blur-xl border border-zinc-800 rounded-2xl p-2 flex items-end gap-2"
+          className="min-w-0 bg-zinc-900/80 backdrop-blur-xl border border-zinc-800 rounded-2xl p-2 flex items-end gap-2 pointer-events-auto"
           onSubmit={(event) => {
             event.preventDefault();
             sendCurrent();
@@ -338,11 +433,11 @@ export default function ChatScreen({
           <div
             role="dialog"
             aria-modal="true"
-            aria-label="Título completo del chat"
+            aria-label="Titulo completo del chat"
             className="w-full max-w-md rounded-2xl border border-zinc-700 bg-zinc-900 p-4"
             onClick={(event) => event.stopPropagation()}
           >
-            <h3 className="text-sm font-semibold text-zinc-200 mb-2">Título completo</h3>
+            <h3 className="text-sm font-semibold text-zinc-200 mb-2">Titulo completo</h3>
             <p className="text-sm text-zinc-100 break-words">{fullTitle}</p>
           </div>
         </div>

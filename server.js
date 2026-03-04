@@ -97,6 +97,8 @@ let codexQuotaCache = {
   fetchedAtMs: 0,
   payload: null
 };
+const activeChatRuns = new Map();
+let activeChatRunClientSeq = 0;
 
 const sessionSecret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 
@@ -546,9 +548,28 @@ function toBase64Json(value) {
 }
 
 function sendSse(res, event, payload) {
-  if (res.writableEnded) return;
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${toBase64Json(payload)}\n\n`);
+  if (!res || res.writableEnded || res.destroyed || (res.socket && res.socket.destroyed)) {
+    return false;
+  }
+  try {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${toBase64Json(payload)}\n\n`);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function sendSseComment(res, comment) {
+  if (!res || res.writableEnded || res.destroyed || (res.socket && res.socket.destroyed)) {
+    return false;
+  }
+  try {
+    res.write(`: ${String(comment || '').trim() || 'ping'}\n\n`);
+    return true;
+  } catch (_error) {
+    return false;
+  }
 }
 
 function createClientRequestError(message, statusCode = 400) {
@@ -982,6 +1003,26 @@ ON conversations(user_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created
 ON messages(conversation_id, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS chat_live_drafts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  conversation_id INTEGER,
+  assistant_message_id INTEGER,
+  request_id TEXT NOT NULL,
+  user_message_content TEXT NOT NULL,
+  assistant_content TEXT NOT NULL DEFAULT '',
+  reasoning_json TEXT NOT NULL DEFAULT '{}',
+  completed INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+  FOREIGN KEY (assistant_message_id) REFERENCES messages(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_live_drafts_user_conversation
+ON chat_live_drafts(user_id, conversation_id, completed, updated_at DESC);
 `);
 
 function hasConversationColumn(columnName) {
@@ -1034,6 +1075,20 @@ const listConversationsStmt = db.prepare(`
     c.reasoning_effort,
     c.created_at,
     (
+      SELECT MAX(d.updated_at)
+      FROM chat_live_drafts d
+      WHERE d.user_id = c.user_id
+        AND d.conversation_id = c.id
+        AND d.completed = 0
+    ) AS live_draft_updated_at,
+    (
+      SELECT COUNT(1)
+      FROM chat_live_drafts d
+      WHERE d.user_id = c.user_id
+        AND d.conversation_id = c.id
+        AND d.completed = 0
+    ) AS live_draft_open,
+    (
       SELECT MAX(m.created_at)
       FROM messages m
       WHERE m.conversation_id = c.id
@@ -1058,6 +1113,70 @@ const listOwnedConversationIdsStmt = db.prepare(`
   ORDER BY created_at DESC
 `);
 const deleteConversationStmt = db.prepare('DELETE FROM conversations WHERE id = ?');
+const closeOpenDraftsByConversationStmt = db.prepare(`
+  UPDATE chat_live_drafts
+  SET completed = 1, updated_at = ?
+  WHERE user_id = ?
+    AND completed = 0
+    AND conversation_id = ?
+`);
+const insertLiveDraftStmt = db.prepare(`
+  INSERT INTO chat_live_drafts (
+    user_id,
+    conversation_id,
+    assistant_message_id,
+    request_id,
+    user_message_content,
+    assistant_content,
+    reasoning_json,
+    completed,
+    created_at,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+const updateLiveDraftSnapshotStmt = db.prepare(`
+  UPDATE chat_live_drafts
+  SET
+    conversation_id = ?,
+    assistant_message_id = ?,
+    assistant_content = ?,
+    reasoning_json = ?,
+    completed = ?,
+    updated_at = ?
+  WHERE id = ? AND user_id = ?
+`);
+const updateLiveDraftSnapshotByRequestStmt = db.prepare(`
+  UPDATE chat_live_drafts
+  SET
+    assistant_message_id = ?,
+    assistant_content = ?,
+    reasoning_json = ?,
+    completed = ?,
+    updated_at = ?
+  WHERE user_id = ?
+    AND conversation_id = ?
+    AND request_id = ?
+`);
+const getOpenLiveDraftForConversationStmt = db.prepare(`
+  SELECT
+    id,
+    request_id,
+    conversation_id,
+    assistant_message_id,
+    user_message_content,
+    assistant_content,
+    reasoning_json,
+    completed,
+    updated_at,
+    created_at
+  FROM chat_live_drafts
+  WHERE user_id = ?
+    AND conversation_id = ?
+    AND completed = 0
+  ORDER BY updated_at DESC, id DESC
+  LIMIT 1
+`);
 
 app.use(
   helmet({
@@ -1065,7 +1184,8 @@ app.use(
       useDefaults: true,
       directives: {
         'script-src': ["'self'"],
-        'style-src': ["'self'", "'unsafe-inline'"]
+        'style-src': ["'self'", "'unsafe-inline'"],
+        'upgrade-insecure-requests': null
       }
     }
   })
@@ -1304,7 +1424,47 @@ function loadCodexModelsFromCache() {
 }
 
 app.post('/api/register', async (req, res) => {
-  return res.status(403).json({ error: 'El registro esta deshabilitado' });
+  const rawUsername = typeof req.body?.username === 'string' ? req.body.username : '';
+  const rawPassword = typeof req.body?.password === 'string' ? req.body.password : '';
+  const username = rawUsername.trim();
+  const password = rawPassword;
+  const safeUsername = truncateForNotify(username || rawUsername);
+
+  if (!username || !password) {
+    void notify(`REGISTER failed username=${safeUsername} reason=missing_fields`);
+    return res.status(400).json({ error: 'Usuario y contraseña obligatorios' });
+  }
+  if (username.length < 3 || username.length > 48) {
+    void notify(`REGISTER failed username=${safeUsername} reason=invalid_username_length`);
+    return res.status(400).json({ error: 'El usuario debe tener entre 3 y 48 caracteres' });
+  }
+  if (!/^[a-zA-Z0-9._-]+$/.test(username)) {
+    void notify(`REGISTER failed username=${safeUsername} reason=invalid_username_chars`);
+    return res.status(400).json({ error: 'Usuario inválido (usa letras, números, punto, guion o guion bajo)' });
+  }
+  if (password.length < 8) {
+    void notify(`REGISTER failed username=${safeUsername} reason=weak_password`);
+    return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
+  }
+
+  try {
+    const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+    if (existing) {
+      void notify(`REGISTER failed username=${safeUsername} reason=already_exists`);
+      return res.status(409).json({ error: 'Ese usuario ya existe' });
+    }
+    const passwordHash = await bcrypt.hash(password, 12);
+    const created = db.prepare('INSERT INTO users (username, password_hash) VALUES (?, ?)').run(username, passwordHash);
+    const userId = Number(created.lastInsertRowid);
+    req.session.userId = userId;
+    req.session.username = username;
+    void notify(`REGISTER ok username=${safeUsername}`);
+    return res.status(201).json({ ok: true, username });
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'register_error', 180);
+    void notify(`REGISTER failed username=${safeUsername} reason=${reason}`);
+    return res.status(500).json({ error: 'No se pudo crear la cuenta' });
+  }
 });
 
 app.post('/api/login', async (req, res) => {
@@ -1405,7 +1565,9 @@ app.get('/api/conversations', requireAuth, (req, res) => {
       model: conversation.model || '',
       reasoningEffort: sanitizeReasoningEffort(conversation.reasoning_effort, DEFAULT_REASONING_EFFORT),
       created_at: conversation.created_at,
-      last_message_at: conversation.last_message_at || conversation.created_at
+      last_message_at: conversation.last_message_at || conversation.created_at,
+      liveDraftOpen: Number(conversation.live_draft_open) > 0,
+      liveDraftUpdatedAt: conversation.live_draft_updated_at || ''
     }))
   });
 });
@@ -1440,6 +1602,18 @@ app.get('/api/conversations/:id/messages', requireAuth, (req, res) => {
     return res.status(404).json({ error: 'Conversación no encontrada' });
   }
   const messages = listMessagesStmt.all(conversationId);
+  const liveDraft = getOpenLiveDraftForConversationStmt.get(req.session.userId, conversationId);
+  let parsedReasoning = {};
+  if (liveDraft && liveDraft.reasoning_json) {
+    try {
+      const decoded = JSON.parse(liveDraft.reasoning_json);
+      if (decoded && typeof decoded === 'object') {
+        parsedReasoning = decoded;
+      }
+    } catch (_error) {
+      parsedReasoning = {};
+    }
+  }
   return res.json({
     ok: true,
     conversation: {
@@ -1448,7 +1622,29 @@ app.get('/api/conversations/:id/messages', requireAuth, (req, res) => {
       model: conversation.model || '',
       reasoningEffort: sanitizeReasoningEffort(conversation.reasoning_effort, DEFAULT_REASONING_EFFORT)
     },
-    messages
+    messages,
+    liveDraft: liveDraft
+      ? {
+          requestId: liveDraft.request_id || '',
+          conversationId: Number.isInteger(liveDraft.conversation_id) ? liveDraft.conversation_id : conversationId,
+          messageId: Number.isInteger(liveDraft.assistant_message_id) ? liveDraft.assistant_message_id : 0,
+          userMessage: {
+            id: 0,
+            role: 'user',
+            content: String(liveDraft.user_message_content || ''),
+            created_at: liveDraft.created_at || nowIso()
+          },
+          assistantMessage: {
+            id: Number.isInteger(liveDraft.assistant_message_id) ? liveDraft.assistant_message_id : 0,
+            role: 'assistant',
+            content: String(liveDraft.assistant_content || ''),
+            created_at: liveDraft.created_at || nowIso()
+          },
+          reasoningByItem: parsedReasoning,
+          completed: false,
+          updatedAt: liveDraft.updated_at || nowIso()
+        }
+      : null
   });
 });
 
@@ -1706,6 +1902,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   let conversationId = null;
   let persistedAttachments = [];
   let assistantMessageId = null;
+  let liveDraftId = null;
+  const liveDraftRequestId = `${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
 
   if (requestedConversationId !== null) {
     if (!Number.isInteger(requestedConversationId) || requestedConversationId <= 0) {
@@ -1746,15 +1944,15 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     const executionPrompt = buildPromptWithAttachments(promptWithHistory, persistedAttachments);
     const codexPath = await resolveCodexPath();
     const args = [
+      '-c',
+      'shell_environment_policy.inherit=all',
       'exec',
       '--skip-git-repo-check',
       '--sandbox',
       'danger-full-access',
       '--json',
       '--color',
-      'never',
-      '-c',
-      'shell_environment_policy.inherit=all'
+      'never'
     ];
     if (selectedModel) {
       args.push('-m', selectedModel);
@@ -1766,18 +1964,176 @@ app.post('/api/chat', requireAuth, async (req, res) => {
 
     const assistantMessage = insertMessageStmt.run(conversationId, 'assistant', '');
     assistantMessageId = Number(assistantMessage.lastInsertRowid);
+    const draftCreatedAt = nowIso();
+    closeOpenDraftsByConversationStmt.run(draftCreatedAt, req.session.userId, conversationId);
+    const draftInsert = insertLiveDraftStmt.run(
+      req.session.userId,
+      conversationId,
+      assistantMessageId,
+      liveDraftRequestId,
+      prompt,
+      '',
+      '{}',
+      0,
+      draftCreatedAt,
+      draftCreatedAt
+    );
+    liveDraftId = Number(draftInsert.lastInsertRowid);
     res.status(200);
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.setHeader('X-Conversation-Id', String(conversationId));
+    req.setTimeout(0);
+    res.setTimeout(0);
+    if (req.socket && typeof req.socket.setTimeout === 'function') {
+      req.socket.setTimeout(0);
+    }
+    if (res.socket && typeof res.socket.setTimeout === 'function') {
+      res.socket.setTimeout(0);
+    }
+    if (req.socket && typeof req.socket.setKeepAlive === 'function') {
+      req.socket.setKeepAlive(true);
+    }
+    if (req.socket && typeof req.socket.setNoDelay === 'function') {
+      req.socket.setNoDelay(true);
+    }
+    if (res.socket && typeof res.socket.setKeepAlive === 'function') {
+      res.socket.setKeepAlive(true);
+    }
+    if (res.socket && typeof res.socket.setNoDelay === 'function') {
+      res.socket.setNoDelay(true);
+    }
     res.flushHeaders();
-    sendSse(res, 'conversation', { conversationId });
-    const heartbeatTimer = setInterval(() => {
-      if (res.writableEnded) return;
-      res.write(': ping\n\n');
-    }, 15000);
+    let codexProcess = null;
+    let clientDisconnected = false;
+    const sseWriteQueue = [];
+    let sseBlocked = false;
+    let queuedBytes = 0;
+    let pendingStreamEnd = false;
+    const sseMaxQueueBytes = 1024 * 1024 * 64;
+
+    const canWriteSse = () =>
+      !clientDisconnected &&
+      !res.writableEnded &&
+      !res.destroyed &&
+      !(res.socket && res.socket.destroyed);
+
+    const pauseCodexStreams = () => {
+      if (!codexProcess) return;
+      if (codexProcess.stdout && typeof codexProcess.stdout.pause === 'function') {
+        codexProcess.stdout.pause();
+      }
+      if (codexProcess.stderr && typeof codexProcess.stderr.pause === 'function') {
+        codexProcess.stderr.pause();
+      }
+    };
+
+    const resumeCodexStreams = () => {
+      if (!codexProcess) return;
+      if (codexProcess.stdout && typeof codexProcess.stdout.resume === 'function') {
+        codexProcess.stdout.resume();
+      }
+      if (codexProcess.stderr && typeof codexProcess.stderr.resume === 'function') {
+        codexProcess.stderr.resume();
+      }
+    };
+
+    const maybeEndSseResponse = () => {
+      if (!pendingStreamEnd) return;
+      if (clientDisconnected) return;
+      if (!canWriteSse()) return;
+      if (sseBlocked || sseWriteQueue.length > 0 || queuedBytes > 0) return;
+      pendingStreamEnd = false;
+      try {
+        if (!res.writableEnded && !res.destroyed) {
+          res.end();
+        }
+      } catch (_error) {
+        // no-op
+      }
+    };
+
+    const flushSseQueue = () => {
+      if (!canWriteSse()) return false;
+      while (sseWriteQueue.length > 0) {
+        const chunk = sseWriteQueue.shift();
+        queuedBytes = Math.max(0, queuedBytes - Buffer.byteLength(chunk, 'utf8'));
+        const canContinue = res.write(chunk);
+        if (!canContinue) {
+          sseBlocked = true;
+          pauseCodexStreams();
+          return true;
+        }
+      }
+      sseBlocked = false;
+      resumeCodexStreams();
+      maybeEndSseResponse();
+      return true;
+    };
+
+    const enqueueSseChunk = (chunk) => {
+      if (!canWriteSse()) return false;
+      const text = String(chunk || '');
+      if (!text) return true;
+      if (sseBlocked || sseWriteQueue.length > 0) {
+        queuedBytes += Buffer.byteLength(text, 'utf8');
+        if (queuedBytes > sseMaxQueueBytes) {
+          pauseCodexStreams();
+        }
+        sseWriteQueue.push(text);
+        return true;
+      }
+      const canContinue = res.write(text);
+      if (!canContinue) {
+        sseBlocked = true;
+        pauseCodexStreams();
+      }
+      return true;
+    };
+
+    const sendSseSafe = (event, payload) => {
+      if (!event) return false;
+      return enqueueSseChunk(`event: ${event}\ndata: ${toBase64Json(payload)}\n\n`);
+    };
+
+    const sendSseCommentSafe = (comment) => {
+      return enqueueSseChunk(`: ${String(comment || '').trim() || 'ping'}\n\n`);
+    };
+
+    res.on('drain', () => {
+      flushSseQueue();
+    });
+    sendSseCommentSafe('ok');
+    sendSseSafe('conversation', { conversationId });
+    let heartbeatTimer = null;
+    const stopHeartbeat = () => {
+      if (heartbeatTimer !== null) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    };
+    heartbeatTimer = setInterval(() => {
+      if (!sendSseCommentSafe('ping')) {
+        stopHeartbeat();
+      }
+    }, 11000);
+    const handleClientDisconnect = () => {
+      if (clientDisconnected) return;
+      clientDisconnected = true;
+      stopHeartbeat();
+      sseWriteQueue.length = 0;
+      sseBlocked = false;
+      queuedBytes = 0;
+      pendingStreamEnd = false;
+      resumeCodexStreams();
+      notifyMilestone('fix_disconnect_no_kill', 'FIX aplicado: disconnect SSE no mata proceso Codex');
+    };
+    req.on('aborted', handleClientDisconnect);
+    req.on('close', handleClientDisconnect);
+    res.on('close', handleClientDisconnect);
+    res.on('error', handleClientDisconnect);
 
     let assistantOutput = '';
     let stdoutPending = '';
@@ -1791,6 +2147,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     let usageSummary = null;
     let sawStructuredEvents = false;
     let lastPersistedAssistantContent = '';
+    let lastPersistedDraftSignature = '';
     let assistantPersistErrorLogged = false;
     let lastCodexError = '';
     let finished = false;
@@ -1838,6 +2195,57 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       return value;
     };
 
+    const serializeReasoningDraft = () => {
+      const byItem = {};
+      reasoningLines.forEach((entry, index) => {
+        if (!entry || !entry.text) return;
+        const key = String(entry.itemId || `reasoning_${index + 1}`);
+        byItem[key] = String(entry.text);
+      });
+      return byItem;
+    };
+
+    const persistLiveDraftSnapshot = (completed) => {
+      if (!liveDraftId) return;
+      const safeCompleted = completed ? 1 : 0;
+      const assistantContent = String(assistantOutput || '');
+      const reasoningSnapshot = serializeReasoningDraft();
+      const reasoningJson = JSON.stringify(reasoningSnapshot);
+      const signature = `${assistantContent.length}|${reasoningJson.length}|${safeCompleted}`;
+      if (!safeCompleted && signature === lastPersistedDraftSignature) return;
+      try {
+        const updatedByTuple = updateLiveDraftSnapshotByRequestStmt.run(
+          assistantMessageId,
+          assistantContent,
+          reasoningJson,
+          safeCompleted,
+          nowIso(),
+          req.session.userId,
+          conversationId,
+          liveDraftRequestId
+        );
+        if (updatedByTuple.changes <= 0) {
+          updateLiveDraftSnapshotStmt.run(
+            conversationId,
+            assistantMessageId,
+            assistantContent,
+            reasoningJson,
+            safeCompleted,
+            nowIso(),
+            liveDraftId,
+            req.session.userId
+          );
+        }
+        lastPersistedDraftSignature = signature;
+      } catch (error) {
+        if (!assistantPersistErrorLogged) {
+          assistantPersistErrorLogged = true;
+          const reason = truncateForNotify(error && error.message ? error.message : 'draft_persist_error', 180);
+          void notify(`WARN chat_draft_persist_failed user=${username} conv=${conversationId} reason=${reason}`);
+        }
+      }
+    };
+
     const pushSystemNotice = (text) => {
       const value = String(text || '').trim();
       if (!value) return;
@@ -1845,7 +2253,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       if (codexNotices.length > 30) {
         codexNotices.shift();
       }
-      sendSse(res, 'system_notice', { text: value });
+      sendSseSafe('system_notice', { text: value });
     };
 
     const buildAssistantContent = () => {
@@ -1859,6 +2267,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       try {
         updateMessageContentStmt.run(contentToSave, assistantMessageId);
         lastPersistedAssistantContent = contentToSave;
+        persistLiveDraftSnapshot(false);
       } catch (error) {
         if (!assistantPersistErrorLogged) {
           assistantPersistErrorLogged = true;
@@ -1872,7 +2281,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       const value = String(text || '');
       if (!value) return;
       assistantOutput += value;
-      sendSse(res, 'assistant_delta', { text: value });
+      sendSseSafe('assistant_delta', { text: value });
+      persistAssistantSnapshot(false);
     };
 
     const pushAssistantMessage = (text) => {
@@ -1895,6 +2305,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       } else {
         reasoningLines.push({ itemId: '', text: value });
       }
+      persistLiveDraftSnapshot(false);
     };
 
     const handleAgentMessageCompleted = (item) => {
@@ -1924,7 +2335,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         reasoningItemTexts.set(itemId, text);
       }
       upsertReasoningLine(text, itemId);
-      sendSse(res, 'reasoning_step', { itemId, text });
+      sendSseSafe('reasoning_step', { itemId, text });
     };
 
     const handleCommandStarted = (item) => {
@@ -1935,9 +2346,9 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       if (itemId) {
         commandOutputByItem.set(itemId, aggregatedOutput);
       }
-      sendSse(res, 'command_started', { itemId, command, status });
+      sendSseSafe('command_started', { itemId, command, status });
       if (aggregatedOutput) {
-        sendSse(res, 'command_output_delta', { itemId, text: aggregatedOutput });
+        sendSseSafe('command_output_delta', { itemId, text: aggregatedOutput });
       }
     };
 
@@ -1952,12 +2363,12 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         if (output && output !== previousOutput) {
           const delta = output.startsWith(previousOutput) ? output.slice(previousOutput.length) : output;
           if (delta) {
-            sendSse(res, 'command_output_delta', { itemId, text: delta });
+            sendSseSafe('command_output_delta', { itemId, text: delta });
           }
         }
         commandOutputByItem.set(itemId, output);
       }
-      sendSse(res, 'command_completed', {
+      sendSseSafe('command_completed', {
         itemId,
         command,
         status,
@@ -1975,7 +2386,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         const itemId = getStringField(item, ['id', 'itemId']);
         if (itemId) {
           reasoningItemTexts.set(itemId, '');
-          sendSse(res, 'reasoning_item_started', { itemId });
+          sendSseSafe('reasoning_item_started', { itemId });
         }
       } else if (itemType === 'agent_message' || itemType === 'assistant_message') {
         const itemId = getStringField(item, ['id', 'itemId']);
@@ -1996,7 +2407,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         if (!nextOutput || nextOutput === previousOutput) return;
         const delta = nextOutput.startsWith(previousOutput) ? nextOutput.slice(previousOutput.length) : nextOutput;
         if (delta) {
-          sendSse(res, 'command_output_delta', { itemId, text: delta });
+          sendSseSafe('command_output_delta', { itemId, text: delta });
         }
         commandOutputByItem.set(itemId, nextOutput);
       }
@@ -2041,14 +2452,18 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       if (eventType.includes('reasoning')) {
         if (itemId) {
           const previous = reasoningItemTexts.get(itemId) || '';
-          reasoningItemTexts.set(itemId, previous + delta);
+          const nextText = `${previous}${delta}`;
+          reasoningItemTexts.set(itemId, nextText);
+          upsertReasoningLine(nextText, itemId);
+        } else {
+          upsertReasoningLine(delta, '');
         }
-        sendSse(res, 'reasoning_delta', { itemId, text: delta });
+        sendSseSafe('reasoning_delta', { itemId, text: delta });
         return;
       }
 
       if (eventType.includes('command_execution')) {
-        sendSse(res, 'command_output_delta', { itemId, text: delta });
+        sendSseSafe('command_output_delta', { itemId, text: delta });
       }
     };
 
@@ -2059,12 +2474,12 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       sawStructuredEvents = true;
 
       if (eventType === 'thread_started') {
-        sendSse(res, 'codex_thread', { threadId: getStringField(eventObj, ['thread_id', 'threadId']) });
+        sendSseSafe('codex_thread', { threadId: getStringField(eventObj, ['thread_id', 'threadId']) });
         return true;
       }
 
       if (eventType === 'turn_started') {
-        sendSse(res, 'turn_started', {});
+        sendSseSafe('turn_started', {});
         return true;
       }
 
@@ -2072,7 +2487,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         const usage = getObjectField(eventObj, ['usage']);
         if (usage && typeof usage === 'object') {
           usageSummary = usage;
-          sendSse(res, 'codex_usage', { usage });
+          sendSseSafe('codex_usage', { usage });
         }
         return true;
       }
@@ -2100,7 +2515,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
             fetchedAtMs: Date.now(),
             payload: snapshot
           };
-          sendSse(res, 'codex_quota', { quota: snapshot });
+          sendSseSafe('codex_quota', { quota: snapshot });
         }
         return true;
       }
@@ -2135,7 +2550,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         return true;
       }
 
-      sendSse(res, 'codex_event', { type: eventType });
+      sendSseSafe('codex_event', { type: eventType });
       return true;
     };
 
@@ -2153,10 +2568,21 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       }
       if (sawStructuredEvents) {
         upsertReasoningLine(raw, 'stdout_fallback');
-        sendSse(res, 'reasoning_delta', { itemId: 'stdout_fallback', text: `${raw}\n` });
+        sendSseSafe('reasoning_delta', { itemId: 'stdout_fallback', text: `${raw}\n` });
         return;
       }
       pushAssistantDelta(`${raw}\n`);
+    };
+
+    const pushRawStdoutDelta = (text) => {
+      const value = String(text || '');
+      if (!value) return;
+      const itemId = 'stdout_raw';
+      const previous = reasoningItemTexts.get(itemId) || '';
+      const nextText = `${previous}${value}`;
+      reasoningItemTexts.set(itemId, nextText);
+      upsertReasoningLine(nextText, itemId);
+      sendSseSafe('raw_stdout_delta', { itemId, text: value });
     };
 
     const flushStdoutPending = () => {
@@ -2166,11 +2592,11 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       handleStdoutLine(tail);
     };
 
-    const codexProcess = spawn(codexPath, args, {
+    codexProcess = execFile(codexPath, args, {
       env: process.env,
-      cwd: process.cwd(),
-      stdio: ['ignore', 'pipe', 'pipe']
+      cwd: process.cwd()
     });
+    notifyMilestone('execfile_stdio_fixed', 'FIX aplicado: execFile invocado sin opción stdio');
 
     const flushStderrPending = () => {
       const tail = stderrPending.trim();
@@ -2183,7 +2609,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     const finalizeResponse = (exitCode, closeReason) => {
       if (finished) return;
       finished = true;
-      clearInterval(heartbeatTimer);
+      stopHeartbeat();
       flushStdoutPending();
       flushStderrPending();
       if (!assistantOutput.trim()) {
@@ -2207,9 +2633,11 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       }
       const outputContent = assistantOutput.trim() ? assistantOutput.trim() : '(Sin salida de Codex)';
       persistAssistantSnapshot(true);
+      persistLiveDraftSnapshot(true);
+      notifyMilestone('draft_persists_offline', 'FIX aplicado: live draft persiste y finaliza aun sin cliente SSE');
 
-      if (!res.writableEnded) {
-        sendSse(res, 'done', {
+      if (!clientDisconnected) {
+        const doneQueued = sendSseSafe('done', {
           ok: exitCode === 0,
           conversationId,
           exitCode,
@@ -2217,10 +2645,20 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           usage: usageSummary,
           structured: sawStructuredEvents
         });
-        res.end();
+        if (doneQueued) {
+          pendingStreamEnd = true;
+          maybeEndSseResponse();
+        }
       }
 
-      if (exitCode === 0) {
+      if (clientDisconnected) {
+        void notify(
+          `Chat desconectado user=${username} conv=${conversationId} draft_guardado=true reason=${truncateForNotify(
+            closeReason || 'client_closed',
+            120
+          )}`
+        );
+      } else if (exitCode === 0) {
         void notify(
           `Chat ejecutado OK user=${username} conv=${conversationId} result=${truncateForNotify(outputContent, 1000)}`
         );
@@ -2235,13 +2673,28 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     };
 
     codexProcess.stdout.on('data', (chunk) => {
-      const text = chunk.toString('utf8');
+      const text = chunk
+        .toString('utf8')
+        .replace(/\r\n/g, '\n')
+        .replace(/\r/g, '\n');
+      if (!text) return;
+      const hadNewline = text.includes('\n');
       stdoutPending += text;
-      const lines = stdoutPending.split(/\r?\n/);
-      stdoutPending = lines.pop() || '';
-      lines.forEach((line) => {
+
+      let newlineIndex = stdoutPending.indexOf('\n');
+      while (newlineIndex >= 0) {
+        let line = stdoutPending.slice(0, newlineIndex);
+        if (line.endsWith('\r')) {
+          line = line.slice(0, -1);
+        }
+        stdoutPending = stdoutPending.slice(newlineIndex + 1);
         handleStdoutLine(line);
-      });
+        newlineIndex = stdoutPending.indexOf('\n');
+      }
+
+      if (!hadNewline && stdoutPending) {
+        pushRawStdoutDelta(text);
+      }
     });
 
     codexProcess.stderr.on('data', (chunk) => {
@@ -2263,15 +2716,36 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       finalizeResponse(1, 'error');
     });
 
-    codexProcess.on('close', (code, signal) => {
-      const closeReason = signal ? `signal ${signal}` : null;
-      finalizeResponse(code || 0, closeReason);
+    let stdoutEnded = false;
+    let stderrEnded = false;
+    let processClosed = false;
+    let pendingExitCode = 0;
+    let pendingCloseReason = null;
+
+    const finalizeWhenDrained = () => {
+      if (!processClosed || !stdoutEnded || !stderrEnded) return;
+      finalizeResponse(pendingExitCode, pendingCloseReason);
+    };
+
+    codexProcess.stdout.on('end', () => {
+      stdoutEnded = true;
+      finalizeWhenDrained();
     });
 
-    res.on('close', () => {
-      if (!finished && codexProcess.exitCode === null) {
-        codexProcess.kill('SIGTERM');
-      }
+    codexProcess.stderr.on('end', () => {
+      stderrEnded = true;
+      finalizeWhenDrained();
+    });
+
+    codexProcess.on('close', (code, signal) => {
+      processClosed = true;
+      pendingExitCode = Number.isInteger(code) ? code : 0;
+      pendingCloseReason = clientDisconnected
+        ? 'client_closed'
+        : signal
+          ? `signal ${signal}`
+          : null;
+      finalizeWhenDrained();
     });
 
     notifyMilestone('codex_full_access', 'CodexWeb ejecuta Codex CLI con acceso total');
@@ -2294,9 +2768,29 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       } else {
         insertMessageStmt.run(conversationId, 'assistant', historyMessage);
       }
+      if (liveDraftId) {
+        try {
+          updateLiveDraftSnapshotStmt.run(
+            conversationId,
+            assistantMessageId,
+            historyMessage,
+            '{}',
+            1,
+            nowIso(),
+            liveDraftId,
+            req.session.userId
+          );
+        } catch (_draftError) {
+          // ignore draft write errors in fallback path
+        }
+      }
       if (res.headersSent) {
-        if (!res.writableEnded) {
-          res.end();
+        try {
+          if (!res.writableEnded && !res.destroyed) {
+            res.end();
+          }
+        } catch (_error) {
+          // no-op if client already disconnected
         }
         return;
       }
@@ -2316,6 +2810,22 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       updateMessageContentStmt.run(errorMessage, assistantMessageId);
     } else {
       insertMessageStmt.run(conversationId, 'assistant', errorMessage);
+    }
+    if (liveDraftId) {
+      try {
+        updateLiveDraftSnapshotStmt.run(
+          conversationId,
+          assistantMessageId,
+          errorMessage,
+          '{}',
+          1,
+          nowIso(),
+          liveDraftId,
+          req.session.userId
+        );
+      } catch (_draftError) {
+        // ignore draft write errors in fallback path
+      }
     }
     return res.status(500).json({ error: `Error ejecutando Codex local. ${details}` });
   }
@@ -2351,7 +2861,7 @@ process.on('uncaughtException', (error) => {
 
 markRestartRecoveredOnStartup();
 
-app.listen(port, host, () => {
+const server = app.listen(port, host, () => {
   console.log(`CodexWeb escuchando en http://${host}:${port}`);
   resolveCodexPath()
     .then((codexPath) => {
@@ -2364,8 +2874,15 @@ app.listen(port, host, () => {
   notifyMilestone('history_persistent', 'Historial persistente implementado');
   notifyMilestone('codex_full_access', 'CodexWeb ejecuta Codex CLI con acceso total');
   notifyMilestone('streaming_realtime', 'Streaming en tiempo real implementado');
-  notifyMilestone('fix_api_key', 'Arranco fix: elimino API key obligatoria');
+  notifyMilestone('fix_streaming_infinito', 'Arranco fix: streaming infinito');
+  notifyMilestone('backend_sse_robusto', 'Backend SSE robusto listo');
+  notifyMilestone('persistencia_incremental', 'Persistencia incremental lista');
+  notifyMilestone('frontend_render_todo', 'Frontend renderiza TODO');
   notifyMilestone('notify_active', 'Notify server-side activo');
   notifyMilestone('service_restarted', 'Servicio reiniciado');
   void notify(`SERVER START CodexWeb listening on http://${host}:${port}`);
 });
+
+server.keepAliveTimeout = 1000 * 60 * 10;
+server.headersTimeout = 1000 * 60 * 11;
+server.requestTimeout = 0;
