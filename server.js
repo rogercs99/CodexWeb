@@ -236,6 +236,7 @@ const gitToolsScanTtlMs = 12000;
 const gitToolsMaxDepth = 6;
 const gitToolsMaxRepos = 80;
 const gitToolsCommandTimeoutMs = 45000;
+const gitToolsScanRoots = resolveGitToolsScanRoots(process.env.GIT_TOOLS_SCAN_ROOTS, [repoRootDir]);
 const deployedAppsScanTtlMs = 12000;
 const deployedAppsMaxSystemdUnits = 80;
 const deployedAppsDefaultLogLines = 180;
@@ -320,6 +321,48 @@ function resolveRepoRootDir(startDir) {
     }
     current = parent;
   }
+}
+
+function normalizeAbsoluteDirPath(rawPath) {
+  const value = String(rawPath || '').trim();
+  if (!value) return '';
+  try {
+    return path.resolve(value);
+  } catch (_error) {
+    return '';
+  }
+}
+
+function resolveGitToolsScanRoots(rawValue, fallbackDirs = []) {
+  const requested = String(rawValue || '')
+    .split(',')
+    .map((entry) => normalizeAbsoluteDirPath(entry))
+    .filter(Boolean);
+  const source =
+    requested.length > 0
+      ? requested
+      : (Array.isArray(fallbackDirs) ? fallbackDirs : [fallbackDirs]);
+  const resolved = [];
+  const seen = new Set();
+
+  source.forEach((entry) => {
+    const absolutePath = normalizeAbsoluteDirPath(entry);
+    if (!absolutePath || seen.has(absolutePath)) return;
+    let stats = null;
+    try {
+      stats = fs.statSync(absolutePath);
+    } catch (_error) {
+      stats = null;
+    }
+    if (!stats || !stats.isDirectory()) return;
+    seen.add(absolutePath);
+    resolved.push(absolutePath);
+  });
+
+  if (resolved.length > 0) {
+    return resolved;
+  }
+  return [repoRootDir];
 }
 
 function stripAnsi(text) {
@@ -2270,9 +2313,21 @@ function parseGitStatusPorcelain(rawOutput) {
   };
 }
 
-function listGitRepositoriesUnderRoot(baseDir) {
-  const startDir = path.resolve(String(baseDir || repoRootDir));
-  const queue = [{ dir: startDir, depth: 0 }];
+function listGitRepositoriesUnderRoots(baseDirs) {
+  const requestedRoots = Array.isArray(baseDirs) ? baseDirs : [baseDirs];
+  const normalizedRoots = [];
+  const seenRoots = new Set();
+  requestedRoots.forEach((entry) => {
+    const absolutePath = normalizeAbsoluteDirPath(entry);
+    if (!absolutePath || seenRoots.has(absolutePath)) return;
+    seenRoots.add(absolutePath);
+    normalizedRoots.push(absolutePath);
+  });
+  if (normalizedRoots.length === 0) {
+    normalizedRoots.push(repoRootDir);
+  }
+
+  const queue = normalizedRoots.map((dir) => ({ dir, depth: 0, scanRoot: dir }));
   const visited = new Set();
   const discovered = [];
   const seenRepos = new Set();
@@ -2281,12 +2336,16 @@ function listGitRepositoriesUnderRoot(baseDir) {
     const current = queue.pop();
     if (!current || !current.dir) continue;
     const currentDir = path.resolve(current.dir);
+    const currentScanRoot = normalizeAbsoluteDirPath(current.scanRoot) || repoRootDir;
     if (visited.has(currentDir)) continue;
     visited.add(currentDir);
 
     const gitPath = path.join(currentDir, '.git');
     if (fs.existsSync(gitPath) && !seenRepos.has(currentDir)) {
-      discovered.push(currentDir);
+      discovered.push({
+        repoPath: currentDir,
+        scanRoot: currentScanRoot
+      });
       seenRepos.add(currentDir);
     }
 
@@ -2308,15 +2367,16 @@ function listGitRepositoriesUnderRoot(baseDir) {
       if (gitToolsIgnoredDirs.has(name)) return;
       queue.push({
         dir: path.join(currentDir, name),
-        depth: current.depth + 1
+        depth: current.depth + 1,
+        scanRoot: currentScanRoot
       });
     });
   }
 
   return discovered.sort((a, b) => {
-    const relA = normalizeRepoRelativePath(path.relative(repoRootDir, a).split(path.sep).join('/')) || '.';
-    const relB = normalizeRepoRelativePath(path.relative(repoRootDir, b).split(path.sep).join('/')) || '.';
-    return relA.localeCompare(relB);
+    const pathA = String(a && a.repoPath ? a.repoPath : '');
+    const pathB = String(b && b.repoPath ? b.repoPath : '');
+    return pathA.localeCompare(pathB);
   });
 }
 
@@ -2325,11 +2385,11 @@ function buildGitRepoId(relativePath, absolutePath) {
   return crypto.createHash('sha1').update(seed).digest('hex').slice(0, 12);
 }
 
-function collectGitRepoSummary(repoDir, scannedAtIso) {
+function collectGitRepoSummary(repoDir, scannedAtIso, scanRoot = repoRootDir) {
   const safeRepoDir = path.resolve(String(repoDir || repoRootDir));
-  const relativePathRaw = path.relative(repoRootDir, safeRepoDir);
-  const relativePath =
-    normalizeRepoRelativePath(relativePathRaw.split(path.sep).join('/')) || '.';
+  const safeScanRoot = path.resolve(String(scanRoot || repoRootDir));
+  const relativePathRaw = path.relative(safeScanRoot, safeRepoDir);
+  const relativePath = normalizeRepoRelativePath(relativePathRaw.split(path.sep).join('/')) || '.';
   const statusResult = runGitInRepoSync(safeRepoDir, ['status', '--porcelain=1', '--branch']);
   if (!statusResult.ok) {
     return null;
@@ -2342,7 +2402,7 @@ function collectGitRepoSummary(repoDir, scannedAtIso) {
     .filter(Boolean);
   const name =
     relativePath === '.'
-      ? path.basename(repoRootDir)
+      ? path.basename(safeRepoDir) || path.basename(safeScanRoot) || safeRepoDir
       : relativePath.split('/').filter(Boolean).slice(-1)[0] || relativePath;
 
   return {
@@ -2362,6 +2422,7 @@ function collectGitRepoSummary(repoDir, scannedAtIso) {
     status: parsedStatus.counts,
     changedFiles: parsedStatus.files.slice(0, 120),
     conflictFiles: parsedStatus.conflictedFiles.slice(0, 120),
+    scanRoot: safeScanRoot,
     scannedAt: scannedAtIso
   };
 }
@@ -2378,9 +2439,11 @@ function collectGitToolsReposSnapshot(forceRefresh = false) {
 
   const scannedAtIso = nowIso();
   const repos = [];
-  const roots = listGitRepositoriesUnderRoot(repoRootDir);
-  roots.forEach((repoPath) => {
-    const summary = collectGitRepoSummary(repoPath, scannedAtIso);
+  const roots = listGitRepositoriesUnderRoots(gitToolsScanRoots);
+  roots.forEach((entry) => {
+    const repoPath = entry && entry.repoPath ? entry.repoPath : '';
+    const scanRoot = entry && entry.scanRoot ? entry.scanRoot : repoRootDir;
+    const summary = collectGitRepoSummary(repoPath, scannedAtIso, scanRoot);
     if (summary) {
       repos.push(summary);
     }
@@ -2389,7 +2452,9 @@ function collectGitToolsReposSnapshot(forceRefresh = false) {
   repos.sort((a, b) => {
     if (a.hasConflicts !== b.hasConflicts) return a.hasConflicts ? -1 : 1;
     if (a.hasChanges !== b.hasChanges) return a.hasChanges ? -1 : 1;
-    return String(a.relativePath || '').localeCompare(String(b.relativePath || ''));
+    const relativeComparison = String(a.relativePath || '').localeCompare(String(b.relativePath || ''));
+    if (relativeComparison !== 0) return relativeComparison;
+    return String(a.absolutePath || '').localeCompare(String(b.absolutePath || ''));
   });
 
   gitToolsRepoCache = {
@@ -5857,6 +5922,7 @@ app.get('/api/tools/git/repos', requireAuth, (req, res) => {
   return res.json({
     ok: true,
     scannedAt: snapshot.scannedAt,
+    scanRoots: gitToolsScanRoots,
     repos: snapshot.repos
   });
 });

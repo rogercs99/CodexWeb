@@ -1661,6 +1661,179 @@ export default function TerminalLogScreen({
           </section>
         ) : null}
 
+        {activeView === 'deployments' ? (
+          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 space-y-3">
+            <div>
+              <h2 className="text-sm font-semibold text-zinc-100">Apps desplegadas</h2>
+              <p className="text-xs text-zinc-500">Listado del sistema con acciones de inicio/parada/reinicio y logs.</p>
+            </div>
+
+            {deployNotice ? <p className="text-xs text-emerald-300">{deployNotice}</p> : null}
+            {deployedAppsError ? <p className="text-xs text-red-300">{deployedAppsError}</p> : null}
+            {deployedAppsScannedAt ? (
+              <p className="text-[10px] text-zinc-600">ultimo escaneo {formatTime(deployedAppsScannedAt)}</p>
+            ) : null}
+
+            {deployedAppsLoading && deployedApps.length === 0 ? (
+              <p className="text-sm text-zinc-500">Buscando apps desplegadas...</p>
+            ) : null}
+
+            {!deployedAppsLoading && deployedApps.length === 0 ? (
+              <p className="text-sm text-zinc-500">No se detectaron apps desplegadas gestionables en este entorno.</p>
+            ) : null}
+
+            <div className="space-y-2">
+              {deployedApps.map((app) => {
+                const isOpen = Boolean(expandedDeployedApps[app.id]);
+                const statusText = formatDeployedStatus(app.status);
+                const statusClass =
+                  app.status === 'running'
+                    ? 'text-emerald-300'
+                    : app.status === 'error'
+                      ? 'text-red-300'
+                      : app.status === 'stopped'
+                        ? 'text-zinc-400'
+                        : 'text-amber-300';
+                const busyForApp = deployActionBusy?.appId === app.id;
+                const logsState = deployLogsByApp[app.id];
+                return (
+                  <article key={app.id} className="rounded-xl border border-zinc-800 bg-black/40 p-3">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setExpandedDeployedApps((prev) => ({ ...prev, [app.id]: !prev[app.id] }));
+                      }}
+                      onMouseEnter={() => openDeployedApp(app.id)}
+                      onFocus={() => openDeployedApp(app.id)}
+                      className="w-full text-left flex items-center justify-between gap-3"
+                    >
+                      <div className="min-w-0">
+                        <p className="text-sm text-zinc-100 truncate">{app.name}</p>
+                        <p className="text-xs text-zinc-500 mt-1 truncate">
+                          {formatDeployedSource(app.source)} · {statusText}
+                          {app.pid ? ` · pid ${app.pid}` : ''} {app.uptime ? ` · uptime ${app.uptime}` : ''}
+                        </p>
+                      </div>
+                      {isOpen ? <ChevronDown size={16} className="text-zinc-500" /> : <ChevronRight size={16} className="text-zinc-500" />}
+                    </button>
+
+                    {isOpen ? (
+                      <div className="mt-3 pt-3 border-t border-zinc-800 space-y-3">
+                        <div className="grid grid-cols-2 gap-2">
+                          <article className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5">
+                            <p className="text-[10px] uppercase text-zinc-500">source / status</p>
+                            <p className={`text-xs mt-1 ${statusClass}`}>
+                              {formatDeployedSource(app.source)} / {statusText}
+                            </p>
+                          </article>
+                          <article className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5">
+                            <p className="text-[10px] uppercase text-zinc-500">pid / uptime</p>
+                            <p className="text-xs text-zinc-200 mt-1">
+                              {app.pid ? app.pid : 'n/a'} / {app.uptime || 'n/a'}
+                            </p>
+                          </article>
+                        </div>
+
+                        {app.description ? (
+                          <p className="text-xs text-zinc-300 break-all">detalle: {app.description}</p>
+                        ) : null}
+                        {app.location ? (
+                          <p className="text-xs text-zinc-500 break-all">ubicacion: {app.location}</p>
+                        ) : null}
+                        {app.detailStatus ? (
+                          <p className="text-[11px] text-zinc-500 break-all">estado raw: {app.detailStatus}</p>
+                        ) : null}
+
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void actionDeployedApp(app.id, 'start');
+                            }}
+                            disabled={!app.canStart || busyForApp}
+                            className={`text-xs px-2.5 py-1.5 rounded-lg border ${
+                              app.canStart ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200' : 'border-zinc-700 text-zinc-500'
+                            } disabled:opacity-50`}
+                          >
+                            {busyForApp && deployActionBusy?.action === 'start' ? 'Iniciando...' : app.canStart ? 'Iniciar' : 'Ya iniciada'}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void actionDeployedApp(app.id, 'stop');
+                            }}
+                            disabled={!app.canStop || busyForApp}
+                            className={`text-xs px-2.5 py-1.5 rounded-lg border ${
+                              app.canStop ? 'border-red-500/40 bg-red-500/10 text-red-200' : 'border-zinc-700 text-zinc-500'
+                            } disabled:opacity-50`}
+                          >
+                            {busyForApp && deployActionBusy?.action === 'stop' ? 'Parando...' : app.canStop ? 'Parar' : 'Ya parada'}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void actionDeployedApp(app.id, 'restart');
+                            }}
+                            disabled={!app.canRestart || busyForApp}
+                            className={`text-xs px-2.5 py-1.5 rounded-lg border ${
+                              app.canRestart ? 'border-amber-500/40 bg-amber-500/10 text-amber-200' : 'border-zinc-700 text-zinc-500'
+                            } disabled:opacity-50`}
+                          >
+                            {busyForApp && deployActionBusy?.action === 'restart' ? 'Reiniciando...' : 'Reiniciar'}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              toggleDeployedLogs(app.id);
+                            }}
+                            disabled={!app.hasLogs}
+                            className={`text-xs px-2.5 py-1.5 rounded-lg border ${
+                              app.hasLogs ? 'border-zinc-600 text-zinc-200' : 'border-zinc-700 text-zinc-500'
+                            } disabled:opacity-50`}
+                          >
+                            {logsState?.visible ? 'Ocultar logs' : 'Ver logs'}
+                          </button>
+
+                          {logsState?.visible ? (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void loadDeployedLogs(app.id, true);
+                              }}
+                              disabled={logsState.loading}
+                              className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-50"
+                            >
+                              {logsState.loading ? 'Actualizando logs...' : 'Actualizar logs'}
+                            </button>
+                          ) : null}
+                        </div>
+
+                        {logsState?.visible ? (
+                          <article className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5 space-y-2">
+                            <p className="text-[11px] uppercase text-zinc-500">
+                              logs{logsState.fetchedAt ? ` · ${formatTime(logsState.fetchedAt)}` : ''}
+                            </p>
+                            {logsState.error ? <p className="text-xs text-red-300">{logsState.error}</p> : null}
+                            {logsState.loading ? <p className="text-xs text-zinc-500">Cargando logs...</p> : null}
+                            {!logsState.loading && !logsState.error ? (
+                              <pre className="max-h-72 overflow-auto text-[11px] text-zinc-300 whitespace-pre-wrap break-all">
+                                {logsState.logs || 'Sin logs recientes.'}
+                              </pre>
+                            ) : null}
+                          </article>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </article>
+                );
+              })}
+            </div>
+          </section>
+        ) : null}
+
         {activeView === 'observability' ? (
           <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 space-y-3">
             <div>
