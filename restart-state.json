@@ -1,31 +1,44 @@
 {
-  "attemptId": "1772143516720-0a5eb84f",
+  "attemptId": "1772712506253-22d39299",
   "active": false,
   "phase": "completed",
-  "requestedBy": "roger",
-  "startedAt": "2026-02-26T22:05:16.721Z",
-  "finishedAt": "2026-02-26T22:05:18.301Z",
-  "updatedAt": "2026-02-26T22:05:18.301Z",
+  "requestedBy": "restart_tester",
+  "notifyWebhookUrl": "https://discord.com/api/webhooks/123456/mocktoken",
+  "startedAt": "2026-03-05T12:08:26.253Z",
+  "finishedAt": "2026-03-05T12:08:27.173Z",
+  "updatedAt": "2026-03-05T12:08:27.173Z",
   "logs": [
     {
-      "at": "2026-02-26T22:05:16.721Z",
-      "message": "Reinicio solicitado por roger"
+      "at": "2026-03-05T12:08:26.253Z",
+      "message": "Reinicio solicitado por restart_tester"
     },
     {
-      "at": "2026-02-26T22:05:16.725Z",
+      "at": "2026-03-05T12:08:26.254Z",
       "message": "Preparando helper de reinicio"
     },
     {
-      "at": "2026-02-26T22:05:16.732Z",
+      "at": "2026-03-05T12:08:26.256Z",
       "message": "Helper de reinicio lanzado"
     },
     {
-      "at": "2026-02-26T22:05:16.740Z",
+      "at": "2026-03-05T12:08:26.265Z",
       "message": "Respuesta enviada. Cerrando proceso actual"
     },
     {
-      "at": "2026-02-26T22:05:18.300Z",
-      "message": "Nuevo proceso iniciado (pid 1267246)"
+      "at": "2026-03-05T12:08:26.311Z",
+      "message": "Helper de reinicio iniciado"
+    },
+    {
+      "at": "2026-03-05T12:08:27.014Z",
+      "message": "Lanzando nuevo proceso de CodexWeb"
+    },
+    {
+      "at": "2026-03-05T12:08:27.016Z",
+      "message": "Nuevo proceso lanzado"
+    },
+    {
+      "at": "2026-03-05T12:08:27.172Z",
+      "message": "Nuevo proceso iniciado (pid 18830)"
     }
   ]
 }

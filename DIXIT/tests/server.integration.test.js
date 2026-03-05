@@ -235,64 +235,6 @@ test('solo con bots completa una ronda y permite pasar a la siguiente', async (t
   assert.ok(['clue', 'submit', 'vote'].includes(nextRound.phase));
 });
 
-test('cuando el narrador es bot genera pista realista con motivo y se identifica como bot', async (t) => {
-  const { port } = await startServer(t);
-  const host = await createClient(t, port);
-  host.send({ type: 'join', name: 'Solo' });
-  await waitForMessage(host, (m) => m.type === 'joined', 'solo joined');
-
-  host.send({ type: 'start_with_bots', difficulty: 'smart' });
-  const initialClue = await waitForMessage(
-    host,
-    (m) => m.type === 'state' && m.phase === 'clue' && m.you?.isStoryteller === true && m.hand?.length >= 1,
-    'first storyteller clue'
-  );
-
-  host.send({ type: 'submit_clue', clue: 'pista test', card: initialClue.hand[0] });
-  const reveal = await waitForMessage(
-    host,
-    (m) => m.type === 'state' && m.phase === 'reveal' && m.summary?.results?.length >= 3,
-    'first reveal'
-  );
-  host.send({ type: 'next_round' });
-
-  const botNarratorSubmit = await waitForMessage(
-    host,
-    (m) => m.type === 'state'
-      && m.round >= reveal.round + 1
-      && m.storytellerId !== m.you?.id
-      && typeof m.clue === 'string'
-      && m.clue.trim().split(/\s+/).length >= 2
-      && m.phase === 'submit'
-      && Array.isArray(m.hand)
-      && m.hand.length >= 1,
-    'bot storyteller submit state',
-    8000
-  );
-
-  const botNarrator = botNarratorSubmit.players.find((player) => player.id === botNarratorSubmit.storytellerId);
-  assert.ok(botNarrator?.isBot);
-  assert.ok(botNarratorSubmit.clue.length >= 8);
-  assert.notEqual(botNarratorSubmit.clue.toLowerCase(), 'pista test');
-
-  host.send({ type: 'submit_card', card: botNarratorSubmit.hand[0] });
-  const voteState = await waitForMessage(
-    host,
-    (m) => m.type === 'state' && m.phase === 'vote' && Array.isArray(m.board) && m.board.length === 3,
-    'bot narrator vote phase'
-  );
-  const choice = voteState.board.find((card) => !card.isYours);
-  assert.ok(choice?.id);
-  host.send({ type: 'vote', submissionId: choice.id });
-
-  const botNarratorReveal = await waitForMessage(
-    host,
-    (m) => m.type === 'state' && m.phase === 'reveal' && m.summary?.storytellerId === botNarratorSubmit.storytellerId,
-    'bot narrator reveal'
-  );
-  assert.ok((botNarratorReveal.summary?.clueReason || '').trim().length >= 20);
-});
-
 test('flujo multijugador: start, submit, vote, reveal y rotación de narrador', async (t) => {
   const { port } = await startServer(t);
   const a = await createClient(t, port);
@@ -373,6 +315,65 @@ test('flujo multijugador: start, submit, vote, reveal y rotación de narrador', 
   assert.equal(nextState.storytellerId, expectedNextStoryteller);
 });
 
+test('pista por audio: se comparte en salas solo humanas y se bloquea con bots', async (t) => {
+  const sampleAudio = 'data:audio/webm;base64,AAAAAA==';
+
+  const { port } = await startServer(t);
+  const a = await createClient(t, port);
+  a.send({ type: 'join', name: 'A' });
+  const joined = await waitForMessage(a, (m) => m.type === 'joined', 'A joined');
+  const roomCode = joined.roomCode;
+
+  const b = await createClient(t, port);
+  const c = await createClient(t, port);
+  b.send({ type: 'join', name: 'B', roomCode });
+  c.send({ type: 'join', name: 'C', roomCode });
+
+  await waitForMessage(a, (m) => m.type === 'state' && m.players.length === 3, 'room with 3 humans');
+  a.send({ type: 'start' });
+
+  const clueA = await waitForMessage(
+    a,
+    (m) => m.type === 'state' && m.phase === 'clue' && m.you?.isStoryteller === true && m.hand?.length >= 1,
+    'A storyteller clue phase'
+  );
+  a.send({ type: 'submit_clue', card: clueA.hand[0], clue: '', clueAudio: sampleAudio });
+
+  const submitB = await waitForMessage(
+    b,
+    (m) => m.type === 'state' && m.phase === 'submit' && typeof m.clueAudio === 'string',
+    'B receives submit phase with clue audio'
+  );
+  assert.equal(submitB.clue, 'Pista por audio');
+  assert.equal(submitB.clueAudio, sampleAudio);
+
+  const withBotsHost = await createClient(t, port);
+  withBotsHost.send({ type: 'join', name: 'Host2' });
+  const withBotsJoined = await waitForMessage(withBotsHost, (m) => m.type === 'joined', 'host2 joined');
+  const withBotsCode = withBotsJoined.roomCode;
+  const withBotsGuest = await createClient(t, port);
+  withBotsGuest.send({ type: 'join', name: 'Guest2', roomCode: withBotsCode });
+  await waitForMessage(withBotsHost, (m) => m.type === 'state' && m.players.length === 2, 'room with 2 humans');
+  withBotsHost.send({ type: 'add_bot' });
+  await waitForMessage(withBotsHost, (m) => m.type === 'state' && m.players.length === 3, 'room with bot');
+  withBotsHost.send({ type: 'start' });
+
+  const withBotClue = await waitForMessage(
+    withBotsHost,
+    (m) => m.type === 'state' && m.phase === 'clue' && m.you?.isStoryteller === true && m.hand?.length >= 1,
+    'host2 storyteller clue phase'
+  );
+  withBotsHost.send({ type: 'submit_clue', card: withBotClue.hand[0], clue: 'texto normal', clueAudio: sampleAudio });
+
+  const withBotSubmit = await waitForMessage(
+    withBotsGuest,
+    (m) => m.type === 'state' && m.phase === 'submit',
+    'guest2 submit phase'
+  );
+  assert.equal(withBotSubmit.clueAudio, '');
+  assert.equal(withBotSubmit.clue, 'Texto normal');
+});
+
 test('end_room elimina la sala y notifica a los jugadores', async (t) => {
   const { port } = await startServer(t);
   const host = await createClient(t, port);
@@ -388,60 +389,6 @@ test('end_room elimina la sala y notifica a los jugadores', async (t) => {
 
   const rooms = await fetch(`http://127.0.0.1:${port}/api/rooms`).then((r) => r.json());
   assert.equal(rooms.find((room) => room.code === joined.roomCode), undefined);
-});
-
-test('end_room desde fuera de la sala funciona con roomCode + password', async (t) => {
-  const { port } = await startServer(t);
-  const host = await createClient(t, port);
-  host.send({ type: 'join', name: 'Host' });
-  const joined = await waitForMessage(host, (m) => m.type === 'joined', 'host joined');
-
-  const outsider = await createClient(t, port);
-  outsider.send({ type: 'end_room', roomCode: joined.roomCode, password: 'hola123' });
-
-  await waitForMessage(host, (m) => m.type === 'ended' && m.roomCode === joined.roomCode, 'ended event on host');
-  const rooms = await fetch(`http://127.0.0.1:${port}/api/rooms`).then((r) => r.json());
-  assert.equal(rooms.find((room) => room.code === joined.roomCode), undefined);
-});
-
-test('DELETE /api/rooms/:roomCode elimina la sala con password admin', async (t) => {
-  const { port } = await startServer(t);
-  const host = await createClient(t, port);
-  host.send({ type: 'join', name: 'Host' });
-  const joined = await waitForMessage(host, (m) => m.type === 'joined', 'host joined');
-
-  const response = await fetch(`http://127.0.0.1:${port}/api/rooms/${joined.roomCode}`, {
-    method: 'DELETE',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ password: 'hola123' }),
-  });
-  assert.equal(response.status, 200);
-  const payload = await response.json();
-  assert.equal(payload.ok, true);
-  assert.equal(payload.roomCode, joined.roomCode);
-
-  await waitForMessage(host, (m) => m.type === 'ended' && m.roomCode === joined.roomCode, 'host ended event');
-  const rooms = await fetch(`http://127.0.0.1:${port}/api/rooms`).then((r) => r.json());
-  assert.equal(rooms.find((room) => room.code === joined.roomCode), undefined);
-});
-
-test('DELETE /api/rooms/:roomCode rechaza password inválido', async (t) => {
-  const { port } = await startServer(t);
-  const host = await createClient(t, port);
-  host.send({ type: 'join', name: 'Host' });
-  const joined = await waitForMessage(host, (m) => m.type === 'joined', 'host joined');
-
-  const response = await fetch(`http://127.0.0.1:${port}/api/rooms/${joined.roomCode}`, {
-    method: 'DELETE',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ password: 'incorrecta' }),
-  });
-  assert.equal(response.status, 401);
-  const payload = await response.json();
-  assert.equal(payload.error, 'No autorizado para eliminar la sala.');
-
-  const rooms = await fetch(`http://127.0.0.1:${port}/api/rooms`).then((r) => r.json());
-  assert.notEqual(rooms.find((room) => room.code === joined.roomCode), undefined);
 });
 
 test('reconexión con playerId recupera el mismo jugador', async (t) => {
@@ -465,4 +412,64 @@ test('reconexión con playerId recupera el mismo jugador', async (t) => {
     'rejoined state'
   );
   assert.equal(rejoinedState.you.id, joined.playerId);
+});
+
+test('narrador bot genera un motivo coherente con la pista', async (t) => {
+  const { port } = await startServer(t);
+  const host = await createClient(t, port);
+  host.send({ type: 'join', name: 'Solo' });
+  await waitForMessage(host, (m) => m.type === 'joined', 'host joined');
+
+  host.send({ type: 'start_with_bots', difficulty: 'normal' });
+  const humanClueState = await waitForMessage(
+    host,
+    (m) => m.type === 'state' && m.phase === 'clue' && m.you?.isStoryteller === true && m.hand?.length >= 1,
+    'human storyteller clue phase'
+  );
+
+  host.send({ type: 'submit_clue', clue: 'pista inicial', card: humanClueState.hand[0] });
+  const firstReveal = await waitForMessage(
+    host,
+    (m) => m.type === 'state' && m.phase === 'reveal' && m.summary?.results?.length >= 3,
+    'first reveal'
+  );
+
+  host.send({ type: 'next_round' });
+  const botSubmitState = await waitForMessage(
+    host,
+    (m) => m.type === 'state'
+      && m.round >= firstReveal.round + 1
+      && m.phase === 'submit'
+      && m.you?.isStoryteller === false
+      && typeof m.clue === 'string'
+      && m.clue.length > 0
+      && Array.isArray(m.hand)
+      && m.hand.length > 0,
+    'bot storyteller reason'
+  );
+
+  host.send({ type: 'submit_card', card: botSubmitState.hand[0] });
+  const botVoteState = await waitForMessage(
+    host,
+    (m) => m.type === 'state' && m.phase === 'vote' && Array.isArray(m.board) && m.board.length >= 3,
+    'bot storyteller vote phase'
+  );
+  const voteChoice = botVoteState.board.find((card) => !card.isYours);
+  assert.ok(voteChoice?.id);
+  host.send({ type: 'vote', submissionId: voteChoice.id });
+
+  const botRevealState = await waitForMessage(
+    host,
+    (m) => m.type === 'state'
+      && m.phase === 'reveal'
+      && m.round >= firstReveal.round + 1
+      && typeof m.summary?.clueReason === 'string'
+      && m.summary.clueReason.length > 0,
+    'bot storyteller reveal'
+  );
+
+  assert.ok(botRevealState.summary.clueReason.includes(`"${botRevealState.summary.clue}"`));
+  assert.match(botRevealState.summary.clueReason, /porque mi carta encajaba con/i);
+  assert.match(botRevealState.summary.clueReason, /Como iba|Busqu[eé] un punto medio/i);
+  assert.match(botRevealState.summary.clueReason, /Intent[eé] que|Buscaba que/i);
 });

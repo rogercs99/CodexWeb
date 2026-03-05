@@ -1,4 +1,4 @@
-import { Plus, Search, RotateCcw, LogOut, Power, Trash2 } from 'lucide-react';
+import { Plus, Search, RotateCcw, LogOut, Power, Trash2, Pencil } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import BottomNav from './BottomNav';
 import type { Conversation, Screen, User } from '../lib/types';
@@ -29,6 +29,7 @@ export default function ChatHubScreen({
   onOpenChat,
   onCreateChat,
   onDeleteChat,
+  onRenameChat,
   onDeleteChats,
   onLogout,
   onRefresh,
@@ -42,6 +43,7 @@ export default function ChatHubScreen({
   onOpenChat: (id: number) => void;
   onCreateChat: () => void;
   onDeleteChat: (id: number) => void;
+  onRenameChat: (id: number, title: string) => void | Promise<void>;
   onDeleteChats: (ids: number[]) => void;
   onLogout: () => void;
   onRefresh: () => void;
@@ -212,18 +214,33 @@ export default function ChatHubScreen({
                     <div className="flex items-center gap-2">
                       <span className="text-xs text-zinc-500 whitespace-nowrap">{formatDate(conversation.last_message_at || conversation.created_at)}</span>
                       {!selectionMode ? (
-                        <button
-                          onClick={() => {
-                            if (window.confirm('¿Eliminar este chat definitivamente?')) {
-                              onDeleteChat(conversation.id);
-                            }
-                          }}
-                          className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-400 hover:text-red-300 hover:border-red-400/60"
-                          type="button"
-                          aria-label="Eliminar chat"
-                        >
-                          <Trash2 size={14} />
-                        </button>
+                        <>
+                          <button
+                            onClick={() => {
+                              const currentTitle = normalizeTitle(conversation.title);
+                              const requestedTitle = window.prompt('Nuevo titulo del chat', currentTitle);
+                              if (requestedTitle === null) return;
+                              void onRenameChat(conversation.id, requestedTitle);
+                            }}
+                            className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-400 hover:text-blue-200 hover:border-blue-400/60"
+                            type="button"
+                            aria-label="Renombrar chat"
+                          >
+                            <Pencil size={14} />
+                          </button>
+                          <button
+                            onClick={() => {
+                              if (window.confirm('¿Eliminar este chat definitivamente?')) {
+                                onDeleteChat(conversation.id);
+                              }
+                            }}
+                            className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-400 hover:text-red-300 hover:border-red-400/60"
+                            type="button"
+                            aria-label="Eliminar chat"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </>
                       ) : null}
                     </div>
                   </div>

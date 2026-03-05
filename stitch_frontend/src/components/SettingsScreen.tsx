@@ -4,9 +4,11 @@ import BottomNav from './BottomNav';
 import {
   cancelCodexDeviceLogin,
   getCodexAuthStatus,
+  getNotificationSettings,
   getCodexQuota,
   logoutCodexAuth,
-  startCodexDeviceLogin
+  startCodexDeviceLogin,
+  updateNotificationSettings
 } from '../lib/api';
 import type {
   Capabilities,
@@ -14,6 +16,7 @@ import type {
   CodexAuthStatus,
   CodexQuota,
   CodexQuotaWindow,
+  NotificationSettings,
   Screen
 } from '../lib/types';
 
@@ -43,6 +46,16 @@ export default function SettingsScreen({
   const [authLoading, setAuthLoading] = useState(true);
   const [authError, setAuthError] = useState('');
   const [authActionBusy, setAuthActionBusy] = useState(false);
+  const [notifications, setNotifications] = useState<NotificationSettings>({
+    discordWebhookUrl: '',
+    notifyOnFinish: false,
+    includeResult: false
+  });
+  const [discordWebhookDraft, setDiscordWebhookDraft] = useState('');
+  const [notificationsLoading, setNotificationsLoading] = useState(true);
+  const [notificationsSaving, setNotificationsSaving] = useState(false);
+  const [notificationsError, setNotificationsError] = useState('');
+  const [notificationsSavedMessage, setNotificationsSavedMessage] = useState('');
 
   const loadQuota = useCallback(async () => {
     setQuotaLoading(true);
@@ -74,10 +87,25 @@ export default function SettingsScreen({
     }
   }, []);
 
+  const loadNotifications = useCallback(async () => {
+    setNotificationsLoading(true);
+    setNotificationsError('');
+    try {
+      const next = await getNotificationSettings();
+      setNotifications(next);
+      setDiscordWebhookDraft(next.discordWebhookUrl || '');
+    } catch (error) {
+      setNotificationsError(error instanceof Error ? error.message : 'No se pudo leer configuración de Discord');
+    } finally {
+      setNotificationsLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     loadQuota();
     loadAuth();
-  }, [loadAuth, loadQuota]);
+    loadNotifications();
+  }, [loadAuth, loadNotifications, loadQuota]);
 
   useEffect(() => {
     if (!auth?.loginInProgress) return undefined;
@@ -88,6 +116,30 @@ export default function SettingsScreen({
       window.clearInterval(pollId);
     };
   }, [auth?.loginInProgress, loadAuth]);
+
+  const saveNotifications = useCallback(
+    async (patch: Partial<NotificationSettings>) => {
+      setNotificationsSaving(true);
+      setNotificationsError('');
+      setNotificationsSavedMessage('');
+      try {
+        const next = await updateNotificationSettings(patch);
+        setNotifications(next);
+        setDiscordWebhookDraft(next.discordWebhookUrl || '');
+        setNotificationsSavedMessage('Guardado');
+        window.setTimeout(() => {
+          setNotificationsSavedMessage((prev) => (prev === 'Guardado' ? '' : prev));
+        }, 1800);
+      } catch (error) {
+        setNotificationsError(
+          error instanceof Error ? error.message : 'No se pudo guardar configuración de Discord'
+        );
+      } finally {
+        setNotificationsSaving(false);
+      }
+    },
+    []
+  );
 
   const formatPercent = (value: number) => `${Math.max(0, Math.round(Number(value || 0)))}%`;
   const formatDate = (value: string) => {
@@ -278,6 +330,84 @@ export default function SettingsScreen({
               onChange={(event) => onCapsChange({ ...caps, memory: event.target.checked })}
             />
           </label>
+        </section>
+
+        <section className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4 space-y-4">
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-xs uppercase text-zinc-500">Discord webhook</h3>
+            <button
+              type="button"
+              onClick={() => {
+                void loadNotifications();
+              }}
+              disabled={notificationsLoading || notificationsSaving}
+              className="text-xs px-2.5 py-1 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-50"
+            >
+              {notificationsLoading ? 'Cargando...' : 'Refrescar'}
+            </button>
+          </div>
+
+          <div className="space-y-2">
+            <p className="text-xs text-zinc-500">
+              Recibe aviso cuando termina una respuesta (estado, hora, duración y resultado opcional).
+            </p>
+            <input
+              type="url"
+              inputMode="url"
+              placeholder="https://discord.com/api/webhooks/..."
+              value={discordWebhookDraft}
+              onChange={(event) => {
+                setDiscordWebhookDraft(event.target.value);
+                if (notificationsError) setNotificationsError('');
+              }}
+              className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2.5 text-sm"
+            />
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  void saveNotifications({ discordWebhookUrl: discordWebhookDraft });
+                }}
+                disabled={
+                  notificationsLoading ||
+                  notificationsSaving ||
+                  discordWebhookDraft.trim() === notifications.discordWebhookUrl.trim()
+                }
+                className="text-xs px-3 py-1.5 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-50"
+              >
+                {notificationsSaving ? 'Guardando...' : 'Guardar webhook'}
+              </button>
+              {notificationsSavedMessage ? (
+                <span className="text-xs text-emerald-300">{notificationsSavedMessage}</span>
+              ) : null}
+            </div>
+          </div>
+
+          <label className="flex items-center justify-between text-sm">
+            <span>Notificar al finalizar respuesta</span>
+            <input
+              type="checkbox"
+              checked={notifications.notifyOnFinish}
+              disabled={notificationsLoading || notificationsSaving}
+              onChange={(event) => {
+                void saveNotifications({ notifyOnFinish: event.target.checked });
+              }}
+            />
+          </label>
+
+          <label className="flex items-center justify-between text-sm">
+            <span>Incluir resultado en el aviso</span>
+            <input
+              type="checkbox"
+              checked={notifications.includeResult}
+              disabled={notificationsLoading || notificationsSaving}
+              onChange={(event) => {
+                void saveNotifications({ includeResult: event.target.checked });
+              }}
+            />
+          </label>
+
+          {notificationsError ? <p className="text-xs text-red-300">{notificationsError}</p> : null}
         </section>
 
         <section className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-4 space-y-3">

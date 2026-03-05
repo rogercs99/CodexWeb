@@ -3,7 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
-const { execFile, spawn } = require('child_process');
+const { execFile, execFileSync, spawn } = require('child_process');
 const { Transform, pipeline } = require('stream');
 const util = require('util');
 const express = require('express');
@@ -17,13 +17,19 @@ const pipelineAsync = util.promisify(pipeline);
 const app = express();
 const port = process.env.PORT || 3000;
 const host = process.env.HOST || '127.0.0.1';
-const webhookUrl =
-  process.env.WEBHOOK_URL ||
-  'https://discord.com/api/webhooks/1386130355190501491/c3p6EQQeH7h0ynizeBWBGuPyTIljMCz4_M0d8qmYe9FPKbX4aB4vy1sfRmFUyHoQBPCb';
+const defaultWebhookUrl = String(process.env.WEBHOOK_URL || '').trim();
 let resolvedCodexPath = null;
 const sentMilestones = new Set();
 const DEFAULT_CHAT_MODEL = 'gpt-5.3-codex';
 const DEFAULT_REASONING_EFFORT = 'xhigh';
+const DISCORD_WEBHOOK_PREFIXES = [
+  'https://discord.com/api/webhooks/',
+  'https://discordapp.com/api/webhooks/',
+  'https://ptb.discord.com/api/webhooks/',
+  'https://canary.discord.com/api/webhooks/'
+];
+const DISCORD_RESULT_SNIPPET_MAX_LEN = 1400;
+const DISCORD_MESSAGE_MAX_LEN = 1900;
 const chatGptModelOptions = [
   DEFAULT_CHAT_MODEL,
   'gpt-5',
@@ -96,6 +102,164 @@ const codexQuotaStateByUser = new Map();
 const activeChatRuns = new Map();
 const activeCodexLoginFlows = new Map();
 let activeChatRunClientSeq = 0;
+const repoContextScanTtlMs = 45 * 1000;
+const repoContextMaxIndexedFiles = 6000;
+const repoContextMaxCandidates = 8;
+const repoContextMaxTopLevelEntries = 10;
+const repoContextIgnoredDirs = new Set([
+  '.git',
+  '.hg',
+  '.svn',
+  '.idea',
+  '.vscode',
+  'node_modules',
+  'dist',
+  'build',
+  'coverage',
+  'tmp',
+  'temp',
+  '.cache',
+  '.next',
+  '.nuxt',
+  '.turbo',
+  '.codex_users',
+  'uploads',
+  'test-results'
+]);
+const repoContextAllowedTextExtensions = new Set([
+  '.js',
+  '.jsx',
+  '.ts',
+  '.tsx',
+  '.mjs',
+  '.cjs',
+  '.json',
+  '.md',
+  '.txt',
+  '.css',
+  '.scss',
+  '.sass',
+  '.less',
+  '.html',
+  '.htm',
+  '.yaml',
+  '.yml',
+  '.toml',
+  '.ini',
+  '.conf',
+  '.env',
+  '.sh',
+  '.bash',
+  '.zsh',
+  '.ps1',
+  '.sql',
+  '.graphql',
+  '.gql',
+  '.py',
+  '.go',
+  '.rs',
+  '.java',
+  '.kt',
+  '.swift',
+  '.rb',
+  '.php',
+  '.cs',
+  '.c',
+  '.h',
+  '.hpp',
+  '.cpp',
+  '.vue',
+  '.svelte'
+]);
+const repoContextAllowedBareNames = new Set([
+  'dockerfile',
+  'makefile',
+  'readme',
+  'readme.md',
+  'license',
+  'license.md'
+]);
+const repoContextStopWords = new Set([
+  'a',
+  'al',
+  'algo',
+  'and',
+  'como',
+  'con',
+  'de',
+  'del',
+  'do',
+  'el',
+  'en',
+  'este',
+  'esta',
+  'esto',
+  'for',
+  'haz',
+  'hacer',
+  'i',
+  'la',
+  'las',
+  'lo',
+  'los',
+  'me',
+  'mi',
+  'my',
+  'need',
+  'necesito',
+  'of',
+  'para',
+  'por',
+  'que',
+  'quiero',
+  'se',
+  'the',
+  'to',
+  'un',
+  'una',
+  'y'
+]);
+const repoRootDir = resolveRepoRootDir(__dirname);
+let repoContextIndexCache = null;
+const taskSnapshotsRootDir = path.join(__dirname, 'tmp', 'task-snapshots');
+const taskCommandOutputMaxChars = 12000;
+const taskResultSummaryMaxChars = 5000;
+const taskPlanMaxChars = 8000;
+const taskDashboardLimitMax = 100;
+const toolsSearchLimitMax = 40;
+const toolsSearchMinQueryLen = 2;
+const observabilityGlobalLatencyLimit = 500;
+const observabilityEndpointLatencyLimit = 140;
+const observabilityRecentErrorsLimit = 140;
+const observabilityEndpointsLimit = 80;
+const gitToolsScanTtlMs = 12000;
+const gitToolsMaxDepth = 6;
+const gitToolsMaxRepos = 80;
+const gitToolsCommandTimeoutMs = 45000;
+const gitToolsIgnoredDirs = new Set([
+  '.git',
+  '.hg',
+  '.svn',
+  '.idea',
+  '.vscode',
+  '.codex_users',
+  'node_modules',
+  'dist',
+  'build',
+  'coverage',
+  'tmp',
+  'temp',
+  '.cache',
+  '.next',
+  '.nuxt',
+  '.turbo',
+  'uploads',
+  'test-results'
+]);
+let gitToolsRepoCache = {
+  scannedAtMs: 0,
+  repos: []
+};
 
 const sessionSecret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 
@@ -107,6 +271,20 @@ db.pragma('foreign_keys = ON');
 fs.mkdirSync(uploadsDir, { recursive: true });
 fs.mkdirSync(pendingUploadsDir, { recursive: true });
 fs.mkdirSync(codexUsersRootDir, { recursive: true });
+fs.mkdirSync(taskSnapshotsRootDir, { recursive: true });
+
+const observabilityState = {
+  startedAtMs: Date.now(),
+  totalRequests: 0,
+  totalErrors: 0,
+  recentLatenciesMs: [],
+  endpointStats: new Map(),
+  recentErrors: []
+};
+let processCpuSnapshot = {
+  usage: process.cpuUsage(),
+  atMs: Date.now()
+};
 
 function truncateForNotify(text, maxLen = 300) {
   const value = String(text || '').replace(/\s+/g, ' ').trim();
@@ -118,6 +296,21 @@ function truncateForNotify(text, maxLen = 300) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function resolveRepoRootDir(startDir) {
+  let current = path.resolve(startDir || __dirname);
+  while (true) {
+    const gitPath = path.join(current, '.git');
+    if (fs.existsSync(gitPath)) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return path.resolve(startDir || __dirname);
+    }
+    current = parent;
+  }
 }
 
 function stripAnsi(text) {
@@ -252,6 +445,17 @@ function clearActiveChatRun(activeRun) {
   if (current && current.id === activeRun.id) {
     activeChatRuns.delete(activeRun.key);
   }
+}
+
+function hasActiveChatRun(userId, conversationId) {
+  const key = buildActiveChatRunKey(userId, conversationId);
+  const activeRun = activeChatRuns.get(key);
+  if (!activeRun || !activeRun.process) return false;
+  if (activeRun.process.exitCode !== null || activeRun.process.killed) {
+    clearActiveChatRun(activeRun);
+    return false;
+  }
+  return true;
 }
 
 function notifyCodexLoginFlowWaiters(flow) {
@@ -662,6 +866,7 @@ function buildDefaultRestartState() {
     active: false,
     phase: 'idle',
     requestedBy: '',
+    notifyWebhookUrl: '',
     startedAt: '',
     finishedAt: '',
     updatedAt: '',
@@ -677,6 +882,7 @@ function normalizeRestartState(rawState) {
   base.active = Boolean(input.active);
   base.phase = String(input.phase || 'idle');
   base.requestedBy = String(input.requestedBy || '');
+  base.notifyWebhookUrl = sanitizeDiscordWebhookUrl(input.notifyWebhookUrl, '');
   base.startedAt = String(input.startedAt || '');
   base.finishedAt = String(input.finishedAt || '');
   base.updatedAt = String(input.updatedAt || '');
@@ -750,8 +956,11 @@ function setRestartPhase(phase) {
   });
 }
 
-function beginRestartAttempt(username) {
+function beginRestartAttempt(username, options = {}) {
   const safeUser = truncateForNotify(username || 'anon', 80);
+  const requestedWebhookUrl =
+    options && typeof options.webhookUrl === 'string' ? options.webhookUrl : '';
+  const notifyWebhookUrl = sanitizeDiscordWebhookUrl(requestedWebhookUrl, defaultWebhookUrl);
   const attemptId = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const startedAt = nowIso();
   restartState = normalizeRestartState({
@@ -759,6 +968,7 @@ function beginRestartAttempt(username) {
     active: true,
     phase: 'requested',
     requestedBy: safeUser,
+    notifyWebhookUrl,
     startedAt,
     finishedAt: '',
     updatedAt: startedAt,
@@ -803,7 +1013,7 @@ function markRestartRecoveredOnStartup() {
   if (!snapshot.active) {
     return;
   }
-  updateRestartState((state) => {
+  const updated = updateRestartState((state) => {
     const logs = Array.isArray(state.logs) ? state.logs : [];
     logs.push({
       at: nowIso(),
@@ -814,16 +1024,127 @@ function markRestartRecoveredOnStartup() {
     state.phase = 'completed';
     state.finishedAt = nowIso();
   });
+  const webhookUrl = sanitizeDiscordWebhookUrl(snapshot.notifyWebhookUrl, defaultWebhookUrl);
+  const startedAtMs = Date.parse(snapshot.startedAt || '');
+  const finishedAtMs = Date.parse(updated.finishedAt || '');
+  const durationMs =
+    Number.isFinite(startedAtMs) && Number.isFinite(finishedAtMs)
+      ? Math.max(0, finishedAtMs - startedAtMs)
+      : null;
+  const restartMessage = buildRestartDiscordMessage({
+    status: 'completed',
+    username: snapshot.requestedBy,
+    attemptId: snapshot.attemptId,
+    finishedAt: updated.finishedAt || nowIso(),
+    durationMs,
+    phase: updated.phase
+  });
+  if (restartMessage) {
+    void notify(restartMessage, { webhookUrl });
+  }
 }
 
-function notify(msg) {
-  const safeMsg = truncateForNotify(msg, 1500);
+function markStaleTaskRunsOnStartup() {
+  try {
+    const timestamp = nowIso();
+    const result = markStaleRunningTaskRunsStmt.run(timestamp, timestamp);
+    if (result && Number(result.changes) > 0) {
+      void notify(`Task runs recuperados tras reinicio: ${Number(result.changes)} marcados como fallidos.`);
+    }
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'stale_task_recovery_failed', 180);
+    void notify(`WARN stale_task_recovery_failed reason=${reason}`);
+  }
+}
+
+function sanitizeDiscordWebhookUrl(rawValue, fallback = '') {
+  const source = typeof rawValue === 'string' ? rawValue.trim() : '';
+  if (!source) return String(fallback || '').trim();
+  const isAllowed = DISCORD_WEBHOOK_PREFIXES.some((prefix) => source.startsWith(prefix));
+  if (!isAllowed) return String(fallback || '').trim();
+  if (source.includes(' ')) return String(fallback || '').trim();
+  return source;
+}
+
+function formatDurationMs(durationMs) {
+  const safeMs = Number.isFinite(Number(durationMs)) ? Math.max(0, Number(durationMs)) : 0;
+  if (safeMs < 1000) return `${safeMs}ms`;
+  const seconds = Math.round(safeMs / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainSeconds = seconds % 60;
+  if (minutes < 60) return `${minutes}m ${remainSeconds}s`;
+  const hours = Math.floor(minutes / 60);
+  const remainMinutes = minutes % 60;
+  return `${hours}h ${remainMinutes}m`;
+}
+
+function buildChatCompletionDiscordMessage(payload) {
+  const safe = payload && typeof payload === 'object' ? payload : {};
+  const status = safe.status === 'ok' ? 'listo' : 'error';
+  const lines = [
+    'CodexWeb - respuesta finalizada',
+    `Estado: ${status}`,
+    `Usuario: ${truncateForNotify(safe.username || 'anon', 80)}`,
+    `Chat: ${Number.isInteger(Number(safe.conversationId)) ? Number(safe.conversationId) : 'n/a'}`,
+    `Hora: ${String(safe.finishedAt || nowIso())}`,
+    `Duracion: ${formatDurationMs(safe.durationMs)}`,
+    `Motivo cierre: ${truncateForNotify(safe.closeReason || 'normal', 120)}`
+  ];
+  const includeResult = Boolean(safe.includeResult);
+  if (includeResult) {
+    const compactResult = truncateForNotify(
+      String(safe.result || '').trim() || '(Sin salida de Codex)',
+      DISCORD_RESULT_SNIPPET_MAX_LEN
+    );
+    lines.push('');
+    lines.push('Resultado:');
+    lines.push(compactResult);
+  }
+  const joined = lines.join('\n').trim();
+  return truncateForNotify(joined, DISCORD_MESSAGE_MAX_LEN);
+}
+
+function buildRestartDiscordMessage(payload) {
+  const safe = payload && typeof payload === 'object' ? payload : {};
+  const normalizedStatus = String(safe.status || '').trim().toLowerCase();
+  let status = 'actualizado';
+  if (normalizedStatus === 'requested') status = 'solicitado';
+  if (normalizedStatus === 'completed') status = 'completado';
+  if (normalizedStatus === 'failed') status = 'fallido';
+  const lines = [
+    'CodexWeb - reinicio',
+    `Estado: ${status}`,
+    `Usuario: ${truncateForNotify(safe.username || 'anon', 80)}`,
+    `Intento: ${truncateForNotify(safe.attemptId || 'n/a', 120)}`,
+    `Hora: ${String(safe.finishedAt || safe.startedAt || nowIso())}`
+  ];
+  if (Number.isFinite(Number(safe.durationMs))) {
+    lines.push(`Duracion: ${formatDurationMs(safe.durationMs)}`);
+  }
+  if (safe.phase) {
+    lines.push(`Fase: ${truncateForNotify(safe.phase, 80)}`);
+  }
+  if (safe.reason) {
+    lines.push(`Detalle: ${truncateForNotify(safe.reason, 220)}`);
+  }
+  return truncateForNotify(lines.join('\n').trim(), DISCORD_MESSAGE_MAX_LEN);
+}
+
+function notify(msg, options = {}) {
+  const requestedWebhook =
+    options && typeof options.webhookUrl === 'string' ? options.webhookUrl : '';
+  const targetWebhookUrl = sanitizeDiscordWebhookUrl(requestedWebhook, defaultWebhookUrl);
+  if (!targetWebhookUrl) {
+    return Promise.resolve(false);
+  }
+  const safeMsg = truncateForNotify(msg, DISCORD_MESSAGE_MAX_LEN);
   try {
     const payload = JSON.stringify({ content: safeMsg });
     return new Promise((resolve) => {
       const curl = spawn(
         'curl',
-        ['-4', '-sS', '-H', 'Content-Type: application/json', '-d', payload, webhookUrl],
+        ['-4', '-sS', '--max-time', '8', '-H', 'Content-Type: application/json', '-d', payload, targetWebhookUrl],
         {
           stdio: ['ignore', 'ignore', 'pipe']
         }
@@ -832,11 +1153,11 @@ function notify(msg) {
       curl.stderr.on('data', () => {
         // Best-effort notifications only; ignore stderr output.
       });
-      curl.on('error', () => resolve());
-      curl.on('close', () => resolve());
+      curl.on('error', () => resolve(false));
+      curl.on('close', () => resolve(true));
     });
   } catch (_error) {
-    return Promise.resolve();
+    return Promise.resolve(false);
   }
 }
 
@@ -874,6 +1195,1209 @@ function createClientRequestError(message, statusCode = 400) {
   error.statusCode = Number.isInteger(statusCode) ? statusCode : 400;
   error.exposeToClient = true;
   return error;
+}
+
+function parseNullSeparatedList(rawText) {
+  return String(rawText || '')
+    .split('\0')
+    .map((entry) => normalizeRepoRelativePath(entry))
+    .filter(Boolean);
+}
+
+function normalizeRepoRelativePath(rawPath) {
+  const source = String(rawPath || '')
+    .replace(/\\/g, '/')
+    .trim();
+  if (!source) return '';
+  const normalized = path.posix.normalize(source).replace(/^(\.\/)+/, '');
+  if (!normalized || normalized === '.' || normalized.includes('\0')) return '';
+  if (normalized.startsWith('../') || normalized === '..') return '';
+  return normalized;
+}
+
+function resolveRepoPathFromRelative(relativePath) {
+  const normalized = normalizeRepoRelativePath(relativePath);
+  if (!normalized) return '';
+  const resolved = path.resolve(repoRootDir, normalized.split('/').join(path.sep));
+  const rel = path.relative(repoRootDir, resolved);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return '';
+  }
+  return resolved;
+}
+
+function runGitStdoutSync(args) {
+  try {
+    return String(
+      execFileSync('git', args, {
+        cwd: repoRootDir,
+        encoding: 'utf8',
+        timeout: 20000,
+        maxBuffer: 1024 * 1024 * 64
+      }) || ''
+    );
+  } catch (_error) {
+    return '';
+  }
+}
+
+function runGitInRepoSync(repoPath, args, options = {}) {
+  const safeRepoPath = String(repoPath || '').trim() || repoRootDir;
+  const safeArgs = Array.isArray(args) ? args.map((entry) => String(entry || '')) : [];
+  const timeoutMs = Number.isInteger(Number(options.timeoutMs))
+    ? Math.max(500, Number(options.timeoutMs))
+    : gitToolsCommandTimeoutMs;
+  const allowNonZero = Boolean(options.allowNonZero);
+  try {
+    const stdout = execFileSync('git', safeArgs, {
+      cwd: safeRepoPath,
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      maxBuffer: 1024 * 1024 * 64,
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: '0'
+      }
+    });
+    return {
+      ok: true,
+      code: 0,
+      stdout: String(stdout || ''),
+      stderr: ''
+    };
+  } catch (error) {
+    const statusCandidate = Number(error && error.status);
+    const codeCandidate = Number(error && error.code);
+    const exitCode = Number.isInteger(statusCandidate)
+      ? statusCandidate
+      : Number.isInteger(codeCandidate)
+        ? codeCandidate
+        : null;
+    return {
+      ok: allowNonZero && exitCode !== null,
+      code: exitCode === null ? 1 : exitCode,
+      stdout: String((error && error.stdout) || ''),
+      stderr: String((error && error.stderr) || (error && error.message) || '')
+    };
+  }
+}
+
+async function runGitInRepoAsync(repoPath, args, options = {}) {
+  const safeRepoPath = String(repoPath || '').trim() || repoRootDir;
+  const safeArgs = Array.isArray(args) ? args.map((entry) => String(entry || '')) : [];
+  const timeoutMs = Number.isInteger(Number(options.timeoutMs))
+    ? Math.max(500, Number(options.timeoutMs))
+    : gitToolsCommandTimeoutMs;
+  const allowNonZero = Boolean(options.allowNonZero);
+  try {
+    const result = await execFileAsync('git', safeArgs, {
+      cwd: safeRepoPath,
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      maxBuffer: 1024 * 1024 * 64,
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: '0'
+      }
+    });
+    return {
+      ok: true,
+      code: 0,
+      stdout: String((result && result.stdout) || ''),
+      stderr: String((result && result.stderr) || '')
+    };
+  } catch (error) {
+    const statusCandidate = Number(error && error.status);
+    const codeCandidate = Number(error && error.code);
+    const exitCode = Number.isInteger(statusCandidate)
+      ? statusCandidate
+      : Number.isInteger(codeCandidate)
+        ? codeCandidate
+        : null;
+    return {
+      ok: allowNonZero && exitCode !== null,
+      code: exitCode === null ? 1 : exitCode,
+      stdout: String((error && error.stdout) || ''),
+      stderr: String((error && error.stderr) || (error && error.message) || '')
+    };
+  }
+}
+
+function parseGitPorcelainPath(line) {
+  const raw = String(line || '');
+  if (raw.length < 4) return '';
+  const body = raw.slice(3).trim();
+  if (!body) return '';
+  const renameMarker = ' -> ';
+  const renameIdx = body.lastIndexOf(renameMarker);
+  const target = renameIdx >= 0 ? body.slice(renameIdx + renameMarker.length) : body;
+  const unquoted = target.replace(/^"/, '').replace(/"$/, '');
+  return normalizeRepoRelativePath(unquoted);
+}
+
+function parseGitStatusPorcelain(rawOutput) {
+  const lines = String(rawOutput || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .filter((line) => String(line || '').trim().length > 0);
+
+  let branch = '';
+  let upstream = '';
+  let ahead = 0;
+  let behind = 0;
+  let detached = false;
+  let headerText = '';
+
+  if (lines.length > 0 && lines[0].startsWith('## ')) {
+    headerText = String(lines.shift() || '').slice(3).trim();
+    const trackingMatch = headerText.match(/\[([^\]]+)\]\s*$/);
+    const trackingText = trackingMatch ? trackingMatch[1] : '';
+    const branchPart = trackingMatch
+      ? headerText.slice(0, headerText.length - trackingMatch[0].length).trim()
+      : headerText;
+
+    if (branchPart.startsWith('No commits yet on ')) {
+      branch = branchPart.replace('No commits yet on ', '').trim();
+    } else if (branchPart.includes('...')) {
+      const split = branchPart.split('...');
+      branch = String(split[0] || '').trim();
+      upstream = String(split[1] || '').trim();
+    } else {
+      branch = branchPart;
+    }
+
+    const aheadMatch = trackingText.match(/ahead\s+(\d+)/i);
+    const behindMatch = trackingText.match(/behind\s+(\d+)/i);
+    ahead = aheadMatch ? Math.max(0, Number(aheadMatch[1])) : 0;
+    behind = behindMatch ? Math.max(0, Number(behindMatch[1])) : 0;
+  }
+
+  if (!branch) {
+    branch = 'HEAD';
+  }
+  detached = branch === 'HEAD' || headerText.includes('detached');
+
+  let staged = 0;
+  let modified = 0;
+  let untracked = 0;
+  let conflicted = 0;
+  const files = [];
+  const conflictedFiles = [];
+
+  for (const line of lines) {
+    if (line.length < 3) continue;
+    const x = line[0];
+    const y = line[1];
+    const isUntracked = x === '?' && y === '?';
+    const isConflict = x === 'U' || y === 'U' || (x === 'A' && y === 'A') || (x === 'D' && y === 'D');
+    if (isUntracked) {
+      untracked += 1;
+    } else {
+      if (x !== ' ' && x !== '?') staged += 1;
+      if (y !== ' ' && y !== '?') modified += 1;
+    }
+    if (isConflict) {
+      conflicted += 1;
+    }
+
+    const filePath = parseGitPorcelainPath(line);
+    if (filePath) {
+      files.push(filePath);
+      if (isConflict) {
+        conflictedFiles.push(filePath);
+      }
+    }
+  }
+
+  const uniqueFiles = Array.from(new Set(files));
+  const uniqueConflictedFiles = Array.from(new Set(conflictedFiles));
+
+  return {
+    branch,
+    upstream,
+    ahead,
+    behind,
+    detached,
+    hasChanges: lines.length > 0,
+    hasConflicts: conflicted > 0,
+    counts: {
+      staged,
+      modified,
+      untracked,
+      conflicted,
+      total: lines.length
+    },
+    files: uniqueFiles,
+    conflictedFiles: uniqueConflictedFiles
+  };
+}
+
+function listGitRepositoriesUnderRoot(baseDir) {
+  const startDir = path.resolve(String(baseDir || repoRootDir));
+  const queue = [{ dir: startDir, depth: 0 }];
+  const visited = new Set();
+  const discovered = [];
+  const seenRepos = new Set();
+
+  while (queue.length > 0 && discovered.length < gitToolsMaxRepos) {
+    const current = queue.pop();
+    if (!current || !current.dir) continue;
+    const currentDir = path.resolve(current.dir);
+    if (visited.has(currentDir)) continue;
+    visited.add(currentDir);
+
+    const gitPath = path.join(currentDir, '.git');
+    if (fs.existsSync(gitPath) && !seenRepos.has(currentDir)) {
+      discovered.push(currentDir);
+      seenRepos.add(currentDir);
+    }
+
+    if (current.depth >= gitToolsMaxDepth) {
+      continue;
+    }
+
+    let entries = [];
+    try {
+      entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    } catch (_error) {
+      entries = [];
+    }
+
+    entries.forEach((entry) => {
+      if (!entry || !entry.isDirectory()) return;
+      const name = String(entry.name || '').trim();
+      if (!name || name === '.' || name === '..') return;
+      if (gitToolsIgnoredDirs.has(name)) return;
+      queue.push({
+        dir: path.join(currentDir, name),
+        depth: current.depth + 1
+      });
+    });
+  }
+
+  return discovered.sort((a, b) => {
+    const relA = normalizeRepoRelativePath(path.relative(repoRootDir, a).split(path.sep).join('/')) || '.';
+    const relB = normalizeRepoRelativePath(path.relative(repoRootDir, b).split(path.sep).join('/')) || '.';
+    return relA.localeCompare(relB);
+  });
+}
+
+function buildGitRepoId(relativePath, absolutePath) {
+  const seed = `${String(relativePath || '.')}|${String(absolutePath || '')}`;
+  return crypto.createHash('sha1').update(seed).digest('hex').slice(0, 12);
+}
+
+function collectGitRepoSummary(repoDir, scannedAtIso) {
+  const safeRepoDir = path.resolve(String(repoDir || repoRootDir));
+  const relativePathRaw = path.relative(repoRootDir, safeRepoDir);
+  const relativePath =
+    normalizeRepoRelativePath(relativePathRaw.split(path.sep).join('/')) || '.';
+  const statusResult = runGitInRepoSync(safeRepoDir, ['status', '--porcelain=1', '--branch']);
+  if (!statusResult.ok) {
+    return null;
+  }
+  const parsedStatus = parseGitStatusPorcelain(statusResult.stdout);
+  const remoteResult = runGitInRepoSync(safeRepoDir, ['remote'], { allowNonZero: true });
+  const remotes = String(remoteResult.stdout || '')
+    .split(/\r?\n/)
+    .map((entry) => String(entry || '').trim())
+    .filter(Boolean);
+  const name =
+    relativePath === '.'
+      ? path.basename(repoRootDir)
+      : relativePath.split('/').filter(Boolean).slice(-1)[0] || relativePath;
+
+  return {
+    id: buildGitRepoId(relativePath, safeRepoDir),
+    name,
+    relativePath,
+    absolutePath: safeRepoDir,
+    branch: parsedStatus.branch,
+    upstream: parsedStatus.upstream,
+    ahead: parsedStatus.ahead,
+    behind: parsedStatus.behind,
+    detached: parsedStatus.detached,
+    hasRemote: remotes.length > 0,
+    remotes,
+    hasChanges: parsedStatus.hasChanges,
+    hasConflicts: parsedStatus.hasConflicts,
+    status: parsedStatus.counts,
+    changedFiles: parsedStatus.files.slice(0, 120),
+    conflictFiles: parsedStatus.conflictedFiles.slice(0, 120),
+    scannedAt: scannedAtIso
+  };
+}
+
+function collectGitToolsReposSnapshot(forceRefresh = false) {
+  const nowMs = Date.now();
+  const cacheFresh = nowMs - gitToolsRepoCache.scannedAtMs <= gitToolsScanTtlMs;
+  if (!forceRefresh && cacheFresh && Array.isArray(gitToolsRepoCache.repos)) {
+    return {
+      scannedAt: new Date(gitToolsRepoCache.scannedAtMs).toISOString(),
+      repos: gitToolsRepoCache.repos
+    };
+  }
+
+  const scannedAtIso = nowIso();
+  const repos = [];
+  const roots = listGitRepositoriesUnderRoot(repoRootDir);
+  roots.forEach((repoPath) => {
+    const summary = collectGitRepoSummary(repoPath, scannedAtIso);
+    if (summary) {
+      repos.push(summary);
+    }
+  });
+
+  repos.sort((a, b) => {
+    if (a.hasConflicts !== b.hasConflicts) return a.hasConflicts ? -1 : 1;
+    if (a.hasChanges !== b.hasChanges) return a.hasChanges ? -1 : 1;
+    return String(a.relativePath || '').localeCompare(String(b.relativePath || ''));
+  });
+
+  gitToolsRepoCache = {
+    scannedAtMs: nowMs,
+    repos
+  };
+  return {
+    scannedAt: scannedAtIso,
+    repos
+  };
+}
+
+function findGitRepoById(repoId, options = {}) {
+  const safeRepoId = String(repoId || '')
+    .trim()
+    .toLowerCase();
+  if (!safeRepoId || !/^[a-f0-9]{6,40}$/.test(safeRepoId)) {
+    return null;
+  }
+  const snapshot = collectGitToolsReposSnapshot(Boolean(options.forceRefresh));
+  return snapshot.repos.find((repo) => String(repo && repo.id).toLowerCase() === safeRepoId) || null;
+}
+
+function normalizeGitCommitMessage(rawMessage, repoName = 'repo') {
+  const value = String(rawMessage || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (value) {
+    return value.length > 180 ? `${value.slice(0, 177)}...` : value;
+  }
+  const timestamp = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+  return `CodexWeb sync ${String(repoName || 'repo')} ${timestamp}`;
+}
+
+function buildGitConflictResolverPrompt(repoSummary) {
+  const repo = repoSummary && typeof repoSummary === 'object' ? repoSummary : {};
+  const conflictFiles = Array.isArray(repo.conflictFiles) ? repo.conflictFiles : [];
+  const fileLines =
+    conflictFiles.length > 0
+      ? conflictFiles.slice(0, 40).map((entry) => `- ${entry}`).join('\n')
+      : '- Detecta los archivos en conflicto con git status';
+  const repoPathLabel =
+    repo.relativePath && repo.relativePath !== '.'
+      ? `${repo.relativePath} (${repo.absolutePath})`
+      : String(repo.absolutePath || repoRootDir);
+
+  return [
+    `Resuelve los conflictos Git del repositorio "${String(repo.name || 'repo')}".`,
+    `Ruta: ${repoPathLabel}`,
+    '',
+    'Archivos en conflicto detectados:',
+    fileLines,
+    '',
+    'Pasos obligatorios:',
+    `1. Entra al repositorio correcto (cd "${String(repo.absolutePath || repoRootDir)}").`,
+    '2. Revisa y resuelve todos los conflictos de merge/rebase.',
+    '3. Ejecuta pruebas o validaciones rapidas relevantes.',
+    '4. Ejecuta git add -A y crea commit con mensaje claro de resolucion.',
+    '5. Ejecuta git push al remoto correcto.',
+    '6. Devuelve resumen final con archivos resueltos, commit y resultado del push.'
+  ].join('\n');
+}
+
+function listTrackedAndUntrackedRepoFiles() {
+  const tracked = parseNullSeparatedList(runGitStdoutSync(['ls-files', '-z']));
+  const untracked = parseNullSeparatedList(
+    runGitStdoutSync(['ls-files', '--others', '--exclude-standard', '-z'])
+  );
+  const merged = [];
+  const seen = new Set();
+  [...tracked, ...untracked].forEach((entry) => {
+    if (!entry || seen.has(entry)) return;
+    seen.add(entry);
+    merged.push(entry);
+  });
+  return merged.sort();
+}
+
+function ensureParentDirForFile(filePath) {
+  const parent = path.dirname(filePath);
+  if (!parent) return;
+  fs.mkdirSync(parent, { recursive: true });
+}
+
+function computeFileSha256(filePath) {
+  const hash = crypto.createHash('sha256');
+  hash.update(fs.readFileSync(filePath));
+  return hash.digest('hex');
+}
+
+function pathExistsOrSymlink(filePath) {
+  try {
+    fs.lstatSync(filePath);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function normalizeTaskSnapshotManifest(rawManifest) {
+  const input = rawManifest && typeof rawManifest === 'object' ? rawManifest : {};
+  const knownPaths = Array.isArray(input.knownPaths) ? input.knownPaths : [];
+  const files = Array.isArray(input.files) ? input.files : [];
+  const normalizedKnown = [];
+  const knownSeen = new Set();
+  knownPaths.forEach((entry) => {
+    const normalized = normalizeRepoRelativePath(entry);
+    if (!normalized || knownSeen.has(normalized)) return;
+    knownSeen.add(normalized);
+    normalizedKnown.push(normalized);
+  });
+  const normalizedFiles = [];
+  files.forEach((entry) => {
+    if (!entry || typeof entry !== 'object') return;
+    const relPath = normalizeRepoRelativePath(entry.path);
+    if (!relPath) return;
+    const type = entry.type === 'symlink' ? 'symlink' : 'file';
+    const normalizedEntry = {
+      path: relPath,
+      type,
+      backupPath:
+        type === 'file' ? normalizeRepoRelativePath(entry.backupPath || path.posix.join('files', relPath)) : '',
+      sha256: type === 'file' ? String(entry.sha256 || '') : '',
+      size: Number.isFinite(Number(entry.size)) ? Number(entry.size) : 0,
+      mode: Number.isFinite(Number(entry.mode)) ? Number(entry.mode) : 0,
+      linkTarget: type === 'symlink' ? String(entry.linkTarget || '') : ''
+    };
+    normalizedFiles.push(normalizedEntry);
+    if (!knownSeen.has(relPath)) {
+      knownSeen.add(relPath);
+      normalizedKnown.push(relPath);
+    }
+  });
+  return {
+    version: 1,
+    createdAt: String(input.createdAt || ''),
+    repoRoot: String(input.repoRoot || repoRootDir),
+    knownPaths: normalizedKnown,
+    files: normalizedFiles
+  };
+}
+
+function loadTaskSnapshotManifest(snapshotDir) {
+  const dir = String(snapshotDir || '').trim();
+  if (!dir) return null;
+  const manifestPath = path.join(dir, 'manifest.json');
+  if (!fs.existsSync(manifestPath)) return null;
+  try {
+    const raw = fs.readFileSync(manifestPath, 'utf8');
+    if (!raw || !raw.trim()) return null;
+    const parsed = JSON.parse(raw);
+    return normalizeTaskSnapshotManifest(parsed);
+  } catch (_error) {
+    return null;
+  }
+}
+
+function createTaskSnapshot(taskRunId) {
+  const safeTaskRunId = Number(taskRunId);
+  if (!Number.isInteger(safeTaskRunId) || safeTaskRunId <= 0) {
+    return {
+      snapshotDir: '',
+      snapshotReady: false,
+      filesTotal: 0,
+      manifest: null
+    };
+  }
+
+  const knownPaths = listTrackedAndUntrackedRepoFiles();
+  const token = `${safeTaskRunId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const snapshotDir = path.join(taskSnapshotsRootDir, token);
+  fs.mkdirSync(snapshotDir, { recursive: true });
+  fs.mkdirSync(path.join(snapshotDir, 'files'), { recursive: true });
+
+  const manifestFiles = [];
+  knownPaths.forEach((relPath) => {
+    const absolutePath = resolveRepoPathFromRelative(relPath);
+    if (!absolutePath || !pathExistsOrSymlink(absolutePath)) return;
+    let stats = null;
+    try {
+      stats = fs.lstatSync(absolutePath);
+    } catch (_error) {
+      stats = null;
+    }
+    if (!stats) return;
+
+    if (stats.isSymbolicLink()) {
+      let linkTarget = '';
+      try {
+        linkTarget = fs.readlinkSync(absolutePath);
+      } catch (_error) {
+        linkTarget = '';
+      }
+      manifestFiles.push({
+        path: relPath,
+        type: 'symlink',
+        linkTarget,
+        mode: Number(stats.mode) || 0
+      });
+      return;
+    }
+
+    if (!stats.isFile()) return;
+    const backupPosixPath = path.posix.join('files', relPath);
+    const backupAbsolutePath = path.join(snapshotDir, ...backupPosixPath.split('/'));
+    try {
+      ensureParentDirForFile(backupAbsolutePath);
+      fs.copyFileSync(absolutePath, backupAbsolutePath);
+      manifestFiles.push({
+        path: relPath,
+        type: 'file',
+        backupPath: backupPosixPath,
+        sha256: computeFileSha256(absolutePath),
+        size: Number(stats.size) || 0,
+        mode: Number(stats.mode) || 0
+      });
+    } catch (_error) {
+      // best-effort snapshot file copy
+    }
+  });
+
+  const manifest = normalizeTaskSnapshotManifest({
+    version: 1,
+    createdAt: nowIso(),
+    repoRoot: repoRootDir,
+    knownPaths,
+    files: manifestFiles
+  });
+  try {
+    fs.writeFileSync(path.join(snapshotDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
+  } catch (_error) {
+    // best-effort snapshot persistence
+  }
+  return {
+    snapshotDir,
+    snapshotReady: manifest.files.length > 0,
+    filesTotal: manifest.files.length,
+    manifest
+  };
+}
+
+function detectTouchedFilesFromSnapshot(snapshotManifest) {
+  if (!snapshotManifest) return [];
+  const manifest = normalizeTaskSnapshotManifest(snapshotManifest);
+  if (!Array.isArray(manifest.files) || manifest.files.length === 0) {
+    return [];
+  }
+  const touched = new Set();
+  const baseline = new Set(manifest.knownPaths || []);
+  const manifestByPath = new Map();
+  manifest.files.forEach((entry) => {
+    manifestByPath.set(entry.path, entry);
+    baseline.add(entry.path);
+  });
+
+  manifest.files.forEach((entry) => {
+    const absolutePath = resolveRepoPathFromRelative(entry.path);
+    if (!absolutePath || !pathExistsOrSymlink(absolutePath)) {
+      touched.add(entry.path);
+      return;
+    }
+    let stats = null;
+    try {
+      stats = fs.lstatSync(absolutePath);
+    } catch (_error) {
+      stats = null;
+    }
+    if (!stats) {
+      touched.add(entry.path);
+      return;
+    }
+
+    if (entry.type === 'symlink') {
+      if (!stats.isSymbolicLink()) {
+        touched.add(entry.path);
+        return;
+      }
+      let currentTarget = '';
+      try {
+        currentTarget = fs.readlinkSync(absolutePath);
+      } catch (_error) {
+        currentTarget = '';
+      }
+      if (String(currentTarget || '') !== String(entry.linkTarget || '')) {
+        touched.add(entry.path);
+      }
+      return;
+    }
+
+    if (!stats.isFile()) {
+      touched.add(entry.path);
+      return;
+    }
+    try {
+      const currentSha = computeFileSha256(absolutePath);
+      if (entry.sha256 && currentSha !== entry.sha256) {
+        touched.add(entry.path);
+        return;
+      }
+      if (!entry.sha256 && Number(stats.size) !== Number(entry.size || 0)) {
+        touched.add(entry.path);
+      }
+    } catch (_error) {
+      touched.add(entry.path);
+    }
+  });
+
+  const currentPaths = listTrackedAndUntrackedRepoFiles();
+  currentPaths.forEach((entryPath) => {
+    const normalized = normalizeRepoRelativePath(entryPath);
+    if (!normalized) return;
+    if (!baseline.has(normalized)) {
+      touched.add(normalized);
+    }
+  });
+
+  return Array.from(touched).sort();
+}
+
+function normalizeTaskStatus(rawStatus) {
+  const normalized = String(rawStatus || '')
+    .trim()
+    .toLowerCase();
+  if (!normalized) return 'running';
+  if (normalized === 'ok') return 'success';
+  if (normalized === 'error') return 'failed';
+  return normalized;
+}
+
+function toTaskCommandStatus(rawStatus, exitCode = null) {
+  const normalized = String(rawStatus || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+  if (normalized === 'running' || normalized === 'in_progress') return 'running';
+  if (normalized === 'success' || normalized === 'ok' || normalized === 'completed') {
+    if (Number.isInteger(exitCode) && Number(exitCode) !== 0) {
+      return 'failed';
+    }
+    return 'success';
+  }
+  if (normalized === 'failed' || normalized === 'error' || normalized === 'declined') return 'failed';
+  if (!normalized) return Number.isInteger(exitCode) ? (Number(exitCode) === 0 ? 'success' : 'failed') : 'notice';
+  return normalized;
+}
+
+function normalizeTaskCommandOutput(rawValue) {
+  const value = String(rawValue || '');
+  if (!value) return '';
+  if (value.length <= taskCommandOutputMaxChars) return value;
+  return `${value.slice(0, taskCommandOutputMaxChars - 3)}...`;
+}
+
+function normalizeTaskResultSummary(rawValue) {
+  const value = String(rawValue || '').trim();
+  if (!value) return '';
+  if (value.length <= taskResultSummaryMaxChars) return value;
+  return `${value.slice(0, taskResultSummaryMaxChars - 3)}...`;
+}
+
+function normalizeTaskPlanText(rawValue) {
+  const value = String(rawValue || '').trim();
+  if (!value) return '';
+  if (value.length <= taskPlanMaxChars) return value;
+  return `${value.slice(0, taskPlanMaxChars - 3)}...`;
+}
+
+function isTestLikeCommand(rawCommand) {
+  const command = String(rawCommand || '')
+    .trim()
+    .toLowerCase();
+  if (!command) return false;
+  return (
+    /\b(test|tests|jest|vitest|pytest|unittest|go test|cargo test|ctest|phpunit|rspec)\b/.test(command) ||
+    /\b(lint|eslint|stylelint)\b/.test(command) ||
+    /\b(typecheck|tsc\b|mypy|pyright|flow)\b/.test(command)
+  );
+}
+
+function computeTaskRiskLevel(payload) {
+  const data = payload && typeof payload === 'object' ? payload : {};
+  const status = normalizeTaskStatus(data.status || 'running');
+  const filesTouchedCount = Number.isFinite(Number(data.filesTouchedCount)) ? Number(data.filesTouchedCount) : 0;
+  const commandFailed = Number.isFinite(Number(data.commandFailed)) ? Number(data.commandFailed) : 0;
+  const testsExecutedCount =
+    Number.isFinite(Number(data.testsExecutedCount)) ? Number(data.testsExecutedCount) : 0;
+  const rollbackReady = Boolean(data.rollbackReady);
+
+  let score = 0;
+  if (status !== 'success') score += 2;
+  if (commandFailed > 0) score += 2;
+  if (filesTouchedCount >= 12) score += 2;
+  else if (filesTouchedCount >= 5) score += 1;
+  if (testsExecutedCount === 0) score += 1;
+  if (!rollbackReady) score += 1;
+
+  if (score >= 5) return 'high';
+  if (score >= 3) return 'medium';
+  return 'low';
+}
+
+function safeParseJsonArray(rawValue) {
+  try {
+    const parsed = JSON.parse(String(rawValue || '[]'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_error) {
+    return [];
+  }
+}
+
+function safeParseJsonObject(rawValue) {
+  try {
+    const parsed = JSON.parse(String(rawValue || '{}'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch (_error) {
+    return {};
+  }
+}
+
+function pushLimited(list, item, maxItems) {
+  if (!Array.isArray(list)) return;
+  list.push(item);
+  if (list.length > maxItems) {
+    list.splice(0, list.length - maxItems);
+  }
+}
+
+function normalizeApiMetricPath(pathValue) {
+  const raw = String(pathValue || '').split('?')[0].trim();
+  if (!raw) return '/';
+  return raw
+    .replace(/\/\d+(?=\/|$)/g, '/:id')
+    .replace(/\/[0-9a-f]{8}-[0-9a-f-]{13,}(?=\/|$)/gi, '/:uuid')
+    .replace(/\/[A-Za-z0-9_-]{18,}(?=\/|$)/g, '/:token');
+}
+
+function resolveApiMetricPath(req) {
+  if (!req || typeof req !== 'object') return '/';
+  if (req.route && typeof req.route.path === 'string') {
+    const base = typeof req.baseUrl === 'string' ? req.baseUrl : '';
+    return normalizeApiMetricPath(`${base}${req.route.path}`);
+  }
+  return normalizeApiMetricPath(req.path || req.originalUrl || '/');
+}
+
+function recordApiRequestMetric(payload) {
+  const data = payload && typeof payload === 'object' ? payload : {};
+  const method = String(data.method || 'GET').trim().toUpperCase() || 'GET';
+  const pathName = normalizeApiMetricPath(data.path || '/');
+  const durationMs = Number.isFinite(Number(data.durationMs)) ? Math.max(0, Number(data.durationMs)) : 0;
+  const statusCode = Number(data.statusCode);
+  const safeStatus = Number.isInteger(statusCode) ? statusCode : 0;
+  const key = `${method} ${pathName}`;
+
+  let entry = observabilityState.endpointStats.get(key);
+  if (!entry) {
+    entry = {
+      method,
+      path: pathName,
+      count: 0,
+      errorCount: 0,
+      totalDurationMs: 0,
+      maxDurationMs: 0,
+      recentDurationsMs: [],
+      lastStatus: 0,
+      lastAt: ''
+    };
+    observabilityState.endpointStats.set(key, entry);
+  }
+
+  entry.count += 1;
+  entry.totalDurationMs += durationMs;
+  entry.maxDurationMs = Math.max(entry.maxDurationMs, durationMs);
+  pushLimited(entry.recentDurationsMs, durationMs, observabilityEndpointLatencyLimit);
+  entry.lastStatus = safeStatus;
+  entry.lastAt = nowIso();
+  if (safeStatus >= 400) {
+    entry.errorCount += 1;
+    observabilityState.totalErrors += 1;
+    pushLimited(
+      observabilityState.recentErrors,
+      {
+        at: entry.lastAt,
+        method,
+        path: pathName,
+        status: safeStatus,
+        durationMs
+      },
+      observabilityRecentErrorsLimit
+    );
+  }
+
+  observabilityState.totalRequests += 1;
+  pushLimited(observabilityState.recentLatenciesMs, durationMs, observabilityGlobalLatencyLimit);
+}
+
+function computePercentile(values, percentile) {
+  if (!Array.isArray(values) || values.length === 0) return 0;
+  const safePercentile = Number.isFinite(Number(percentile)) ? Math.max(0, Math.min(100, Number(percentile))) : 0;
+  const sorted = values
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value))
+    .sort((a, b) => a - b);
+  if (sorted.length === 0) return 0;
+  const index = Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.ceil((safePercentile / 100) * sorted.length) - 1)
+  );
+  return sorted[index];
+}
+
+function summarizeLatencySamples(values) {
+  const numbers = Array.isArray(values)
+    ? values.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0)
+    : [];
+  if (numbers.length === 0) {
+    return {
+      sampleCount: 0,
+      avgMs: 0,
+      p50Ms: 0,
+      p95Ms: 0,
+      p99Ms: 0,
+      maxMs: 0
+    };
+  }
+  const total = numbers.reduce((acc, value) => acc + value, 0);
+  const maxMs = numbers.reduce((acc, value) => Math.max(acc, value), 0);
+  return {
+    sampleCount: numbers.length,
+    avgMs: Number((total / numbers.length).toFixed(1)),
+    p50Ms: Number(computePercentile(numbers, 50).toFixed(1)),
+    p95Ms: Number(computePercentile(numbers, 95).toFixed(1)),
+    p99Ms: Number(computePercentile(numbers, 99).toFixed(1)),
+    maxMs: Number(maxMs.toFixed(1))
+  };
+}
+
+function sampleProcessCpuUsagePercent() {
+  const nowMs = Date.now();
+  const usage = process.cpuUsage();
+  const elapsedUs = Math.max(1, (nowMs - processCpuSnapshot.atMs) * 1000);
+  const userDiff = usage.user - processCpuSnapshot.usage.user;
+  const systemDiff = usage.system - processCpuSnapshot.usage.system;
+  const totalUsedUs = Math.max(0, userDiff + systemDiff);
+  const rawPercent = (totalUsedUs / elapsedUs) * 100;
+  processCpuSnapshot = {
+    usage,
+    atMs: nowMs
+  };
+  const logicalCpuCount = Math.max(1, (os.cpus() || []).length);
+  return {
+    processCpuPercent: Number(rawPercent.toFixed(1)),
+    processCpuPerCorePercent: Number((rawPercent / logicalCpuCount).toFixed(1))
+  };
+}
+
+function buildObservabilitySnapshot() {
+  const nowMs = Date.now();
+  const uptimeSeconds = Math.max(0, Math.round(process.uptime()));
+  const processMemory = process.memoryUsage();
+  const totalMemBytes = os.totalmem();
+  const freeMemBytes = os.freemem();
+  const usedMemBytes = Math.max(0, totalMemBytes - freeMemBytes);
+  const usedMemPercent = totalMemBytes > 0 ? (usedMemBytes / totalMemBytes) * 100 : 0;
+  const cpuUsage = sampleProcessCpuUsagePercent();
+  const endpointStats = Array.from(observabilityState.endpointStats.values()).map((entry) => {
+    const latency = summarizeLatencySamples(entry.recentDurationsMs);
+    const requests = Math.max(0, Number(entry.count) || 0);
+    const errors = Math.max(0, Number(entry.errorCount) || 0);
+    return {
+      method: entry.method,
+      path: entry.path,
+      requests,
+      errors,
+      errorRate: requests > 0 ? Number(((errors / requests) * 100).toFixed(1)) : 0,
+      avgMs: latency.avgMs,
+      p95Ms: latency.p95Ms,
+      maxMs: latency.maxMs,
+      lastStatus: Number.isInteger(Number(entry.lastStatus)) ? Number(entry.lastStatus) : 0,
+      lastAt: String(entry.lastAt || '')
+    };
+  });
+  endpointStats.sort((a, b) => {
+    if (b.errors !== a.errors) return b.errors - a.errors;
+    if (b.avgMs !== a.avgMs) return b.avgMs - a.avgMs;
+    return b.requests - a.requests;
+  });
+  const globalLatency = summarizeLatencySamples(observabilityState.recentLatenciesMs);
+  const totalRequests = Math.max(0, Number(observabilityState.totalRequests) || 0);
+  const totalErrors = Math.max(0, Number(observabilityState.totalErrors) || 0);
+
+  return {
+    sampledAt: new Date(nowMs).toISOString(),
+    startedAt: new Date(observabilityState.startedAtMs).toISOString(),
+    uptimeSeconds,
+    process: {
+      pid: process.pid,
+      nodeVersion: process.version,
+      platform: process.platform,
+      cpuPercent: cpuUsage.processCpuPercent,
+      cpuPerCorePercent: cpuUsage.processCpuPerCorePercent,
+      memory: {
+        rssBytes: processMemory.rss,
+        heapUsedBytes: processMemory.heapUsed,
+        heapTotalBytes: processMemory.heapTotal,
+        externalBytes: processMemory.external,
+        arrayBuffersBytes: processMemory.arrayBuffers
+      }
+    },
+    system: {
+      cpuCount: Math.max(1, (os.cpus() || []).length),
+      loadAvg1m: Number((os.loadavg()[0] || 0).toFixed(2)),
+      loadAvg5m: Number((os.loadavg()[1] || 0).toFixed(2)),
+      loadAvg15m: Number((os.loadavg()[2] || 0).toFixed(2)),
+      totalMemBytes,
+      freeMemBytes,
+      usedMemBytes,
+      usedMemPercent: Number(usedMemPercent.toFixed(1))
+    },
+    api: {
+      totalRequests,
+      totalErrors,
+      errorRate: totalRequests > 0 ? Number(((totalErrors / totalRequests) * 100).toFixed(1)) : 0,
+      latency: globalLatency,
+      endpoints: endpointStats.slice(0, observabilityEndpointsLimit),
+      recentErrors: observabilityState.recentErrors.slice().reverse().slice(0, 50)
+    }
+  };
+}
+
+function normalizeToolsSearchQuery(rawValue) {
+  const compact = String(rawValue || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!compact) return '';
+  if (compact.length <= 120) return compact;
+  return compact.slice(0, 120);
+}
+
+function toSqlLikePattern(value) {
+  return `%${String(value || '').toLowerCase()}%`;
+}
+
+function buildSearchSnippet(rawText, rawQuery, maxLen = 190) {
+  const text = String(rawText || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return '';
+  if (!rawQuery) {
+    return text.length > maxLen ? `${text.slice(0, maxLen - 3)}...` : text;
+  }
+  const query = String(rawQuery || '').toLowerCase();
+  const lower = text.toLowerCase();
+  const matchIdx = lower.indexOf(query);
+  if (matchIdx < 0) {
+    return text.length > maxLen ? `${text.slice(0, maxLen - 3)}...` : text;
+  }
+  const contextPadding = Math.max(30, Math.floor(maxLen * 0.35));
+  const start = Math.max(0, matchIdx - contextPadding);
+  const end = Math.min(text.length, start + maxLen);
+  const chunk = text.slice(start, end);
+  const prefix = start > 0 ? '...' : '';
+  const suffix = end < text.length ? '...' : '';
+  return `${prefix}${chunk}${suffix}`;
+}
+
+function serializeTaskCommandRow(row) {
+  const safe = row && typeof row === 'object' ? row : {};
+  const exitCode = Number(safe.exit_code);
+  const parsedId = Number(safe.id);
+  const durationMs = Number(safe.duration_ms);
+  return {
+    id: Number.isInteger(parsedId) ? parsedId : 0,
+    itemId: String(safe.item_id || ''),
+    command: String(safe.command || ''),
+    output: normalizeTaskCommandOutput(safe.output || ''),
+    status: toTaskCommandStatus(safe.status || '', Number.isInteger(exitCode) ? exitCode : null),
+    exitCode: Number.isInteger(exitCode) ? exitCode : null,
+    startedAt: String(safe.started_at || ''),
+    finishedAt: String(safe.finished_at || ''),
+    durationMs: Number.isFinite(durationMs) ? Math.max(0, durationMs) : 0
+  };
+}
+
+function serializeTaskRow(row) {
+  const safe = row && typeof row === 'object' ? row : {};
+  const filesTouched = safeParseJsonArray(safe.files_touched_json)
+    .map((entry) => normalizeRepoRelativePath(entry))
+    .filter(Boolean);
+  const testsExecuted = safeParseJsonArray(safe.tests_json)
+    .map((entry) => String(entry || '').trim())
+    .filter(Boolean);
+  const metrics = safeParseJsonObject(safe.metrics_json);
+  const parsedConversationId = Number(safe.conversation_id);
+  const parsedTaskId = Number(safe.id);
+  const commandTotal = Number(safe.command_total);
+  const commandFailed = Number(safe.command_failed);
+  const durationMs = Number(safe.duration_ms);
+
+  return {
+    id: Number.isInteger(parsedTaskId) ? parsedTaskId : 0,
+    conversationId:
+      Number.isInteger(parsedConversationId) && parsedConversationId > 0 ? parsedConversationId : null,
+    conversationTitle: String(safe.conversation_title || ''),
+    status: normalizeTaskStatus(safe.status || 'running'),
+    result: normalizeTaskResultSummary(safe.result_summary || ''),
+    closeReason: String(safe.close_reason || ''),
+    riskLevel: String(safe.risk_level || 'low'),
+    startedAt: String(safe.started_at || ''),
+    finishedAt: String(safe.finished_at || ''),
+    updatedAt: String(safe.updated_at || ''),
+    durationMs: Number.isFinite(durationMs) ? Math.max(0, durationMs) : 0,
+    filesTouched,
+    testsExecuted,
+    metrics,
+    commandTotal: Number.isFinite(commandTotal) ? Math.max(0, Number(commandTotal)) : 0,
+    commandFailed: Number.isFinite(commandFailed) ? Math.max(0, Number(commandFailed)) : 0,
+    rollbackAvailable: Boolean(Number(safe.rollback_available)),
+    rollbackStatus: String(safe.rollback_status || ''),
+    rollbackError: String(safe.rollback_error || ''),
+    rollbackAt: String(safe.rollback_at || ''),
+    snapshotReady: Boolean(Number(safe.snapshot_ready)),
+    snapshotDir: String(safe.snapshot_dir || ''),
+    planText: normalizeTaskPlanText(safe.plan_text || '')
+  };
+}
+
+function serializeTaskRecovery(row, commandRows, fallbackPlanText = '') {
+  if (!row) return null;
+  const task = serializeTaskRow(row);
+  const commands = Array.isArray(commandRows) ? commandRows.map(serializeTaskCommandRow) : [];
+  const planText = task.planText || normalizeTaskPlanText(fallbackPlanText);
+  return {
+    taskId: task.id,
+    status: task.status,
+    startedAt: task.startedAt,
+    updatedAt: task.updatedAt,
+    planText,
+    commands
+  };
+}
+
+function serializeReasoningMapToText(reasoningMap) {
+  if (!reasoningMap || typeof reasoningMap !== 'object') return '';
+  return normalizeTaskPlanText(
+    Object.values(reasoningMap)
+      .map((entry) => String(entry || '').trim())
+      .filter(Boolean)
+      .join('\n\n')
+  );
+}
+
+function restoreTaskFilesFromSnapshot(snapshotDir, touchedFiles) {
+  const manifest = loadTaskSnapshotManifest(snapshotDir);
+  if (!manifest) {
+    return {
+      restored: 0,
+      removed: 0,
+      failed: 1,
+      touchedFiles: [],
+      errors: ['snapshot_manifest_missing']
+    };
+  }
+  const entryByPath = new Map();
+  manifest.files.forEach((entry) => {
+    entryByPath.set(entry.path, entry);
+  });
+
+  const targetPaths = [];
+  const seen = new Set();
+  (Array.isArray(touchedFiles) ? touchedFiles : []).forEach((entry) => {
+    const normalized = normalizeRepoRelativePath(entry);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    targetPaths.push(normalized);
+  });
+  if (targetPaths.length === 0) {
+    const inferredTouched = detectTouchedFilesFromSnapshot(manifest);
+    inferredTouched.forEach((entry) => {
+      if (!seen.has(entry)) {
+        seen.add(entry);
+        targetPaths.push(entry);
+      }
+    });
+  }
+
+  let restored = 0;
+  let removed = 0;
+  let failed = 0;
+  const errors = [];
+
+  targetPaths.forEach((relPath) => {
+    const absolutePath = resolveRepoPathFromRelative(relPath);
+    if (!absolutePath) return;
+    const snapshotEntry = entryByPath.get(relPath);
+    try {
+      if (snapshotEntry) {
+        ensureParentDirForFile(absolutePath);
+        if (pathExistsOrSymlink(absolutePath)) {
+          fs.rmSync(absolutePath, { recursive: true, force: true });
+        }
+        if (snapshotEntry.type === 'symlink') {
+          fs.symlinkSync(snapshotEntry.linkTarget || '', absolutePath);
+          restored += 1;
+          return;
+        }
+        const backupPath = normalizeRepoRelativePath(snapshotEntry.backupPath);
+        const backupAbsolutePath = backupPath
+          ? path.join(snapshotDir, ...backupPath.split('/'))
+          : '';
+        if (!backupAbsolutePath || !fs.existsSync(backupAbsolutePath)) {
+          failed += 1;
+          errors.push(`backup_missing:${relPath}`);
+          return;
+        }
+        fs.copyFileSync(backupAbsolutePath, absolutePath);
+        if (Number.isInteger(snapshotEntry.mode) && snapshotEntry.mode > 0) {
+          try {
+            fs.chmodSync(absolutePath, snapshotEntry.mode);
+          } catch (_error) {
+            // best-effort mode restore
+          }
+        }
+        restored += 1;
+        return;
+      }
+
+      if (pathExistsOrSymlink(absolutePath)) {
+        fs.rmSync(absolutePath, { recursive: true, force: true });
+        removed += 1;
+      }
+    } catch (error) {
+      failed += 1;
+      errors.push(
+        `${relPath}:${truncateForNotify(error && error.message ? error.message : 'restore_failed', 160)}`
+      );
+    }
+  });
+
+  return {
+    restored,
+    removed,
+    failed,
+    touchedFiles: targetPaths,
+    errors
+  };
 }
 
 function sanitizeFilename(name) {
@@ -1135,6 +2659,342 @@ function buildPromptWithConversationHistory(currentPrompt, conversationMessages)
   return lines.join('\n');
 }
 
+function normalizeRepoRelativePath(value) {
+  return String(value || '')
+    .replace(/\\/g, '/')
+    .replace(/^\.?\//, '')
+    .trim();
+}
+
+function shouldIgnoreRepoDir(name) {
+  const dirName = String(name || '').trim().toLowerCase();
+  if (!dirName) return true;
+  if (repoContextIgnoredDirs.has(dirName)) return true;
+  if (dirName.startsWith('.') && dirName !== '.github') return true;
+  return false;
+}
+
+function shouldIncludeRepoFile(fileName, relativePath) {
+  const normalized = normalizeRepoRelativePath(relativePath).toLowerCase();
+  if (!normalized) return false;
+  if (
+    normalized.startsWith('uploads/') ||
+    normalized.startsWith('.codex_users/') ||
+    normalized.startsWith('public/assets/') ||
+    normalized.includes('/node_modules/')
+  ) {
+    return false;
+  }
+
+  const baseName = String(fileName || '').trim().toLowerCase();
+  if (!baseName) return false;
+  if (repoContextAllowedBareNames.has(baseName)) return true;
+  const ext = path.extname(baseName);
+  if (!ext || !repoContextAllowedTextExtensions.has(ext)) return false;
+  if (baseName.endsWith('.min.js') || baseName.endsWith('.min.css')) return false;
+  return true;
+}
+
+function detectRepoStackHints(indexedFiles) {
+  const lowerPaths = new Set(
+    (Array.isArray(indexedFiles) ? indexedFiles : []).map((file) => String(file && file.lowerPath).toLowerCase())
+  );
+  const hasTs = Array.from(lowerPaths).some((entry) => entry.endsWith('.ts') || entry.endsWith('.tsx'));
+  const hasReact = Array.from(lowerPaths).some((entry) => entry.endsWith('.tsx') || entry.endsWith('.jsx'));
+  const hints = [];
+
+  if (lowerPaths.has('package.json')) hints.push('Node.js');
+  if (hasTs || lowerPaths.has('tsconfig.json')) hints.push('TypeScript');
+  if (hasReact) hints.push('React');
+  if (lowerPaths.has('server.js') || Array.from(lowerPaths).some((entry) => entry.startsWith('server/'))) {
+    hints.push('Backend JavaScript');
+  }
+  if (lowerPaths.has('readme.md')) hints.push('README');
+  return hints.slice(0, 5);
+}
+
+function buildRepoContextIndex() {
+  const now = Date.now();
+  if (repoContextIndexCache && now - repoContextIndexCache.indexedAtMs < repoContextScanTtlMs) {
+    return repoContextIndexCache;
+  }
+
+  const indexedFiles = [];
+  const topLevelEntries = [];
+  const pendingDirs = [{ absPath: repoRootDir, relPath: '', depth: 0 }];
+
+  while (pendingDirs.length > 0 && indexedFiles.length < repoContextMaxIndexedFiles) {
+    const current = pendingDirs.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(current.absPath, { withFileTypes: true });
+    } catch (_error) {
+      continue;
+    }
+
+    entries.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+    if (current.depth === 0) {
+      entries.forEach((entry) => {
+        if (topLevelEntries.length >= repoContextMaxTopLevelEntries) return;
+        if (shouldIgnoreRepoDir(entry.name)) return;
+        topLevelEntries.push(entry.name);
+      });
+    }
+
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      const name = String(entry && entry.name ? entry.name : '').trim();
+      if (!name) continue;
+      const relativePath = current.relPath ? `${current.relPath}/${name}` : name;
+      const normalizedRel = normalizeRepoRelativePath(relativePath).toLowerCase();
+      if (!normalizedRel) continue;
+      if (entry.isSymbolicLink && entry.isSymbolicLink()) continue;
+
+      if (entry.isDirectory()) {
+        if (shouldIgnoreRepoDir(name)) continue;
+        if (
+          normalizedRel === 'dixit/cards' ||
+          normalizedRel.startsWith('uploads/') ||
+          normalizedRel.startsWith('.codex_users/') ||
+          normalizedRel.startsWith('public/assets/')
+        ) {
+          continue;
+        }
+        pendingDirs.push({
+          absPath: path.join(current.absPath, name),
+          relPath: relativePath,
+          depth: current.depth + 1
+        });
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (!shouldIncludeRepoFile(name, relativePath)) continue;
+      indexedFiles.push({
+        relativePath,
+        lowerPath: normalizedRel,
+        baseLower: name.toLowerCase()
+      });
+      if (indexedFiles.length >= repoContextMaxIndexedFiles) {
+        break;
+      }
+    }
+  }
+
+  indexedFiles.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  const nextCache = {
+    rootDir: repoRootDir,
+    indexedAtMs: now,
+    files: indexedFiles,
+    topLevelEntries,
+    stackHints: detectRepoStackHints(indexedFiles)
+  };
+  repoContextIndexCache = nextCache;
+  return nextCache;
+}
+
+function extractRepoQueryTokens(text) {
+  const source = String(text || '').toLowerCase();
+  if (!source) return [];
+  const rawParts = source.match(/[a-z0-9._/-]{2,}/g) || [];
+  const unique = new Set();
+  const result = [];
+
+  const pushToken = (rawValue) => {
+    const token = String(rawValue || '')
+      .toLowerCase()
+      .replace(/^[._/-]+|[._/-]+$/g, '');
+    if (!token) return;
+    if (token.length < 2) return;
+    if (/^\d+$/.test(token)) return;
+    if (repoContextStopWords.has(token)) return;
+    if (unique.has(token)) return;
+    unique.add(token);
+    result.push(token);
+  };
+
+  rawParts.forEach((part) => {
+    pushToken(part);
+    if (part.includes('/')) {
+      part.split('/').forEach((segment) => pushToken(segment));
+    }
+    if (part.includes('.')) {
+      part.split('.').forEach((segment) => pushToken(segment));
+    }
+  });
+
+  return result.slice(0, 28);
+}
+
+function extractExplicitRepoPaths(text) {
+  const source = String(text || '');
+  const matches = source.match(/(?:\.{0,2}\/)?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+/g) || [];
+  const normalized = new Set();
+  matches.forEach((entry) => {
+    const cleaned = String(entry || '').replace(/^[`"'([{]+|[`"')\]},.:;!?]+$/g, '');
+    const relative = normalizeRepoRelativePath(cleaned).toLowerCase();
+    if (relative) {
+      normalized.add(relative);
+    }
+  });
+  return normalized;
+}
+
+function extractExplicitRepoFilenames(text) {
+  const source = String(text || '').toLowerCase();
+  const matches = source.match(/\b[a-z0-9_.-]+\.[a-z0-9_-]{1,8}\b/g) || [];
+  return new Set(matches.map((entry) => String(entry || '').trim()).filter(Boolean));
+}
+
+function selectDefaultRepoCandidates(indexedFiles) {
+  const preferredPaths = [
+    'server.js',
+    'package.json',
+    'readme.md',
+    'stitch_frontend/src/components/chatscreen.tsx',
+    'stitch_frontend/src/app.tsx'
+  ];
+  const chosen = [];
+  preferredPaths.forEach((target) => {
+    if (chosen.length >= repoContextMaxCandidates) return;
+    const hit = indexedFiles.find((file) => file.lowerPath === target);
+    if (!hit) return;
+    chosen.push({
+      relativePath: hit.relativePath,
+      score: 1,
+      matches: ['base']
+    });
+  });
+  if (chosen.length >= repoContextMaxCandidates) {
+    return chosen;
+  }
+
+  const extras = indexedFiles
+    .filter((file) => !chosen.some((entry) => entry.relativePath === file.relativePath))
+    .slice(0, repoContextMaxCandidates - chosen.length)
+    .map((file) => ({
+      relativePath: file.relativePath,
+      score: 1,
+      matches: ['base']
+    }));
+  return [...chosen, ...extras];
+}
+
+function rankRepoFilesForPrompt(promptText) {
+  const contextIndex = buildRepoContextIndex();
+  const indexedFiles = contextIndex.files;
+  if (!indexedFiles || indexedFiles.length === 0) {
+    return {
+      rootDir: contextIndex.rootDir,
+      stackHints: contextIndex.stackHints,
+      topLevelEntries: contextIndex.topLevelEntries,
+      candidates: []
+    };
+  }
+
+  const tokens = extractRepoQueryTokens(promptText);
+  const explicitPaths = extractExplicitRepoPaths(promptText);
+  const explicitPathList = Array.from(explicitPaths);
+  const explicitFilenames = extractExplicitRepoFilenames(promptText);
+
+  const scored = [];
+  indexedFiles.forEach((file) => {
+    let score = 0;
+    const matchedTokens = new Set();
+
+    if (
+      explicitPaths.has(file.lowerPath) ||
+      explicitPathList.some((entry) => file.lowerPath === entry || file.lowerPath.endsWith(`/${entry}`))
+    ) {
+      score += 360;
+      matchedTokens.add('ruta');
+    }
+    if (explicitFilenames.has(file.baseLower)) {
+      score += 190;
+      matchedTokens.add(file.baseLower);
+    }
+
+    tokens.forEach((token) => {
+      let tokenMatched = false;
+
+      if (file.baseLower === token) {
+        score += 180;
+        tokenMatched = true;
+      } else if (
+        file.baseLower.startsWith(`${token}.`) ||
+        file.baseLower.startsWith(`${token}-`) ||
+        file.baseLower.startsWith(`${token}_`)
+      ) {
+        score += 120;
+        tokenMatched = true;
+      } else if (file.baseLower.includes(token)) {
+        score += 70;
+        tokenMatched = true;
+      }
+
+      if (file.lowerPath.includes(`/${token}/`) || file.lowerPath.endsWith(`/${token}`)) {
+        score += 55;
+        tokenMatched = true;
+      } else if (file.lowerPath.includes(token)) {
+        score += 25;
+        tokenMatched = true;
+      }
+
+      if (tokenMatched && matchedTokens.size < 4) {
+        matchedTokens.add(token);
+      }
+    });
+
+    if (score > 0) {
+      scored.push({
+        relativePath: file.relativePath,
+        score,
+        matches: Array.from(matchedTokens).slice(0, 4)
+      });
+    }
+  });
+
+  scored.sort((a, b) => b.score - a.score || a.relativePath.localeCompare(b.relativePath));
+  const selected = scored.slice(0, repoContextMaxCandidates);
+  const candidates = selected.length > 0 ? selected : selectDefaultRepoCandidates(indexedFiles);
+
+  return {
+    rootDir: contextIndex.rootDir,
+    stackHints: contextIndex.stackHints,
+    topLevelEntries: contextIndex.topLevelEntries,
+    candidates
+  };
+}
+
+function buildPromptWithRepoContext(currentPrompt, userPrompt) {
+  const context = rankRepoFilesForPrompt(userPrompt);
+  const candidates = Array.isArray(context.candidates) ? context.candidates : [];
+  if (candidates.length === 0) {
+    return currentPrompt;
+  }
+
+  const lines = [currentPrompt, '', 'Contexto automatico del repo (deteccion previa de CodexWeb):'];
+  lines.push(`Raiz detectada: ${context.rootDir}`);
+
+  if (Array.isArray(context.stackHints) && context.stackHints.length > 0) {
+    lines.push(`Stack probable: ${context.stackHints.join(', ')}`);
+  }
+  if (Array.isArray(context.topLevelEntries) && context.topLevelEntries.length > 0) {
+    lines.push(`Top-level: ${context.topLevelEntries.join(', ')}`);
+  }
+
+  lines.push('Archivos posiblemente relevantes para esta consulta:');
+  candidates.forEach((entry, index) => {
+    const matchHint =
+      Array.isArray(entry.matches) && entry.matches.length > 0
+        ? ` [match: ${entry.matches.join(', ')}]`
+        : '';
+    lines.push(`${index + 1}. ${entry.relativePath}${matchHint}`);
+  });
+
+  lines.push('Toma esto como punto de partida y valida en los archivos reales antes de editar.');
+  return lines.join('\n');
+}
+
 function notifyMilestone(key, message) {
   if (sentMilestones.has(key)) return;
   sentMilestones.add(key);
@@ -1320,10 +3180,73 @@ CREATE TABLE IF NOT EXISTS chat_live_drafts (
 
 CREATE INDEX IF NOT EXISTS idx_chat_live_drafts_user_conversation
 ON chat_live_drafts(user_id, conversation_id, completed, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS task_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  conversation_id INTEGER,
+  request_id TEXT NOT NULL UNIQUE,
+  prompt_text TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  reasoning_effort TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'running',
+  close_reason TEXT NOT NULL DEFAULT '',
+  result_summary TEXT NOT NULL DEFAULT '',
+  plan_text TEXT NOT NULL DEFAULT '',
+  risk_level TEXT NOT NULL DEFAULT 'low',
+  snapshot_dir TEXT NOT NULL DEFAULT '',
+  snapshot_ready INTEGER NOT NULL DEFAULT 0,
+  files_touched_json TEXT NOT NULL DEFAULT '[]',
+  tests_json TEXT NOT NULL DEFAULT '[]',
+  metrics_json TEXT NOT NULL DEFAULT '{}',
+  command_total INTEGER NOT NULL DEFAULT 0,
+  command_failed INTEGER NOT NULL DEFAULT 0,
+  rollback_available INTEGER NOT NULL DEFAULT 0,
+  rollback_status TEXT NOT NULL DEFAULT '',
+  rollback_error TEXT NOT NULL DEFAULT '',
+  rollback_at TEXT NOT NULL DEFAULT '',
+  started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  finished_at TEXT NOT NULL DEFAULT '',
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_runs_user_started
+ON task_runs(user_id, started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_task_runs_user_conversation_started
+ON task_runs(user_id, conversation_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS task_run_commands (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_run_id INTEGER NOT NULL,
+  item_id TEXT NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0,
+  command TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT '',
+  output TEXT NOT NULL DEFAULT '',
+  exit_code INTEGER,
+  started_at TEXT NOT NULL DEFAULT '',
+  finished_at TEXT NOT NULL DEFAULT '',
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+  UNIQUE(task_run_id, item_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_run_commands_task_position
+ON task_run_commands(task_run_id, position ASC, id ASC);
 `);
 
 function hasConversationColumn(columnName) {
   const columns = db.prepare('PRAGMA table_info(conversations)').all();
+  return columns.some((column) => String(column && column.name) === columnName);
+}
+
+function hasUserColumn(columnName) {
+  const columns = db.prepare('PRAGMA table_info(users)').all();
   return columns.some((column) => String(column && column.name) === columnName);
 }
 
@@ -1337,6 +3260,18 @@ if (!hasConversationColumn('reasoning_effort')) {
   );
 }
 
+if (!hasUserColumn('discord_webhook_url')) {
+  db.exec("ALTER TABLE users ADD COLUMN discord_webhook_url TEXT NOT NULL DEFAULT ''");
+}
+
+if (!hasUserColumn('discord_notify_on_finish')) {
+  db.exec('ALTER TABLE users ADD COLUMN discord_notify_on_finish INTEGER NOT NULL DEFAULT 0');
+}
+
+if (!hasUserColumn('discord_include_result')) {
+  db.exec('ALTER TABLE users ADD COLUMN discord_include_result INTEGER NOT NULL DEFAULT 0');
+}
+
 db.exec(`
 UPDATE conversations
 SET model = COALESCE(model, '')
@@ -1347,6 +3282,19 @@ SET reasoning_effort = CASE
   WHEN reasoning_effort IN ('minimal', 'low', 'medium', 'high', 'xhigh') THEN reasoning_effort
   ELSE '${DEFAULT_REASONING_EFFORT}'
 END
+`);
+db.exec(`
+UPDATE users
+SET
+  discord_webhook_url = COALESCE(discord_webhook_url, ''),
+  discord_notify_on_finish = CASE
+    WHEN discord_notify_on_finish IN (0, 1) THEN discord_notify_on_finish
+    ELSE 0
+  END,
+  discord_include_result = CASE
+    WHEN discord_include_result IN (0, 1) THEN discord_include_result
+    ELSE 0
+  END
 `);
 
 const createConversationStmt = db.prepare(
@@ -1363,6 +3311,9 @@ const getConversationStmt = db.prepare(
 );
 const updateConversationTitleStmt = db.prepare(
   "UPDATE conversations SET title = ? WHERE id = ? AND (title = 'Nuevo chat' OR title = '')"
+);
+const renameConversationTitleStmt = db.prepare(
+  'UPDATE conversations SET title = ? WHERE id = ?'
 );
 const listConversationsStmt = db.prepare(`
   SELECT
@@ -1396,6 +3347,17 @@ const listConversationsStmt = db.prepare(`
 `);
 const updateConversationSettingsStmt = db.prepare(
   'UPDATE conversations SET model = ?, reasoning_effort = ? WHERE id = ?'
+);
+const getUserNotificationSettingsStmt = db.prepare(`
+  SELECT
+    discord_webhook_url,
+    discord_notify_on_finish,
+    discord_include_result
+  FROM users
+  WHERE id = ?
+`);
+const updateUserNotificationSettingsStmt = db.prepare(
+  'UPDATE users SET discord_webhook_url = ?, discord_notify_on_finish = ?, discord_include_result = ? WHERE id = ?'
 );
 const listMessagesStmt = db.prepare(`
   SELECT id, role, content, created_at
@@ -1474,6 +3436,378 @@ const getOpenLiveDraftForConversationStmt = db.prepare(`
   ORDER BY updated_at DESC, id DESC
   LIMIT 1
 `);
+const insertTaskRunStmt = db.prepare(`
+  INSERT INTO task_runs (
+    user_id,
+    conversation_id,
+    request_id,
+    prompt_text,
+    model,
+    reasoning_effort,
+    status,
+    snapshot_dir,
+    snapshot_ready,
+    started_at,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, 'running', '', 0, ?, ?)
+`);
+const updateTaskRunSnapshotStmt = db.prepare(`
+  UPDATE task_runs
+  SET
+    snapshot_dir = ?,
+    snapshot_ready = ?,
+    updated_at = ?
+  WHERE id = ? AND user_id = ?
+`);
+const completeTaskRunStmt = db.prepare(`
+  UPDATE task_runs
+  SET
+    status = ?,
+    close_reason = ?,
+    result_summary = ?,
+    plan_text = ?,
+    risk_level = ?,
+    files_touched_json = ?,
+    tests_json = ?,
+    metrics_json = ?,
+    command_total = ?,
+    command_failed = ?,
+    rollback_available = ?,
+    finished_at = ?,
+    duration_ms = ?,
+    updated_at = ?
+  WHERE id = ? AND user_id = ?
+`);
+const markTaskRunRollbackStmt = db.prepare(`
+  UPDATE task_runs
+  SET
+    status = 'rolled_back',
+    rollback_status = ?,
+    rollback_error = ?,
+    rollback_at = ?,
+    rollback_available = ?,
+    close_reason = ?,
+    updated_at = ?
+  WHERE id = ? AND user_id = ?
+`);
+const markTaskRunRollbackFailedStmt = db.prepare(`
+  UPDATE task_runs
+  SET
+    rollback_status = ?,
+    rollback_error = ?,
+    rollback_at = ?,
+    updated_at = ?
+  WHERE id = ? AND user_id = ?
+`);
+const getTaskRunByIdForUserStmt = db.prepare(`
+  SELECT
+    t.*,
+    c.title AS conversation_title
+  FROM task_runs t
+  LEFT JOIN conversations c
+    ON c.id = t.conversation_id
+  WHERE t.id = ? AND t.user_id = ?
+  LIMIT 1
+`);
+const listTaskRunsForUserStmt = db.prepare(`
+  SELECT
+    t.*,
+    c.title AS conversation_title
+  FROM task_runs t
+  LEFT JOIN conversations c
+    ON c.id = t.conversation_id
+  WHERE t.user_id = ?
+  ORDER BY t.started_at DESC, t.id DESC
+  LIMIT ?
+`);
+const searchConversationsStmt = db.prepare(`
+  SELECT
+    c.id AS conversation_id,
+    c.title,
+    c.created_at,
+    (
+      SELECT MAX(m.created_at)
+      FROM messages m
+      WHERE m.conversation_id = c.id
+    ) AS last_message_at,
+    (
+      SELECT m.content
+      FROM messages m
+      WHERE m.conversation_id = c.id
+      ORDER BY m.created_at DESC, m.id DESC
+      LIMIT 1
+    ) AS last_message
+  FROM conversations c
+  WHERE c.user_id = ?
+    AND (
+      LOWER(c.title) LIKE ?
+      OR EXISTS (
+        SELECT 1
+        FROM messages m
+        WHERE m.conversation_id = c.id
+          AND LOWER(m.content) LIKE ?
+      )
+    )
+  ORDER BY COALESCE(last_message_at, c.created_at) DESC, c.id DESC
+  LIMIT ?
+`);
+const searchTaskCommandsStmt = db.prepare(`
+  SELECT
+    cmd.id,
+    cmd.command,
+    cmd.output,
+    cmd.status,
+    cmd.exit_code,
+    cmd.started_at,
+    cmd.finished_at,
+    cmd.duration_ms,
+    task.id AS task_id,
+    task.conversation_id,
+    task.updated_at AS task_updated_at,
+    conv.title AS conversation_title
+  FROM task_run_commands cmd
+  INNER JOIN task_runs task
+    ON task.id = cmd.task_run_id
+  LEFT JOIN conversations conv
+    ON conv.id = task.conversation_id
+  WHERE task.user_id = ?
+    AND (
+      LOWER(cmd.command) LIKE ?
+      OR LOWER(cmd.output) LIKE ?
+    )
+  ORDER BY COALESCE(cmd.finished_at, cmd.started_at, task.updated_at) DESC, cmd.id DESC
+  LIMIT ?
+`);
+const searchTaskErrorsStmt = db.prepare(`
+  SELECT
+    task.id,
+    task.conversation_id,
+    conv.title AS conversation_title,
+    task.status,
+    task.close_reason,
+    task.result_summary,
+    task.command_failed,
+    task.updated_at,
+    task.finished_at,
+    task.started_at
+  FROM task_runs task
+  LEFT JOIN conversations conv
+    ON conv.id = task.conversation_id
+  WHERE task.user_id = ?
+    AND (
+      task.status = 'failed'
+      OR task.command_failed > 0
+      OR LENGTH(task.close_reason) > 0
+    )
+    AND (
+      LOWER(task.close_reason) LIKE ?
+      OR LOWER(task.result_summary) LIKE ?
+      OR LOWER(task.plan_text) LIKE ?
+    )
+  ORDER BY COALESCE(task.finished_at, task.updated_at, task.started_at) DESC, task.id DESC
+  LIMIT ?
+`);
+const searchTaskFilesStmt = db.prepare(`
+  SELECT
+    task.id,
+    task.conversation_id,
+    conv.title AS conversation_title,
+    task.files_touched_json,
+    task.updated_at,
+    task.finished_at,
+    task.started_at
+  FROM task_runs task
+  LEFT JOIN conversations conv
+    ON conv.id = task.conversation_id
+  WHERE task.user_id = ?
+    AND LOWER(task.files_touched_json) LIKE ?
+  ORDER BY COALESCE(task.finished_at, task.updated_at, task.started_at) DESC, task.id DESC
+  LIMIT ?
+`);
+const getLatestTaskRunForConversationStmt = db.prepare(`
+  SELECT
+    t.*,
+    c.title AS conversation_title
+  FROM task_runs t
+  LEFT JOIN conversations c
+    ON c.id = t.conversation_id
+  WHERE t.user_id = ?
+    AND t.conversation_id = ?
+  ORDER BY t.started_at DESC, t.id DESC
+  LIMIT 1
+`);
+const getTaskRunCommandByItemStmt = db.prepare(`
+  SELECT
+    id,
+    task_run_id,
+    item_id,
+    position,
+    command,
+    status,
+    output,
+    exit_code,
+    started_at,
+    finished_at,
+    duration_ms,
+    updated_at
+  FROM task_run_commands
+  WHERE task_run_id = ?
+    AND item_id = ?
+  LIMIT 1
+`);
+const insertTaskRunCommandStmt = db.prepare(`
+  INSERT INTO task_run_commands (
+    task_run_id,
+    item_id,
+    position,
+    command,
+    status,
+    output,
+    exit_code,
+    started_at,
+    finished_at,
+    duration_ms,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+const updateTaskRunCommandStmt = db.prepare(`
+  UPDATE task_run_commands
+  SET
+    position = ?,
+    command = ?,
+    status = ?,
+    output = ?,
+    exit_code = ?,
+    started_at = ?,
+    finished_at = ?,
+    duration_ms = ?,
+    updated_at = ?
+  WHERE task_run_id = ?
+    AND item_id = ?
+`);
+const listTaskRunCommandsStmt = db.prepare(`
+  SELECT
+    id,
+    task_run_id,
+    item_id,
+    position,
+    command,
+    status,
+    output,
+    exit_code,
+    started_at,
+    finished_at,
+    duration_ms,
+    updated_at
+  FROM task_run_commands
+  WHERE task_run_id = ?
+  ORDER BY position ASC, id ASC
+  LIMIT ?
+`);
+const markStaleRunningTaskRunsStmt = db.prepare(`
+  UPDATE task_runs
+  SET
+    status = 'failed',
+    close_reason = 'server_restarted',
+    finished_at = ?,
+    rollback_available = CASE
+      WHEN snapshot_ready = 1 THEN rollback_available
+      ELSE 0
+    END,
+    updated_at = ?
+  WHERE status = 'running'
+`);
+
+function resolveTaskDurationMs(startedAt, finishedAt, fallbackDuration = null) {
+  if (Number.isFinite(Number(fallbackDuration))) {
+    return Math.max(0, Number(fallbackDuration));
+  }
+  const startedMs = Date.parse(String(startedAt || ''));
+  const finishedMs = Date.parse(String(finishedAt || ''));
+  if (Number.isFinite(startedMs) && Number.isFinite(finishedMs)) {
+    return Math.max(0, finishedMs - startedMs);
+  }
+  return 0;
+}
+
+function upsertTaskRunCommandRecord(taskRunId, itemId, payload = {}) {
+  const safeTaskRunId = Number(taskRunId);
+  const safeItemId = String(itemId || '').trim();
+  if (!Number.isInteger(safeTaskRunId) || safeTaskRunId <= 0 || !safeItemId) {
+    return null;
+  }
+
+  const existing = getTaskRunCommandByItemStmt.get(safeTaskRunId, safeItemId);
+  const now = nowIso();
+  const nextPositionRaw = Number(payload.position);
+  const nextPosition =
+    Number.isInteger(nextPositionRaw) && nextPositionRaw > 0
+      ? nextPositionRaw
+      : existing && Number.isInteger(Number(existing.position)) && Number(existing.position) > 0
+        ? Number(existing.position)
+        : 0;
+  const nextCommand =
+    String(payload.command || '').trim() ||
+    String((existing && existing.command) || '').trim() ||
+    '(comando)';
+  const payloadExit = Number(payload.exitCode);
+  const nextExitCode = Number.isInteger(payloadExit)
+    ? payloadExit
+    : Number.isInteger(Number(existing && existing.exit_code))
+      ? Number(existing.exit_code)
+      : null;
+  const nextStatus = toTaskCommandStatus(
+    String(payload.status || (existing && existing.status) || ''),
+    nextExitCode
+  );
+  const nextOutput =
+    payload.output !== undefined
+      ? normalizeTaskCommandOutput(payload.output)
+      : normalizeTaskCommandOutput((existing && existing.output) || '');
+  const nextStartedAt =
+    String(payload.startedAt || '').trim() ||
+    String((existing && existing.started_at) || '').trim() ||
+    now;
+  const nextFinishedAt =
+    String(payload.finishedAt || '').trim() ||
+    String((existing && existing.finished_at) || '').trim() ||
+    '';
+  const nextDurationMs = resolveTaskDurationMs(nextStartedAt, nextFinishedAt, payload.durationMs);
+
+  if (!existing) {
+    insertTaskRunCommandStmt.run(
+      safeTaskRunId,
+      safeItemId,
+      nextPosition,
+      nextCommand,
+      nextStatus,
+      nextOutput,
+      nextExitCode,
+      nextStartedAt,
+      nextFinishedAt,
+      nextDurationMs,
+      now
+    );
+    return getTaskRunCommandByItemStmt.get(safeTaskRunId, safeItemId) || null;
+  }
+
+  updateTaskRunCommandStmt.run(
+    nextPosition,
+    nextCommand,
+    nextStatus,
+    nextOutput,
+    nextExitCode,
+    nextStartedAt,
+    nextFinishedAt,
+    nextDurationMs,
+    now,
+    safeTaskRunId,
+    safeItemId
+  );
+  return getTaskRunCommandByItemStmt.get(safeTaskRunId, safeItemId) || null;
+}
 
 app.use(
   helmet({
@@ -1509,6 +3843,26 @@ app.use(
 );
 
 app.use(express.static(path.join(__dirname, 'public')));
+
+app.use((req, res, next) => {
+  const pathName = String(req.path || '');
+  if (!pathName.startsWith('/api/') && pathName !== '/health') {
+    next();
+    return;
+  }
+  const startedAtNs = process.hrtime.bigint();
+  res.on('finish', () => {
+    const endedAtNs = process.hrtime.bigint();
+    const durationMs = Number(endedAtNs - startedAtNs) / 1e6;
+    recordApiRequestMetric({
+      method: req.method,
+      path: resolveApiMetricPath(req),
+      statusCode: res.statusCode,
+      durationMs
+    });
+  });
+  next();
+});
 
 app.use((req, res, next) => {
   const sensitiveRoutes = new Set(['/api/login', '/api/logout', '/api/uploads', '/api/chat', '/api/restart', '/health']);
@@ -1552,6 +3906,28 @@ function sanitizeReasoningEffort(rawValue, fallback = DEFAULT_REASONING_EFFORT) 
     return fallback;
   }
   return DEFAULT_REASONING_EFFORT;
+}
+
+function normalizeUserNotificationSettings(rawValue) {
+  const row = rawValue && typeof rawValue === 'object' ? rawValue : {};
+  const webhookUrl = sanitizeDiscordWebhookUrl(row.discord_webhook_url, '');
+  return {
+    discordWebhookUrl: webhookUrl,
+    notifyOnFinish: Number(row.discord_notify_on_finish) === 1,
+    includeResult: Number(row.discord_include_result) === 1
+  };
+}
+
+function getUserNotificationSettings(userId) {
+  const row = getUserNotificationSettingsStmt.get(userId);
+  return normalizeUserNotificationSettings(row);
+}
+
+function parseBooleanSetting(rawValue, fallback) {
+  if (typeof rawValue === 'boolean') return rawValue;
+  if (rawValue === 1 || rawValue === '1') return true;
+  if (rawValue === 0 || rawValue === '0') return false;
+  return Boolean(fallback);
 }
 
 function getOwnedConversationOrNull(conversationId, userId) {
@@ -1819,13 +4195,97 @@ app.get('/api/me', (req, res) => {
   });
 });
 
+app.get('/api/settings/notifications', requireAuth, (req, res) => {
+  const notifications = getUserNotificationSettings(req.session.userId);
+  return res.json({
+    ok: true,
+    notifications
+  });
+});
+
+app.patch('/api/settings/notifications', requireAuth, (req, res) => {
+  const currentSettings = getUserNotificationSettings(req.session.userId);
+  const webhookWasProvided =
+    req.body && Object.prototype.hasOwnProperty.call(req.body, 'discordWebhookUrl');
+  const notifyWasProvided =
+    req.body && Object.prototype.hasOwnProperty.call(req.body, 'notifyOnFinish');
+  const includeWasProvided =
+    req.body && Object.prototype.hasOwnProperty.call(req.body, 'includeResult');
+
+  const rawWebhookUrl = webhookWasProvided ? req.body.discordWebhookUrl : currentSettings.discordWebhookUrl;
+  if (webhookWasProvided && typeof rawWebhookUrl !== 'string') {
+    return res.status(400).json({ error: 'Webhook de Discord inválido' });
+  }
+  const normalizedWebhook = sanitizeDiscordWebhookUrl(rawWebhookUrl, '');
+  if (webhookWasProvided && String(rawWebhookUrl || '').trim() && !normalizedWebhook) {
+    return res.status(400).json({ error: 'Webhook de Discord inválido' });
+  }
+
+  let notifyOnFinish = currentSettings.notifyOnFinish;
+  if (notifyWasProvided) {
+    const rawNotify = req.body.notifyOnFinish;
+    const rawType = typeof rawNotify;
+    if (
+      !(
+        rawType === 'boolean' ||
+        rawNotify === 0 ||
+        rawNotify === 1 ||
+        rawNotify === '0' ||
+        rawNotify === '1'
+      )
+    ) {
+      return res.status(400).json({ error: 'Valor inválido para notifyOnFinish' });
+    }
+    notifyOnFinish = parseBooleanSetting(rawNotify, currentSettings.notifyOnFinish);
+  }
+
+  let includeResult = currentSettings.includeResult;
+  if (includeWasProvided) {
+    const rawInclude = req.body.includeResult;
+    const rawType = typeof rawInclude;
+    if (
+      !(
+        rawType === 'boolean' ||
+        rawInclude === 0 ||
+        rawInclude === 1 ||
+        rawInclude === '0' ||
+        rawInclude === '1'
+      )
+    ) {
+      return res.status(400).json({ error: 'Valor inválido para includeResult' });
+    }
+    includeResult = parseBooleanSetting(rawInclude, currentSettings.includeResult);
+  }
+
+  if (notifyOnFinish && !sanitizeDiscordWebhookUrl(normalizedWebhook, defaultWebhookUrl)) {
+    return res.status(400).json({ error: 'Configura un webhook de Discord antes de habilitar notificaciones' });
+  }
+
+  updateUserNotificationSettingsStmt.run(
+    normalizedWebhook,
+    notifyOnFinish ? 1 : 0,
+    includeResult ? 1 : 0,
+    req.session.userId
+  );
+  const notifications = getUserNotificationSettings(req.session.userId);
+  return res.json({
+    ok: true,
+    notifications
+  });
+});
+
 app.post('/api/restart', requireAuth, (req, res) => {
   if (restartScheduled) {
     return res.status(409).json({ error: 'Ya hay un reinicio en progreso' });
   }
 
   const username = truncateForNotify(req.session && req.session.username ? req.session.username : 'anon');
-  const attempt = beginRestartAttempt(username);
+  const userNotificationSettings = getUserNotificationSettings(req.session.userId);
+  const restartWebhookUrl = sanitizeDiscordWebhookUrl(
+    userNotificationSettings.discordWebhookUrl,
+    defaultWebhookUrl
+  );
+  const attempt = beginRestartAttempt(username, { webhookUrl: restartWebhookUrl });
   try {
     restartScheduled = true;
     setRestartPhase('scheduling');
@@ -1833,7 +4293,16 @@ app.post('/api/restart', requireAuth, (req, res) => {
     scheduleApplicationRestart(attempt.attemptId);
     pushRestartLog('Helper de reinicio lanzado');
     setRestartPhase('waiting_shutdown');
-    void notify(`RESTART requested user=${username}`);
+    const restartMessage = buildRestartDiscordMessage({
+      status: 'requested',
+      username,
+      attemptId: attempt.attemptId,
+      startedAt: attempt.startedAt,
+      phase: 'waiting_shutdown'
+    });
+    if (restartMessage) {
+      void notify(restartMessage, { webhookUrl: restartWebhookUrl });
+    }
 
     res.on('finish', () => {
       pushRestartLog('Respuesta enviada. Cerrando proceso actual');
@@ -1847,7 +4316,17 @@ app.post('/api/restart', requireAuth, (req, res) => {
     restartScheduled = false;
     const reason = truncateForNotify(error && error.message ? error.message : 'restart_error', 200);
     finishRestartAttempt('failed', `Error preparando reinicio: ${reason}`);
-    void notify(`RESTART failed user=${username} reason=${reason}`);
+    const failedMessage = buildRestartDiscordMessage({
+      status: 'failed',
+      username,
+      attemptId: attempt.attemptId,
+      finishedAt: nowIso(),
+      phase: 'failed',
+      reason
+    });
+    if (failedMessage) {
+      void notify(failedMessage, { webhookUrl: restartWebhookUrl });
+    }
     return res.status(500).json({ error: 'No se pudo reiniciar CodexWeb' });
   }
 });
@@ -1863,7 +4342,9 @@ app.get('/api/conversations', requireAuth, (req, res) => {
       reasoningEffort: sanitizeReasoningEffort(conversation.reasoning_effort, DEFAULT_REASONING_EFFORT),
       created_at: conversation.created_at,
       last_message_at: conversation.last_message_at || conversation.created_at,
-      liveDraftOpen: Number(conversation.live_draft_open) > 0,
+      liveDraftOpen:
+        Number(conversation.live_draft_open) > 0 &&
+        hasActiveChatRun(req.session.userId, conversation.id),
       liveDraftUpdatedAt: conversation.live_draft_updated_at || ''
     }))
   });
@@ -1899,7 +4380,13 @@ app.get('/api/conversations/:id/messages', requireAuth, (req, res) => {
     return res.status(404).json({ error: 'Conversación no encontrada' });
   }
   const messages = listMessagesStmt.all(conversationId);
-  const liveDraft = getOpenLiveDraftForConversationStmt.get(req.session.userId, conversationId);
+  const runIsActive = hasActiveChatRun(req.session.userId, conversationId);
+  if (!runIsActive) {
+    closeOpenDraftsByConversationStmt.run(nowIso(), req.session.userId, conversationId);
+  }
+  const liveDraft = runIsActive
+    ? getOpenLiveDraftForConversationStmt.get(req.session.userId, conversationId)
+    : null;
   let parsedReasoning = {};
   if (liveDraft && liveDraft.reasoning_json) {
     try {
@@ -1911,6 +4398,14 @@ app.get('/api/conversations/:id/messages', requireAuth, (req, res) => {
       parsedReasoning = {};
     }
   }
+  const latestTaskRun = getLatestTaskRunForConversationStmt.get(req.session.userId, conversationId) || null;
+  const latestTaskCommands =
+    latestTaskRun && Number.isInteger(Number(latestTaskRun.id))
+      ? listTaskRunCommandsStmt.all(Number(latestTaskRun.id), 220)
+      : [];
+  const taskRecovery = latestTaskRun
+    ? serializeTaskRecovery(latestTaskRun, latestTaskCommands, serializeReasoningMapToText(parsedReasoning))
+    : null;
   return res.json({
     ok: true,
     conversation: {
@@ -1941,7 +4436,35 @@ app.get('/api/conversations/:id/messages', requireAuth, (req, res) => {
           completed: false,
           updatedAt: liveDraft.updated_at || nowIso()
         }
-      : null
+      : null,
+    taskRecovery
+  });
+});
+
+app.patch('/api/conversations/:id/title', requireAuth, (req, res) => {
+  const conversationId = Number(req.params.id);
+  if (!Number.isInteger(conversationId) || conversationId <= 0) {
+    return res.status(400).json({ error: 'conversation_id inválido' });
+  }
+
+  const conversation = getOwnedConversationOrNull(conversationId, req.session.userId);
+  if (!conversation) {
+    return res.status(404).json({ error: 'Conversación no encontrada' });
+  }
+
+  if (!req.body || typeof req.body.title !== 'string') {
+    return res.status(400).json({ error: 'Título inválido' });
+  }
+
+  const nextTitle = buildConversationTitle(req.body.title);
+  renameConversationTitleStmt.run(nextTitle, conversationId);
+
+  return res.json({
+    ok: true,
+    conversation: {
+      id: conversationId,
+      title: nextTitle
+    }
   });
 });
 
@@ -2139,6 +4662,399 @@ app.post('/api/codex/runs/kill-all', requireAuth, (req, res) => {
     ok: true,
     active: activeRuns.length,
     stopped
+  });
+});
+
+app.get('/api/tasks', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const rawLimit = Number.parseInt(String(req.query.limit || ''), 10);
+  const safeLimit = Number.isInteger(rawLimit)
+    ? Math.min(Math.max(rawLimit, 1), taskDashboardLimitMax)
+    : 30;
+  const rows = listTaskRunsForUserStmt.all(safeUserId, safeLimit);
+  return res.json({
+    ok: true,
+    tasks: rows.map((row) => serializeTaskRow(row))
+  });
+});
+
+app.get('/api/tools/search', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const query = normalizeToolsSearchQuery(req.query.q);
+  const rawLimit = Number.parseInt(String(req.query.limit || ''), 10);
+  const safeLimit = Number.isInteger(rawLimit)
+    ? Math.min(Math.max(rawLimit, 1), toolsSearchLimitMax)
+    : 12;
+
+  if (!query || query.length < toolsSearchMinQueryLen) {
+    return res.json({
+      ok: true,
+      query,
+      minQueryLength: toolsSearchMinQueryLen,
+      limit: safeLimit,
+      counts: {
+        chats: 0,
+        commands: 0,
+        errors: 0,
+        files: 0
+      },
+      results: {
+        chats: [],
+        commands: [],
+        errors: [],
+        files: []
+      }
+    });
+  }
+
+  const queryLower = query.toLowerCase();
+  const likePattern = toSqlLikePattern(queryLower);
+  const chatRows = searchConversationsStmt.all(safeUserId, likePattern, likePattern, safeLimit);
+  const commandRows = searchTaskCommandsStmt.all(safeUserId, likePattern, likePattern, safeLimit);
+  const errorRows = searchTaskErrorsStmt.all(
+    safeUserId,
+    likePattern,
+    likePattern,
+    likePattern,
+    safeLimit
+  );
+  const fileRows = searchTaskFilesStmt.all(safeUserId, likePattern, safeLimit * 3);
+
+  const chats = chatRows.map((row) => {
+    const conversationId = Number(row && row.conversation_id);
+    const safeConversationId = Number.isInteger(conversationId) && conversationId > 0 ? conversationId : 0;
+    const title = String((row && row.title) || '').trim() || `Chat ${safeConversationId}`;
+    const titleMatches = title.toLowerCase().includes(queryLower);
+    const messageSample = String((row && row.last_message) || '');
+    const sourceText = titleMatches ? title : messageSample || title;
+    return {
+      conversationId: safeConversationId,
+      title,
+      lastMessageAt: String((row && row.last_message_at) || (row && row.created_at) || ''),
+      matchField: titleMatches ? 'title' : 'messages',
+      snippet: buildSearchSnippet(sourceText, query)
+    };
+  });
+
+  const commands = commandRows.map((row) => {
+    const conversationIdRaw = Number(row && row.conversation_id);
+    const conversationId =
+      Number.isInteger(conversationIdRaw) && conversationIdRaw > 0 ? conversationIdRaw : null;
+    const taskIdRaw = Number(row && row.task_id);
+    const taskId = Number.isInteger(taskIdRaw) && taskIdRaw > 0 ? taskIdRaw : 0;
+    const output = String((row && row.output) || '');
+    const commandText = String((row && row.command) || '');
+    const outputMatches = output.toLowerCase().includes(queryLower);
+    const snippetSource = outputMatches ? output : commandText;
+    const atValue =
+      String((row && row.finished_at) || (row && row.started_at) || (row && row.task_updated_at) || '');
+    const exitCodeRaw = Number(row && row.exit_code);
+    return {
+      id: Number(row && row.id) || 0,
+      taskId,
+      conversationId,
+      conversationTitle:
+        String((row && row.conversation_title) || '').trim() ||
+        (conversationId ? `Chat ${conversationId}` : 'Sin chat'),
+      command: buildSearchSnippet(commandText, query, 160),
+      outputSnippet: buildSearchSnippet(snippetSource, query, 200),
+      status: toTaskCommandStatus((row && row.status) || '', Number.isInteger(exitCodeRaw) ? exitCodeRaw : null),
+      exitCode: Number.isInteger(exitCodeRaw) ? exitCodeRaw : null,
+      at: atValue
+    };
+  });
+
+  const errors = errorRows.map((row) => {
+    const conversationIdRaw = Number(row && row.conversation_id);
+    const conversationId =
+      Number.isInteger(conversationIdRaw) && conversationIdRaw > 0 ? conversationIdRaw : null;
+    const taskIdRaw = Number(row && row.id);
+    const taskId = Number.isInteger(taskIdRaw) && taskIdRaw > 0 ? taskIdRaw : 0;
+    const closeReason = String((row && row.close_reason) || '').trim();
+    const resultSummary = String((row && row.result_summary) || '').trim();
+    const summarySource = closeReason || resultSummary || 'Error sin detalle';
+    const atValue = String((row && row.finished_at) || (row && row.updated_at) || (row && row.started_at) || '');
+    const failedCommands = Number(row && row.command_failed);
+    return {
+      taskId,
+      conversationId,
+      conversationTitle:
+        String((row && row.conversation_title) || '').trim() ||
+        (conversationId ? `Chat ${conversationId}` : 'Sin chat'),
+      status: normalizeTaskStatus((row && row.status) || ''),
+      commandFailed: Number.isFinite(failedCommands) ? Math.max(0, failedCommands) : 0,
+      summary: buildSearchSnippet(summarySource, query, 220),
+      at: atValue
+    };
+  });
+
+  const files = [];
+  for (const row of fileRows) {
+    if (files.length >= safeLimit) break;
+    const allFiles = safeParseJsonArray(row && row.files_touched_json)
+      .map((entry) => normalizeRepoRelativePath(entry))
+      .filter(Boolean);
+    const matchedFiles = allFiles.filter((entry) => String(entry).toLowerCase().includes(queryLower));
+    if (matchedFiles.length === 0) continue;
+    const conversationIdRaw = Number(row && row.conversation_id);
+    const conversationId =
+      Number.isInteger(conversationIdRaw) && conversationIdRaw > 0 ? conversationIdRaw : null;
+    const taskIdRaw = Number(row && row.id);
+    const taskId = Number.isInteger(taskIdRaw) && taskIdRaw > 0 ? taskIdRaw : 0;
+    files.push({
+      taskId,
+      conversationId,
+      conversationTitle:
+        String((row && row.conversation_title) || '').trim() ||
+        (conversationId ? `Chat ${conversationId}` : 'Sin chat'),
+      files: matchedFiles.slice(0, 10),
+      filesCount: matchedFiles.length,
+      at: String((row && row.finished_at) || (row && row.updated_at) || (row && row.started_at) || '')
+    });
+  }
+
+  return res.json({
+    ok: true,
+    query,
+    minQueryLength: toolsSearchMinQueryLen,
+    limit: safeLimit,
+    counts: {
+      chats: chats.length,
+      commands: commands.length,
+      errors: errors.length,
+      files: files.length
+    },
+    results: {
+      chats,
+      commands,
+      errors,
+      files
+    }
+  });
+});
+
+app.get('/api/tools/observability', requireAuth, (_req, res) => {
+  return res.json({
+    ok: true,
+    observability: buildObservabilitySnapshot()
+  });
+});
+
+app.get('/api/tools/git/repos', requireAuth, (req, res) => {
+  const forceRefresh = String(req.query.refresh || '').trim() === '1';
+  const snapshot = collectGitToolsReposSnapshot(forceRefresh);
+  return res.json({
+    ok: true,
+    scannedAt: snapshot.scannedAt,
+    repos: snapshot.repos
+  });
+});
+
+app.post('/api/tools/git/repos/:repoId/push', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+
+  const repo = findGitRepoById(req.params.repoId, { forceRefresh: true });
+  if (!repo) {
+    return res.status(404).json({ error: 'Repositorio no encontrado' });
+  }
+  if (repo.hasConflicts) {
+    return res.status(409).json({ error: 'Este repositorio tiene conflictos. Resuelvelos antes de subir.' });
+  }
+
+  const commitMessage = normalizeGitCommitMessage(req.body && req.body.commitMessage, repo.name);
+  const addResult = await runGitInRepoAsync(repo.absolutePath, ['add', '-A']);
+  if (!addResult.ok) {
+    const reason = truncateForNotify(addResult.stderr || addResult.stdout || 'git_add_failed', 220);
+    return res.status(500).json({ error: `No se pudo preparar cambios: ${reason}` });
+  }
+
+  const stagedCheck = await runGitInRepoAsync(
+    repo.absolutePath,
+    ['diff', '--cached', '--quiet'],
+    { allowNonZero: true }
+  );
+  if (![0, 1].includes(Number(stagedCheck.code))) {
+    const reason = truncateForNotify(stagedCheck.stderr || stagedCheck.stdout || 'git_diff_failed', 220);
+    return res.status(500).json({ error: `No se pudo validar cambios staged: ${reason}` });
+  }
+
+  let commitCreated = false;
+  let commitHash = '';
+  let commitOutput = '';
+
+  if (Number(stagedCheck.code) === 1) {
+    const commitResult = await runGitInRepoAsync(repo.absolutePath, ['commit', '-m', commitMessage]);
+    if (!commitResult.ok) {
+      const reason = truncateForNotify(commitResult.stderr || commitResult.stdout || 'git_commit_failed', 220);
+      return res.status(500).json({ error: `No se pudo crear commit: ${reason}` });
+    }
+    commitCreated = true;
+    commitOutput = String(commitResult.stdout || commitResult.stderr || '');
+    const hashResult = runGitInRepoSync(repo.absolutePath, ['rev-parse', '--short', 'HEAD']);
+    commitHash = hashResult.ok ? String(hashResult.stdout || '').trim() : '';
+  }
+
+  const refreshedBeforePush = collectGitRepoSummary(repo.absolutePath, nowIso());
+  if (!refreshedBeforePush) {
+    return res.status(500).json({ error: 'No se pudo refrescar estado del repositorio.' });
+  }
+  if (refreshedBeforePush.hasConflicts) {
+    return res.status(409).json({ error: 'El repositorio volvió a quedar con conflictos.' });
+  }
+  if (refreshedBeforePush.detached) {
+    return res.status(409).json({ error: 'No se puede subir desde HEAD detached.' });
+  }
+  if (!refreshedBeforePush.hasRemote || refreshedBeforePush.remotes.length === 0) {
+    return res.status(409).json({ error: 'Este repositorio no tiene remotos configurados.' });
+  }
+
+  if (!commitCreated && refreshedBeforePush.ahead <= 0) {
+    return res.status(409).json({ error: 'No hay cambios para subir al remoto.' });
+  }
+
+  const pushArgs = ['push'];
+  if (!refreshedBeforePush.upstream) {
+    const defaultRemote = refreshedBeforePush.remotes.includes('origin')
+      ? 'origin'
+      : refreshedBeforePush.remotes[0];
+    if (!defaultRemote) {
+      return res.status(409).json({ error: 'No se encontró remoto para hacer push.' });
+    }
+    pushArgs.push('-u', defaultRemote, refreshedBeforePush.branch);
+  }
+
+  const pushResult = await runGitInRepoAsync(repo.absolutePath, pushArgs, {
+    timeoutMs: gitToolsCommandTimeoutMs,
+    allowNonZero: false
+  });
+  if (!pushResult.ok) {
+    const reason = truncateForNotify(pushResult.stderr || pushResult.stdout || 'git_push_failed', 260);
+    return res.status(500).json({ error: `Push fallido: ${reason}` });
+  }
+
+  const refreshedSnapshot = collectGitToolsReposSnapshot(true);
+  const refreshedRepo =
+    refreshedSnapshot.repos.find((entry) => entry.id === repo.id) || refreshedBeforePush;
+  const output = truncateForNotify(
+    [commitOutput, pushResult.stdout, pushResult.stderr].filter(Boolean).join('\n').trim(),
+    1800
+  );
+
+  return res.json({
+    ok: true,
+    repo: refreshedRepo,
+    push: {
+      commitCreated,
+      commitMessage,
+      commitHash,
+      output
+    }
+  });
+});
+
+app.post('/api/tools/git/repos/:repoId/resolve-conflicts', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+
+  const repo = findGitRepoById(req.params.repoId, { forceRefresh: true });
+  if (!repo) {
+    return res.status(404).json({ error: 'Repositorio no encontrado' });
+  }
+  if (!repo.hasConflicts) {
+    return res.status(409).json({ error: 'Este repositorio no tiene conflictos activos.' });
+  }
+
+  const title = buildConversationTitle(`Resolver conflictos ${repo.name || 'repo'}`);
+  const created = createConversationStmt.run(
+    safeUserId,
+    title,
+    DEFAULT_CHAT_MODEL,
+    DEFAULT_REASONING_EFFORT
+  );
+  const conversationId = Number(created.lastInsertRowid);
+  if (!Number.isInteger(conversationId) || conversationId <= 0) {
+    return res.status(500).json({ error: 'No se pudo crear el chat de resolución.' });
+  }
+
+  return res.json({
+    ok: true,
+    repo,
+    resolver: {
+      conversationId,
+      prompt: buildGitConflictResolverPrompt(repo),
+      autoSend: true
+    }
+  });
+});
+
+app.post('/api/tasks/:id/rollback', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const taskId = Number(req.params.id);
+  if (!Number.isInteger(taskId) || taskId <= 0) {
+    return res.status(400).json({ error: 'task_id inválido' });
+  }
+  const row = getTaskRunByIdForUserStmt.get(taskId, safeUserId);
+  if (!row) {
+    return res.status(404).json({ error: 'Tarea no encontrada' });
+  }
+  const task = serializeTaskRow(row);
+  if (task.rollbackStatus === 'done') {
+    return res.json({
+      ok: true,
+      alreadyRolledBack: true,
+      task
+    });
+  }
+  if (!task.snapshotReady || !task.snapshotDir) {
+    return res.status(409).json({ error: 'Esta tarea no tiene snapshot para rollback.' });
+  }
+  const rollbackResult = restoreTaskFilesFromSnapshot(task.snapshotDir, task.filesTouched);
+  if (rollbackResult.failed > 0) {
+    const rollbackAt = nowIso();
+    const errorSummary = truncateForNotify(rollbackResult.errors.join(' | ') || 'rollback_failed', 900);
+    markTaskRunRollbackFailedStmt.run(
+      'failed',
+      errorSummary,
+      rollbackAt,
+      nowIso(),
+      taskId,
+      safeUserId
+    );
+    return res.status(500).json({
+      error: 'El rollback no pudo completarse.',
+      rollback: rollbackResult
+    });
+  }
+  const rollbackAt = nowIso();
+  markTaskRunRollbackStmt.run(
+    'done',
+    '',
+    rollbackAt,
+    0,
+    'manual_rollback',
+    nowIso(),
+    taskId,
+    safeUserId
+  );
+  const refreshed = getTaskRunByIdForUserStmt.get(taskId, safeUserId);
+  return res.json({
+    ok: true,
+    task: serializeTaskRow(refreshed || row),
+    rollback: rollbackResult
   });
 });
 
@@ -2433,6 +5349,7 @@ app.post('/api/uploads', requireAuth, async (req, res) => {
 });
 
 app.post('/api/chat', requireAuth, async (req, res) => {
+  const requestStartedAtMs = Date.now();
   const { message } = req.body;
   const requestedModel = sanitizeConversationModel(req.body && req.body.model);
   const modelWasProvided = req.body && Object.prototype.hasOwnProperty.call(req.body, 'model');
@@ -2445,6 +5362,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   const requestedConversationId = req.body && req.body.conversationId ? Number(req.body.conversationId) : null;
   const rawAttachments = req.body && Array.isArray(req.body.attachments) ? req.body.attachments : [];
   const username = truncateForNotify(req.session && req.session.username ? req.session.username : 'anon');
+  const userNotificationSettings = getUserNotificationSettings(req.session.userId);
   const hasAttachments = rawAttachments.length > 0;
   if ((!message || !message.trim()) && !hasAttachments) {
     void notify(`Error en chat user=${username}: mensaje vacío`);
@@ -2464,6 +5382,74 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   let assistantMessageId = null;
   let liveDraftId = null;
   const liveDraftRequestId = `${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+  let taskRunId = null;
+  let taskSnapshot = null;
+  let taskCommandSeq = 0;
+  const taskCommandStateByItem = new Map();
+  const taskTestCommands = new Set();
+  let taskCompletionWritten = false;
+
+  const finalizeTaskRun = (payload = {}) => {
+    if (!taskRunId || taskCompletionWritten) return;
+    taskCompletionWritten = true;
+    const finishedAt = String(payload.finishedAt || nowIso());
+    const status = normalizeTaskStatus(payload.status || 'failed');
+    const closeReason = String(payload.closeReason || '').trim();
+    const resultSummary = normalizeTaskResultSummary(payload.resultSummary || '');
+    const planText = normalizeTaskPlanText(payload.planText || '');
+    const explicitDurationMs = Number(payload.durationMs);
+    const durationMs = Number.isFinite(explicitDurationMs)
+      ? Math.max(0, explicitDurationMs)
+      : Math.max(0, Date.now() - requestStartedAtMs);
+    const sortedCommands = Array.from(taskCommandStateByItem.values()).sort(
+      (a, b) => Number(a.position || 0) - Number(b.position || 0)
+    );
+    const commandTotal = sortedCommands.length;
+    const commandFailed = sortedCommands.reduce((acc, entry) => {
+      return toTaskCommandStatus(entry.status || '', entry.exitCode) === 'failed' ? acc + 1 : acc;
+    }, 0);
+    const testsExecuted = Array.from(taskTestCommands.values()).slice(0, 40);
+    const filesTouched =
+      taskSnapshot && taskSnapshot.manifest ? detectTouchedFilesFromSnapshot(taskSnapshot.manifest) : [];
+    const rollbackAvailable = Boolean(taskSnapshot && taskSnapshot.snapshotReady && filesTouched.length > 0);
+    const riskLevel = computeTaskRiskLevel({
+      status,
+      filesTouchedCount: filesTouched.length,
+      commandFailed,
+      testsExecutedCount: testsExecuted.length,
+      rollbackReady: rollbackAvailable
+    });
+    const metrics = {
+      usage: payload.usage && typeof payload.usage === 'object' ? payload.usage : null,
+      structured: Boolean(payload.structured),
+      filesTouchedCount: filesTouched.length,
+      clientDisconnected: Boolean(payload.clientDisconnected),
+      snapshotReady: Boolean(taskSnapshot && taskSnapshot.snapshotReady)
+    };
+    try {
+      completeTaskRunStmt.run(
+        status,
+        closeReason,
+        resultSummary,
+        planText,
+        riskLevel,
+        JSON.stringify(filesTouched),
+        JSON.stringify(testsExecuted),
+        JSON.stringify(metrics),
+        commandTotal,
+        commandFailed,
+        rollbackAvailable ? 1 : 0,
+        finishedAt,
+        durationMs,
+        nowIso(),
+        taskRunId,
+        req.session.userId
+      );
+    } catch (error) {
+      const reason = truncateForNotify(error && error.message ? error.message : 'task_finalize_failed', 160);
+      void notify(`WARN task_finalize_failed user=${username} conv=${conversationId} reason=${reason}`);
+    }
+  };
 
   if (requestedConversationId !== null) {
     if (!Number.isInteger(requestedConversationId) || requestedConversationId <= 0) {
@@ -2493,6 +5479,36 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     conversationId = Number(created.lastInsertRowid);
   }
 
+  try {
+    const taskStartedAt = nowIso();
+    const createdTask = insertTaskRunStmt.run(
+      req.session.userId,
+      conversationId,
+      liveDraftRequestId,
+      prompt,
+      selectedModel,
+      selectedReasoningEffort,
+      taskStartedAt,
+      taskStartedAt
+    );
+    taskRunId = Number(createdTask.lastInsertRowid);
+    taskSnapshot = createTaskSnapshot(taskRunId);
+    if (taskRunId) {
+      updateTaskRunSnapshotStmt.run(
+        String((taskSnapshot && taskSnapshot.snapshotDir) || ''),
+        taskSnapshot && taskSnapshot.snapshotReady ? 1 : 0,
+        nowIso(),
+        taskRunId,
+        req.session.userId
+      );
+    }
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'task_start_failed', 160);
+    void notify(`WARN task_start_failed user=${username} conv=${conversationId} reason=${reason}`);
+    taskRunId = null;
+    taskSnapshot = null;
+  }
+
   insertMessageStmt.run(conversationId, 'user', prompt);
   updateConversationTitleStmt.run(buildConversationTitle(prompt), conversationId);
   void notify(`Arranca request chat user=${username}`);
@@ -2501,7 +5517,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     persistedAttachments = persistAttachments(rawAttachments, conversationId, req.session.userId);
     const conversationMessages = listMessagesStmt.all(conversationId);
     const promptWithHistory = buildPromptWithConversationHistory(prompt, conversationMessages);
-    const executionPrompt = buildPromptWithAttachments(promptWithHistory, persistedAttachments);
+    const promptWithRepoContext = buildPromptWithRepoContext(promptWithHistory, prompt);
+    const executionPrompt = buildPromptWithAttachments(promptWithRepoContext, persistedAttachments);
     const codexPath = await resolveCodexPath();
     const args = [
       '-c',
@@ -2870,6 +5887,101 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       persistLiveDraftSnapshot(false);
     };
 
+    const resolveTaskCommandItemId = (rawItemId, rawCommand) => {
+      const explicitId = String(rawItemId || '').trim();
+      if (explicitId) return explicitId;
+      const normalizedCommand = String(rawCommand || '').trim();
+      if (normalizedCommand) {
+        for (const entry of taskCommandStateByItem.values()) {
+          if (entry.command === normalizedCommand && !entry.finishedAt) {
+            return entry.itemId;
+          }
+        }
+      }
+      const commandSlug = normalizedCommand
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 22);
+      return `cmd_auto_${taskCommandSeq + 1}_${commandSlug || 'step'}`;
+    };
+
+    const rememberTaskCommandState = (rawItemId, patch = {}) => {
+      const itemId = resolveTaskCommandItemId(rawItemId, patch.command || '');
+      const previous = taskCommandStateByItem.get(itemId) || null;
+      let position = Number(patch.position);
+      if (!Number.isInteger(position) || position <= 0) {
+        const previousPos = previous ? Number(previous.position) : 0;
+        if (Number.isInteger(previousPos) && previousPos > 0) {
+          position = previousPos;
+        } else {
+          taskCommandSeq += 1;
+          position = taskCommandSeq;
+        }
+      } else if (position > taskCommandSeq) {
+        taskCommandSeq = position;
+      }
+
+      const command =
+        String(patch.command || '').trim() || String((previous && previous.command) || '').trim() || '(comando)';
+      const exitCodeRaw = Number(patch.exitCode);
+      const previousExit = previous ? Number(previous.exitCode) : NaN;
+      const exitCode = Number.isInteger(exitCodeRaw)
+        ? exitCodeRaw
+        : Number.isInteger(previousExit)
+          ? previousExit
+          : null;
+      const startedAt =
+        String(patch.startedAt || '').trim() ||
+        String((previous && previous.startedAt) || '').trim() ||
+        nowIso();
+      const finishedAt =
+        String(patch.finishedAt || '').trim() ||
+        String((previous && previous.finishedAt) || '').trim() ||
+        '';
+      const status = toTaskCommandStatus(
+        String(patch.status || (previous && previous.status) || ''),
+        exitCode
+      );
+      const output =
+        patch.output !== undefined
+          ? normalizeTaskCommandOutput(patch.output)
+          : normalizeTaskCommandOutput((previous && previous.output) || '');
+      const durationMs = resolveTaskDurationMs(
+        startedAt,
+        finishedAt,
+        patch.durationMs !== undefined ? patch.durationMs : previous && previous.durationMs
+      );
+      const next = {
+        itemId,
+        position,
+        command,
+        status,
+        output,
+        exitCode,
+        startedAt,
+        finishedAt,
+        durationMs
+      };
+      taskCommandStateByItem.set(itemId, next);
+      if (isTestLikeCommand(command)) {
+        taskTestCommands.add(truncateForNotify(command, 220));
+      }
+      if (taskRunId) {
+        upsertTaskRunCommandRecord(taskRunId, itemId, {
+          position,
+          command,
+          status,
+          output,
+          exitCode,
+          startedAt,
+          finishedAt,
+          durationMs
+        });
+      }
+      return next;
+    };
+
     const handleAgentMessageCompleted = (item) => {
       const itemId = getStringField(item, ['id', 'itemId']);
       const nextText = getStringField(item, ['text', 'message']);
@@ -2899,12 +6011,19 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       const command = getStringField(item, ['command']);
       const status = toSnakeCase(getStringField(item, ['status'])) || 'in_progress';
       const aggregatedOutput = getStringField(item, ['aggregated_output', 'aggregatedOutput']);
-      if (itemId) {
-        commandOutputByItem.set(itemId, aggregatedOutput);
+      const tracked = rememberTaskCommandState(itemId, {
+        command,
+        status,
+        output: aggregatedOutput,
+        startedAt: nowIso()
+      });
+      const safeItemId = tracked ? tracked.itemId : itemId;
+      if (safeItemId) {
+        commandOutputByItem.set(safeItemId, aggregatedOutput);
       }
-      sendSseSafe('command_started', { itemId, command, status });
+      sendSseSafe('command_started', { itemId: safeItemId, command, status });
       if (aggregatedOutput) {
-        sendSseSafe('command_output_delta', { itemId, text: aggregatedOutput });
+        sendSseSafe('command_output_delta', { itemId: safeItemId, text: aggregatedOutput });
       }
     };
 
@@ -2914,18 +6033,26 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       const status = toSnakeCase(getStringField(item, ['status'])) || 'completed';
       const output = getStringField(item, ['aggregated_output', 'aggregatedOutput']);
       const exitCode = getNumberField(item, ['exit_code', 'exitCode']);
-      if (itemId) {
-        const previousOutput = commandOutputByItem.get(itemId) || '';
+      const tracked = rememberTaskCommandState(itemId, {
+        command,
+        status,
+        output,
+        exitCode,
+        finishedAt: nowIso()
+      });
+      const safeItemId = tracked ? tracked.itemId : itemId;
+      if (safeItemId) {
+        const previousOutput = commandOutputByItem.get(safeItemId) || '';
         if (output && output !== previousOutput) {
           const delta = output.startsWith(previousOutput) ? output.slice(previousOutput.length) : output;
           if (delta) {
-            sendSseSafe('command_output_delta', { itemId, text: delta });
+            sendSseSafe('command_output_delta', { itemId: safeItemId, text: delta });
           }
         }
-        commandOutputByItem.set(itemId, output);
+        commandOutputByItem.set(safeItemId, output);
       }
       sendSseSafe('command_completed', {
-        itemId,
+        itemId: safeItemId,
         command,
         status,
         output,
@@ -2957,15 +6084,26 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       const itemType = toSnakeCase(getStringField(item, ['type']));
       if (itemType === 'command_execution' || itemType.includes('command_execution')) {
         const itemId = getStringField(item, ['id', 'itemId']);
-        if (!itemId) return;
-        const previousOutput = commandOutputByItem.get(itemId) || '';
+        const command = getStringField(item, ['command']);
+        const tracked = rememberTaskCommandState(itemId, {
+          command,
+          status: 'running'
+        });
+        const safeItemId = tracked ? tracked.itemId : itemId;
+        if (!safeItemId) return;
+        const previousOutput = commandOutputByItem.get(safeItemId) || '';
         const nextOutput = getStringField(item, ['aggregated_output', 'aggregatedOutput']);
         if (!nextOutput || nextOutput === previousOutput) return;
         const delta = nextOutput.startsWith(previousOutput) ? nextOutput.slice(previousOutput.length) : nextOutput;
         if (delta) {
-          sendSseSafe('command_output_delta', { itemId, text: delta });
+          sendSseSafe('command_output_delta', { itemId: safeItemId, text: delta });
         }
-        commandOutputByItem.set(itemId, nextOutput);
+        commandOutputByItem.set(safeItemId, nextOutput);
+        rememberTaskCommandState(safeItemId, {
+          command: tracked ? tracked.command : command,
+          status: tracked ? tracked.status : 'running',
+          output: nextOutput
+        });
       }
     };
 
@@ -3215,6 +6353,39 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         }
       }
 
+      const finishedAt = nowIso();
+      const durationMs = Math.max(0, Date.now() - requestStartedAtMs);
+      const closeReasonText =
+        closeReason || (exitCode === 0 ? 'completed' : `exit_code_${Number(exitCode)}`);
+      finalizeTaskRun({
+        status: exitCode === 0 ? 'success' : 'failed',
+        closeReason: closeReasonText,
+        resultSummary: outputContent,
+        planText: serializeReasoningMapToText(serializeReasoningDraft()),
+        finishedAt,
+        durationMs,
+        usage: usageSummary,
+        structured: sawStructuredEvents,
+        clientDisconnected
+      });
+      if (userNotificationSettings.notifyOnFinish) {
+        const message = buildChatCompletionDiscordMessage({
+          status: exitCode === 0 ? 'ok' : 'error',
+          username,
+          conversationId,
+          finishedAt,
+          durationMs,
+          closeReason: closeReasonText,
+          includeResult: userNotificationSettings.includeResult,
+          result: outputContent
+        });
+        if (message) {
+          void notify(message, {
+            webhookUrl: userNotificationSettings.discordWebhookUrl
+          });
+        }
+      }
+
       if (clientDisconnected) {
         void notify(
           `Chat desconectado user=${username} conv=${conversationId} draft_guardado=true reason=${truncateForNotify(
@@ -3331,6 +6502,34 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       const shortError = truncateForNotify(clientMessage, 140);
       void notify(`Error en chat user=${username}: ${shortError}`);
       const historyMessage = `No se pudo procesar la solicitud: ${clientMessage}`;
+      finalizeTaskRun({
+        status: 'failed',
+        closeReason: 'client_error',
+        resultSummary: historyMessage,
+        planText: '',
+        finishedAt: nowIso(),
+        durationMs: Math.max(0, Date.now() - requestStartedAtMs),
+        usage: null,
+        structured: false,
+        clientDisconnected: false
+      });
+      if (userNotificationSettings.notifyOnFinish) {
+        const message = buildChatCompletionDiscordMessage({
+          status: 'error',
+          username,
+          conversationId,
+          finishedAt: nowIso(),
+          durationMs: Math.max(0, Date.now() - requestStartedAtMs),
+          closeReason: 'client_error',
+          includeResult: userNotificationSettings.includeResult,
+          result: historyMessage
+        });
+        if (message) {
+          void notify(message, {
+            webhookUrl: userNotificationSettings.discordWebhookUrl
+          });
+        }
+      }
       if (assistantMessageId) {
         updateMessageContentStmt.run(historyMessage, assistantMessageId);
       } else {
@@ -3374,6 +6573,34 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       ? 'No se encontró el binario codex en el servidor.'
       : 'No se pudo ejecutar codex en el servidor.';
     const errorMessage = `Error ejecutando Codex local: ${details}`;
+    finalizeTaskRun({
+      status: 'failed',
+      closeReason: codeNotFound ? 'codex_not_found' : 'exec_error',
+      resultSummary: errorMessage,
+      planText: '',
+      finishedAt: nowIso(),
+      durationMs: Math.max(0, Date.now() - requestStartedAtMs),
+      usage: null,
+      structured: false,
+      clientDisconnected: false
+    });
+    if (userNotificationSettings.notifyOnFinish) {
+      const message = buildChatCompletionDiscordMessage({
+        status: 'error',
+        username,
+        conversationId,
+        finishedAt: nowIso(),
+        durationMs: Math.max(0, Date.now() - requestStartedAtMs),
+        closeReason: codeNotFound ? 'codex_not_found' : 'exec_error',
+        includeResult: userNotificationSettings.includeResult,
+        result: errorMessage
+      });
+      if (message) {
+        void notify(message, {
+          webhookUrl: userNotificationSettings.discordWebhookUrl
+        });
+      }
+    }
     if (assistantMessageId) {
       updateMessageContentStmt.run(errorMessage, assistantMessageId);
     } else {
@@ -3427,6 +6654,7 @@ process.on('uncaughtException', (error) => {
     });
 });
 
+markStaleTaskRunsOnStartup();
 markRestartRecoveredOnStartup();
 
 const server = app.listen(port, host, () => {

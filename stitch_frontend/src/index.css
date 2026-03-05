@@ -18,6 +18,11 @@ body,
 html,
 body {
   overflow-x: hidden;
+  background: #000;
+}
+
+#root {
+  background: #000;
 }
 
 img,

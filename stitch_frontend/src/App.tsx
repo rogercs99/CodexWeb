@@ -12,6 +12,7 @@ import {
   deleteAttachment,
   deleteConversation,
   getChatOptions,
+  getCodexRuns,
   getMe,
   getRestartStatus,
   killConversationSession,
@@ -23,6 +24,7 @@ import {
   restartServer,
   startChatStream,
   updateConversationSettings,
+  updateConversationTitle,
   uploadAttachment
 } from './lib/api';
 import { consumeSse } from './lib/sse';
@@ -30,10 +32,12 @@ import type {
   AttachmentItem,
   Capabilities,
   ChatOptions,
+  CodexBackgroundRun,
   Conversation,
   Message,
   RestartState,
   Screen,
+  TaskRecovery,
   TerminalEntry,
   User
 } from './lib/types';
@@ -71,6 +75,25 @@ function classifyTerminalStatus(rawStatus: string, exitCode: number | null): Ter
   return 'notice';
 }
 
+function listRunningConversationIds(runs: CodexBackgroundRun[]): number[] {
+  return Array.from(
+    new Set(
+      (runs || [])
+        .map((run) => Number(run && run.conversationId))
+        .filter((id) => Number.isInteger(id) && id > 0)
+    )
+  )
+    .sort((a, b) => a - b) as number[];
+}
+
+function sameIdList(a: number[], b: number[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 interface LiveChatDraft {
   username: string;
   conversationId: number | null;
@@ -81,6 +104,12 @@ interface LiveChatDraft {
   reasoningByItem: Record<string, string>;
   completed: boolean;
   updatedAt: string;
+}
+
+interface NavigateData {
+  chatId?: number;
+  draftMessage?: string;
+  autoSend?: boolean;
 }
 
 function getSafeLocalStorage(): Storage | null {
@@ -238,6 +267,38 @@ function sanitizeTerminalEntries(raw: unknown): TerminalEntry[] {
     .filter((entry) => entry.id);
 }
 
+function normalizeTerminalConversationId(value: unknown): number | null {
+  const parsedConversationId = Number(value);
+  if (!Number.isInteger(parsedConversationId) || parsedConversationId <= 0) {
+    return null;
+  }
+  return parsedConversationId;
+}
+
+function buildTerminalEntriesFromTaskRecovery(
+  conversationId: number,
+  taskRecovery: TaskRecovery | null | undefined
+): TerminalEntry[] {
+  if (!taskRecovery || !Array.isArray(taskRecovery.commands)) return [];
+  return taskRecovery.commands
+    .map((command, index) => {
+      const itemId = String(command.itemId || command.id || `recovered_${index + 1}`);
+      const statusText = String(command.status || 'notice');
+      return {
+        id: `taskrec_${taskRecovery.taskId}_${itemId}`,
+        itemId,
+        conversationId,
+        kind: classifyTerminalStatus(statusText, command.exitCode),
+        command: String(command.command || '(comando)'),
+        output: String(command.output || ''),
+        statusText,
+        timestamp: String(command.startedAt || command.finishedAt || new Date().toISOString()),
+        durationMs: Number.isFinite(Number(command.durationMs)) ? Number(command.durationMs) : 0
+      } as TerminalEntry;
+    })
+    .sort((a, b) => Date.parse(a.timestamp || '') - Date.parse(b.timestamp || ''));
+}
+
 export default function App() {
   const [screen, setScreen] = useState<Screen>('login');
   const [user, setUser] = useState<User | null>(null);
@@ -267,6 +328,11 @@ export default function App() {
   const [restartState, setRestartState] = useState<RestartState | null>(null);
   const [restartBusy, setRestartBusy] = useState(false);
   const [liveReasoning, setLiveReasoning] = useState('');
+  const [pendingChatDraft, setPendingChatDraft] = useState<{
+    chatId: number;
+    message: string;
+    autoSend: boolean;
+  } | null>(null);
 
   const streamAbortRef = useRef<AbortController | null>(null);
   const assistantDraftRef = useRef('');
@@ -281,10 +347,21 @@ export default function App() {
   const previousScreenRef = useRef<Screen>('hub');
   const hydrateInFlightRef = useRef<Promise<void> | null>(null);
   const activeConversationIdRef = useRef<number | null>(null);
+  const runningConversationIdsRef = useRef<number[]>([]);
+  const previousRunningConversationIdsRef = useRef<number[]>([]);
+  const sendingRef = useRef(false);
 
   useEffect(() => {
     activeConversationIdRef.current = activeConversationId;
   }, [activeConversationId]);
+
+  useEffect(() => {
+    runningConversationIdsRef.current = runningConversationIds;
+  }, [runningConversationIds]);
+
+  useEffect(() => {
+    sendingRef.current = sending;
+  }, [sending]);
 
   const resetTransientStreamState = useCallback(() => {
     if (draftPersistTimerRef.current !== null) {
@@ -485,6 +562,31 @@ export default function App() {
     [persistActiveDraftNow]
   );
 
+  const forceFinalizeStaleStream = useCallback(
+    (statusMessage: string) => {
+      const draftId = liveAssistantMessageIdRef.current;
+      const hasDraftContent = assistantDraftRef.current.trim().length > 0;
+
+      streamSessionRef.current += 1;
+      if (streamAbortRef.current) {
+        streamAbortRef.current.abort();
+      }
+
+      if (draftId !== null) {
+        persistActiveDraftNow(hasDraftContent);
+      }
+
+      if (draftId !== null && !hasDraftContent) {
+        setMessages((prev) => prev.filter((entry) => entry.id !== draftId));
+        deleteDraftSnapshot(activeDraftStorageKeyRef.current);
+      }
+
+      resetTransientStreamState();
+      setStatus(statusMessage);
+    },
+    [deleteDraftSnapshot, persistActiveDraftNow, resetTransientStreamState]
+  );
+
   const persistTerminal = useCallback((next: TerminalEntry[]) => {
     setTerminalEntries(next);
     try {
@@ -494,15 +596,14 @@ export default function App() {
     }
   }, []);
 
-  const clearTerminalForPrompt = useCallback((conversationId: number | null) => {
+  const clearTerminalForConversation = useCallback((conversationId: number | null) => {
     setTerminalEntries((prev) => {
       const next = prev.filter((entry) => {
-        const parsedConversationId = Number(entry.conversationId);
-        const normalizedConversationId =
-          Number.isInteger(parsedConversationId) && parsedConversationId > 0 ? parsedConversationId : null;
+        const normalizedConversationId = normalizeTerminalConversationId(entry.conversationId);
         if (conversationId === null) return normalizedConversationId !== null;
         return normalizedConversationId !== conversationId;
       });
+      if (next.length === prev.length) return prev;
       try {
         localStorage.setItem(TERMINAL_KEY, JSON.stringify(next));
       } catch (_error) {
@@ -511,6 +612,48 @@ export default function App() {
       return next;
     });
   }, []);
+
+  const clearTerminalForMissingChats = useCallback((conversationIds: number[]) => {
+    const knownConversationIds = new Set(
+      (conversationIds || []).filter((id) => Number.isInteger(id) && id > 0)
+    );
+    setTerminalEntries((prev) => {
+      const next = prev.filter((entry) => {
+        const conversationId = normalizeTerminalConversationId(entry.conversationId);
+        if (conversationId === null) return true;
+        return knownConversationIds.has(conversationId);
+      });
+      if (next.length === prev.length) return prev;
+      try {
+        localStorage.setItem(TERMINAL_KEY, JSON.stringify(next));
+      } catch (_error) {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
+
+  const applyTaskRecoveryToTerminal = useCallback(
+    (conversationId: number | null, taskRecovery: TaskRecovery | null | undefined) => {
+      if (!conversationId || conversationId <= 0) return;
+      const recovered = buildTerminalEntriesFromTaskRecovery(conversationId, taskRecovery);
+      setTerminalEntries((prev) => {
+        const base = prev.filter((entry) => {
+          const entryConversationId = normalizeTerminalConversationId(entry.conversationId);
+          if (entryConversationId !== conversationId) return true;
+          return !String(entry.id || '').startsWith('taskrec_');
+        });
+        const next = recovered.length > 0 ? [...base, ...recovered] : base;
+        try {
+          localStorage.setItem(TERMINAL_KEY, JSON.stringify(next));
+        } catch (_error) {
+          // ignore
+        }
+        return next;
+      });
+    },
+    []
+  );
 
   const upsertTerminal = useCallback(
     (itemId: string, patch: Partial<TerminalEntry>) => {
@@ -587,16 +730,26 @@ export default function App() {
     });
   }, []);
 
+  const refreshRunningConversationIds = useCallback(async (): Promise<number[]> => {
+    try {
+      const runs = await getCodexRuns();
+      const nextIds = listRunningConversationIds(runs);
+      setRunningConversationIds((prev) => (sameIdList(prev, nextIds) ? prev : nextIds));
+      return nextIds;
+    } catch (_error) {
+      return runningConversationIdsRef.current;
+    }
+  }, []);
+
   const loadConversationsAndPick = useCallback(
     async (preferredId?: number | null, usernameOverride?: string | null) => {
-      const rows = await listConversations();
+      const [rows, runningIds]: [Conversation[], number[]] = await Promise.all([
+        listConversations(),
+        refreshRunningConversationIds()
+      ]);
       const sorted = byDateDesc(rows);
       setConversations(sorted);
-      setRunningConversationIds(
-        sorted
-          .filter((item) => Boolean(item.liveDraftOpen))
-          .map((item) => item.id)
-      );
+      clearTerminalForMissingChats(sorted.map((item) => item.id));
 
       const chosenId =
         preferredId && sorted.some((item) => item.id === preferredId)
@@ -612,7 +765,7 @@ export default function App() {
         setMessages(
           draftOnly
             ? mergeMessagesWithDraft([], draftOnly.draft, {
-                hideAssistantContentWhileRunning: true
+                hideAssistantContentWhileRunning: false
               })
             : []
         );
@@ -628,14 +781,18 @@ export default function App() {
       const localDraft = getLiveDraftForConversation(chosenId, usernameOverride);
       const serverDraft =
         detail.liveDraft && typeof detail.liveDraft === 'object' ? (detail.liveDraft as LiveChatDraft) : null;
-      const liveDraft =
-        serverDraft && !serverDraft.completed
+      const runningSet = new Set(runningIds);
+      const streamStillActive = runningSet.has(chosenId);
+      const liveDraft = streamStillActive
+        ? serverDraft && !serverDraft.completed
           ? { storageKey: '', draft: serverDraft }
-          : localDraft;
-      const chosenConversation = sorted.find((item) => item.id === chosenId) || null;
-      const hideAssistantWhileRunning =
-        Boolean(chosenConversation && chosenConversation.liveDraftOpen) ||
-        Boolean(liveDraft && !liveDraft.draft.completed);
+          : localDraft
+        : null;
+      const hideAssistantWhileRunning = streamStillActive;
+      const recoveryPlanText =
+        detail.taskRecovery && typeof detail.taskRecovery.planText === 'string'
+          ? detail.taskRecovery.planText
+          : '';
       setActiveConversationId(chosenId);
       setChatTitle(detail.conversation.title || 'Chat');
       setMessages(
@@ -644,12 +801,22 @@ export default function App() {
         })
       );
       setLiveReasoning(
-        liveDraft ? serializeReasoning(new Map(Object.entries(liveDraft.draft.reasoningByItem || {}))) : ''
+        liveDraft
+          ? serializeReasoning(new Map(Object.entries(liveDraft.draft.reasoningByItem || {})))
+          : recoveryPlanText
       );
       setChatModel(detail.conversation.model || DEFAULT_MODEL);
       setChatReasoningEffort(detail.conversation.reasoningEffort || DEFAULT_REASONING_EFFORT);
+      applyTaskRecoveryToTerminal(chosenId, detail.taskRecovery || null);
     },
-    [defaultModel, defaultReasoningEffort, getLiveDraftForConversation]
+    [
+      applyTaskRecoveryToTerminal,
+      clearTerminalForMissingChats,
+      defaultModel,
+      defaultReasoningEffort,
+      getLiveDraftForConversation,
+      refreshRunningConversationIds
+    ]
   );
 
   const hydrate = useCallback(async () => {
@@ -776,16 +943,98 @@ export default function App() {
     };
   }, [sending, sendStartedAtMs]);
 
+  useEffect(() => {
+    if (!user || sending || runningConversationIds.length === 0) return undefined;
+    const timerId = window.setInterval(() => {
+      void refreshRunningConversationIds();
+    }, 3000);
+    return () => {
+      window.clearInterval(timerId);
+    };
+  }, [user, sending, runningConversationIds.length, refreshRunningConversationIds]);
+
+  useEffect(() => {
+    if (!user || !sending || !sendStartedAtMs) return undefined;
+    let cancelled = false;
+
+    const syncStuckStreamingState = async () => {
+      if (Date.now() - sendStartedAtMs < 12000) return;
+
+      const currentSession = streamSessionRef.current;
+      const parsedConversationId = Number(
+        activeStreamConversationRef.current ?? activeConversationIdRef.current
+      );
+      if (!Number.isInteger(parsedConversationId) || parsedConversationId <= 0) return;
+
+      const runningIds = await refreshRunningConversationIds();
+      if (cancelled) return;
+      if (!sendingRef.current) return;
+      if (streamSessionRef.current !== currentSession) return;
+      if (runningIds.includes(parsedConversationId)) return;
+
+      forceFinalizeStaleStream('Sincronizado: la ejecución anterior ya terminó.');
+      void loadConversationsAndPick(parsedConversationId).catch(() => {
+        // ignore sync refresh errors
+      });
+      void listAttachments(200)
+        .then((items) => {
+          if (!cancelled) {
+            setAttachments(items);
+          }
+        })
+        .catch(() => {
+          // ignore attachments refresh errors
+        });
+    };
+
+    void syncStuckStreamingState();
+    const timerId = window.setInterval(() => {
+      void syncStuckStreamingState();
+    }, 5000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timerId);
+    };
+  }, [
+    forceFinalizeStaleStream,
+    loadConversationsAndPick,
+    refreshRunningConversationIds,
+    sendStartedAtMs,
+    sending,
+    user
+  ]);
+
+  useEffect(() => {
+    const previous = previousRunningConversationIdsRef.current;
+    previousRunningConversationIdsRef.current = runningConversationIds;
+
+    const activeId = activeConversationIdRef.current;
+    if (sending || !activeId || activeId <= 0) return;
+    const hadActiveRun = previous.includes(activeId);
+    const hasActiveRun = runningConversationIds.includes(activeId);
+    if (!hadActiveRun || hasActiveRun) return;
+
+    setLiveReasoning('');
+    void loadConversationsAndPick(activeId).catch(() => {
+      // ignore refresh errors in run-sync fallback
+    });
+  }, [runningConversationIds, sending, loadConversationsAndPick]);
+
   const navigate = useCallback(
-    (next: Screen, data?: { chatId?: number }) => {
+    (next: Screen, data?: NavigateData) => {
       if (next !== 'offline') {
         previousScreenRef.current = next;
       }
 
       const targetChatId =
         next === 'chat' && Number.isInteger(data?.chatId) ? Number(data?.chatId) : null;
+      const incomingDraft = String(data?.draftMessage || '').trim();
+      const shouldAutoSendDraft = Boolean(data?.autoSend);
+      const shouldKeepStreamingInTools = next === 'terminal';
       if (
         sending &&
+        !shouldKeepStreamingInTools &&
         (next !== 'chat' || !targetChatId || targetChatId !== activeConversationId)
       ) {
         detachActiveStream('Ejecución en segundo plano para el chat anterior.');
@@ -794,19 +1043,25 @@ export default function App() {
       if (next === 'chat' && targetChatId) {
         void (async () => {
           try {
-            const detail = await listMessages(targetChatId);
+            const [detail, latestRunningIds] = await Promise.all([
+              listMessages(targetChatId),
+              refreshRunningConversationIds()
+            ]);
             const localDraft = getLiveDraftForConversation(targetChatId);
             const serverDraft =
               detail.liveDraft && typeof detail.liveDraft === 'object' ? (detail.liveDraft as LiveChatDraft) : null;
-            const liveDraft =
-              serverDraft && !serverDraft.completed
+            const runningSet = new Set(latestRunningIds);
+            const streamStillActive = runningSet.has(targetChatId);
+            const liveDraft = streamStillActive
+              ? serverDraft && !serverDraft.completed
                 ? { storageKey: '', draft: serverDraft }
-                : localDraft;
-            const hasServerRunningFlag = conversations.some(
-              (item) => item.id === targetChatId && Boolean(item.liveDraftOpen)
-            );
-            const hideAssistantWhileRunning =
-              hasServerRunningFlag || Boolean(liveDraft && !liveDraft.draft.completed);
+                : localDraft
+              : null;
+            const hideAssistantWhileRunning = streamStillActive;
+            const recoveryPlanText =
+              detail.taskRecovery && typeof detail.taskRecovery.planText === 'string'
+                ? detail.taskRecovery.planText
+                : '';
             setActiveConversationId(targetChatId);
             setChatTitle(detail.conversation.title || 'Chat');
             setMessages(
@@ -815,23 +1070,46 @@ export default function App() {
               })
             );
             setLiveReasoning(
-              liveDraft ? serializeReasoning(new Map(Object.entries(liveDraft.draft.reasoningByItem || {}))) : ''
+              liveDraft
+                ? serializeReasoning(new Map(Object.entries(liveDraft.draft.reasoningByItem || {})))
+                : recoveryPlanText
             );
             setChatModel(detail.conversation.model || DEFAULT_MODEL);
             setChatReasoningEffort(
               detail.conversation.reasoningEffort || DEFAULT_REASONING_EFFORT
             );
+            applyTaskRecoveryToTerminal(targetChatId, detail.taskRecovery || null);
+            setPendingChatDraft(
+              incomingDraft
+                ? {
+                    chatId: targetChatId,
+                    message: incomingDraft,
+                    autoSend: shouldAutoSendDraft
+                  }
+                : null
+            );
             setScreen('chat');
           } catch (error: any) {
+            setPendingChatDraft(null);
             setStatus(error?.message || 'No se pudo abrir el chat.');
           }
         })();
         return;
       }
 
+      if (next !== 'chat') {
+        setPendingChatDraft(null);
+      }
       setScreen(next);
     },
-    [activeConversationId, conversations, detachActiveStream, getLiveDraftForConversation, sending]
+    [
+      activeConversationId,
+      applyTaskRecoveryToTerminal,
+      detachActiveStream,
+      getLiveDraftForConversation,
+      refreshRunningConversationIds,
+      sending
+    ]
   );
 
   const handleLogin = useCallback(
@@ -857,6 +1135,7 @@ export default function App() {
     setUser(null);
     setMessages([]);
     setConversations([]);
+    setRunningConversationIds([]);
     setActiveConversationId(null);
     setScreen('login');
   }, [cancelActiveStream]);
@@ -909,6 +1188,9 @@ export default function App() {
         const deletedIds = uniqueIds.filter((id) => !failedIds.includes(id));
         if (deletedIds.length > 0) {
           setRunningConversationIds((prev) => prev.filter((id) => !deletedIds.includes(id)));
+          for (const deletedId of deletedIds) {
+            clearTerminalForConversation(deletedId);
+          }
         }
 
         const preferredId = deletingActiveConversation ? null : activeConversationId;
@@ -931,7 +1213,7 @@ export default function App() {
         setStatus(error?.message || 'No se pudieron eliminar los chats seleccionados.');
       }
     },
-    [activeConversationId, cancelActiveStream, loadConversationsAndPick, screen, sending]
+    [activeConversationId, cancelActiveStream, clearTerminalForConversation, loadConversationsAndPick, screen, sending]
   );
 
   const handleDeleteConversation = useCallback(
@@ -939,6 +1221,27 @@ export default function App() {
       await handleDeleteConversations([conversationId]);
     },
     [handleDeleteConversations]
+  );
+
+  const handleRenameConversation = useCallback(
+    async (conversationId: number, title: string) => {
+      if (!Number.isInteger(conversationId) || conversationId <= 0) return;
+      try {
+        const updated = await updateConversationTitle(conversationId, title);
+        setConversations((prev) =>
+          prev.map((item) =>
+            item.id === conversationId ? { ...item, title: updated.title } : item
+          )
+        );
+        if (activeConversationId === conversationId) {
+          setChatTitle(updated.title || 'Nuevo chat');
+        }
+        setStatus('Titulo actualizado.');
+      } catch (error: any) {
+        setStatus(error?.message || 'No se pudo actualizar el titulo del chat.');
+      }
+    },
+    [activeConversationId]
   );
 
   const handleDeleteAttachment = useCallback(async (attachmentId: string) => {
@@ -1034,8 +1337,18 @@ export default function App() {
       streamSessionRef.current = streamSessionId;
       const isCurrentSession = () => streamSessionRef.current === streamSessionId;
 
-      clearTerminalForPrompt(activeConversationId);
-      setMessages((prev) => [...prev, userMessage, assistantMessage]);
+      clearTerminalForConversation(activeConversationId);
+      setMessages((prev) => {
+        const next = [...prev];
+        while (
+          next.length > 0 &&
+          next[next.length - 1].role === 'assistant' &&
+          !String(next[next.length - 1].content || '').trim()
+        ) {
+          next.pop();
+        }
+        return [...next, userMessage, assistantMessage];
+      });
       setLiveReasoning('');
       assistantDraftRef.current = '';
       liveUserMessageRef.current = userMessage;
@@ -1307,19 +1620,36 @@ export default function App() {
         if (!isCurrentSession()) return;
 
         if (!streamCompleted) {
-          keepRunningIndicator = true;
-          persistActiveDraftNow(false);
-          if (
-            conversationFromStream &&
-            conversationFromStream > 0 &&
-            activeConversationIdRef.current === conversationFromStream
-          ) {
-            void loadConversationsAndPick(conversationFromStream).catch(() => {
-              // ignore refresh errors in detached mode
-            });
+          const streamConversationId = resolveStreamConversationId();
+          let hasActiveRun = false;
+          if (Number.isInteger(streamConversationId) && streamConversationId > 0) {
+            try {
+              const latestRuns = await getCodexRuns();
+              const latestRunningIds = listRunningConversationIds(latestRuns);
+              setRunningConversationIds(latestRunningIds);
+              hasActiveRun = latestRunningIds.includes(streamConversationId);
+            } catch (_error) {
+              hasActiveRun = true;
+            }
           }
-          setStatus('La conexión se cerró, pero la ejecución sigue en segundo plano.');
-          return;
+
+          if (hasActiveRun) {
+            keepRunningIndicator = true;
+            persistActiveDraftNow(false);
+            if (
+              conversationFromStream &&
+              conversationFromStream > 0 &&
+              activeConversationIdRef.current === conversationFromStream
+            ) {
+              void loadConversationsAndPick(conversationFromStream).catch(() => {
+                // ignore refresh errors in detached mode
+              });
+            }
+            setStatus('La conexión se cerró, pero la ejecución sigue en segundo plano.');
+            return;
+          }
+
+          streamCompleted = true;
         }
 
         await loadConversationsAndPick(conversationFromStream);
@@ -1380,11 +1710,23 @@ export default function App() {
       scheduleDraftPersist,
       selectedFiles,
       sending,
-      clearTerminalForPrompt,
+      clearTerminalForConversation,
       updateActiveDraft,
       upsertTerminal
     ]
   );
+
+  useEffect(() => {
+    if (!pendingChatDraft) return;
+    if (!pendingChatDraft.autoSend) return;
+    if (screen !== 'chat') return;
+    if (activeConversationId !== pendingChatDraft.chatId) return;
+    if (sending) return;
+    const message = String(pendingChatDraft.message || '').trim();
+    setPendingChatDraft(null);
+    if (!message) return;
+    void handleSend(message);
+  }, [activeConversationId, handleSend, pendingChatDraft, screen, sending]);
 
   const handleRequestRestart = useCallback(async () => {
     setRestartBusy(true);
@@ -1467,6 +1809,7 @@ export default function App() {
           onOpenChat={(id) => navigate('chat', { chatId: id })}
           onCreateChat={handleCreateChat}
           onDeleteChat={handleDeleteConversation}
+          onRenameChat={handleRenameConversation}
           onDeleteChats={handleDeleteConversations}
           onLogout={handleLogout}
           onRefresh={handleRefresh}
@@ -1520,7 +1863,9 @@ export default function App() {
       {screen === 'terminal' && (
         <TerminalLogScreen
           entries={terminalEntries}
+          conversations={filteredConversations}
           onClear={() => persistTerminal([])}
+          onClearConversation={clearTerminalForConversation}
           onRunsChanged={() => {
             void handleRefresh();
           }}

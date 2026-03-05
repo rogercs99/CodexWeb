@@ -72,6 +72,12 @@ export interface ChatOptions {
   };
 }
 
+export interface NotificationSettings {
+  discordWebhookUrl: string;
+  notifyOnFinish: boolean;
+  includeResult: boolean;
+}
+
 export interface RestartState {
   attemptId: string;
   active: boolean;
@@ -81,6 +87,222 @@ export interface RestartState {
   finishedAt: string;
   updatedAt: string;
   logs: Array<{ at: string; message: string }>;
+}
+
+export interface TaskRunCommand {
+  id: number;
+  itemId: string;
+  command: string;
+  output: string;
+  status: string;
+  exitCode: number | null;
+  startedAt: string;
+  finishedAt: string;
+  durationMs: number;
+}
+
+export interface TaskRecovery {
+  taskId: number;
+  status: string;
+  startedAt: string;
+  updatedAt: string;
+  planText: string;
+  commands: TaskRunCommand[];
+}
+
+export interface TaskRunDashboardItem {
+  id: number;
+  conversationId: number | null;
+  conversationTitle: string;
+  status: string;
+  result: string;
+  closeReason: string;
+  riskLevel: string;
+  startedAt: string;
+  finishedAt: string;
+  updatedAt: string;
+  durationMs: number;
+  filesTouched: string[];
+  testsExecuted: string[];
+  metrics: Record<string, any>;
+  commandTotal: number;
+  commandFailed: number;
+  rollbackAvailable: boolean;
+  rollbackStatus: string;
+  rollbackError: string;
+  rollbackAt: string;
+  snapshotReady: boolean;
+  snapshotDir: string;
+  planText: string;
+}
+
+export interface UnifiedSearchChatHit {
+  conversationId: number;
+  title: string;
+  lastMessageAt: string;
+  matchField: 'title' | 'messages';
+  snippet: string;
+}
+
+export interface UnifiedSearchCommandHit {
+  id: number;
+  taskId: number;
+  conversationId: number | null;
+  conversationTitle: string;
+  command: string;
+  outputSnippet: string;
+  status: string;
+  exitCode: number | null;
+  at: string;
+}
+
+export interface UnifiedSearchErrorHit {
+  taskId: number;
+  conversationId: number | null;
+  conversationTitle: string;
+  status: string;
+  commandFailed: number;
+  summary: string;
+  at: string;
+}
+
+export interface UnifiedSearchFileHit {
+  taskId: number;
+  conversationId: number | null;
+  conversationTitle: string;
+  files: string[];
+  filesCount: number;
+  at: string;
+}
+
+export interface UnifiedSearchPayload {
+  query: string;
+  minQueryLength: number;
+  limit: number;
+  counts: {
+    chats: number;
+    commands: number;
+    errors: number;
+    files: number;
+  };
+  results: {
+    chats: UnifiedSearchChatHit[];
+    commands: UnifiedSearchCommandHit[];
+    errors: UnifiedSearchErrorHit[];
+    files: UnifiedSearchFileHit[];
+  };
+}
+
+export interface ApiObservabilityEndpoint {
+  method: string;
+  path: string;
+  requests: number;
+  errors: number;
+  errorRate: number;
+  avgMs: number;
+  p95Ms: number;
+  maxMs: number;
+  lastStatus: number;
+  lastAt: string;
+}
+
+export interface ApiObservabilityErrorSample {
+  at: string;
+  method: string;
+  path: string;
+  status: number;
+  durationMs: number;
+}
+
+export interface ObservabilitySnapshot {
+  sampledAt: string;
+  startedAt: string;
+  uptimeSeconds: number;
+  process: {
+    pid: number;
+    nodeVersion: string;
+    platform: string;
+    cpuPercent: number;
+    cpuPerCorePercent: number;
+    memory: {
+      rssBytes: number;
+      heapUsedBytes: number;
+      heapTotalBytes: number;
+      externalBytes: number;
+      arrayBuffersBytes: number;
+    };
+  };
+  system: {
+    cpuCount: number;
+    loadAvg1m: number;
+    loadAvg5m: number;
+    loadAvg15m: number;
+    totalMemBytes: number;
+    freeMemBytes: number;
+    usedMemBytes: number;
+    usedMemPercent: number;
+  };
+  api: {
+    totalRequests: number;
+    totalErrors: number;
+    errorRate: number;
+    latency: {
+      sampleCount: number;
+      avgMs: number;
+      p50Ms: number;
+      p95Ms: number;
+      p99Ms: number;
+      maxMs: number;
+    };
+    endpoints: ApiObservabilityEndpoint[];
+    recentErrors: ApiObservabilityErrorSample[];
+  };
+}
+
+export interface ToolsGitRepoStatusCounts {
+  staged: number;
+  modified: number;
+  untracked: number;
+  conflicted: number;
+  total: number;
+}
+
+export interface ToolsGitRepoSummary {
+  id: string;
+  name: string;
+  relativePath: string;
+  absolutePath: string;
+  branch: string;
+  upstream: string;
+  ahead: number;
+  behind: number;
+  detached: boolean;
+  hasRemote: boolean;
+  remotes: string[];
+  hasChanges: boolean;
+  hasConflicts: boolean;
+  status: ToolsGitRepoStatusCounts;
+  changedFiles: string[];
+  conflictFiles: string[];
+  scannedAt: string;
+}
+
+export interface ToolsGitReposPayload {
+  scannedAt: string;
+  repos: ToolsGitRepoSummary[];
+}
+
+export interface ToolsGitPushResult {
+  commitCreated: boolean;
+  commitMessage: string;
+  commitHash: string;
+  output: string;
+}
+
+export interface ToolsGitResolvePayload {
+  conversationId: number;
+  prompt: string;
+  autoSend: boolean;
 }
 
 export interface Capabilities {

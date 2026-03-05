@@ -56,6 +56,8 @@ const BOT_NAMES = ['Iris', 'Lumen', 'Atlas', 'Vela', 'Echo', 'Nova', 'Pixel', 'S
 const BOT_LEVELS = ['easy', 'normal', 'smart'];
 const MAX_ROUNDS = 10;
 const DRINK_LEVELS = ['light', 'medium', 'heavy'];
+const MAX_CLUE_AUDIO_DATA_URL_LENGTH = 900000;
+const CLUE_AUDIO_FALLBACK_TEXT = 'Pista por audio';
 
 // Pseudo-semantic tags to give bots/context more coherent reasons.
 const CARD_THEMES = ['bosque', 'océano', 'cielo', 'ciudad', 'desierto', 'montaña', 'invierno', 'verano', 'sueño', 'espacio'];
@@ -70,8 +72,17 @@ const BOT_PERSONALITIES = [
   { id: 'poeta', openers: ['huele a', 'me suena a', 'parece un'], cadence: ['a media voz', 'sin avisar', 'como un recuerdo'], riskBias: 0.55 },
   { id: 'cineasta', openers: ['si fuera una película sería', 'fotograma de', 'escena de'], cadence: ['con cámara lenta', 'con zoom al fondo', 'sin diálogo'], riskBias: 0.45 },
   { id: 'narrador', openers: ['me recuerda a', 'es casi', 'diría que es'], cadence: ['al final del cuento', 'justo antes del giro', 'en el capítulo dos'], riskBias: 0.35 },
+  { id: 'estratega', openers: ['la clave está en', 'pista corta:', 'piensa en'], cadence: ['sin ser literal', 'con doble lectura', 'dejando margen'], riskBias: 0.2 },
+  { id: 'surrealista', openers: ['esto parece', 'sueña con', 'imagina'], cadence: ['flotando en silencio', 'como un glitch bonito', 'fuera de contexto'], riskBias: 0.65 },
 ];
 const BOT_PERSONALITY_BY_ID = Object.fromEntries(BOT_PERSONALITIES.map((persona) => [persona.id, persona]));
+const BOT_PERSONA_REASON_STYLE = {
+  poeta: 'La formulé como una imagen sensorial para sugerir más de lo que describe.',
+  cineasta: 'La pensé como una escena visual concreta para que se entienda rápido.',
+  narrador: 'La armé como mini-historia para unir bien los elementos de la carta.',
+  estratega: 'Usé una frase corta y jugable para equilibrar claridad y engaño.',
+  surrealista: 'Le di un giro extraño, pero manteniendo una base coherente con la carta.',
+};
 
 const BOT_DIFFICULTY_PROFILE = {
   easy: {
@@ -84,6 +95,8 @@ const BOT_DIFFICULTY_PROFILE = {
     desiredLead: 0.42,
     minOwnScore: 0.8,
     decoyThreshold: 0.62,
+    creativityWeight: 0.62,
+    discriminationWeight: 0.38,
   },
   normal: {
     storyTemperature: 0.85,
@@ -95,6 +108,8 @@ const BOT_DIFFICULTY_PROFILE = {
     desiredLead: 0.24,
     minOwnScore: 1.05,
     decoyThreshold: 0.72,
+    creativityWeight: 0.5,
+    discriminationWeight: 0.5,
   },
   smart: {
     storyTemperature: 0.45,
@@ -106,8 +121,21 @@ const BOT_DIFFICULTY_PROFILE = {
     desiredLead: 0.12,
     minOwnScore: 1.15,
     decoyThreshold: 0.78,
+    creativityWeight: 0.42,
+    discriminationWeight: 0.58,
   },
 };
+
+const BOT_METAPHOR_SPARKS = [
+  'sin mapa',
+  'con eco',
+  'a contratiempo',
+  'de madrugada',
+  'sin gravedad',
+  'en bucle',
+  'con olor a lluvia',
+  'en cámara lenta',
+];
 
 const BOT_THEME_LEXICON = {
   bosque: ['arboleda', 'raíces', 'hojarasca'],
@@ -192,6 +220,28 @@ function normalizeText(value = '') {
     .trim();
 }
 
+function roomAllowsAudioClue(room) {
+  if (!room || room.players.size < 2) return false;
+  for (const participant of room.players.values()) {
+    if (participant.isBot) return false;
+  }
+  return true;
+}
+
+function sanitizeClueAudioDataUrl(value = '') {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > MAX_CLUE_AUDIO_DATA_URL_LENGTH) return '';
+  if (!trimmed.startsWith('data:audio/')) return '';
+  const commaIndex = trimmed.indexOf(',');
+  if (commaIndex <= 0) return '';
+  const meta = trimmed.slice(0, commaIndex).toLowerCase();
+  if (!meta.includes(';base64')) return '';
+  const payload = trimmed.slice(commaIndex + 1);
+  if (!payload || !/^[a-z0-9+/=\s]+$/i.test(payload)) return '';
+  return trimmed;
+}
+
 function tokenize(value = '') {
   return normalizeText(value)
     .split(' ')
@@ -228,6 +278,9 @@ function createBotBrain() {
     botPersonaById: {},
     recentVotesByOwner: {},
     recentCardsByBot: {},
+    storyGuessRateByPlayer: {},
+    storyTokensByPlayer: {},
+    globalTokenUse: {},
   };
 }
 
@@ -243,6 +296,9 @@ function ensureBotBrain(room) {
   if (!room.botBrain.botPersonaById) room.botBrain.botPersonaById = {};
   if (!room.botBrain.recentVotesByOwner) room.botBrain.recentVotesByOwner = {};
   if (!room.botBrain.recentCardsByBot) room.botBrain.recentCardsByBot = {};
+  if (!room.botBrain.storyGuessRateByPlayer) room.botBrain.storyGuessRateByPlayer = {};
+  if (!room.botBrain.storyTokensByPlayer) room.botBrain.storyTokensByPlayer = {};
+  if (!room.botBrain.globalTokenUse) room.botBrain.globalTokenUse = {};
   return room.botBrain;
 }
 
@@ -342,6 +398,42 @@ function scoreCardForClue(clue, cardPath) {
   return (overlap + semantic) * lengthFactor;
 }
 
+function getScorePressure(room, playerId) {
+  const players = Array.from(room.players.values());
+  if (players.length === 0) return { relative: 0.5, isLeading: false, gapToLead: 0 };
+
+  const scores = players.map((player) => player.score || 0);
+  const topScore = Math.max(...scores);
+  const bottomScore = Math.min(...scores);
+  const me = room.players.get(playerId);
+  const myScore = me?.score || 0;
+  const span = Math.max(topScore - bottomScore, 1);
+  const relative = (myScore - bottomScore) / span;
+  const gapToLead = topScore - myScore;
+  return {
+    relative,
+    isLeading: gapToLead <= 0,
+    gapToLead,
+  };
+}
+
+function weightedProfileAffinity(profileTokens, tokenWeights = {}) {
+  let score = 0;
+  for (const [token, weight] of Object.entries(tokenWeights || {})) {
+    if (!weight || weight <= 0) continue;
+    if (!profileTokens.has(token)) continue;
+    score += weight;
+  }
+  return score;
+}
+
+function getStoryGuessRate(room, storytellerId) {
+  const brain = ensureBotBrain(room);
+  const value = brain.storyGuessRateByPlayer?.[storytellerId];
+  if (typeof value !== 'number' || Number.isNaN(value)) return 0.5;
+  return clamp(value, 0, 1);
+}
+
 function clueNoveltyPenalty(room, clue) {
   const brain = ensureBotBrain(room);
   const normalized = normalizeText(clue);
@@ -363,7 +455,11 @@ function clueNoveltyPenalty(room, clue) {
     const overlap = shared / Math.max(clueTokens.size, prevTokens.length);
     penalty = Math.max(penalty, overlap * (1 - age * 0.06));
   }
-  return penalty;
+  let tokenReusePenalty = 0;
+  for (const token of clueTokens) {
+    tokenReusePenalty += Math.min((brain.globalTokenUse?.[token] || 0) * 0.025, 0.3);
+  }
+  return penalty + tokenReusePenalty;
 }
 
 function softmaxPick(items, scoreSelector, temperature = 1) {
@@ -389,23 +485,121 @@ function softmaxPick(items, scoreSelector, temperature = 1) {
   return weighted[weighted.length - 1].item;
 }
 
-function buildBotReason(profile, persona, clue) {
-  const templates = [
-    `La elegí por el contraste ${profile.mood} y el aire de ${profile.theme}; suena clara sin ser obvia.`,
-    `Me apoyé en ${profile.element}, tonos ${profile.colors} y ritmo ${profile.rhythm} para dejar una duda razonable.`,
-    `La pista "${clue}" apunta a ${profile.theme}, pero también permite que otra carta compita.`,
-    `Con estilo ${persona.id}, busqué sugerir ${profile.mood} y ${profile.light} sin regalar la respuesta.`,
+function formatNaturalList(items = []) {
+  const clean = uniqueByNormalized((items || []).filter(Boolean));
+  if (clean.length === 0) return '';
+  if (clean.length === 1) return clean[0];
+  if (clean.length === 2) return `${clean[0]} y ${clean[1]}`;
+  return `${clean.slice(0, -1).join(', ')} y ${clean[clean.length - 1]}`;
+}
+
+function buildReasonSignals(clue, profile) {
+  const normalizedClue = normalizeText(clue);
+  const clueTokens = tokenize(clue);
+  const buckets = [
+    {
+      phrase: `tema de ${profile.theme}`,
+      terms: [profile.theme, ...(BOT_THEME_LEXICON[profile.theme] || [])],
+    },
+    {
+      phrase: `ambiente ${profile.mood}`,
+      terms: [profile.mood, ...(BOT_MOOD_LEXICON[profile.mood] || [])],
+    },
+    {
+      phrase: `elementos de ${singularize(profile.element)}`,
+      terms: [singularize(profile.element), profile.element, ...(BOT_ELEMENT_LEXICON[profile.element] || [])],
+    },
+    {
+      phrase: `paleta ${profile.colors}`,
+      terms: [profile.colors, ...(BOT_COLOR_LEXICON[profile.colors] || [])],
+    },
+    {
+      phrase: `clima de ${profile.weather}`,
+      terms: [profile.weather],
+    },
+    {
+      phrase: `luz de ${profile.light}`,
+      terms: [profile.light],
+    },
+    {
+      phrase: `ritmo ${profile.rhythm}`,
+      terms: [profile.rhythm],
+    },
   ];
-  return pickRandom(templates) || templates[0];
+
+  const scored = buckets
+    .map((bucket, index) => {
+      const terms = uniqueByNormalized(bucket.terms);
+      const profileTokens = new Set(terms.flatMap((term) => tokenize(term)));
+      let score = tokenOverlapScore(clueTokens, profileTokens);
+      for (const term of terms) {
+        const normalizedTerm = normalizeText(term);
+        if (normalizedTerm && normalizedClue.includes(normalizedTerm)) score += 1;
+      }
+      return { ...bucket, score, index };
+    })
+    .sort((a, b) => (b.score - a.score) || (a.index - b.index));
+
+  const positive = scored.filter((entry) => entry.score > 0.15).slice(0, 2);
+  if (positive.length === 2) return positive.map((entry) => entry.phrase);
+  if (positive.length === 1) {
+    const fallback = scored.find((entry) => entry.phrase !== positive[0].phrase);
+    return fallback ? [positive[0].phrase, fallback.phrase] : [positive[0].phrase];
+  }
+  return [`tema de ${profile.theme}`, `ambiente ${profile.mood}`];
+}
+
+function buildStrategyHint(meta = {}) {
+  if (meta?.isLeading) return 'Como iba arriba en el marcador, forcé un poco más de ambigüedad.';
+  if (meta?.isBehind) return 'Como iba por detrás, prioricé una lectura más clara.';
+  return 'Busqué un punto medio: entendible, pero no totalmente obvia.';
+}
+
+function buildTargetHint(meta = {}) {
+  if (typeof meta?.targetAmbiguity !== 'number' || Number.isNaN(meta.targetAmbiguity)) {
+    return 'La intención era que no fuera ni regalada ni imposible.';
+  }
+  const target = Math.max(0, Math.round(meta.targetAmbiguity));
+  if (target <= 0) return 'Intenté que casi todos pudieran reconocerla.';
+  if (target === 1) return 'Buscaba que dudara justo 1 rival.';
+  return `Buscaba que dudaran aproximadamente ${target} rivales.`;
+}
+
+function buildSharpnessHint(meta = {}) {
+  if (typeof meta?.ownScore !== 'number' || Number.isNaN(meta.ownScore)) return '';
+  if (meta.ownScore >= 1.8) return 'Por eso la pista quedó bastante directa.';
+  if (meta.ownScore >= 1.2) return 'La dejé reconocible, pero sin ser literal.';
+  return 'La mantuve más abstracta para que no señalara la carta de forma evidente.';
+}
+
+function buildBotReason(profile, persona, clue, meta = {}) {
+  const signals = buildReasonSignals(clue, profile);
+  const focus = formatNaturalList(signals) || `tema de ${profile.theme}`;
+  const styleHint = BOT_PERSONA_REASON_STYLE[persona?.id] || 'Intenté que sonara natural y jugable.';
+  const strategyHint = buildStrategyHint(meta);
+  const targetHint = buildTargetHint(meta);
+  const sharpnessHint = buildSharpnessHint(meta);
+  return [
+    `Elegí "${clue}" porque mi carta encajaba con ${focus}.`,
+    styleHint,
+    strategyHint,
+    sharpnessHint,
+    targetHint,
+  ].filter(Boolean).join(' ');
 }
 
 function buildBotClueCandidates(room, storyteller, cardPath) {
   const profile = getCardProfile(cardPath);
   const persona = storyteller?.isBot ? resolveBotPersona(room, storyteller) : BOT_PERSONALITIES[2];
+  const brain = ensureBotBrain(room);
   const themeWords = [profile.theme, ...(BOT_THEME_LEXICON[profile.theme] || [])];
   const moodWords = [profile.mood, ...(BOT_MOOD_LEXICON[profile.mood] || [])];
   const elementWords = [singularize(profile.element), ...(BOT_ELEMENT_LEXICON[profile.element] || [])];
   const colorWords = [profile.colors, ...(BOT_COLOR_LEXICON[profile.colors] || [])];
+  const contrastThemes = CARD_THEMES.filter((value) => value !== profile.theme);
+  const contrastMoods = CARD_MOODS.filter((value) => value !== profile.mood);
+  const contrastTheme = pickRandom(contrastThemes) || profile.theme;
+  const contrastMood = pickRandom(contrastMoods) || profile.mood;
   const opener = pickRandom(persona.openers) || 'me recuerda a';
   const cadence = pickRandom(persona.cadence) || 'sin aviso';
   const noun = pickRandom(BOT_NOUNS) || profile.theme;
@@ -417,31 +611,45 @@ function buildBotClueCandidates(room, storyteller, cardPath) {
   const anchorElement = pickRandom(elementWords) || singularize(profile.element);
   const anchorColor = pickRandom(colorWords) || profile.colors;
   const linker = pickRandom(BOT_LINKERS) || 'entre';
+  const metaphor = pickRandom(BOT_METAPHOR_SPARKS) || 'sin mapa';
+  const frequentTokens = Object.entries(brain.globalTokenUse || {})
+    .sort((a, b) => (b[1] || 0) - (a[1] || 0))
+    .slice(0, 10)
+    .map(([token]) => token);
+  const antiRepeatTheme = themeWords.find((word) => !frequentTokens.includes(normalizeText(word))) || anchorTheme;
+  const riskyAnchor = persona.riskBias >= 0.5 ? contrastTheme : anchorTheme;
 
   const clues = uniqueByNormalized([
     cleanClue(`${anchorTheme} ${anchorMood} ${twist}`),
+    cleanClue(`${riskyAnchor} ${anchorMood} ${metaphor}`),
     cleanClue(`${opener} ${anchorElement} ${cadence}`),
     cleanClue(`${scene}: ${anchorTheme} ${twist}`),
     cleanClue(`${anchorElement} ${linker} ${anchorMood}`),
     cleanClue(`${anchorColor} y ${anchorMood}`),
+    cleanClue(`${anchorTheme} pero ${contrastMood}`),
+    cleanClue(`${anchorElement} en ${contrastTheme}`),
+    cleanClue(`${antiRepeatTheme} ${linker} ${anchorColor}`),
     cleanClue(`${noun} ${adj} ${twist}`),
     cleanClue(`${profile.light} ${linker} ${anchorTheme}`),
-    cleanClue(`${opener} ${noun} ${pickRandom(['sin mapa', 'en cámara lenta', 'sin final'])}`),
+    cleanClue(`${opener} ${noun} ${pickRandom(['sin final', 'sin aviso', 'sin gravedad'])}`),
+    cleanClue(`${anchorTheme} ${linker} ${profile.weather}`),
+    cleanClue(`${anchorMood} ${linker} ${profile.rhythm}`),
   ]).filter((clue) => clue.length >= 8 && clue.split(' ').length >= 2 && clue.length <= 80);
 
   if (clues.length === 0) {
-    clues.push(cleanClue(`${profile.theme} ${profile.mood} ${twist}`));
+    clues.push(cleanClue(`${profile.theme} ${profile.mood} ${metaphor}`));
   }
 
   return clues.map((clue) => ({
     clue,
-    reason: buildBotReason(profile, persona, clue),
     profile,
+    persona,
   }));
 }
 
 function evaluateStoryCandidate(room, storyteller, cardPath, clue, level = 'normal') {
   const config = getBotDifficulty(level);
+  const brain = ensureBotBrain(room);
   const ownScore = scoreCardForClue(clue, cardPath);
   const opponents = Array.from(room.players.values()).filter((player) => player.id !== storyteller.id);
 
@@ -462,23 +670,61 @@ function evaluateStoryCandidate(room, storyteller, cardPath, clue, level = 'norm
   }
   if (bestOpponentScore === -Infinity) bestOpponentScore = 0;
 
+  const pressure = getScorePressure(room, storyteller.id);
+  const guessRate = getStoryGuessRate(room, storyteller.id);
+
+  const adaptiveTargetRatio = clamp(
+    config.targetAmbiguity
+      + (pressure.isLeading ? 0.12 : -0.08)
+      + (guessRate > 0.68 ? 0.12 : guessRate < 0.32 ? -0.08 : 0),
+    0.1,
+    0.92,
+  );
   const targetAmbiguity = clamp(
-    Math.round(opponents.length * config.targetAmbiguity),
+    Math.round(opponents.length * adaptiveTargetRatio),
     opponents.length > 1 ? 1 : 0,
     Math.max(opponents.length - 1, 0),
   );
   const ambiguityPenalty = Math.abs(strongOpponents - targetAmbiguity) * 1.25;
 
+  const adaptiveDesiredLead = clamp(
+    config.desiredLead
+      + (pressure.isLeading ? -0.08 : 0.1)
+      + (guessRate > 0.68 ? -0.05 : guessRate < 0.32 ? 0.07 : 0),
+    -0.22,
+    0.9,
+  );
   const lead = ownScore - bestOpponentScore;
-  const leadPenalty = Math.abs(lead - config.desiredLead) * 1.85;
+  const leadPenalty = Math.abs(lead - adaptiveDesiredLead) * 1.85;
 
   const noveltyPenalty = clueNoveltyPenalty(room, clue);
   const clarityPenalty = ownScore < config.minOwnScore ? (config.minOwnScore - ownScore) * 2.3 : 0;
 
-  const wordCount = tokenize(clue).length;
+  const clueTokens = tokenize(clue);
+  const wordCount = clueTokens.length;
   let naturalBonus = 0.15;
   if (wordCount >= 2 && wordCount <= 6) naturalBonus += 0.35;
   if (clue.length >= 12 && clue.length <= 46) naturalBonus += 0.2;
+  if (clue.includes(':') || clue.includes(',')) naturalBonus += 0.07;
+
+  const profile = getCardProfile(cardPath);
+  let coherenceBonus = 0;
+  const normalizedClue = normalizeText(clue);
+  if (normalizedClue.includes(normalizeText(profile.theme))) coherenceBonus += 0.24;
+  if (normalizedClue.includes(normalizeText(profile.mood))) coherenceBonus += 0.2;
+  if (normalizedClue.includes(normalizeText(singularize(profile.element)))) coherenceBonus += 0.16;
+
+  let rareTokenBonus = 0;
+  for (const token of clueTokens) {
+    const usage = brain.globalTokenUse?.[token] || 0;
+    if (usage <= 1) rareTokenBonus += 0.1;
+    else if (usage <= 3) rareTokenBonus += 0.04;
+    else rareTokenBonus -= 0.03;
+  }
+  rareTokenBonus = clamp(rareTokenBonus, -0.2, 0.35);
+
+  const creativityDiscriminationBalance =
+    rareTokenBonus * config.creativityWeight + coherenceBonus * config.discriminationWeight;
 
   const quality = ownScore * 2.2
     - ambiguityPenalty
@@ -486,9 +732,16 @@ function evaluateStoryCandidate(room, storyteller, cardPath, clue, level = 'norm
     - noveltyPenalty
     - clarityPenalty
     + naturalBonus
+    + creativityDiscriminationBalance
     + Math.random() * 0.04;
 
-  return { quality };
+  return {
+    quality,
+    ownScore,
+    targetAmbiguity,
+    isLeading: pressure.isLeading,
+    isBehind: pressure.gapToLead > 0,
+  };
 }
 
 function selectStorytellerPlan(room, storyteller, level = storyteller?.difficulty || 'normal') {
@@ -498,12 +751,14 @@ function selectStorytellerPlan(room, storyteller, level = storyteller?.difficult
   for (const card of storyteller.hand) {
     const candidates = buildBotClueCandidates(room, storyteller, card);
     for (const candidate of candidates) {
-      const { quality } = evaluateStoryCandidate(room, storyteller, card, candidate.clue, level);
+      const evaluated = evaluateStoryCandidate(room, storyteller, card, candidate.clue, level);
       options.push({
         card,
         clue: candidate.clue,
-        reason: candidate.reason,
-        quality,
+        quality: evaluated.quality,
+        profile: candidate.profile,
+        persona: candidate.persona,
+        meta: evaluated,
       });
     }
   }
@@ -513,7 +768,12 @@ function selectStorytellerPlan(room, storyteller, level = storyteller?.difficult
   const shortlist = options
     .sort((a, b) => b.quality - a.quality)
     .slice(0, 8);
-  return softmaxPick(shortlist, (option) => option.quality, config.storyTemperature) || shortlist[0];
+  const selected = softmaxPick(shortlist, (option) => option.quality, config.storyTemperature) || shortlist[0];
+  return {
+    card: selected.card,
+    clue: selected.clue,
+    reason: buildBotReason(selected.profile, selected.persona, selected.clue, selected.meta),
+  };
 }
 
 function chooseBotSubmissionCard(room, bot, level = bot?.difficulty || 'normal') {
@@ -521,13 +781,17 @@ function chooseBotSubmissionCard(room, bot, level = bot?.difficulty || 'normal')
   const config = getBotDifficulty(level);
   const brain = ensureBotBrain(room);
   const recentCards = brain.recentCardsByBot[bot.id] || [];
+  const pressure = getScorePressure(room, bot.id);
+  const storytellerTokens = brain.storyTokensByPlayer?.[room.storytellerId] || {};
 
-  const scored = bot.hand.map((card) => {
+  const scoredRaw = bot.hand.map((card) => {
     const similarity = scoreCardForClue(room.clue, card);
+    const profile = getCardProfile(card);
+    const styleAffinity = weightedProfileAffinity(profile.tokens, storytellerTokens);
     const repeatPenalty = recentCards.includes(card) ? 0.45 : 0;
     return {
       card,
-      score: similarity - repeatPenalty + Math.random() * 0.05,
+      score: similarity + styleAffinity * 0.06 - repeatPenalty,
     };
   });
 
@@ -535,7 +799,31 @@ function chooseBotSubmissionCard(room, bot, level = bot?.difficulty || 'normal')
     return pickRandom(bot.hand) || bot.hand[0];
   }
 
-  const selected = softmaxPick(scored, (entry) => entry.score, config.submitTemperature) || scored[0];
+  const rawValues = scoredRaw.map((entry) => entry.score);
+  const minRaw = Math.min(...rawValues);
+  const maxRaw = Math.max(...rawValues);
+  const span = Math.max(maxRaw - minRaw, 0.01);
+  const targetPosition = pressure.isLeading
+    ? 0.62
+    : pressure.gapToLead >= 3
+      ? 0.9
+      : 0.78;
+  const tacticalWeight = pressure.isLeading ? 0.45 : 0.22;
+  const scored = scoredRaw.map((entry) => {
+    const normalized = (entry.score - minRaw) / span;
+    const tacticalPenalty = Math.abs(normalized - targetPosition) * tacticalWeight;
+    return {
+      card: entry.card,
+      score: entry.score - tacticalPenalty + Math.random() * 0.04,
+    };
+  });
+
+  const adaptiveTemp = clamp(
+    config.submitTemperature + (pressure.isLeading ? 0.12 : -0.08),
+    0.18,
+    1.9,
+  );
+  const selected = softmaxPick(scored, (entry) => entry.score, adaptiveTemp) || scored[0];
   return selected.card;
 }
 
@@ -543,6 +831,9 @@ function chooseBotVote(room, bot, level = bot?.difficulty || 'normal') {
   const choices = room.shuffledSubmissions.filter((submission) => submission.playerId !== bot.id);
   if (choices.length === 0) return null;
   const config = getBotDifficulty(level);
+  const brain = ensureBotBrain(room);
+  const pressure = getScorePressure(room, bot.id);
+  const storytellerTokens = brain.storyTokensByPlayer?.[room.storytellerId] || {};
 
   if (Math.random() < config.randomVoteChance) {
     return pickRandom(choices) || choices[0];
@@ -550,9 +841,23 @@ function chooseBotVote(room, bot, level = bot?.difficulty || 'normal') {
 
   const scored = choices.map((choice) => ({
     choice,
-    score: scoreCardForClue(room.clue, choice.card) + Math.random() * 0.05,
+    score: (() => {
+      const similarity = scoreCardForClue(room.clue, choice.card);
+      const profile = getCardProfile(choice.card);
+      const styleAffinity = weightedProfileAffinity(profile.tokens, storytellerTokens) * 0.05;
+      const ownerVoteTrend = brain.recentVotesByOwner?.[choice.playerId] || 0;
+      const storytellerBoost = choice.playerId === room.storytellerId ? 0.32 : 0;
+      const decoyPenalty = choice.playerId === room.storytellerId ? 0 : Math.min(ownerVoteTrend * 0.12, 0.45);
+      const comebackBias = pressure.gapToLead >= 3 && choice.playerId === room.storytellerId ? 0.06 : 0;
+      return similarity + storytellerBoost + styleAffinity - decoyPenalty + comebackBias + Math.random() * 0.03;
+    })(),
   }));
-  const selected = softmaxPick(scored, (entry) => entry.score, config.voteTemperature) || scored[0];
+  const adaptiveTemp = clamp(
+    config.voteTemperature + (pressure.isLeading ? 0.2 : -0.12),
+    0.15,
+    2.1,
+  );
+  const selected = softmaxPick(scored, (entry) => entry.score, adaptiveTemp) || scored[0];
   return selected.choice;
 }
 
@@ -565,6 +870,10 @@ function rememberClueMemory(room, storytellerId, clue) {
   brain.usedClues.push(normalized);
   if (brain.usedClues.length > 60) {
     brain.usedClues = brain.usedClues.slice(-60);
+  }
+  const tokens = tokenize(normalized);
+  for (const token of tokens) {
+    brain.globalTokenUse[token] = Math.min((brain.globalTokenUse[token] || 0) + 0.35, 400);
   }
   if (storytellerId && brain.botPersonaById[storytellerId] === undefined) {
     brain.botPersonaById[storytellerId] = null;
@@ -583,6 +892,40 @@ function rememberRoundOutcome(room) {
     const next = current === undefined ? votes : current * 0.65 + votes * 0.35;
     brain.recentVotesByOwner[submission.playerId] = next;
   }
+
+  const storytellerId = room.storytellerId;
+  const storytellerSubmission = room.submissions.find((submission) => submission.playerId === storytellerId);
+  if (storytellerId && storytellerSubmission) {
+    const votesToStoryteller = votesBySubmission.get(storytellerSubmission.id) || 0;
+    const totalVoters = Math.max(room.players.size - 1, 1);
+    const guessRate = clamp(votesToStoryteller / totalVoters, 0, 1);
+    const current = brain.storyGuessRateByPlayer[storytellerId];
+    brain.storyGuessRateByPlayer[storytellerId] = typeof current === 'number'
+      ? current * 0.7 + guessRate * 0.3
+      : guessRate;
+  }
+
+  const clueTokens = tokenize(room.clue || '');
+  if (storytellerId && clueTokens.length > 0) {
+    const tokenMap = brain.storyTokensByPlayer[storytellerId] || {};
+
+    for (const token of Object.keys(tokenMap)) {
+      tokenMap[token] *= 0.9;
+      if (tokenMap[token] < 0.08) delete tokenMap[token];
+    }
+    for (const token of clueTokens) {
+      tokenMap[token] = Math.min((tokenMap[token] || 0) + 1, 8);
+      brain.globalTokenUse[token] = Math.min((brain.globalTokenUse[token] || 0) + 1, 400);
+    }
+    brain.storyTokensByPlayer[storytellerId] = tokenMap;
+  }
+
+  if (Object.keys(brain.globalTokenUse).length > 220) {
+    for (const token of Object.keys(brain.globalTokenUse)) {
+      brain.globalTokenUse[token] *= 0.96;
+      if (brain.globalTokenUse[token] < 0.25) delete brain.globalTokenUse[token];
+    }
+  }
 }
 
 function applyStorytellerPlan(room, storyteller, plan) {
@@ -594,6 +937,7 @@ function applyStorytellerPlan(room, storyteller, plan) {
   storyteller.submittedCardId = submissionId;
   room.clue = cleanClue(plan.clue);
   room.clueReason = plan.reason || '';
+  room.clueAudio = '';
   room.submissions = [{ id: submissionId, playerId: storyteller.id, card: plan.card }];
   room.shuffledSubmissions = [];
   room.votes = [];
@@ -665,6 +1009,7 @@ function roomToJSON(room) {
     round: room.round,
     clue: room.clue,
     clueReason: room.clueReason,
+    clueAudio: room.clueAudio || '',
     submissions: room.submissions,
     shuffledSubmissions: room.shuffledSubmissions,
     votes: room.votes,
@@ -677,6 +1022,32 @@ function roomToJSON(room) {
     mode: room.mode,
     drinkLevel: room.drinkLevel
   };
+}
+
+function isPlayerConnected(player) {
+  if (!player || !player.connected || player.isBot) return false;
+  if (!player.ws) return false;
+  return player.ws.readyState === player.ws.OPEN;
+}
+
+function pickConnectedHost(room) {
+  if (!room || !Array.isArray(room.order)) return null;
+  for (const id of room.order) {
+    const candidate = room.players.get(id);
+    if (isPlayerConnected(candidate)) return id;
+  }
+  return null;
+}
+
+function ensureHostId(room) {
+  if (!room) return null;
+  const currentHost = room.players.get(room.hostId);
+  if (isPlayerConnected(currentHost)) {
+    return room.hostId;
+  }
+  const nextHost = pickConnectedHost(room);
+  room.hostId = nextHost;
+  return nextHost;
 }
 
 function saveRooms() {
@@ -697,13 +1068,16 @@ function loadRooms() {
       const room = {
         ...r,
         players: new Map(),
+        clueAudio: r.clueAudio || '',
+        summary: r.summary ? { ...r.summary, clueAudio: r.summary.clueAudio || '' } : null,
         mode: r.mode || 'classic',
         drinkLevel: r.drinkLevel || 'light',
         botBrain: createBotBrain(),
       };
       r.players.forEach(p => {
-        room.players.set(p.id, { ...p, ws: null });
+        room.players.set(p.id, { ...p, ws: null, connected: false });
       });
+      ensureHostId(room);
       for (const player of room.players.values()) {
         if (player.isBot) resolveBotPersona(room, player);
       }
@@ -757,6 +1131,7 @@ function createRoom(code) {
     round: 0,
     clue: '',
     clueReason: '',
+    clueAudio: '',
     submissions: [],
     shuffledSubmissions: [],
     votes: [],
@@ -824,6 +1199,7 @@ function resetRound(room) {
   room.phase = 'clue';
   room.clue = '';
   room.clueReason = '';
+  room.clueAudio = '';
   room.submissions = [];
   room.shuffledSubmissions = [];
   room.votes = [];
@@ -1000,11 +1376,7 @@ function addBot(room, name = 'Bot', difficulty = 'normal') {
 }
 
 function pickNextHost(room) {
-  const connected = room.order.find((id) => {
-    const candidate = room.players.get(id);
-    return candidate && (candidate.connected || candidate.isBot);
-  });
-  return connected || room.order[0] || null;
+  return pickConnectedHost(room);
 }
 
 function removePlayer(room, playerId, reason = 'left') {
@@ -1026,6 +1398,8 @@ function removePlayer(room, playerId, reason = 'left') {
     delete room.botBrain.botPersonaById?.[playerId];
     delete room.botBrain.recentVotesByOwner?.[playerId];
     delete room.botBrain.recentCardsByBot?.[playerId];
+    delete room.botBrain.storyGuessRateByPlayer?.[playerId];
+    delete room.botBrain.storyTokensByPlayer?.[playerId];
   }
 
   if (room.players.size === 0) {
@@ -1044,6 +1418,7 @@ function removePlayer(room, playerId, reason = 'left') {
     room.phase = 'lobby';
     room.clue = '';
     room.clueReason = '';
+    room.clueAudio = '';
     room.submissions = [];
     room.shuffledSubmissions = [];
     room.votes = [];
@@ -1096,6 +1471,7 @@ function computeScores(room) {
   room.summary = {
     clue: room.clue,
     clueReason: room.clueReason || '',
+    clueAudio: room.clueAudio || '',
     storytellerId,
     votes,
     votesDetail: votes.map(v => {
@@ -1142,6 +1518,7 @@ function toClientState(room, playerId) {
     hostId: room.hostId,
     storytellerId: room.storytellerId,
     clue: room.clue,
+    clueAudio: room.clueAudio || '',
     you: player ? {
       id: player.id,
       name: player.name,
@@ -1157,7 +1534,7 @@ function toClientState(room, playerId) {
       name: p.name,
       score: p.score,
       ready: p.ready,
-      connected: p.connected,
+      connected: isPlayerConnected(p),
       isBot: p.isBot || false,
       difficulty: p.difficulty || 'normal',
       isHost: room.hostId === p.id,
@@ -1203,6 +1580,7 @@ function toClientState(room, playerId) {
 }
 
 function broadcast(room) {
+  ensureHostId(room);
   ensureBotActions(room);
   for (const p of room.players.values()) {
     if (p.ws && p.ws.readyState === p.ws.OPEN) {
@@ -1237,6 +1615,8 @@ wss.on('connection', (ws) => {
         const existing = room.players.get(msg.playerId);
         existing.ws = ws;
         existing.connected = true;
+        if (!room.hostId) room.hostId = existing.id;
+        ensureHostId(room);
         currentRoom = room;
         currentPlayerId = existing.id;
         send(ws, { type: 'joined', roomCode: room.code, playerId: existing.id });
@@ -1262,6 +1642,7 @@ wss.on('connection', (ws) => {
         send(ws, { type: 'error', message: 'Sala no encontrada.' });
         return;
       }
+      ensureHostId(target);
 
       const player = currentRoom && currentPlayerId ? currentRoom.players.get(currentPlayerId) : null;
       const canEndAsHost = Boolean(player && target.hostId === player.id);
@@ -1285,6 +1666,7 @@ wss.on('connection', (ws) => {
     const room = currentRoom;
     const player = room.players.get(currentPlayerId);
     if (!player) return;
+    ensureHostId(room);
 
     switch (type) {
       case 'set_ready': {
@@ -1328,6 +1710,7 @@ wss.on('connection', (ws) => {
         room.round = 0;
         room.storytellerId = room.order[0];
         room.phase = 'clue';
+        room.clueAudio = '';
         room.phaseStartedAt = Date.now();
         room.botBrain = createBotBrain();
         refillHands(room);
@@ -1363,6 +1746,7 @@ wss.on('connection', (ws) => {
         room.round = 0;
         room.storytellerId = room.order[0];
         room.phase = 'clue';
+        room.clueAudio = '';
         room.phaseStartedAt = Date.now();
         room.botBrain = createBotBrain();
         for (const participant of room.players.values()) {
@@ -1378,13 +1762,16 @@ wss.on('connection', (ws) => {
         if (room.phase !== 'clue' || room.storytellerId !== player.id) return;
         const card = msg.card;
         const clue = (msg.clue || '').toString().trim().slice(0, 80);
-        if (!card || !player.hand.includes(card) || !clue) return;
+        const clueAudio = roomAllowsAudioClue(room) ? sanitizeClueAudioDataUrl(msg.clueAudio || '') : '';
+        if (!card || !player.hand.includes(card)) return;
+        if (!clue && !clueAudio) return;
         // remove card from hand
         player.hand = player.hand.filter(c => c !== card);
         const submissionId = crypto.randomUUID();
         player.submittedCardId = submissionId;
-        room.clue = cleanClue(clue);
+        room.clue = cleanClue(clue || CLUE_AUDIO_FALLBACK_TEXT);
         room.clueReason = '';
+        room.clueAudio = clueAudio;
         room.submissions = [{ id: submissionId, playerId: player.id, card }];
         room.shuffledSubmissions = [];
         room.votes = [];
@@ -1474,7 +1861,12 @@ app.get('/api/rooms', (req, res) => {
     turnSeconds: r.turnSeconds,
     mode: r.mode || 'classic',
     drinkLevel: r.drinkLevel || 'light',
-    players: Array.from(r.players.values()).map(p => ({ id: p.id, name: p.name, score: p.score, connected: p.connected }))
+    players: Array.from(r.players.values()).map(p => ({
+      id: p.id,
+      name: p.name,
+      score: p.score,
+      connected: isPlayerConnected(p)
+    }))
   }));
   res.json(list);
 });

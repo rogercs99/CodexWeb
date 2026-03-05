@@ -1,4 +1,4 @@
-import { ChevronLeft, Clipboard, Paperclip, RefreshCw, Send, Settings, Square, X } from 'lucide-react';
+import { Check, ChevronLeft, Clipboard, Copy, Paperclip, RefreshCw, Send, Settings, Square, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -6,8 +6,6 @@ import BottomNav from './BottomNav';
 import type { ChatOptions, Message, Screen, TerminalEntry } from '../lib/types';
 
 const TITLE_MAX_LENGTH = 40;
-const COLLAPSED_CODE_LINES = 20;
-
 function formatDate(value: string) {
   const date = value ? new Date(value) : null;
   if (!date || Number.isNaN(date.getTime())) return '';
@@ -31,29 +29,118 @@ function truncateTitle(value: string, maxLength = TITLE_MAX_LENGTH) {
   return `${value.slice(0, maxLength - 1).trimEnd()}…`;
 }
 
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  const source = String(text || '');
+  if (!source) return false;
+
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(source);
+      return true;
+    }
+  } catch (_error) {
+    // fallback below
+  }
+
+  try {
+    const textarea = document.createElement('textarea');
+    textarea.value = source;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    textarea.style.pointerEvents = 'none';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    const copied = document.execCommand('copy');
+    document.body.removeChild(textarea);
+    return copied;
+  } catch (_error) {
+    return false;
+  }
+}
+
 function CodeBlock({ text, language }: { text: string; language: string }) {
   const [expanded, setExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<number | null>(null);
   const lines = String(text || '').split('\n');
-  const canCollapse = lines.length > COLLAPSED_CODE_LINES;
-  const shown = !canCollapse || expanded ? lines : lines.slice(0, COLLAPSED_CODE_LINES);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleCopy = async () => {
+    const ok = await copyTextToClipboard(text);
+    if (!ok) return;
+    setCopied(true);
+    if (copyTimerRef.current !== null) {
+      window.clearTimeout(copyTimerRef.current);
+    }
+    copyTimerRef.current = window.setTimeout(() => {
+      setCopied(false);
+      copyTimerRef.current = null;
+    }, 1600);
+  };
 
   return (
     <div className="rounded-xl border border-zinc-700 bg-zinc-950/90 overflow-hidden">
-      <div className="flex items-center justify-between px-3 py-2 border-b border-zinc-800 bg-zinc-900/70">
+      <div
+        className="flex items-center justify-between px-3 py-2 border-b border-zinc-800 bg-zinc-900/70 cursor-pointer"
+        role="button"
+        tabIndex={0}
+        onMouseEnter={() => {
+          if (!expanded) setExpanded(true);
+        }}
+        onClick={() => setExpanded((prev) => !prev)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            setExpanded((prev) => !prev);
+          }
+        }}
+      >
         <span className="text-[11px] uppercase tracking-wide text-zinc-400">{language || 'code'}</span>
-        {canCollapse ? (
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-blue-300">{expanded ? 'Ver menos' : `Abrir (${lines.length} lineas)`}</span>
           <button
             type="button"
-            onClick={() => setExpanded((prev) => !prev)}
-            className="text-[11px] text-blue-300 hover:text-blue-200"
+            onClick={(event) => {
+              event.stopPropagation();
+              void handleCopy();
+            }}
+            className="inline-flex items-center gap-1 rounded-md border border-zinc-700 px-2 py-1 text-[11px] text-zinc-200 hover:bg-zinc-800/90"
+            aria-label="Copiar codigo"
           >
-            {expanded ? 'Ver menos' : `Ver mas (${lines.length - COLLAPSED_CODE_LINES} lineas)`}
+            {copied ? <Check size={12} /> : <Copy size={12} />}
+            {copied ? 'Copiado' : 'Copiar'}
           </button>
-        ) : null}
+        </div>
       </div>
-      <pre className="text-xs text-zinc-200 p-3 overflow-x-auto whitespace-pre">
-        <code>{shown.join('\n')}{!expanded && canCollapse ? '\n...' : ''}</code>
-      </pre>
+      {expanded ? (
+        <pre className="text-xs text-zinc-200 p-3 overflow-x-auto whitespace-pre">
+          <code>{lines.join('\n')}</code>
+        </pre>
+      ) : (
+        <div
+          role="button"
+          tabIndex={0}
+          className="px-3 py-2 text-xs text-zinc-500 cursor-pointer select-none"
+          onClick={() => setExpanded(true)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              setExpanded(true);
+            }
+          }}
+        >
+          Toca para abrir el bloque de codigo
+        </div>
+      )}
     </div>
   );
 }
@@ -152,12 +239,22 @@ export default function ChatScreen({
   const [hasTerminalActivity, setHasTerminalActivity] = useState(false);
   const [showTitleModal, setShowTitleModal] = useState(false);
   const fileRef = useRef<HTMLInputElement | null>(null);
+  const headerRef = useRef<HTMLElement | null>(null);
   const messagesRef = useRef<HTMLElement | null>(null);
+  const [headerOffset, setHeaderOffset] = useState(136);
 
   const grouped = useMemo(() => messages, [messages]);
   const fullTitle = normalizeTitle(chatTitle);
   const shortTitle = truncateTitle(fullTitle);
   const isLongTitle = fullTitle.length > TITLE_MAX_LENGTH;
+  const pendingAssistantMessageId = useMemo(() => {
+    for (let i = grouped.length - 1; i >= 0; i -= 1) {
+      const item = grouped[i];
+      if (item.role !== 'assistant') continue;
+      return String(item.content || '').trim() ? null : item.id;
+    }
+    return null;
+  }, [grouped]);
 
   const lastMessageFingerprint = grouped.length > 0 ? `${grouped[grouped.length - 1].id}:${String(grouped[grouped.length - 1].content || '').length}` : 'none';
   const lastTerminalEntry = terminalEntries.length > 0 ? terminalEntries[terminalEntries.length - 1] : null;
@@ -181,6 +278,32 @@ export default function ChatScreen({
     window.addEventListener('keydown', handleEscape);
     return () => window.removeEventListener('keydown', handleEscape);
   }, [showTitleModal]);
+
+  useEffect(() => {
+    const node = headerRef.current;
+    if (!node) return undefined;
+
+    const syncHeaderOffset = () => {
+      const height = Math.ceil(node.getBoundingClientRect().height);
+      setHeaderOffset((prev) => (prev === height ? prev : height));
+    };
+
+    syncHeaderOffset();
+    window.addEventListener('resize', syncHeaderOffset);
+
+    if (typeof ResizeObserver !== 'undefined') {
+      const observer = new ResizeObserver(syncHeaderOffset);
+      observer.observe(node);
+      return () => {
+        observer.disconnect();
+        window.removeEventListener('resize', syncHeaderOffset);
+      };
+    }
+
+    return () => {
+      window.removeEventListener('resize', syncHeaderOffset);
+    };
+  }, []);
 
   useEffect(() => {
     const node = messagesRef.current;
@@ -238,86 +361,94 @@ export default function ChatScreen({
 
   return (
     <div className="h-screen bg-black flex flex-col relative overflow-hidden overflow-x-hidden">
-      <header className="fixed top-0 left-0 right-0 z-[70] bg-black/85 backdrop-blur-xl border-b border-zinc-900 px-3 py-3">
-        <div className="flex items-center gap-1">
-          <button onClick={onBack} className="w-9 h-9 shrink-0 flex items-center justify-center rounded-full hover:bg-white/10 transition-colors" type="button" aria-label="Volver al hub">
-            <ChevronLeft size={24} />
-          </button>
-          <div className="min-w-0 flex-1 text-center px-1">
-            <button
-              type="button"
-              onClick={() => {
-                if (!isLongTitle) return;
-                setShowTitleModal(true);
-              }}
-              className={`mx-auto max-w-full text-[16px] font-semibold tracking-tight flex items-center justify-center gap-2 ${
-                isLongTitle ? 'cursor-help' : ''
-              }`}
-              title={isLongTitle ? fullTitle : undefined}
-              aria-label={fullTitle}
-            >
-              {sending || isRunning ? (
-                <span
-                  className="h-3.5 w-3.5 rounded-full border-2 border-blue-400 border-t-transparent animate-spin shrink-0"
-                  aria-label="Chat en ejecucion"
-                />
-              ) : null}
-              <span className="truncate">{shortTitle}</span>
+      <header ref={headerRef} className="fixed top-0 left-0 right-0 z-[70] bg-black border-b border-zinc-900">
+        <div className="h-[env(safe-area-inset-top)] bg-black" aria-hidden="true" />
+        <div className="px-3 pb-3 pt-2">
+          <div className="flex items-center gap-1">
+            <button onClick={onBack} className="w-9 h-9 shrink-0 flex items-center justify-center rounded-full hover:bg-white/10 transition-colors" type="button" aria-label="Volver al hub">
+              <ChevronLeft size={24} />
             </button>
-            <p className="text-xs text-zinc-500">{headerStatus}</p>
+            <div className="min-w-0 flex-1 text-center px-1">
+              <button
+                type="button"
+                onClick={() => {
+                  if (!isLongTitle) return;
+                  setShowTitleModal(true);
+                }}
+                className={`mx-auto max-w-full text-[16px] font-semibold tracking-tight flex items-center justify-center gap-2 ${
+                  isLongTitle ? 'cursor-help' : ''
+                }`}
+                title={isLongTitle ? fullTitle : undefined}
+                aria-label={fullTitle}
+              >
+                {sending || isRunning ? (
+                  <span
+                    className="h-3.5 w-3.5 rounded-full border-2 border-blue-400 border-t-transparent animate-spin shrink-0"
+                    aria-label="Chat en ejecucion"
+                  />
+                ) : null}
+                <span className="truncate">{shortTitle}</span>
+              </button>
+              <p className="text-xs text-zinc-500">{headerStatus}</p>
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                onClick={onRefresh}
+                className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-300 hover:text-white hover:border-zinc-500"
+                type="button"
+                aria-label="Refrescar chat"
+              >
+                <RefreshCw size={15} />
+              </button>
+              <button
+                onClick={() => onNavigate('settings')}
+                className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-300 hover:text-white hover:border-zinc-500"
+                type="button"
+                aria-label="Abrir opciones"
+              >
+                <Settings size={15} />
+              </button>
+            </div>
           </div>
-          <div className="flex items-center gap-1 shrink-0">
-            <button
-              onClick={onRefresh}
-              className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-300 hover:text-white hover:border-zinc-500"
-              type="button"
-              aria-label="Refrescar chat"
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <select
+              value={model}
+              onChange={(event) => onModelChange(event.target.value)}
+              className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-200"
+              aria-label="Modelo del chat"
             >
-              <RefreshCw size={15} />
-            </button>
-            <button
-              onClick={() => onNavigate('settings')}
-              className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-300 hover:text-white hover:border-zinc-500"
-              type="button"
-              aria-label="Abrir opciones"
+              <option value="">Automatico (default CLI)</option>
+              {options.models.map((item) => (
+                <option key={item} value={item}>{item}</option>
+              ))}
+            </select>
+            <select
+              value={reasoningEffort}
+              onChange={(event) => onReasoningChange(event.target.value)}
+              className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-200"
+              aria-label="Nivel de razonamiento del chat"
             >
-              <Settings size={15} />
-            </button>
+              {options.reasoningEfforts.map((item) => (
+                <option key={item} value={item}>{item}</option>
+              ))}
+            </select>
           </div>
-        </div>
-        <div className="mt-2 grid grid-cols-2 gap-2">
-          <select
-            value={model}
-            onChange={(event) => onModelChange(event.target.value)}
-            className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-200"
-            aria-label="Modelo del chat"
-          >
-            <option value="">Automatico (default CLI)</option>
-            {options.models.map((item) => (
-              <option key={item} value={item}>{item}</option>
-            ))}
-          </select>
-          <select
-            value={reasoningEffort}
-            onChange={(event) => onReasoningChange(event.target.value)}
-            className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-200"
-            aria-label="Nivel de razonamiento del chat"
-          >
-            {options.reasoningEfforts.map((item) => (
-              <option key={item} value={item}>{item}</option>
-            ))}
-          </select>
         </div>
       </header>
 
-      <main ref={messagesRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4 pt-32 pb-72 space-y-4">
+      <main ref={messagesRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4 pb-72 space-y-4" style={{ paddingTop: headerOffset }}>
         {grouped.length === 0 ? (
           <div className="text-center text-zinc-500 text-sm py-10">Escribe un mensaje para iniciar la conversacion.</div>
         ) : null}
         {grouped.map((message) => {
           const rawContent = String(message.content || '');
           const hasVisibleContent = rawContent.trim().length > 0;
-          const showThinking = (sending || isRunning) && message.role === 'assistant' && !hasVisibleContent;
+          const showThinking =
+            (sending || isRunning) &&
+            message.role === 'assistant' &&
+            !hasVisibleContent &&
+            pendingAssistantMessageId !== null &&
+            message.id === pendingAssistantMessageId;
           const fallbackText =
             message.role === 'assistant'
               ? '(Sin respuesta visible del modelo. Revisa terminal para el detalle del error.)'

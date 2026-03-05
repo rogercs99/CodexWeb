@@ -4,9 +4,18 @@ import type {
   CodexAuthStatus,
   ChatOptions,
   CodexQuota,
+  NotificationSettings,
   Conversation,
   Message,
+  ToolsGitPushResult,
+  ToolsGitRepoSummary,
+  ToolsGitResolvePayload,
+  ToolsGitReposPayload,
   RestartState,
+  TaskRecovery,
+  TaskRunDashboardItem,
+  UnifiedSearchPayload,
+  ObservabilitySnapshot,
   User
 } from './types';
 
@@ -61,6 +70,21 @@ export async function deleteConversation(conversationId: number): Promise<void> 
   await api(`/api/conversations/${conversationId}`, { method: 'DELETE' });
 }
 
+export async function updateConversationTitle(
+  conversationId: number,
+  title: string
+): Promise<{ id: number; title: string }> {
+  const data = await api<{ conversation: { id: number; title: string } }>(
+    `/api/conversations/${conversationId}/title`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title })
+    }
+  );
+  return data.conversation;
+}
+
 export async function killConversationSession(
   conversationId: number
 ): Promise<{ ok: true; killed: boolean; reason?: string }> {
@@ -71,18 +95,24 @@ export async function listMessages(conversationId: number): Promise<{
   conversation: { id: number; title: string; model: string; reasoningEffort: string };
   messages: Message[];
   liveDraft?: any;
+  taskRecovery?: TaskRecovery | null;
 }> {
   const data = await api<{
     conversation: { id: number; title: string; model: string; reasoningEffort: string };
     messages: Message[];
     liveDraft?: any;
+    taskRecovery?: TaskRecovery | null;
   }>(
     `/api/conversations/${conversationId}/messages`
   );
   return {
     conversation: data.conversation,
     messages: Array.isArray(data.messages) ? data.messages : [],
-    liveDraft: data.liveDraft && typeof data.liveDraft === 'object' ? data.liveDraft : null
+    liveDraft: data.liveDraft && typeof data.liveDraft === 'object' ? data.liveDraft : null,
+    taskRecovery:
+      data.taskRecovery && typeof data.taskRecovery === 'object'
+        ? (data.taskRecovery as TaskRecovery)
+        : null
   };
 }
 
@@ -105,6 +135,22 @@ export async function getChatOptions(): Promise<ChatOptions> {
   return api('/api/chat/options');
 }
 
+export async function getNotificationSettings(): Promise<NotificationSettings> {
+  const data = await api<{ notifications: NotificationSettings }>('/api/settings/notifications');
+  return data.notifications;
+}
+
+export async function updateNotificationSettings(
+  payload: Partial<NotificationSettings>
+): Promise<NotificationSettings> {
+  const data = await api<{ notifications: NotificationSettings }>('/api/settings/notifications', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  return data.notifications;
+}
+
 export async function getCodexQuota(): Promise<CodexQuota | null> {
   const data = await api<{ quota: CodexQuota | null }>('/api/codex/quota');
   return data.quota ?? null;
@@ -117,6 +163,76 @@ export async function getCodexRuns(): Promise<CodexBackgroundRun[]> {
 
 export async function killAllCodexRuns(): Promise<{ active: number; stopped: number }> {
   return api('/api/codex/runs/kill-all', { method: 'POST' });
+}
+
+export async function getTaskDashboard(limit = 30): Promise<TaskRunDashboardItem[]> {
+  const safeLimit = Number.isInteger(limit) ? Math.min(Math.max(limit, 1), 100) : 30;
+  const data = await api<{ tasks: TaskRunDashboardItem[] }>(`/api/tasks?limit=${safeLimit}`);
+  return Array.isArray(data.tasks) ? data.tasks : [];
+}
+
+export async function rollbackTaskRun(
+  taskRunId: number
+): Promise<{ task: TaskRunDashboardItem; rollback: { restored: number; removed: number; failed: number } }> {
+  return api(`/api/tasks/${taskRunId}/rollback`, { method: 'POST' });
+}
+
+export async function getUnifiedToolsSearch(query: string, limit = 12): Promise<UnifiedSearchPayload> {
+  const safeLimit = Number.isInteger(limit) ? Math.min(Math.max(limit, 1), 40) : 12;
+  const encodedQuery = encodeURIComponent(String(query || ''));
+  const data = await api<UnifiedSearchPayload>(
+    `/api/tools/search?q=${encodedQuery}&limit=${safeLimit}`
+  );
+  return {
+    query: String(data.query || ''),
+    minQueryLength: Number(data.minQueryLength) || 2,
+    limit: Number(data.limit) || safeLimit,
+    counts: {
+      chats: Number(data.counts?.chats) || 0,
+      commands: Number(data.counts?.commands) || 0,
+      errors: Number(data.counts?.errors) || 0,
+      files: Number(data.counts?.files) || 0
+    },
+    results: {
+      chats: Array.isArray(data.results?.chats) ? data.results.chats : [],
+      commands: Array.isArray(data.results?.commands) ? data.results.commands : [],
+      errors: Array.isArray(data.results?.errors) ? data.results.errors : [],
+      files: Array.isArray(data.results?.files) ? data.results.files : []
+    }
+  };
+}
+
+export async function getToolsObservability(): Promise<ObservabilitySnapshot> {
+  const data = await api<{ observability: ObservabilitySnapshot }>('/api/tools/observability');
+  return data.observability;
+}
+
+export async function getToolsGitRepos(forceRefresh = false): Promise<ToolsGitReposPayload> {
+  const suffix = forceRefresh ? '?refresh=1' : '';
+  const data = await api<{ scannedAt: string; repos: ToolsGitRepoSummary[] }>(`/api/tools/git/repos${suffix}`);
+  return {
+    scannedAt: String(data.scannedAt || ''),
+    repos: Array.isArray(data.repos) ? data.repos : []
+  };
+}
+
+export async function pushToolsGitRepo(
+  repoId: string,
+  commitMessage = ''
+): Promise<{ repo: ToolsGitRepoSummary; push: ToolsGitPushResult }> {
+  return api(`/api/tools/git/repos/${encodeURIComponent(String(repoId || ''))}/push`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ commitMessage })
+  });
+}
+
+export async function resolveToolsGitConflicts(
+  repoId: string
+): Promise<{ repo: ToolsGitRepoSummary; resolver: ToolsGitResolvePayload }> {
+  return api(`/api/tools/git/repos/${encodeURIComponent(String(repoId || ''))}/resolve-conflicts`, {
+    method: 'POST'
+  });
 }
 
 export async function getCodexAuthStatus(): Promise<CodexAuthStatus> {
