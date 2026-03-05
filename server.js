@@ -160,7 +160,7 @@ const aiAgentTutorialsById = {
     title: 'Integracion Codex CLI',
     steps: [
       'Instala Codex CLI en el servidor donde corre CodexWeb.',
-      'En Settings > Codex CLI, pulsa "Iniciar sesion con ChatGPT".',
+      'En Settings > Integraciones IA > Codex CLI, pulsa "Iniciar sesion con ChatGPT".',
       'Abre el enlace de verificacion, pega el codigo y confirma.',
       'Vuelve a CodexWeb, refresca y verifica estado "Conectado".',
       'Activa la integracion de Codex CLI en Agentes IA y guarda.'
@@ -5378,21 +5378,25 @@ function isCodexCliLinkedWithChatGptForUser(userId) {
 }
 
 function getAiAgentSerializationOptionsForUser(userId) {
+  const codexLinked = isCodexCliLinkedWithChatGptForUser(userId);
   const forceEnabledAgentIds = new Set();
-  if (isCodexCliLinkedWithChatGptForUser(userId)) {
+  if (codexLinked) {
     forceEnabledAgentIds.add('codex-cli');
   }
   return {
-    forceEnabledAgentIds
+    forceEnabledAgentIds,
+    codexLinked
   };
 }
 
 function serializeAiAgentIntegration(agent, integrationRow, options = {}) {
   const normalized = normalizeUserAgentIntegrationRow(integrationRow);
   const forceEnabled = Boolean(options && options.forceEnabled);
+  const codexLinked = Boolean(options && options.codexLinked);
   const hasApiKey = Boolean(normalized.apiKey);
   const requiresApiKey = String(agent.integrationType || '') === 'api_key';
-  const configured = requiresApiKey ? hasApiKey : true;
+  const isCodexCli = String(agent && agent.id ? agent.id : '') === 'codex-cli';
+  const configured = isCodexCli ? codexLinked : requiresApiKey ? hasApiKey : true;
   return {
     enabled: forceEnabled ? true : normalized.enabled,
     configured,
@@ -5409,6 +5413,7 @@ function serializeAiAgentSetting(agent, integrationRow, options = {}) {
     options.forceEnabledAgentIds &&
     typeof options.forceEnabledAgentIds.has === 'function' &&
     options.forceEnabledAgentIds.has(agent.id);
+  const codexLinked = Boolean(options && options.codexLinked);
   return {
     id: agent.id,
     name: agent.name,
@@ -5419,7 +5424,7 @@ function serializeAiAgentSetting(agent, integrationRow, options = {}) {
     integrationType: agent.integrationType,
     docsUrl: agent.docsUrl,
     supportsBaseUrl: Boolean(agent.supportsBaseUrl),
-    integration: serializeAiAgentIntegration(agent, integrationRow, { forceEnabled }),
+    integration: serializeAiAgentIntegration(agent, integrationRow, { forceEnabled, codexLinked }),
     tutorial: buildAiAgentTutorial(agent)
   };
 }
