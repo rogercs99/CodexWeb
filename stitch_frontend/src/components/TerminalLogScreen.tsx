@@ -8,13 +8,17 @@ import {
   LayoutDashboard,
   RefreshCw,
   Search as SearchIcon,
+  Server,
   Square,
   Terminal as TerminalIcon,
   Trash2
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
+  actionToolsDeployedApp,
   getCodexRuns,
+  getToolsDeployedAppLogs,
+  getToolsDeployedApps,
   getTaskDashboard,
   getToolsGitRepos,
   getToolsObservability,
@@ -31,13 +35,22 @@ import type {
   Conversation,
   ObservabilitySnapshot,
   Screen,
+  ToolsDeployedApp,
   TaskRunDashboardItem,
   TerminalEntry,
   ToolsGitRepoSummary,
   UnifiedSearchPayload
 } from '../lib/types';
 
-type ToolsView = 'menu' | 'processes' | 'dashboard' | 'terminal' | 'search' | 'observability' | 'git';
+type ToolsView =
+  | 'menu'
+  | 'processes'
+  | 'dashboard'
+  | 'terminal'
+  | 'search'
+  | 'observability'
+  | 'git'
+  | 'deployments';
 
 function formatTime(value: string) {
   const date = value ? new Date(value) : null;
@@ -147,6 +160,14 @@ interface UnifiedSearchGroup {
   latestAt: number;
 }
 
+interface DeployLogsState {
+  visible: boolean;
+  loading: boolean;
+  error: string;
+  logs: string;
+  fetchedAt: string;
+}
+
 export default function TerminalLogScreen({
   entries,
   conversations,
@@ -192,6 +213,16 @@ export default function TerminalLogScreen({
   const [pushingGitRepoId, setPushingGitRepoId] = useState<string | null>(null);
   const [resolvingGitRepoId, setResolvingGitRepoId] = useState<string | null>(null);
   const [gitNotice, setGitNotice] = useState('');
+  const [deployedApps, setDeployedApps] = useState<ToolsDeployedApp[]>([]);
+  const [deployedAppsScannedAt, setDeployedAppsScannedAt] = useState('');
+  const [deployedAppsLoading, setDeployedAppsLoading] = useState(true);
+  const [deployedAppsError, setDeployedAppsError] = useState('');
+  const [expandedDeployedApps, setExpandedDeployedApps] = useState<Record<string, boolean>>({});
+  const [deployNotice, setDeployNotice] = useState('');
+  const [deployActionBusy, setDeployActionBusy] = useState<{ appId: string; action: 'start' | 'stop' | 'restart' } | null>(
+    null
+  );
+  const [deployLogsByApp, setDeployLogsByApp] = useState<Record<string, DeployLogsState>>({});
 
   const loadRuns = useCallback(async (silent = false) => {
     if (!silent) {
@@ -359,6 +390,39 @@ export default function TerminalLogScreen({
       window.clearInterval(pollId);
     };
   }, [activeView, loadGitRepoView]);
+
+  const loadDeployedAppsView = useCallback(async (silent = false, forceRefresh = false) => {
+    if (!silent) {
+      setDeployedAppsLoading(true);
+    }
+    setDeployedAppsError('');
+    try {
+      const payload = await getToolsDeployedApps(forceRefresh);
+      setDeployedApps(Array.isArray(payload.apps) ? payload.apps : []);
+      setDeployedAppsScannedAt(String(payload.scannedAt || ''));
+    } catch (error) {
+      setDeployedAppsError(error instanceof Error ? error.message : 'No se pudo cargar apps desplegadas');
+    } finally {
+      if (!silent) {
+        setDeployedAppsLoading(false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadDeployedAppsView(true, false);
+  }, [loadDeployedAppsView]);
+
+  useEffect(() => {
+    if (activeView !== 'deployments') return;
+    void loadDeployedAppsView(false, true);
+    const pollId = window.setInterval(() => {
+      void loadDeployedAppsView(true, false);
+    }, 7000);
+    return () => {
+      window.clearInterval(pollId);
+    };
+  }, [activeView, loadDeployedAppsView]);
 
   const filtered = useMemo(
     () => entries.filter((entry) => (filter === 'all' ? true : entry.kind === filter)),
@@ -599,6 +663,26 @@ export default function TerminalLogScreen({
     return 'bajo';
   };
 
+  const formatDeployedStatus = (status: string) => {
+    const normalized = String(status || '')
+      .trim()
+      .toLowerCase();
+    if (normalized === 'running') return 'ejecutando';
+    if (normalized === 'stopped') return 'detenida';
+    if (normalized === 'error') return 'error';
+    return 'desconocido';
+  };
+
+  const formatDeployedSource = (source: string) => {
+    const normalized = String(source || '')
+      .trim()
+      .toLowerCase();
+    if (normalized === 'systemd') return 'systemd';
+    if (normalized === 'docker') return 'docker';
+    if (normalized === 'pm2') return 'pm2';
+    return normalized || 'source';
+  };
+
   const openRunGroup = (key: string) => {
     setExpandedRunGroups((prev) => (prev[key] ? prev : { ...prev, [key]: true }));
   };
@@ -617,6 +701,122 @@ export default function TerminalLogScreen({
 
   const openGitRepo = (repoId: string) => {
     setExpandedGitRepos((prev) => (prev[repoId] ? prev : { ...prev, [repoId]: true }));
+  };
+
+  const openDeployedApp = (appId: string) => {
+    setExpandedDeployedApps((prev) => (prev[appId] ? prev : { ...prev, [appId]: true }));
+  };
+
+  const loadDeployedLogs = async (appId: string, forceReload = false) => {
+    setDeployedAppsError('');
+    setDeployLogsByApp((prev) => {
+      const current = prev[appId] || {
+        visible: true,
+        loading: false,
+        error: '',
+        logs: '',
+        fetchedAt: ''
+      };
+      return {
+        ...prev,
+        [appId]: {
+          ...current,
+          visible: true,
+          loading: true,
+          error: '',
+          logs: forceReload ? '' : current.logs
+        }
+      };
+    });
+    try {
+      const payload = await getToolsDeployedAppLogs(appId, 220);
+      setDeployLogsByApp((prev) => {
+        const current = prev[appId] || {
+          visible: true,
+          loading: false,
+          error: '',
+          logs: '',
+          fetchedAt: ''
+        };
+        return {
+          ...prev,
+          [appId]: {
+            ...current,
+            visible: true,
+            loading: false,
+            error: '',
+            logs: String(payload.logs || ''),
+            fetchedAt: String(payload.fetchedAt || '')
+          }
+        };
+      });
+    } catch (error) {
+      setDeployLogsByApp((prev) => {
+        const current = prev[appId] || {
+          visible: true,
+          loading: false,
+          error: '',
+          logs: '',
+          fetchedAt: ''
+        };
+        return {
+          ...prev,
+          [appId]: {
+            ...current,
+            visible: true,
+            loading: false,
+            error: error instanceof Error ? error.message : 'No se pudieron cargar logs',
+            logs: '',
+            fetchedAt: ''
+          }
+        };
+      });
+    }
+  };
+
+  const toggleDeployedLogs = (appId: string) => {
+    const current = deployLogsByApp[appId];
+    const nextVisible = !current?.visible;
+    setDeployLogsByApp((prev) => {
+      const base = prev[appId] || {
+        visible: false,
+        loading: false,
+        error: '',
+        logs: '',
+        fetchedAt: ''
+      };
+      return {
+        ...prev,
+        [appId]: {
+          ...base,
+          visible: nextVisible
+        }
+      };
+    });
+    if (nextVisible && (!current || !current.logs)) {
+      void loadDeployedLogs(appId, false);
+    }
+  };
+
+  const actionDeployedApp = async (appId: string, action: 'start' | 'stop' | 'restart') => {
+    setDeployedAppsError('');
+    setDeployNotice('');
+    setDeployActionBusy({ appId, action });
+    try {
+      const payload = await actionToolsDeployedApp(appId, action);
+      const output = String(payload.output || '').trim();
+      const suffix = output ? ` · ${output.slice(0, 120)}` : '';
+      setDeployNotice(`Accion ${action} aplicada sobre ${payload.app.name}.${suffix}`);
+      await loadDeployedAppsView(true, true);
+      if (deployLogsByApp[appId]?.visible) {
+        await loadDeployedLogs(appId, true);
+      }
+      onRunsChanged?.();
+    } catch (error) {
+      setDeployedAppsError(error instanceof Error ? error.message : 'No se pudo ejecutar accion de app');
+    } finally {
+      setDeployActionBusy(null);
+    }
   };
 
   const pushGitRepo = async (repoId: string) => {
@@ -672,10 +872,12 @@ export default function TerminalLogScreen({
           : activeView === 'terminal'
             ? 'Tools · Terminal'
             : activeView === 'search'
-              ? 'Tools · Busqueda'
-              : activeView === 'observability'
-                ? 'Tools · Observabilidad'
-                : 'Tools · Git';
+            ? 'Tools · Busqueda'
+            : activeView === 'observability'
+              ? 'Tools · Observabilidad'
+              : activeView === 'git'
+                ? 'Tools · Git'
+                : 'Tools · Apps desplegadas';
 
   const handleBack = () => {
     if (activeView === 'menu') {
@@ -709,6 +911,10 @@ export default function TerminalLogScreen({
     }
     if (activeView === 'git') {
       void loadGitRepoView(false, true);
+      return;
+    }
+    if (activeView === 'deployments') {
+      void loadDeployedAppsView(false, true);
       return;
     }
     void loadRuns();
@@ -837,6 +1043,25 @@ export default function TerminalLogScreen({
                       <p className="text-sm text-zinc-100">Repos Git</p>
                       <p className="text-xs text-zinc-500 truncate">
                         {gitRepos.length} repo(s) · conflictos {gitRepos.filter((repo) => repo.hasConflicts).length}
+                      </p>
+                    </div>
+                  </div>
+                  <ChevronRight size={16} className="text-zinc-600" />
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveView('deployments')}
+                className="w-full text-left rounded-xl border border-zinc-800 bg-black/40 p-3 hover:border-zinc-700 transition-colors"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Server size={18} className="text-sky-300 shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-sm text-zinc-100">Apps desplegadas</p>
+                      <p className="text-xs text-zinc-500 truncate">
+                        {deployedApps.length} app(s) · activas {deployedApps.filter((app) => app.status === 'running').length}
                       </p>
                     </div>
                   </div>

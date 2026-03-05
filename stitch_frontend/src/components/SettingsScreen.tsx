@@ -155,6 +155,15 @@ export default function SettingsScreen({
     });
   };
 
+  const formatAuthMethodLabel = (value: string) => {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!normalized) return '-';
+    if (normalized === 'chatgpt') return 'ChatGPT';
+    if (normalized === 'api_key' || normalized === 'api-key') return 'API key';
+    if (normalized === 'session') return 'Sesion';
+    return normalized;
+  };
+
   const copyText = async (value: string) => {
     const text = String(value || '').trim();
     if (!text) return;
@@ -173,6 +182,7 @@ export default function SettingsScreen({
       setAuth((prev) => ({
         loggedIn: prev?.loggedIn || false,
         statusText: prev?.statusText || '',
+        details: prev?.details || null,
         loginInProgress: Boolean(login && login.inProgress),
         login: login || null
       }));
@@ -258,6 +268,17 @@ export default function SettingsScreen({
       windowData: quota.secondary
     });
   }
+  const authDetails = auth?.details || null;
+  const showAuthDetails = Boolean(
+    authDetails &&
+      (auth?.loggedIn ||
+        authDetails.email ||
+        authDetails.accountId ||
+        authDetails.authMode ||
+        authDetails.authMethod ||
+        authDetails.hasApiKey ||
+        authDetails.hasRefreshToken)
+  );
 
   const getRemainingColorClass = (remainingPercent: number) => {
     if (remainingPercent <= 20) return 'text-red-300';
@@ -437,6 +458,54 @@ export default function SettingsScreen({
 
             {auth?.statusText ? (
               <p className="text-xs text-zinc-500 whitespace-pre-wrap break-words">{auth.statusText}</p>
+            ) : null}
+
+            {showAuthDetails ? (
+              <div className="rounded-lg border border-zinc-800 bg-black/40 p-3 space-y-2">
+                <p className="text-[11px] uppercase tracking-wide text-zinc-500">Cuenta asociada</p>
+                <div className="space-y-2 text-xs">
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="text-zinc-500">Cuenta ChatGPT</span>
+                    <span className="text-zinc-200 text-right break-all">{authDetails?.email || '-'}</span>
+                  </div>
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="text-zinc-500">Account ID</span>
+                    <span className="text-zinc-200 text-right break-all">{authDetails?.accountId || '-'}</span>
+                  </div>
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="text-zinc-500">Metodo</span>
+                    <span className="text-zinc-200 text-right">
+                      {formatAuthMethodLabel(authDetails?.authMethod || authDetails?.authMode || '')}
+                    </span>
+                  </div>
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="text-zinc-500">Email verificado</span>
+                    <span className="text-zinc-200 text-right">
+                      {authDetails?.email
+                        ? authDetails?.emailVerified
+                          ? 'Si'
+                          : 'No'
+                        : '-'}
+                    </span>
+                  </div>
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="text-zinc-500">Auth provider</span>
+                    <span className="text-zinc-200 text-right break-all">{authDetails?.authProvider || '-'}</span>
+                  </div>
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="text-zinc-500">Ultimo refresh</span>
+                    <span className="text-zinc-200 text-right">{formatDate(authDetails?.lastRefresh || '')}</span>
+                  </div>
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="text-zinc-500">Token expira</span>
+                    <span className="text-zinc-200 text-right">{formatDate(authDetails?.tokenExpiresAt || '')}</span>
+                  </div>
+                  <div className="flex items-start justify-between gap-3">
+                    <span className="text-zinc-500">Comprobado</span>
+                    <span className="text-zinc-200 text-right">{formatDate(authDetails?.checkedAt || '')}</span>
+                  </div>
+                </div>
+              </div>
             ) : null}
 
             {authError ? <p className="text-xs text-red-300">{authError}</p> : null}

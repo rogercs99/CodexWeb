@@ -8,6 +8,9 @@ import type {
   Conversation,
   MessageAttachment,
   Message,
+  ToolsDeployedAppActionResponse,
+  ToolsDeployedAppLogsResponse,
+  ToolsDeployedAppsPayload,
   ToolsGitPushResult,
   ToolsGitRepoSummary,
   ToolsGitResolvePayload,
@@ -229,6 +232,36 @@ export async function getUnifiedToolsSearch(query: string, limit = 12): Promise<
 export async function getToolsObservability(): Promise<ObservabilitySnapshot> {
   const data = await api<{ observability: ObservabilitySnapshot }>('/api/tools/observability');
   return data.observability;
+}
+
+export async function getToolsDeployedApps(forceRefresh = false): Promise<ToolsDeployedAppsPayload> {
+  const suffix = forceRefresh ? '?refresh=1' : '';
+  const data = await api<{ scannedAt: string; apps: ToolsDeployedAppsPayload['apps'] }>(
+    `/api/tools/deployed-apps${suffix}`
+  );
+  return {
+    scannedAt: String(data.scannedAt || ''),
+    apps: Array.isArray(data.apps) ? data.apps : []
+  };
+}
+
+export async function actionToolsDeployedApp(
+  appId: string,
+  action: 'start' | 'stop' | 'restart'
+): Promise<ToolsDeployedAppActionResponse> {
+  return api(`/api/tools/deployed-apps/${encodeURIComponent(String(appId || ''))}/action`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action })
+  });
+}
+
+export async function getToolsDeployedAppLogs(
+  appId: string,
+  lines = 180
+): Promise<ToolsDeployedAppLogsResponse> {
+  const safeLines = Number.isInteger(lines) ? Math.min(Math.max(lines, 20), 1000) : 180;
+  return api(`/api/tools/deployed-apps/${encodeURIComponent(String(appId || ''))}/logs?lines=${safeLines}`);
 }
 
 export async function getToolsGitRepos(forceRefresh = false): Promise<ToolsGitReposPayload> {

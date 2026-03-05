@@ -269,6 +269,45 @@ export interface ObservabilitySnapshot {
   };
 }
 
+export type DeployedAppSource = 'docker' | 'systemd' | 'pm2';
+export type DeployedAppStatus = 'running' | 'stopped' | 'error' | 'unknown';
+
+export interface ToolsDeployedApp {
+  id: string;
+  source: DeployedAppSource;
+  name: string;
+  status: DeployedAppStatus;
+  detailStatus: string;
+  description: string;
+  pid: number | null;
+  location: string;
+  uptime: string;
+  canStart: boolean;
+  canStop: boolean;
+  canRestart: boolean;
+  hasLogs: boolean;
+  scannedAt: string;
+}
+
+export interface ToolsDeployedAppsPayload {
+  scannedAt: string;
+  apps: ToolsDeployedApp[];
+}
+
+export interface ToolsDeployedAppActionResponse {
+  action: 'start' | 'stop' | 'restart';
+  app: ToolsDeployedApp;
+  output: string;
+  scannedAt: string;
+}
+
+export interface ToolsDeployedAppLogsResponse {
+  app: ToolsDeployedApp;
+  lines: number;
+  logs: string;
+  fetchedAt: string;
+}
+
 export interface ToolsGitRepoStatusCounts {
   staged: number;
   modified: number;
@@ -359,9 +398,27 @@ export interface CodexDeviceLogin {
   error: string;
 }
 
+export interface CodexAuthDetails {
+  checkedAt: string;
+  authMethod: string;
+  authMode: string;
+  accountId: string;
+  email: string;
+  emailVerified: boolean;
+  subject: string;
+  issuer: string;
+  authProvider: string;
+  lastRefresh: string;
+  tokenIssuedAt: string;
+  tokenExpiresAt: string;
+  hasRefreshToken: boolean;
+  hasApiKey: boolean;
+}
+
 export interface CodexAuthStatus {
   loggedIn: boolean;
   statusText: string;
+  details?: CodexAuthDetails | null;
   loginInProgress: boolean;
   login: CodexDeviceLogin | null;
 }

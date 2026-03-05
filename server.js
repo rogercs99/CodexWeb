@@ -236,6 +236,10 @@ const gitToolsScanTtlMs = 12000;
 const gitToolsMaxDepth = 6;
 const gitToolsMaxRepos = 80;
 const gitToolsCommandTimeoutMs = 45000;
+const deployedAppsScanTtlMs = 12000;
+const deployedAppsMaxSystemdUnits = 80;
+const deployedAppsDefaultLogLines = 180;
+const deployedAppsMaxLogLines = 1000;
 const gitToolsIgnoredDirs = new Set([
   '.git',
   '.hg',
@@ -259,6 +263,11 @@ const gitToolsIgnoredDirs = new Set([
 let gitToolsRepoCache = {
   scannedAtMs: 0,
   repos: []
+};
+const commandExistsCache = new Map();
+let deployedAppsCache = {
+  scannedAtMs: 0,
+  apps: []
 };
 
 const sessionSecret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
@@ -389,6 +398,109 @@ function normalizeCodexStatusText(rawValue, fallback = '') {
     .trim();
   if (cleaned) return cleaned;
   return String(fallback || '').trim();
+}
+
+function readJsonObjectFileSafe(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const raw = fs.readFileSync(filePath, 'utf8');
+    if (!raw || !raw.trim()) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function decodeJwtPayloadUnsafe(token) {
+  const rawToken = String(token || '').trim();
+  if (!rawToken) return null;
+  const parts = rawToken.split('.');
+  if (parts.length < 2) return null;
+  try {
+    const payloadRaw = Buffer.from(parts[1], 'base64url').toString('utf8');
+    const payload = JSON.parse(payloadRaw);
+    return payload && typeof payload === 'object' ? payload : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function inferCodexAuthMethod(statusText, authMode, hasApiKey) {
+  const hints = [String(authMode || ''), String(statusText || '')]
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+  if (hints.some((value) => value.includes('chatgpt'))) {
+    return 'chatgpt';
+  }
+  if (
+    hints.some((value) => value.includes('api key') || value.includes('api_key') || value.includes('api-key')) ||
+    hasApiKey
+  ) {
+    return 'api_key';
+  }
+  if (hints.some((value) => value.includes('logged in'))) {
+    return 'session';
+  }
+  return '';
+}
+
+function getCodexAuthDetailsForUser(userId, statusText) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) {
+    return null;
+  }
+  const codexHome = getUserCodexHome(safeUserId);
+  const authPath = path.join(codexHome, 'auth.json');
+  const rawAuth = readJsonObjectFileSafe(authPath);
+  const tokens = rawAuth && rawAuth.tokens && typeof rawAuth.tokens === 'object' ? rawAuth.tokens : {};
+  const apiKeyRaw =
+    rawAuth && Object.prototype.hasOwnProperty.call(rawAuth, 'OPENAI_API_KEY')
+      ? rawAuth.OPENAI_API_KEY
+      : '';
+  const hasApiKey = typeof apiKeyRaw === 'string' && Boolean(apiKeyRaw.trim());
+  const authMode = rawAuth && typeof rawAuth.auth_mode === 'string' ? rawAuth.auth_mode.trim() : '';
+  const accountId = typeof tokens.account_id === 'string' ? tokens.account_id.trim() : '';
+  const hasRefreshToken = typeof tokens.refresh_token === 'string' && Boolean(tokens.refresh_token.trim());
+  const idTokenPayload = decodeJwtPayloadUnsafe(
+    typeof tokens.id_token === 'string' ? tokens.id_token : ''
+  );
+  const email = idTokenPayload && typeof idTokenPayload.email === 'string' ? idTokenPayload.email.trim() : '';
+  const emailVerified = Boolean(idTokenPayload && idTokenPayload.email_verified);
+  const subject = idTokenPayload && typeof idTokenPayload.sub === 'string' ? idTokenPayload.sub.trim() : '';
+  const issuer = idTokenPayload && typeof idTokenPayload.iss === 'string' ? idTokenPayload.iss.trim() : '';
+  const authProvider =
+    idTokenPayload && typeof idTokenPayload.auth_provider === 'string'
+      ? idTokenPayload.auth_provider.trim()
+      : '';
+
+  const issuedAtSeconds = Number(idTokenPayload && idTokenPayload.iat);
+  const expiresAtSeconds = Number(idTokenPayload && idTokenPayload.exp);
+  const tokenIssuedAt =
+    Number.isFinite(issuedAtSeconds) && issuedAtSeconds > 0
+      ? new Date(issuedAtSeconds * 1000).toISOString()
+      : '';
+  const tokenExpiresAt =
+    Number.isFinite(expiresAtSeconds) && expiresAtSeconds > 0
+      ? new Date(expiresAtSeconds * 1000).toISOString()
+      : '';
+
+  return {
+    checkedAt: nowIso(),
+    authMethod: inferCodexAuthMethod(statusText, authMode, hasApiKey),
+    authMode,
+    accountId,
+    email,
+    emailVerified,
+    subject,
+    issuer,
+    authProvider,
+    lastRefresh: rawAuth && typeof rawAuth.last_refresh === 'string' ? rawAuth.last_refresh : '',
+    tokenIssuedAt,
+    tokenExpiresAt,
+    hasRefreshToken,
+    hasApiKey
+  };
 }
 
 function buildActiveChatRunKey(userId, conversationId) {
@@ -578,7 +690,8 @@ async function getCodexAuthStatusForUser(userId, options = {}) {
     const statusText = normalizeCodexStatusText(result && result.stdout, 'Logged in using ChatGPT');
     return {
       loggedIn: true,
-      statusText
+      statusText,
+      details: getCodexAuthDetailsForUser(userId, statusText)
     };
   } catch (error) {
     const outText = normalizeCodexStatusText(
@@ -592,7 +705,8 @@ async function getCodexAuthStatusForUser(userId, options = {}) {
       statusText.toLowerCase().includes('not authenticated');
     return {
       loggedIn: !notLogged && !String(statusText).toLowerCase().includes('error'),
-      statusText
+      statusText,
+      details: getCodexAuthDetailsForUser(userId, statusText)
     };
   }
 }
@@ -1450,6 +1564,600 @@ function ensureGitIdentityForRepo(repoPath, gitIdentity) {
       email: targetEmail
     },
     configured: !existingName || !existingEmail
+  };
+}
+
+function truncateRawText(rawValue, maxChars = 120000) {
+  const text = String(rawValue || '');
+  if (!text) return '';
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function runSystemCommandSync(command, args, options = {}) {
+  const safeCommand = String(command || '').trim();
+  if (!safeCommand) {
+    return {
+      ok: false,
+      code: 1,
+      stdout: '',
+      stderr: 'invalid_command'
+    };
+  }
+  const safeArgs = Array.isArray(args) ? args.map((entry) => String(entry || '')) : [];
+  const timeoutMs = Number.isInteger(Number(options.timeoutMs))
+    ? Math.max(500, Number(options.timeoutMs))
+    : gitToolsCommandTimeoutMs;
+  const allowNonZero = Boolean(options.allowNonZero);
+  const cwdValue = options && typeof options.cwd === 'string' && options.cwd.trim() ? options.cwd : process.cwd();
+  const maxBuffer = Number.isInteger(Number(options.maxBuffer))
+    ? Math.max(1024 * 8, Number(options.maxBuffer))
+    : 1024 * 1024 * 64;
+
+  try {
+    const stdout = execFileSync(safeCommand, safeArgs, {
+      cwd: cwdValue,
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      maxBuffer,
+      env: process.env
+    });
+    return {
+      ok: true,
+      code: 0,
+      stdout: String(stdout || ''),
+      stderr: ''
+    };
+  } catch (error) {
+    const statusCandidate = Number(error && error.status);
+    const codeCandidate = Number(error && error.code);
+    const exitCode = Number.isInteger(statusCandidate)
+      ? statusCandidate
+      : Number.isInteger(codeCandidate)
+        ? codeCandidate
+        : null;
+    return {
+      ok: allowNonZero && exitCode !== null,
+      code: exitCode === null ? 1 : exitCode,
+      stdout: String((error && error.stdout) || ''),
+      stderr: String((error && error.stderr) || (error && error.message) || '')
+    };
+  }
+}
+
+function commandExistsSync(commandName) {
+  const safeName = String(commandName || '').trim();
+  if (!safeName) return false;
+  if (commandExistsCache.has(safeName)) {
+    return Boolean(commandExistsCache.get(safeName));
+  }
+  const result = runSystemCommandSync('which', [safeName], {
+    allowNonZero: true,
+    timeoutMs: 4000,
+    maxBuffer: 32 * 1024
+  });
+  const exists = Boolean(result && result.code === 0 && String(result.stdout || '').trim());
+  commandExistsCache.set(safeName, exists);
+  return exists;
+}
+
+function parseKeyValueOutput(rawText) {
+  const map = {};
+  const lines = String(rawText || '')
+    .replace(/\r/g, '')
+    .split('\n');
+  lines.forEach((line) => {
+    const idx = line.indexOf('=');
+    if (idx <= 0) return;
+    const key = String(line.slice(0, idx) || '').trim();
+    if (!key) return;
+    map[key] = String(line.slice(idx + 1) || '').trim();
+  });
+  return map;
+}
+
+function buildDeployedAppId(source, locator) {
+  const safeSource = String(source || '')
+    .trim()
+    .toLowerCase();
+  const safeLocator = String(locator || '').trim();
+  if (!safeSource || !safeLocator) return '';
+  return `${safeSource}:${Buffer.from(safeLocator, 'utf8').toString('base64url')}`;
+}
+
+function parseDeployedAppId(rawAppId) {
+  const value = String(rawAppId || '').trim();
+  if (!value) return null;
+  const idx = value.indexOf(':');
+  if (idx <= 0) return null;
+  const source = value.slice(0, idx).toLowerCase();
+  const encodedLocator = value.slice(idx + 1);
+  if (!['docker', 'systemd', 'pm2'].includes(source)) return null;
+  if (!/^[A-Za-z0-9_-]+$/.test(encodedLocator)) return null;
+  let locator = '';
+  try {
+    locator = Buffer.from(encodedLocator, 'base64url').toString('utf8').trim();
+  } catch (_error) {
+    locator = '';
+  }
+  if (!locator || locator.length > 260 || locator.includes('\0')) return null;
+  return {
+    source,
+    locator
+  };
+}
+
+function normalizeDeployedStatus(rawValue, fallback = 'unknown') {
+  const value = String(rawValue || '')
+    .trim()
+    .toLowerCase();
+  if (!value) return fallback;
+  if (
+    value.includes('running') ||
+    value.includes('active') ||
+    value.includes('online') ||
+    value.includes('up')
+  ) {
+    return 'running';
+  }
+  if (
+    value.includes('error') ||
+    value.includes('errored') ||
+    value.includes('failed') ||
+    value.includes('unhealthy')
+  ) {
+    return 'error';
+  }
+  if (
+    value.includes('stopped') ||
+    value.includes('inactive') ||
+    value.includes('exited') ||
+    value.includes('dead') ||
+    value.includes('created')
+  ) {
+    return 'stopped';
+  }
+  return fallback;
+}
+
+function buildDeployedAppSummary(payload, scannedAtIso) {
+  const source = String(payload && payload.source ? payload.source : '')
+    .trim()
+    .toLowerCase();
+  const locator = String(payload && payload.locator ? payload.locator : '').trim();
+  const name = String(payload && payload.name ? payload.name : '').trim();
+  if (!source || !locator || !name) {
+    return null;
+  }
+  const id = buildDeployedAppId(source, locator);
+  if (!id) return null;
+  const status = normalizeDeployedStatus(payload && payload.status ? payload.status : 'unknown');
+  const pidRaw = Number(payload && payload.pid);
+  const pid = Number.isInteger(pidRaw) && pidRaw > 0 ? pidRaw : null;
+  return {
+    id,
+    source,
+    name,
+    status,
+    detailStatus: String((payload && payload.detailStatus) || '').trim(),
+    description: String((payload && payload.description) || '').trim(),
+    pid,
+    location: String((payload && payload.location) || '').trim(),
+    uptime: String((payload && payload.uptime) || '').trim(),
+    canStart: Boolean(payload && payload.canStart),
+    canStop: Boolean(payload && payload.canStop),
+    canRestart: Boolean(payload && payload.canRestart),
+    hasLogs: Boolean(payload && payload.hasLogs),
+    scannedAt: scannedAtIso
+  };
+}
+
+function collectDockerDeployedApps(scannedAtIso) {
+  if (!commandExistsSync('docker')) return [];
+  const listResult = runSystemCommandSync('docker', ['ps', '-a', '--no-trunc', '--format', '{{json .}}'], {
+    allowNonZero: true,
+    timeoutMs: 12000,
+    maxBuffer: 1024 * 1024 * 16
+  });
+  const rows = String(listResult.stdout || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (rows.length === 0) {
+    return [];
+  }
+
+  const apps = [];
+  rows.forEach((line) => {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(line);
+    } catch (_error) {
+      parsed = null;
+    }
+    if (!parsed || typeof parsed !== 'object') return;
+
+    const containerId = String(parsed.ID || '').trim();
+    const names = String(parsed.Names || '').trim();
+    const locator = containerId || names;
+    if (!locator) return;
+
+    const statusRaw = String(parsed.Status || '').trim();
+    const stateRaw = String(parsed.State || '').trim().toLowerCase();
+    let status = normalizeDeployedStatus(stateRaw || statusRaw, 'unknown');
+    if (/^up\b/i.test(statusRaw)) status = 'running';
+    if (stateRaw === 'restarting') status = 'running';
+    if (stateRaw === 'paused') status = 'running';
+    if (stateRaw === 'dead') status = 'error';
+
+    const summary = buildDeployedAppSummary(
+      {
+        source: 'docker',
+        locator,
+        name: names || containerId.slice(0, 12) || 'container',
+        status,
+        detailStatus: statusRaw || stateRaw,
+        description: String(parsed.Image || '').trim(),
+        location: String(parsed.Ports || '').trim(),
+        uptime: String(parsed.RunningFor || '').trim(),
+        canStart: status !== 'running',
+        canStop: status === 'running',
+        canRestart: true,
+        hasLogs: true
+      },
+      scannedAtIso
+    );
+    if (summary) {
+      apps.push(summary);
+    }
+  });
+
+  return apps.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function listSystemdServiceUnits() {
+  const rootDir = '/etc/systemd/system';
+  if (!fs.existsSync(rootDir)) return [];
+  const units = new Set();
+  const queue = [{ dir: rootDir, depth: 0 }];
+  const visited = new Set();
+
+  while (queue.length > 0 && units.size < deployedAppsMaxSystemdUnits) {
+    const current = queue.pop();
+    if (!current || !current.dir) continue;
+    const currentDir = path.resolve(current.dir);
+    if (visited.has(currentDir)) continue;
+    visited.add(currentDir);
+
+    let entries = [];
+    try {
+      entries = fs.readdirSync(currentDir, { withFileTypes: true });
+    } catch (_error) {
+      entries = [];
+    }
+
+    entries.forEach((entry) => {
+      const name = String(entry && entry.name ? entry.name : '').trim();
+      if (!name || name === '.' || name === '..') return;
+      if (name.endsWith('.service')) {
+        units.add(path.basename(name));
+      }
+      if (entry && entry.isDirectory() && current.depth < 2) {
+        queue.push({
+          dir: path.join(currentDir, name),
+          depth: current.depth + 1
+        });
+      }
+    });
+  }
+
+  return Array.from(units)
+    .filter((unit) => unit && unit.endsWith('.service'))
+    .sort((a, b) => a.localeCompare(b))
+    .slice(0, deployedAppsMaxSystemdUnits);
+}
+
+function collectSystemdDeployedApps(scannedAtIso) {
+  if (!commandExistsSync('systemctl')) return [];
+  const units = listSystemdServiceUnits();
+  if (units.length === 0) return [];
+  const apps = [];
+
+  units.forEach((unitName) => {
+    const showResult = runSystemCommandSync(
+      'systemctl',
+      [
+        'show',
+        unitName,
+        '--no-pager',
+        '--property=Id,Description,ActiveState,SubState,MainPID,ExecMainStartTimestamp,FragmentPath,UnitFileState'
+      ],
+      {
+        allowNonZero: true,
+        timeoutMs: 9000,
+        maxBuffer: 1024 * 1024 * 2
+      }
+    );
+    const fields = parseKeyValueOutput(showResult.stdout || '');
+    const serviceId = String(fields.Id || unitName).trim() || unitName;
+    if (!serviceId.endsWith('.service')) return;
+
+    const activeState = String(fields.ActiveState || '').trim().toLowerCase();
+    const subState = String(fields.SubState || '').trim().toLowerCase();
+    const detailStatus = [activeState, subState].filter(Boolean).join(' ').trim() || 'unknown';
+    let status = normalizeDeployedStatus(detailStatus, 'unknown');
+    if (activeState === 'activating') status = 'running';
+    if (activeState === 'failed') status = 'error';
+
+    const mainPid = Number(fields.MainPID);
+    const startTimestampRaw = String(fields.ExecMainStartTimestamp || '').trim();
+    const startedAtMs = Date.parse(startTimestampRaw);
+    const uptime =
+      Number.isFinite(startedAtMs) && startedAtMs > 0 && status === 'running'
+        ? formatDurationMs(Date.now() - startedAtMs)
+        : '';
+
+    const summary = buildDeployedAppSummary(
+      {
+        source: 'systemd',
+        locator: serviceId,
+        name: serviceId.replace(/\.service$/, ''),
+        status,
+        detailStatus,
+        description: String(fields.Description || '').trim(),
+        pid: Number.isInteger(mainPid) && mainPid > 0 ? mainPid : null,
+        location: String(fields.FragmentPath || '').trim(),
+        uptime,
+        canStart: status !== 'running',
+        canStop: status === 'running',
+        canRestart: true,
+        hasLogs: true
+      },
+      scannedAtIso
+    );
+    if (summary) {
+      apps.push(summary);
+    }
+  });
+
+  return apps.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function collectPm2DeployedApps(scannedAtIso) {
+  if (!commandExistsSync('pm2')) return [];
+  const result = runSystemCommandSync('pm2', ['jlist'], {
+    allowNonZero: true,
+    timeoutMs: 15000,
+    maxBuffer: 1024 * 1024 * 16
+  });
+  const raw = String(result.stdout || '').trim();
+  if (!raw) return [];
+  let parsed = [];
+  try {
+    const json = JSON.parse(raw);
+    parsed = Array.isArray(json) ? json : [];
+  } catch (_error) {
+    parsed = [];
+  }
+  const apps = [];
+
+  parsed.forEach((item) => {
+    if (!item || typeof item !== 'object') return;
+    const pm2Env = item.pm2_env && typeof item.pm2_env === 'object' ? item.pm2_env : {};
+    const pmId = Number(item.pm_id);
+    const name = String(item.name || '').trim() || (Number.isInteger(pmId) ? `pm2-${pmId}` : 'pm2-app');
+    const locator = Number.isInteger(pmId) ? String(pmId) : name;
+    const rawStatus = String(pm2Env.status || item.status || '').trim().toLowerCase();
+    let status = normalizeDeployedStatus(rawStatus, 'unknown');
+    if (rawStatus === 'online' || rawStatus === 'launching' || rawStatus === 'waiting restart') {
+      status = 'running';
+    }
+    if (rawStatus === 'stopped' || rawStatus === 'stopping') {
+      status = 'stopped';
+    }
+    if (rawStatus === 'errored') {
+      status = 'error';
+    }
+
+    const pidRaw = Number(item.pid || pm2Env.pm_pid);
+    const uptimeFrom = Number(pm2Env.pm_uptime);
+    const uptime =
+      Number.isFinite(uptimeFrom) && uptimeFrom > 0 && status === 'running'
+        ? formatDurationMs(Date.now() - uptimeFrom)
+        : '';
+
+    const summary = buildDeployedAppSummary(
+      {
+        source: 'pm2',
+        locator,
+        name,
+        status,
+        detailStatus: rawStatus || 'unknown',
+        description: String(pm2Env.pm_exec_path || '').trim() || String(pm2Env.node_args || '').trim(),
+        pid: Number.isInteger(pidRaw) && pidRaw > 0 ? pidRaw : null,
+        location: String(pm2Env.pm_cwd || '').trim(),
+        uptime,
+        canStart: status !== 'running',
+        canStop: status === 'running',
+        canRestart: true,
+        hasLogs: true
+      },
+      scannedAtIso
+    );
+    if (summary) {
+      apps.push(summary);
+    }
+  });
+
+  return apps.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function collectDeployedAppsSnapshot(forceRefresh = false) {
+  const nowMs = Date.now();
+  const cacheFresh = nowMs - deployedAppsCache.scannedAtMs <= deployedAppsScanTtlMs;
+  if (!forceRefresh && cacheFresh && Array.isArray(deployedAppsCache.apps)) {
+    return {
+      scannedAt: new Date(deployedAppsCache.scannedAtMs).toISOString(),
+      apps: deployedAppsCache.apps
+    };
+  }
+
+  const scannedAtIso = nowIso();
+  const apps = [
+    ...collectDockerDeployedApps(scannedAtIso),
+    ...collectSystemdDeployedApps(scannedAtIso),
+    ...collectPm2DeployedApps(scannedAtIso)
+  ];
+  const statusRank = (status) => {
+    if (status === 'running') return 0;
+    if (status === 'error') return 1;
+    if (status === 'unknown') return 2;
+    return 3;
+  };
+  apps.sort((a, b) => {
+    const rankDelta = statusRank(String(a.status || '')) - statusRank(String(b.status || ''));
+    if (rankDelta !== 0) return rankDelta;
+    const sourceDelta = String(a.source || '').localeCompare(String(b.source || ''));
+    if (sourceDelta !== 0) return sourceDelta;
+    return String(a.name || '').localeCompare(String(b.name || ''));
+  });
+
+  deployedAppsCache = {
+    scannedAtMs: nowMs,
+    apps
+  };
+  return {
+    scannedAt: scannedAtIso,
+    apps
+  };
+}
+
+function findDeployedAppById(appId, options = {}) {
+  const safeId = String(appId || '').trim();
+  if (!safeId) return null;
+  const snapshot = collectDeployedAppsSnapshot(Boolean(options.forceRefresh));
+  return snapshot.apps.find((app) => String(app && app.id).trim() === safeId) || null;
+}
+
+function normalizeDeployedAppAction(rawAction) {
+  const action = String(rawAction || '')
+    .trim()
+    .toLowerCase();
+  if (action === 'start' || action === 'stop' || action === 'restart') {
+    return action;
+  }
+  return '';
+}
+
+function runDeployedAppAction(appId, action) {
+  const parsedAppId = parseDeployedAppId(appId);
+  if (!parsedAppId) {
+    return {
+      ok: false,
+      code: 1,
+      stdout: '',
+      stderr: 'app_id_invalido'
+    };
+  }
+  const safeAction = normalizeDeployedAppAction(action);
+  if (!safeAction) {
+    return {
+      ok: false,
+      code: 1,
+      stdout: '',
+      stderr: 'accion_invalida'
+    };
+  }
+
+  if (parsedAppId.source === 'docker') {
+    return runSystemCommandSync('docker', [safeAction, parsedAppId.locator], {
+      timeoutMs: 45000
+    });
+  }
+  if (parsedAppId.source === 'systemd') {
+    return runSystemCommandSync('systemctl', [safeAction, parsedAppId.locator, '--no-pager'], {
+      timeoutMs: 45000
+    });
+  }
+  if (parsedAppId.source === 'pm2') {
+    return runSystemCommandSync('pm2', [safeAction, parsedAppId.locator], {
+      timeoutMs: 45000
+    });
+  }
+  return {
+    ok: false,
+    code: 1,
+    stdout: '',
+    stderr: 'source_no_soportado'
+  };
+}
+
+function getDeployedAppLogs(appId, rawLines) {
+  const parsedAppId = parseDeployedAppId(appId);
+  if (!parsedAppId) {
+    return {
+      ok: false,
+      lines: deployedAppsDefaultLogLines,
+      logs: '',
+      error: 'app_id_invalido'
+    };
+  }
+  const parsedLines = Number.parseInt(String(rawLines || ''), 10);
+  const safeLines = Number.isInteger(parsedLines)
+    ? Math.min(Math.max(parsedLines, 20), deployedAppsMaxLogLines)
+    : deployedAppsDefaultLogLines;
+
+  let result = null;
+  if (parsedAppId.source === 'docker') {
+    result = runSystemCommandSync('docker', ['logs', '--tail', String(safeLines), parsedAppId.locator], {
+      allowNonZero: true,
+      timeoutMs: 45000,
+      maxBuffer: 1024 * 1024 * 12
+    });
+  } else if (parsedAppId.source === 'systemd') {
+    result = runSystemCommandSync(
+      'journalctl',
+      ['-u', parsedAppId.locator, '-n', String(safeLines), '--no-pager', '--output=short-iso'],
+      {
+        allowNonZero: true,
+        timeoutMs: 45000,
+        maxBuffer: 1024 * 1024 * 12
+      }
+    );
+  } else if (parsedAppId.source === 'pm2') {
+    result = runSystemCommandSync('pm2', ['logs', parsedAppId.locator, '--nostream', '--lines', String(safeLines)], {
+      allowNonZero: true,
+      timeoutMs: 45000,
+      maxBuffer: 1024 * 1024 * 12
+    });
+  } else {
+    return {
+      ok: false,
+      lines: safeLines,
+      logs: '',
+      error: 'source_no_soportado'
+    };
+  }
+
+  const mergedOutput = truncateRawText(
+    stripAnsi([result.stdout, result.stderr].filter(Boolean).join('\n')).trim(),
+    120000
+  );
+  if (!result.ok && !mergedOutput) {
+    return {
+      ok: false,
+      lines: safeLines,
+      logs: '',
+      error: truncateForNotify(result.stderr || result.stdout || 'logs_failed', 220)
+    };
+  }
+
+  return {
+    ok: true,
+    lines: safeLines,
+    logs: mergedOutput,
+    error: ''
   };
 }
 
@@ -5069,6 +5777,80 @@ app.get('/api/tools/observability', requireAuth, (_req, res) => {
   });
 });
 
+app.get('/api/tools/deployed-apps', requireAuth, (req, res) => {
+  const forceRefresh = String(req.query.refresh || '').trim() === '1';
+  const snapshot = collectDeployedAppsSnapshot(forceRefresh);
+  return res.json({
+    ok: true,
+    scannedAt: snapshot.scannedAt,
+    apps: snapshot.apps
+  });
+});
+
+app.post('/api/tools/deployed-apps/:appId/action', requireAuth, (req, res) => {
+  const appId = String(req.params.appId || '').trim();
+  const action = normalizeDeployedAppAction(req.body && req.body.action);
+  if (!action) {
+    return res.status(400).json({ error: 'Accion invalida. Usa start, stop o restart.' });
+  }
+
+  const appSummary = findDeployedAppById(appId, { forceRefresh: true });
+  if (!appSummary) {
+    return res.status(404).json({ error: 'App desplegada no encontrada.' });
+  }
+  if (action === 'start' && !appSummary.canStart) {
+    return res.status(409).json({ error: 'Esta app ya esta en ejecucion.' });
+  }
+  if (action === 'stop' && !appSummary.canStop) {
+    return res.status(409).json({ error: 'Esta app ya esta detenida.' });
+  }
+  if (action === 'restart' && !appSummary.canRestart) {
+    return res.status(409).json({ error: 'Reinicio no disponible para esta app.' });
+  }
+
+  const actionResult = runDeployedAppAction(appSummary.id, action);
+  if (!actionResult.ok) {
+    const reason = truncateForNotify(actionResult.stderr || actionResult.stdout || 'app_action_failed', 220);
+    return res.status(500).json({ error: `No se pudo aplicar accion "${action}": ${reason}` });
+  }
+
+  const refreshedSnapshot = collectDeployedAppsSnapshot(true);
+  const refreshedApp = refreshedSnapshot.apps.find((entry) => entry.id === appSummary.id) || appSummary;
+  const output = truncateRawText(stripAnsi([actionResult.stdout, actionResult.stderr].filter(Boolean).join('\n')).trim(), 6000);
+
+  return res.json({
+    ok: true,
+    action,
+    app: refreshedApp,
+    output,
+    scannedAt: refreshedSnapshot.scannedAt
+  });
+});
+
+app.get('/api/tools/deployed-apps/:appId/logs', requireAuth, (req, res) => {
+  const appId = String(req.params.appId || '').trim();
+  const appSummary = findDeployedAppById(appId, { forceRefresh: true });
+  if (!appSummary) {
+    return res.status(404).json({ error: 'App desplegada no encontrada.' });
+  }
+  if (!appSummary.hasLogs) {
+    return res.status(409).json({ error: 'Esta app no expone logs desde esta vista.' });
+  }
+
+  const logsPayload = getDeployedAppLogs(appSummary.id, req.query.lines);
+  if (!logsPayload.ok) {
+    return res.status(500).json({ error: `No se pudieron obtener logs: ${logsPayload.error || 'logs_failed'}` });
+  }
+
+  return res.json({
+    ok: true,
+    app: appSummary,
+    lines: logsPayload.lines,
+    logs: logsPayload.logs,
+    fetchedAt: nowIso()
+  });
+});
+
 app.get('/api/tools/git/repos', requireAuth, (req, res) => {
   const forceRefresh = String(req.query.refresh || '').trim() === '1';
   const snapshot = collectGitToolsReposSnapshot(forceRefresh);
@@ -5322,6 +6104,7 @@ app.get('/api/codex/auth/status', requireAuth, async (req, res) => {
       auth: {
         loggedIn: Boolean(auth.loggedIn),
         statusText: String(auth.statusText || ''),
+        details: auth && auth.details && typeof auth.details === 'object' ? auth.details : null,
         loginInProgress: Boolean(activeFlow),
         login: serializeCodexLoginFlow(activeFlow)
       }
