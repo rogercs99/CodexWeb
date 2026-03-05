@@ -6,6 +6,7 @@ import type {
   CodexQuota,
   NotificationSettings,
   Conversation,
+  MessageAttachment,
   Message,
   ToolsGitPushResult,
   ToolsGitRepoSummary,
@@ -107,7 +108,30 @@ export async function listMessages(conversationId: number): Promise<{
   );
   return {
     conversation: data.conversation,
-    messages: Array.isArray(data.messages) ? data.messages : [],
+    messages: Array.isArray(data.messages)
+      ? data.messages.map((entry: any) => {
+          const attachments: MessageAttachment[] = Array.isArray(entry?.attachments)
+            ? entry.attachments.map((file: any) => ({
+                id: String(file?.id || ''),
+                conversationId: Number(file?.conversationId) || 0,
+                name: String(file?.name || ''),
+                size: Math.max(0, Number(file?.size) || 0),
+                mimeType: String(file?.mimeType || 'application/octet-stream'),
+                uploadedAt: String(file?.uploadedAt || '')
+              }))
+            : [];
+          return {
+            id: Number(entry?.id) || 0,
+            role:
+              entry?.role === 'assistant' || entry?.role === 'system' || entry?.role === 'user'
+                ? entry.role
+                : 'assistant',
+            content: String(entry?.content || ''),
+            created_at: String(entry?.created_at || ''),
+            attachments: attachments.filter((file) => Boolean(file.id) && Boolean(file.name))
+          } as Message;
+        })
+      : [],
     liveDraft: data.liveDraft && typeof data.liveDraft === 'object' ? data.liveDraft : null,
     taskRecovery:
       data.taskRecovery && typeof data.taskRecovery === 'object'

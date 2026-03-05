@@ -30,6 +30,16 @@ export interface Message {
   role: 'user' | 'assistant' | 'system';
   content: string;
   created_at: string;
+  attachments?: MessageAttachment[];
+}
+
+export interface MessageAttachment {
+  id: string;
+  conversationId: number;
+  name: string;
+  size: number;
+  mimeType: string;
+  uploadedAt: string;
 }
 
 export interface AttachmentItem {

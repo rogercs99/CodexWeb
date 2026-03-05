@@ -35,12 +35,62 @@ export default function AttachmentsScreen({
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [query, setQuery] = useState('');
+  const [expandedChats, setExpandedChats] = useState<Record<number, boolean>>({});
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return attachments;
-    return attachments.filter((item) => item.name.toLowerCase().includes(q) || item.conversationTitle.toLowerCase().includes(q));
+    return attachments.filter(
+      (item) =>
+        item.name.toLowerCase().includes(q) ||
+        item.conversationTitle.toLowerCase().includes(q)
+    );
   }, [attachments, query]);
+
+  const groupedByConversation = useMemo(() => {
+    const groups = new Map<
+      number,
+      {
+        conversationId: number;
+        conversationTitle: string;
+        latestAt: string;
+        totalSize: number;
+        items: AttachmentItem[];
+      }
+    >();
+    filtered.forEach((item) => {
+      const conversationId = Number(item.conversationId);
+      if (!Number.isInteger(conversationId) || conversationId <= 0) return;
+      if (!groups.has(conversationId)) {
+        groups.set(conversationId, {
+          conversationId,
+          conversationTitle: String(item.conversationTitle || 'Chat'),
+          latestAt: String(item.uploadedAt || ''),
+          totalSize: 0,
+          items: []
+        });
+      }
+      const group = groups.get(conversationId);
+      if (!group) return;
+      group.items.push(item);
+      group.totalSize += Math.max(0, Number(item.size) || 0);
+      const currentLatest = Date.parse(group.latestAt || '');
+      const candidate = Date.parse(String(item.uploadedAt || ''));
+      if (!Number.isFinite(currentLatest) || (Number.isFinite(candidate) && candidate > currentLatest)) {
+        group.latestAt = String(item.uploadedAt || group.latestAt || '');
+      }
+    });
+    return Array.from(groups.values())
+      .map((group) => ({
+        ...group,
+        items: group.items
+          .slice()
+          .sort((a, b) => Date.parse(b.uploadedAt || '') - Date.parse(a.uploadedAt || ''))
+      }))
+      .sort((a, b) => Date.parse(b.latestAt || '') - Date.parse(a.latestAt || ''));
+  }, [filtered]);
+
+  const autoExpandAll = query.trim().length > 0;
 
   return (
     <div className="min-h-screen bg-black flex flex-col">
@@ -84,29 +134,74 @@ export default function AttachmentsScreen({
         </section>
 
         <section>
-          <h3 className="text-xs text-zinc-500 uppercase mb-2">En servidor</h3>
+          <h3 className="text-xs text-zinc-500 uppercase mb-2">En servidor (por chat)</h3>
           <div className="space-y-2">
-            {filtered.length === 0 ? <div className="text-sm text-zinc-500">No hay adjuntos.</div> : null}
-            {filtered.map((item) => (
-              <div key={item.id} className="bg-zinc-900/30 border border-zinc-800 rounded-xl p-3 flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="text-sm text-white truncate">{item.name}</p>
-                  <p className="text-xs text-zinc-500">{formatBytes(item.size)} • {item.conversationTitle} • {formatDate(item.uploadedAt)}</p>
-                </div>
-                <button
-                  onClick={() => {
-                    if (window.confirm(`¿Eliminar adjunto ${item.name} definitivamente?`)) {
-                      onDeleteAttachment(item.id);
-                    }
+            {groupedByConversation.length === 0 ? (
+              <div className="text-sm text-zinc-500">No hay adjuntos.</div>
+            ) : null}
+            {groupedByConversation.map((group) => {
+              const expanded = autoExpandAll || Boolean(expandedChats[group.conversationId]);
+              return (
+                <article
+                  key={group.conversationId}
+                  className="rounded-xl border border-zinc-800 bg-zinc-900/30 overflow-hidden"
+                  onMouseEnter={() => {
+                    setExpandedChats((prev) => {
+                      if (prev[group.conversationId]) return prev;
+                      return { ...prev, [group.conversationId]: true };
+                    });
                   }}
-                  className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-400 hover:text-red-300 hover:border-red-400/60 shrink-0"
-                  type="button"
-                  aria-label="Eliminar adjunto"
                 >
-                  <Trash2 size={14} />
-                </button>
-              </div>
-            ))}
+                  <button
+                    type="button"
+                    className="w-full text-left px-3 py-3 hover:bg-zinc-900/70"
+                    onClick={() => {
+                      setExpandedChats((prev) => ({
+                        ...prev,
+                        [group.conversationId]: !prev[group.conversationId]
+                      }));
+                    }}
+                  >
+                    <p className="text-sm text-white truncate">
+                      {expanded ? '▾' : '▸'} {group.conversationTitle}
+                    </p>
+                    <p className="text-xs text-zinc-500">
+                      {group.items.length} archivo{group.items.length === 1 ? '' : 's'} · {formatBytes(group.totalSize)}
+                      {group.latestAt ? ` · ${formatDate(group.latestAt)}` : ''}
+                    </p>
+                  </button>
+                  {expanded ? (
+                    <div className="border-t border-zinc-800 p-2 space-y-2">
+                      {group.items.map((item) => (
+                        <div
+                          key={item.id}
+                          className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3 flex items-center justify-between gap-3"
+                        >
+                          <div className="min-w-0">
+                            <p className="text-sm text-white truncate">{item.name}</p>
+                            <p className="text-xs text-zinc-500">
+                              {formatBytes(item.size)} · {formatDate(item.uploadedAt)}
+                            </p>
+                          </div>
+                          <button
+                            onClick={() => {
+                              if (window.confirm(`¿Eliminar adjunto ${item.name} definitivamente?`)) {
+                                onDeleteAttachment(item.id);
+                              }
+                            }}
+                            className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-400 hover:text-red-300 hover:border-red-400/60 shrink-0"
+                            type="button"
+                            aria-label="Eliminar adjunto"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </article>
+              );
+            })}
           </div>
         </section>
       </main>

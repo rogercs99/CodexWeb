@@ -1241,6 +1241,33 @@ function runGitStdoutSync(args) {
   }
 }
 
+function sanitizeGitIdentityName(rawName) {
+  const value = String(rawName || '')
+    .replace(/[\r\n\t]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!value) return '';
+  return value.length > 80 ? value.slice(0, 80).trim() : value;
+}
+
+function buildGitIdentityFromRequest(req) {
+  const username =
+    req && req.session && typeof req.session.username === 'string'
+      ? req.session.username
+      : '';
+  const name = sanitizeGitIdentityName(username) || 'CodexWeb';
+  const localPart = String(name || 'codexweb')
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+  const safeLocalPart = localPart || 'codexweb';
+  return {
+    name,
+    email: `${safeLocalPart}@codexweb.local`
+  };
+}
+
 function runGitInRepoSync(repoPath, args, options = {}) {
   const safeRepoPath = String(repoPath || '').trim() || repoRootDir;
   const safeArgs = Array.isArray(args) ? args.map((entry) => String(entry || '')) : [];
@@ -1248,6 +1275,10 @@ function runGitInRepoSync(repoPath, args, options = {}) {
     ? Math.max(500, Number(options.timeoutMs))
     : gitToolsCommandTimeoutMs;
   const allowNonZero = Boolean(options.allowNonZero);
+  const extraEnv =
+    options && options.env && typeof options.env === 'object' && !Array.isArray(options.env)
+      ? options.env
+      : {};
   try {
     const stdout = execFileSync('git', safeArgs, {
       cwd: safeRepoPath,
@@ -1256,7 +1287,8 @@ function runGitInRepoSync(repoPath, args, options = {}) {
       maxBuffer: 1024 * 1024 * 64,
       env: {
         ...process.env,
-        GIT_TERMINAL_PROMPT: '0'
+        GIT_TERMINAL_PROMPT: '0',
+        ...extraEnv
       }
     });
     return {
@@ -1289,6 +1321,10 @@ async function runGitInRepoAsync(repoPath, args, options = {}) {
     ? Math.max(500, Number(options.timeoutMs))
     : gitToolsCommandTimeoutMs;
   const allowNonZero = Boolean(options.allowNonZero);
+  const extraEnv =
+    options && options.env && typeof options.env === 'object' && !Array.isArray(options.env)
+      ? options.env
+      : {};
   try {
     const result = await execFileAsync('git', safeArgs, {
       cwd: safeRepoPath,
@@ -1297,7 +1333,8 @@ async function runGitInRepoAsync(repoPath, args, options = {}) {
       maxBuffer: 1024 * 1024 * 64,
       env: {
         ...process.env,
-        GIT_TERMINAL_PROMPT: '0'
+        GIT_TERMINAL_PROMPT: '0',
+        ...extraEnv
       }
     });
     return {
@@ -1586,8 +1623,18 @@ function normalizeGitCommitMessage(rawMessage, repoName = 'repo') {
   return `CodexWeb sync ${String(repoName || 'repo')} ${timestamp}`;
 }
 
-function buildGitConflictResolverPrompt(repoSummary) {
+function buildGitConflictResolverPrompt(repoSummary, gitIdentity) {
   const repo = repoSummary && typeof repoSummary === 'object' ? repoSummary : {};
+  const identity =
+    gitIdentity && typeof gitIdentity === 'object'
+      ? {
+          name: sanitizeGitIdentityName(gitIdentity.name) || 'CodexWeb',
+          email: String(gitIdentity.email || '').trim() || 'codexweb@codexweb.local'
+        }
+      : {
+          name: 'CodexWeb',
+          email: 'codexweb@codexweb.local'
+        };
   const conflictFiles = Array.isArray(repo.conflictFiles) ? repo.conflictFiles : [];
   const fileLines =
     conflictFiles.length > 0
@@ -1611,7 +1658,8 @@ function buildGitConflictResolverPrompt(repoSummary) {
     '3. Ejecuta pruebas o validaciones rapidas relevantes.',
     '4. Ejecuta git add -A y crea commit con mensaje claro de resolucion.',
     '5. Ejecuta git push al remoto correcto.',
-    '6. Devuelve resumen final con archivos resueltos, commit y resultado del push.'
+    `6. Si Git solicita identidad, usa nombre "${identity.name}" y email "${identity.email}".`,
+    '7. Devuelve resumen final con archivos resueltos, commit y resultado del push.'
   ].join('\n');
 }
 
@@ -3155,11 +3203,31 @@ CREATE TABLE IF NOT EXISTS messages (
   FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS message_attachments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id INTEGER NOT NULL,
+  conversation_id INTEGER NOT NULL,
+  stored_name TEXT NOT NULL,
+  display_name TEXT NOT NULL,
+  mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+  FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+  UNIQUE (message_id, stored_name)
+);
+
 CREATE INDEX IF NOT EXISTS idx_conversations_user_created
 ON conversations(user_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created
 ON messages(conversation_id, created_at ASC);
+
+CREATE INDEX IF NOT EXISTS idx_message_attachments_message
+ON message_attachments(message_id, id ASC);
+
+CREATE INDEX IF NOT EXISTS idx_message_attachments_conversation
+ON message_attachments(conversation_id, id ASC);
 
 CREATE TABLE IF NOT EXISTS chat_live_drafts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3364,6 +3432,36 @@ const listMessagesStmt = db.prepare(`
   FROM messages
   WHERE conversation_id = ?
   ORDER BY created_at ASC, id ASC
+`);
+const listMessageAttachmentsByConversationStmt = db.prepare(`
+  SELECT
+    message_id,
+    conversation_id,
+    stored_name,
+    display_name,
+    mime_type,
+    size_bytes,
+    created_at
+  FROM message_attachments
+  WHERE conversation_id = ?
+  ORDER BY id ASC
+`);
+const insertMessageAttachmentStmt = db.prepare(`
+  INSERT INTO message_attachments (
+    message_id,
+    conversation_id,
+    stored_name,
+    display_name,
+    mime_type,
+    size_bytes,
+    created_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?)
+`);
+const deleteMessageAttachmentsByFileStmt = db.prepare(`
+  DELETE FROM message_attachments
+  WHERE conversation_id = ?
+    AND stored_name = ?
 `);
 const listOwnedConversationIdsStmt = db.prepare(`
   SELECT id, title
@@ -4379,7 +4477,39 @@ app.get('/api/conversations/:id/messages', requireAuth, (req, res) => {
   if (!conversation) {
     return res.status(404).json({ error: 'Conversación no encontrada' });
   }
-  const messages = listMessagesStmt.all(conversationId);
+  const messageRows = listMessagesStmt.all(conversationId);
+  const attachmentRows = listMessageAttachmentsByConversationStmt.all(conversationId);
+  const attachmentsByMessageId = new Map();
+  attachmentRows.forEach((row) => {
+    const messageId = Number(row && row.message_id);
+    if (!Number.isInteger(messageId) || messageId <= 0) return;
+    const storedName = sanitizeFilename((row && row.stored_name) || '');
+    if (!storedName) return;
+    const filePath = path.join(uploadsDir, String(conversationId), storedName);
+    if (!fs.existsSync(filePath)) return;
+    if (!attachmentsByMessageId.has(messageId)) {
+      attachmentsByMessageId.set(messageId, []);
+    }
+    attachmentsByMessageId.get(messageId).push({
+      id: `${conversationId}:${storedName}`,
+      conversationId,
+      name: String((row && row.display_name) || storedName),
+      mimeType: String((row && row.mime_type) || inferMimeTypeFromFilename(storedName)),
+      size: Math.max(0, Number(row && row.size_bytes) || 0),
+      uploadedAt: String((row && row.created_at) || '')
+    });
+  });
+  const messages = messageRows.map((message) => {
+    const messageId = Number(message && message.id);
+    const attachments =
+      Number.isInteger(messageId) && messageId > 0 && attachmentsByMessageId.has(messageId)
+        ? attachmentsByMessageId.get(messageId)
+        : [];
+    return {
+      ...message,
+      attachments
+    };
+  });
   const runIsActive = hasActiveChatRun(req.session.userId, conversationId);
   if (!runIsActive) {
     closeOpenDraftsByConversationStmt.run(nowIso(), req.session.userId, conversationId);
@@ -4871,6 +5001,7 @@ app.post('/api/tools/git/repos/:repoId/push', requireAuth, async (req, res) => {
   }
 
   const commitMessage = normalizeGitCommitMessage(req.body && req.body.commitMessage, repo.name);
+  const gitIdentity = buildGitIdentityFromRequest(req);
   const addResult = await runGitInRepoAsync(repo.absolutePath, ['add', '-A']);
   if (!addResult.ok) {
     const reason = truncateForNotify(addResult.stderr || addResult.stdout || 'git_add_failed', 220);
@@ -4892,7 +5023,14 @@ app.post('/api/tools/git/repos/:repoId/push', requireAuth, async (req, res) => {
   let commitOutput = '';
 
   if (Number(stagedCheck.code) === 1) {
-    const commitResult = await runGitInRepoAsync(repo.absolutePath, ['commit', '-m', commitMessage]);
+    const commitResult = await runGitInRepoAsync(repo.absolutePath, ['commit', '-m', commitMessage], {
+      env: {
+        GIT_AUTHOR_NAME: gitIdentity.name,
+        GIT_AUTHOR_EMAIL: gitIdentity.email,
+        GIT_COMMITTER_NAME: gitIdentity.name,
+        GIT_COMMITTER_EMAIL: gitIdentity.email
+      }
+    });
     if (!commitResult.ok) {
       const reason = truncateForNotify(commitResult.stderr || commitResult.stdout || 'git_commit_failed', 220);
       return res.status(500).json({ error: `No se pudo crear commit: ${reason}` });
@@ -4974,6 +5112,7 @@ app.post('/api/tools/git/repos/:repoId/resolve-conflicts', requireAuth, (req, re
   if (!repo.hasConflicts) {
     return res.status(409).json({ error: 'Este repositorio no tiene conflictos activos.' });
   }
+  const gitIdentity = buildGitIdentityFromRequest(req);
 
   const title = buildConversationTitle(`Resolver conflictos ${repo.name || 'repo'}`);
   const created = createConversationStmt.run(
@@ -4992,7 +5131,7 @@ app.post('/api/tools/git/repos/:repoId/resolve-conflicts', requireAuth, (req, re
     repo,
     resolver: {
       conversationId,
-      prompt: buildGitConflictResolverPrompt(repo),
+      prompt: buildGitConflictResolverPrompt(repo, gitIdentity),
       autoSend: true
     }
   });
@@ -5255,6 +5394,7 @@ app.delete('/api/attachments/:id', requireAuth, (req, res) => {
   }
 
   fs.unlinkSync(targetPath);
+  deleteMessageAttachmentsByFileStmt.run(parsedId.conversationId, parsedId.storedName);
   try {
     const leftovers = fs.readdirSync(conversationDir);
     if (leftovers.length === 0) {
@@ -5379,6 +5519,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   );
   let conversationId = null;
   let persistedAttachments = [];
+  let userMessageId = null;
   let assistantMessageId = null;
   let liveDraftId = null;
   const liveDraftRequestId = `${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
@@ -5509,12 +5650,38 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     taskSnapshot = null;
   }
 
-  insertMessageStmt.run(conversationId, 'user', prompt);
+  const userMessage = insertMessageStmt.run(conversationId, 'user', prompt);
+  userMessageId = Number(userMessage.lastInsertRowid);
   updateConversationTitleStmt.run(buildConversationTitle(prompt), conversationId);
   void notify(`Arranca request chat user=${username}`);
 
   try {
     persistedAttachments = persistAttachments(rawAttachments, conversationId, req.session.userId);
+    if (userMessageId && Number.isInteger(userMessageId) && persistedAttachments.length > 0) {
+      try {
+        persistedAttachments.forEach((file) => {
+          const storedName = sanitizeFilename(path.basename(String((file && file.path) || '')));
+          if (!storedName) return;
+          const safeDisplayName = sanitizeFilename((file && file.name) || storedName);
+          const safeMimeType =
+            String((file && file.mimeType) || inferMimeTypeFromFilename(storedName)).trim() ||
+            'application/octet-stream';
+          const safeSize = Math.max(0, Number(file && file.size) || 0);
+          insertMessageAttachmentStmt.run(
+            userMessageId,
+            conversationId,
+            storedName,
+            safeDisplayName,
+            safeMimeType,
+            safeSize,
+            nowIso()
+          );
+        });
+      } catch (error) {
+        const reason = truncateForNotify(error && error.message ? error.message : 'message_attachments_insert_failed', 160);
+        void notify(`WARN message_attachments_insert_failed user=${username} conv=${conversationId} reason=${reason}`);
+      }
+    }
     const conversationMessages = listMessagesStmt.all(conversationId);
     const promptWithHistory = buildPromptWithConversationHistory(prompt, conversationMessages);
     const promptWithRepoContext = buildPromptWithRepoContext(promptWithHistory, prompt);

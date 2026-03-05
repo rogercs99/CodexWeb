@@ -12,6 +12,13 @@ function formatDate(value: string) {
   return date.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
 }
 
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function formatElapsed(totalSeconds: number) {
   const safeSeconds = Math.max(0, Math.floor(totalSeconds || 0));
   const minutes = Math.floor(safeSeconds / 60);
@@ -443,6 +450,7 @@ export default function ChatScreen({
         {grouped.map((message) => {
           const rawContent = String(message.content || '');
           const hasVisibleContent = rawContent.trim().length > 0;
+          const messageAttachments = Array.isArray(message.attachments) ? message.attachments : [];
           const showThinking =
             (sending || isRunning) &&
             message.role === 'assistant' &&
@@ -467,6 +475,22 @@ export default function ChatScreen({
                 ) : (
                   <MarkdownMessage content={visibleContent} />
                 )}
+                {messageAttachments.length > 0 ? (
+                  <div className="mt-2 space-y-1.5">
+                    <p className="text-[10px] uppercase tracking-wide text-zinc-400">Adjuntos enviados</p>
+                    {messageAttachments.map((file) => (
+                      <div
+                        key={file.id}
+                        className="rounded-lg border border-zinc-700/80 bg-zinc-950/60 px-2.5 py-1.5 text-xs text-zinc-200 flex items-center justify-between gap-2"
+                      >
+                        <span className="truncate">{file.name}</span>
+                        <span className="shrink-0 text-zinc-400">
+                          {formatBytes(file.size)} · {String(file.mimeType || '').split('/')[0] || 'archivo'}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
                 <p className="text-[10px] text-zinc-500 mt-2">{formatDate(message.created_at)}</p>
               </div>
             </div>

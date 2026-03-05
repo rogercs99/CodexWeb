@@ -34,6 +34,7 @@ import type {
   ChatOptions,
   CodexBackgroundRun,
   Conversation,
+  MessageAttachment,
   Message,
   RestartState,
   Screen,
@@ -1319,13 +1320,22 @@ export default function App() {
 
       const now = Date.now();
       const startedAtIso = new Date(now).toISOString();
+      const pendingMessageAttachments: MessageAttachment[] = selectedFiles.map((file, index) => ({
+        id: `pending_${now}_${index + 1}_${file.name}`,
+        conversationId: activeConversationId && activeConversationId > 0 ? activeConversationId : 0,
+        name: String(file.name || `archivo_${index + 1}`),
+        size: Math.max(0, Number(file.size) || 0),
+        mimeType: String(file.type || 'application/octet-stream'),
+        uploadedAt: startedAtIso
+      }));
       const tempUserMessageId = -now;
       const tempAssistantMessageId = -(now + 1);
       const userMessage: Message = {
         id: tempUserMessageId,
         role: 'user',
-        content: trimmed || '[Adjuntos enviados]',
-        created_at: startedAtIso
+        content: trimmed || 'Adjuntos enviados.',
+        created_at: startedAtIso,
+        attachments: pendingMessageAttachments
       };
       const assistantMessage: Message = {
         id: tempAssistantMessageId,
