@@ -1245,14 +1245,45 @@ export default function App() {
     [activeConversationId]
   );
 
-  const handleDeleteAttachment = useCallback(async (attachmentId: string) => {
-    try {
-      await deleteAttachment(attachmentId);
-      setAttachments((prev) => prev.filter((item) => item.id !== attachmentId));
-      setStatus('Adjunto eliminado.');
-    } catch (error: any) {
-      setStatus(error?.message || 'No se pudo eliminar el adjunto.');
+  const handleDeleteAttachments = useCallback(async (attachmentIds: string[]) => {
+    const uniqueIds = Array.from(
+      new Set(
+        (attachmentIds || [])
+          .map((id) => String(id || '').trim())
+          .filter(Boolean)
+      )
+    );
+
+    if (uniqueIds.length === 0) {
+      return { deletedIds: [], failedIds: [] };
     }
+
+    const results = await Promise.allSettled(uniqueIds.map((id) => deleteAttachment(id)));
+    const deletedIds: string[] = [];
+    const failedIds: string[] = [];
+
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        deletedIds.push(uniqueIds[index]);
+      } else {
+        failedIds.push(uniqueIds[index]);
+      }
+    });
+
+    if (deletedIds.length > 0) {
+      const deletedSet = new Set(deletedIds);
+      setAttachments((prev) => prev.filter((item) => !deletedSet.has(item.id)));
+    }
+
+    if (failedIds.length === 0) {
+      setStatus(deletedIds.length === 1 ? 'Adjunto eliminado.' : `${deletedIds.length} adjuntos eliminados.`);
+    } else if (deletedIds.length > 0) {
+      setStatus(`${deletedIds.length} adjuntos eliminados, ${failedIds.length} no se pudieron eliminar.`);
+    } else {
+      setStatus('No se pudieron eliminar los adjuntos seleccionados.');
+    }
+
+    return { deletedIds, failedIds };
   }, []);
 
   const handleChatModelChange = useCallback(
@@ -1894,7 +1925,7 @@ export default function App() {
           onRemoveSelected={(name) => {
             setSelectedFiles((prev) => prev.filter((item) => item.name !== name));
           }}
-          onDeleteAttachment={handleDeleteAttachment}
+          onDeleteAttachments={handleDeleteAttachments}
           onRefresh={() => {
             void (async () => {
               try {

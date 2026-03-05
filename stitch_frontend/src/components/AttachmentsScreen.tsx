@@ -1,5 +1,5 @@
-import { ChevronLeft, RefreshCw, Plus, X, Trash2 } from 'lucide-react';
-import { useMemo, useRef, useState } from 'react';
+import { ChevronLeft, Plus, RefreshCw, Trash2, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import BottomNav from './BottomNav';
 import type { AttachmentItem, Screen } from '../lib/types';
 
@@ -21,7 +21,7 @@ export default function AttachmentsScreen({
   attachments,
   onPickFiles,
   onRemoveSelected,
-  onDeleteAttachment,
+  onDeleteAttachments,
   onRefresh,
   onNavigate
 }: {
@@ -29,21 +29,21 @@ export default function AttachmentsScreen({
   attachments: AttachmentItem[];
   onPickFiles: (files: File[]) => void;
   onRemoveSelected: (name: string) => void;
-  onDeleteAttachment: (attachmentId: string) => void;
+  onDeleteAttachments: (attachmentIds: string[]) => Promise<{ deletedIds: string[]; failedIds: string[] }>;
   onRefresh: () => void;
   onNavigate: (screen: Screen) => void;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [query, setQuery] = useState('');
   const [expandedChats, setExpandedChats] = useState<Record<number, boolean>>({});
+  const [selectedAttachmentIds, setSelectedAttachmentIds] = useState<Record<string, true>>({});
+  const [deletingSelection, setDeletingSelection] = useState(false);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return attachments;
     return attachments.filter(
-      (item) =>
-        item.name.toLowerCase().includes(q) ||
-        item.conversationTitle.toLowerCase().includes(q)
+      (item) => item.name.toLowerCase().includes(q) || item.conversationTitle.toLowerCase().includes(q)
     );
   }, [attachments, query]);
 
@@ -58,9 +58,11 @@ export default function AttachmentsScreen({
         items: AttachmentItem[];
       }
     >();
+
     filtered.forEach((item) => {
       const conversationId = Number(item.conversationId);
       if (!Number.isInteger(conversationId) || conversationId <= 0) return;
+
       if (!groups.has(conversationId)) {
         groups.set(conversationId, {
           conversationId,
@@ -70,16 +72,20 @@ export default function AttachmentsScreen({
           items: []
         });
       }
+
       const group = groups.get(conversationId);
       if (!group) return;
+
       group.items.push(item);
       group.totalSize += Math.max(0, Number(item.size) || 0);
+
       const currentLatest = Date.parse(group.latestAt || '');
       const candidate = Date.parse(String(item.uploadedAt || ''));
       if (!Number.isFinite(currentLatest) || (Number.isFinite(candidate) && candidate > currentLatest)) {
         group.latestAt = String(item.uploadedAt || group.latestAt || '');
       }
     });
+
     return Array.from(groups.values())
       .map((group) => ({
         ...group,
@@ -91,6 +97,68 @@ export default function AttachmentsScreen({
   }, [filtered]);
 
   const autoExpandAll = query.trim().length > 0;
+  const attachmentIdSet = useMemo(() => new Set(attachments.map((item) => item.id)), [attachments]);
+  const selectedCount = Object.keys(selectedAttachmentIds).length;
+
+  useEffect(() => {
+    setSelectedAttachmentIds((prev) => {
+      const ids = Object.keys(prev);
+      if (ids.length === 0) return prev;
+
+      const next: Record<string, true> = {};
+      let changed = false;
+
+      ids.forEach((id) => {
+        if (attachmentIdSet.has(id)) {
+          next[id] = true;
+        } else {
+          changed = true;
+        }
+      });
+
+      return changed ? next : prev;
+    });
+  }, [attachmentIdSet]);
+
+  const toggleAttachmentSelection = (attachmentId: string) => {
+    setSelectedAttachmentIds((prev) => {
+      const next = { ...prev };
+      if (next[attachmentId]) {
+        delete next[attachmentId];
+      } else {
+        next[attachmentId] = true;
+      }
+      return next;
+    });
+  };
+
+  const clearSelection = () => {
+    setSelectedAttachmentIds({});
+  };
+
+  const handleDeleteSelection = async (ids: string[]) => {
+    const uniqueIds = Array.from(new Set(ids.filter(Boolean)));
+    if (uniqueIds.length === 0 || deletingSelection) return;
+
+    const label = uniqueIds.length === 1 ? 'este adjunto' : `${uniqueIds.length} adjuntos`;
+    if (!window.confirm(`¿Eliminar ${label} definitivamente?`)) return;
+
+    setDeletingSelection(true);
+    try {
+      const result = await onDeleteAttachments(uniqueIds);
+      if (result.deletedIds.length > 0) {
+        setSelectedAttachmentIds((prev) => {
+          const next = { ...prev };
+          result.deletedIds.forEach((id) => {
+            delete next[id];
+          });
+          return next;
+        });
+      }
+    } finally {
+      setDeletingSelection(false);
+    }
+  };
 
   return (
     <div className="min-h-screen bg-black flex flex-col">
@@ -134,13 +202,40 @@ export default function AttachmentsScreen({
         </section>
 
         <section>
-          <h3 className="text-xs text-zinc-500 uppercase mb-2">En servidor (por chat)</h3>
-          <div className="space-y-2">
-            {groupedByConversation.length === 0 ? (
-              <div className="text-sm text-zinc-500">No hay adjuntos.</div>
+          <div className="flex items-center justify-between gap-3 mb-2">
+            <h3 className="text-xs text-zinc-500 uppercase">En servidor (por chat)</h3>
+            {selectedCount > 0 ? (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-zinc-400">{selectedCount} seleccionados</span>
+                <button
+                  type="button"
+                  onClick={clearSelection}
+                  className="text-xs text-zinc-400 hover:text-white"
+                  disabled={deletingSelection}
+                >
+                  Limpiar
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleDeleteSelection(Object.keys(selectedAttachmentIds));
+                  }}
+                  className="text-xs px-2.5 py-1.5 rounded-lg border border-red-400/50 text-red-300 hover:bg-red-500/10 disabled:opacity-60"
+                  disabled={deletingSelection}
+                >
+                  {deletingSelection ? 'Eliminando...' : 'Eliminar'}
+                </button>
+              </div>
             ) : null}
+          </div>
+
+          <div className="space-y-2">
+            {groupedByConversation.length === 0 ? <div className="text-sm text-zinc-500">No hay adjuntos.</div> : null}
             {groupedByConversation.map((group) => {
               const expanded = autoExpandAll || Boolean(expandedChats[group.conversationId]);
+              const selectedInGroup = group.items.filter((item) => Boolean(selectedAttachmentIds[item.id])).length;
+              const allInGroupSelected = group.items.length > 0 && selectedInGroup === group.items.length;
+
               return (
                 <article
                   key={group.conversationId}
@@ -152,24 +247,52 @@ export default function AttachmentsScreen({
                     });
                   }}
                 >
-                  <button
-                    type="button"
-                    className="w-full text-left px-3 py-3 hover:bg-zinc-900/70"
-                    onClick={() => {
-                      setExpandedChats((prev) => ({
-                        ...prev,
-                        [group.conversationId]: !prev[group.conversationId]
-                      }));
-                    }}
-                  >
-                    <p className="text-sm text-white truncate">
-                      {expanded ? '▾' : '▸'} {group.conversationTitle}
-                    </p>
-                    <p className="text-xs text-zinc-500">
-                      {group.items.length} archivo{group.items.length === 1 ? '' : 's'} · {formatBytes(group.totalSize)}
-                      {group.latestAt ? ` · ${formatDate(group.latestAt)}` : ''}
-                    </p>
-                  </button>
+                  <div className="flex items-center gap-2 px-3 py-2.5">
+                    <button
+                      type="button"
+                      className="flex-1 text-left hover:bg-zinc-900/70 rounded-lg px-1.5 py-1.5"
+                      onClick={() => {
+                        setExpandedChats((prev) => ({
+                          ...prev,
+                          [group.conversationId]: !prev[group.conversationId]
+                        }));
+                      }}
+                    >
+                      <p className="text-sm text-white truncate">
+                        {expanded ? '▾' : '▸'} {group.conversationTitle}
+                      </p>
+                      <p className="text-xs text-zinc-500">
+                        {group.items.length} archivo{group.items.length === 1 ? '' : 's'} · {formatBytes(group.totalSize)}
+                        {selectedInGroup > 0 ? ` · ${selectedInGroup} seleccionados` : ''}
+                        {group.latestAt ? ` · ${formatDate(group.latestAt)}` : ''}
+                      </p>
+                    </button>
+                    <button
+                      type="button"
+                      className="text-xs px-2 py-1 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-60"
+                      disabled={deletingSelection}
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        setSelectedAttachmentIds((prev) => {
+                          const next = { ...prev };
+                          if (allInGroupSelected) {
+                            group.items.forEach((item) => {
+                              delete next[item.id];
+                            });
+                          } else {
+                            group.items.forEach((item) => {
+                              next[item.id] = true;
+                            });
+                          }
+                          return next;
+                        });
+                      }}
+                    >
+                      {allInGroupSelected ? 'Quitar todo' : 'Seleccionar todo'}
+                    </button>
+                  </div>
+
                   {expanded ? (
                     <div className="border-t border-zinc-800 p-2 space-y-2">
                       {group.items.map((item) => (
@@ -177,17 +300,25 @@ export default function AttachmentsScreen({
                           key={item.id}
                           className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-3 flex items-center justify-between gap-3"
                         >
-                          <div className="min-w-0">
-                            <p className="text-sm text-white truncate">{item.name}</p>
-                            <p className="text-xs text-zinc-500">
-                              {formatBytes(item.size)} · {formatDate(item.uploadedAt)}
-                            </p>
-                          </div>
+                          <label className="min-w-0 flex-1 flex items-center gap-3 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              className="w-4 h-4 rounded border-zinc-700 bg-zinc-900 text-blue-500 focus:ring-blue-500/50"
+                              checked={Boolean(selectedAttachmentIds[item.id])}
+                              onChange={() => {
+                                toggleAttachmentSelection(item.id);
+                              }}
+                            />
+                            <div className="min-w-0">
+                              <p className="text-sm text-white truncate">{item.name}</p>
+                              <p className="text-xs text-zinc-500">
+                                {formatBytes(item.size)} · {formatDate(item.uploadedAt)}
+                              </p>
+                            </div>
+                          </label>
                           <button
                             onClick={() => {
-                              if (window.confirm(`¿Eliminar adjunto ${item.name} definitivamente?`)) {
-                                onDeleteAttachment(item.id);
-                              }
+                              void handleDeleteSelection([item.id]);
                             }}
                             className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-400 hover:text-red-300 hover:border-red-400/60 shrink-0"
                             type="button"
