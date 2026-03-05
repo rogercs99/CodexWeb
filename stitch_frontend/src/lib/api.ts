@@ -1,4 +1,6 @@
 import type {
+  AiAgentSettingsItem,
+  AiAgentSettingsPayload,
   AttachmentItem,
   CodexBackgroundRun,
   CodexAuthStatus,
@@ -176,6 +178,43 @@ export async function updateNotificationSettings(
     body: JSON.stringify(payload)
   });
   return data.notifications;
+}
+
+export async function getAiAgentSettings(): Promise<AiAgentSettingsPayload> {
+  const data = await api<{ agents: AiAgentSettingsItem[]; activeAgentId?: string }>('/api/settings/ai-agents');
+  return {
+    agents: Array.isArray(data.agents) ? data.agents : [],
+    activeAgentId: String(data.activeAgentId || '')
+  };
+}
+
+export async function updateAiAgentSetting(
+  agentId: string,
+  payload: { enabled?: boolean; apiKey?: string; baseUrl?: string }
+): Promise<{ agent: AiAgentSettingsItem; activeAgentId: string }> {
+  const data = await api<{ agent: AiAgentSettingsItem; activeAgentId?: string }>(
+    `/api/settings/ai-agents/${encodeURIComponent(String(agentId || ''))}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }
+  );
+  return {
+    agent: data.agent,
+    activeAgentId: String(data.activeAgentId || '')
+  };
+}
+
+export async function updateActiveAiAgentSetting(agentId: string): Promise<{ activeAgentId: string }> {
+  const data = await api<{ activeAgentId?: string }>('/api/settings/ai-agents/active', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agentId })
+  });
+  return {
+    activeAgentId: String(data.activeAgentId || '')
+  };
 }
 
 export async function getCodexQuota(): Promise<CodexQuota | null> {

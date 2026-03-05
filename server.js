@@ -30,6 +30,290 @@ const DISCORD_WEBHOOK_PREFIXES = [
 ];
 const DISCORD_RESULT_SNIPPET_MAX_LEN = 1400;
 const DISCORD_MESSAGE_MAX_LEN = 1900;
+const supportedAiAgents = [
+  {
+    id: 'codex-cli',
+    name: 'Codex CLI',
+    vendor: 'OpenAI',
+    description: 'Agente de terminal para tareas de codigo y repositorios.',
+    pricing: 'paid',
+    integrationType: 'oauth',
+    docsUrl: 'https://developers.openai.com/codex/cli',
+    supportsBaseUrl: false
+  },
+  {
+    id: 'claude-code',
+    name: 'Claude Code',
+    vendor: 'Anthropic',
+    description: 'Agente CLI de Anthropic para desarrollo asistido.',
+    pricing: 'paid',
+    integrationType: 'api_key',
+    docsUrl: 'https://docs.anthropic.com/en/docs/claude-code/overview',
+    supportsBaseUrl: false
+  },
+  {
+    id: 'gemini-cli',
+    name: 'Gemini CLI',
+    vendor: 'Google',
+    description: 'CLI de Gemini para trabajar en terminal y scripting.',
+    pricing: 'freemium',
+    integrationType: 'api_key',
+    docsUrl: 'https://ai.google.dev/gemini-api/docs/quickstart',
+    supportsBaseUrl: false
+  },
+  {
+    id: 'cursor-agent',
+    name: 'Cursor Agent',
+    vendor: 'Cursor',
+    description: 'Agente dentro de Cursor para cambios multiarchivo.',
+    pricing: 'freemium',
+    integrationType: 'oauth',
+    docsUrl: 'https://docs.cursor.com/get-started/installation',
+    supportsBaseUrl: false
+  },
+  {
+    id: 'windsurf-cascade',
+    name: 'Windsurf Cascade',
+    vendor: 'Codeium',
+    description: 'Agente de edicion y ejecucion contextual en IDE.',
+    pricing: 'freemium',
+    integrationType: 'oauth',
+    docsUrl: 'https://docs.windsurf.com/windsurf/getting-started',
+    supportsBaseUrl: false
+  },
+  {
+    id: 'github-copilot',
+    name: 'GitHub Copilot',
+    vendor: 'GitHub',
+    description: 'Asistente de codigo con modo chat y agentes.',
+    pricing: 'freemium',
+    integrationType: 'oauth',
+    docsUrl: 'https://docs.github.com/en/copilot',
+    supportsBaseUrl: false
+  },
+  {
+    id: 'cline',
+    name: 'Cline',
+    vendor: 'Open Source',
+    description: 'Agente OSS para VS Code con soporte multiproveedor.',
+    pricing: 'free',
+    integrationType: 'api_key',
+    docsUrl: 'https://github.com/cline/cline',
+    supportsBaseUrl: true
+  },
+  {
+    id: 'roo-code',
+    name: 'Roo Code',
+    vendor: 'Open Source',
+    description: 'Agente OSS para tareas de codigo en VS Code.',
+    pricing: 'free',
+    integrationType: 'api_key',
+    docsUrl: 'https://github.com/RooVetGit/Roo-Code',
+    supportsBaseUrl: true
+  },
+  {
+    id: 'continue',
+    name: 'Continue',
+    vendor: 'Continue',
+    description: 'Agente/extensible para IDE con modelos locales y remotos.',
+    pricing: 'free',
+    integrationType: 'api_key',
+    docsUrl: 'https://docs.continue.dev/',
+    supportsBaseUrl: true
+  },
+  {
+    id: 'aider',
+    name: 'Aider',
+    vendor: 'Open Source',
+    description: 'Pair-programmer en terminal para cambios en git.',
+    pricing: 'free',
+    integrationType: 'api_key',
+    docsUrl: 'https://aider.chat/docs/',
+    supportsBaseUrl: true
+  },
+  {
+    id: 'openhands',
+    name: 'OpenHands',
+    vendor: 'OpenHands',
+    description: 'Agente OSS para tareas autonomas de desarrollo.',
+    pricing: 'free',
+    integrationType: 'api_key',
+    docsUrl: 'https://docs.all-hands.dev/',
+    supportsBaseUrl: true
+  },
+  {
+    id: 'tabbyml',
+    name: 'Tabby',
+    vendor: 'TabbyML',
+    description: 'Asistente OSS self-hosted para completado y chat.',
+    pricing: 'free',
+    integrationType: 'local_cli',
+    docsUrl: 'https://tabby.tabbyml.com/docs/',
+    supportsBaseUrl: true
+  }
+];
+const supportedAiAgentsById = new Map(
+  supportedAiAgents.map((agent) => [agent.id, agent])
+);
+const aiAgentTutorialsById = {
+  'codex-cli': {
+    title: 'Integracion Codex CLI',
+    steps: [
+      'Instala Codex CLI en el servidor donde corre CodexWeb.',
+      'En Settings > Codex CLI, pulsa "Iniciar sesion con ChatGPT".',
+      'Abre el enlace de verificacion, pega el codigo y confirma.',
+      'Vuelve a CodexWeb, refresca y verifica estado "Conectado".',
+      'Activa la integracion de Codex CLI en Agentes IA y guarda.'
+    ],
+    notes: [
+      'No necesitas API key para esta integracion cuando usas login ChatGPT.',
+      'Si usas API key en Codex CLI, valida permisos antes de ejecutar tareas.'
+    ]
+  },
+  'claude-code': {
+    title: 'Integracion Claude Code',
+    steps: [
+      'Crea una API key en Anthropic Console para tu cuenta.',
+      'En CodexWeb > Settings > Agentes IA, abre Claude Code.',
+      'Activa la integracion y pega la API key en el campo.',
+      'Pulsa Guardar y confirma estado "Listo".',
+      'Haz una prueba corta para validar que responde sin errores.'
+    ],
+    notes: [
+      'Si rotas la clave, reemplazala aqui y guarda de nuevo.'
+    ]
+  },
+  'gemini-cli': {
+    title: 'Integracion Gemini CLI',
+    steps: [
+      'Crea una API key en Google AI Studio o Google Cloud.',
+      'Abre Gemini CLI dentro de Agentes IA en CodexWeb.',
+      'Activa la integracion y pega la API key.',
+      'Guarda cambios y revisa que el estado quede "Listo".',
+      'Ejecuta una prueba breve para confirmar conectividad.'
+    ],
+    notes: [
+      'Revisa cuota y limites de tu proyecto en Google para evitar bloqueos.'
+    ]
+  },
+  'cursor-agent': {
+    title: 'Integracion Cursor Agent',
+    steps: [
+      'Instala Cursor y entra con tu cuenta en el editor.',
+      'Activa Cursor Agent desde su configuracion interna.',
+      'En CodexWeb, activa la integracion de Cursor Agent.',
+      'Guarda para dejarlo registrado como agente disponible.',
+      'Si lo usaras como agente principal, selecciona Cursor en el desplegable.'
+    ],
+    notes: [
+      'Esta integracion en CodexWeb no requiere API key en este panel.'
+    ]
+  },
+  'windsurf-cascade': {
+    title: 'Integracion Windsurf Cascade',
+    steps: [
+      'Instala Windsurf e inicia sesion en tu cuenta Codeium.',
+      'Habilita Cascade dentro del IDE y valida permisos.',
+      'En CodexWeb, activa Windsurf Cascade en Agentes IA.',
+      'Guarda y comprueba que quede marcado como "Listo".',
+      'Selecciona Windsurf en el desplegable si quieres usarlo por defecto.'
+    ],
+    notes: [
+      'En este panel no necesitas API key para Windsurf Cascade.'
+    ]
+  },
+  'github-copilot': {
+    title: 'Integracion GitHub Copilot',
+    steps: [
+      'Activa GitHub Copilot en tu cuenta GitHub y editor.',
+      'Verifica que tu licencia y organizacion permiten el uso.',
+      'En CodexWeb, activa la integracion GitHub Copilot.',
+      'Guarda para registrarlo en tu cuenta de CodexWeb.',
+      'Selecciona Copilot en el desplegable si sera tu agente de uso.'
+    ],
+    notes: [
+      'Si no aparece disponible en tu editor, revisa permisos de la cuenta.'
+    ]
+  },
+  cline: {
+    title: 'Integracion Cline',
+    steps: [
+      'Instala Cline en VS Code.',
+      'Consigue una API key del proveedor que vas a usar.',
+      'En CodexWeb, activa Cline y pega la API key.',
+      'Opcional: define Base URL si usas proxy o endpoint propio.',
+      'Guarda y valida estado "Listo".'
+    ],
+    notes: [
+      'Si usas OpenRouter o endpoint propio, Base URL debe iniciar por https://'
+    ]
+  },
+  'roo-code': {
+    title: 'Integracion Roo Code',
+    steps: [
+      'Instala Roo Code en VS Code.',
+      'Genera una API key del proveedor compatible.',
+      'En CodexWeb, activa Roo Code e introduce la API key.',
+      'Opcional: configura Base URL personalizada.',
+      'Guarda y comprueba que quede en estado "Listo".'
+    ],
+    notes: [
+      'Usa claves separadas por entorno para facilitar rotacion.'
+    ]
+  },
+  continue: {
+    title: 'Integracion Continue',
+    steps: [
+      'Instala Continue en tu IDE.',
+      'Prepara la API key del proveedor de modelo.',
+      'En CodexWeb, activa Continue y pega la API key.',
+      'Si usas backend propio, completa Base URL.',
+      'Guarda y verifica estado "Listo".'
+    ],
+    notes: [
+      'Si el proveedor cambia de endpoint, actualiza Base URL y vuelve a guardar.'
+    ]
+  },
+  aider: {
+    title: 'Integracion Aider',
+    steps: [
+      'Instala Aider en el servidor o equipo de trabajo.',
+      'Crea API key para el modelo que usara Aider.',
+      'En CodexWeb, activa Aider y pega la API key.',
+      'Configura Base URL solo si usas endpoint no estandar.',
+      'Guarda y ejecuta una prueba corta en repo de test.'
+    ],
+    notes: [
+      'Aider funciona mejor con repos Git limpios o con commits frecuentes.'
+    ]
+  },
+  openhands: {
+    title: 'Integracion OpenHands',
+    steps: [
+      'Despliega OpenHands segun su guia oficial.',
+      'Genera API key o credencial de acceso del backend.',
+      'En CodexWeb, activa OpenHands y pega la API key.',
+      'Completa Base URL con el endpoint del servicio.',
+      'Guarda y confirma estado "Listo".'
+    ],
+    notes: [
+      'Asegura que el endpoint sea accesible desde el servidor de CodexWeb.'
+    ]
+  },
+  tabbyml: {
+    title: 'Integracion Tabby',
+    steps: [
+      'Instala o levanta Tabby en tu infraestructura.',
+      'Define la URL publica o interna de Tabby.',
+      'En CodexWeb, activa Tabby.',
+      'Completa Base URL con la URL de Tabby y guarda.',
+      'Verifica conectividad y logs del servicio Tabby.'
+    ],
+    notes: [
+      'Tabby no usa API key en este formulario cuando operas self-hosted.'
+    ]
+  }
+};
 const chatGptModelOptions = [
   DEFAULT_CHAT_MODEL,
   'gpt-5',
@@ -1227,6 +1511,23 @@ function sanitizeDiscordWebhookUrl(rawValue, fallback = '') {
   if (!isAllowed) return String(fallback || '').trim();
   if (source.includes(' ')) return String(fallback || '').trim();
   return source;
+}
+
+function sanitizeHttpUrl(rawValue, fallback = '') {
+  const source = typeof rawValue === 'string' ? rawValue.trim() : '';
+  if (!source) return String(fallback || '').trim();
+  try {
+    const parsed = new URL(source);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return String(fallback || '').trim();
+    }
+    if (parsed.username || parsed.password) {
+      return String(fallback || '').trim();
+    }
+    return parsed.toString();
+  } catch (_error) {
+    return String(fallback || '').trim();
+  }
 }
 
 function formatDurationMs(durationMs) {
@@ -4049,8 +4350,23 @@ CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
+  active_ai_agent_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS user_agent_integrations (
+  user_id INTEGER NOT NULL,
+  agent_id TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  api_key TEXT NOT NULL DEFAULT '',
+  base_url TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, agent_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_agent_integrations_user
+ON user_agent_integrations(user_id, agent_id ASC);
 
 CREATE TABLE IF NOT EXISTS conversations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4206,6 +4522,10 @@ if (!hasUserColumn('discord_include_result')) {
   db.exec('ALTER TABLE users ADD COLUMN discord_include_result INTEGER NOT NULL DEFAULT 0');
 }
 
+if (!hasUserColumn('active_ai_agent_id')) {
+  db.exec("ALTER TABLE users ADD COLUMN active_ai_agent_id TEXT NOT NULL DEFAULT ''");
+}
+
 db.exec(`
 UPDATE conversations
 SET model = COALESCE(model, '')
@@ -4228,7 +4548,8 @@ SET
   discord_include_result = CASE
     WHEN discord_include_result IN (0, 1) THEN discord_include_result
     ELSE 0
-  END
+  END,
+  active_ai_agent_id = COALESCE(active_ai_agent_id, '')
 `);
 
 const createConversationStmt = db.prepare(
@@ -4293,6 +4614,57 @@ const getUserNotificationSettingsStmt = db.prepare(`
 const updateUserNotificationSettingsStmt = db.prepare(
   'UPDATE users SET discord_webhook_url = ?, discord_notify_on_finish = ?, discord_include_result = ? WHERE id = ?'
 );
+const getUserActiveAiAgentIdStmt = db.prepare(`
+  SELECT active_ai_agent_id
+  FROM users
+  WHERE id = ?
+  LIMIT 1
+`);
+const updateUserActiveAiAgentIdStmt = db.prepare(
+  'UPDATE users SET active_ai_agent_id = ? WHERE id = ?'
+);
+const listUserAgentIntegrationsStmt = db.prepare(`
+  SELECT
+    agent_id,
+    enabled,
+    api_key,
+    base_url,
+    updated_at
+  FROM user_agent_integrations
+  WHERE user_id = ?
+  ORDER BY agent_id ASC
+`);
+const getUserAgentIntegrationStmt = db.prepare(`
+  SELECT
+    agent_id,
+    enabled,
+    api_key,
+    base_url,
+    updated_at
+  FROM user_agent_integrations
+  WHERE user_id = ? AND agent_id = ?
+  LIMIT 1
+`);
+const upsertUserAgentIntegrationStmt = db.prepare(`
+  INSERT INTO user_agent_integrations (
+    user_id,
+    agent_id,
+    enabled,
+    api_key,
+    base_url,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?)
+  ON CONFLICT(user_id, agent_id) DO UPDATE SET
+    enabled = excluded.enabled,
+    api_key = excluded.api_key,
+    base_url = excluded.base_url,
+    updated_at = excluded.updated_at
+`);
+const deleteUserAgentIntegrationStmt = db.prepare(`
+  DELETE FROM user_agent_integrations
+  WHERE user_id = ? AND agent_id = ?
+`);
 const listMessagesStmt = db.prepare(`
   SELECT id, role, content, created_at
   FROM messages
@@ -4894,6 +5266,230 @@ function parseBooleanSetting(rawValue, fallback) {
   return Boolean(fallback);
 }
 
+function maskSecretValue(rawValue) {
+  const value = String(rawValue || '').trim();
+  if (!value) return '';
+  if (value.length <= 8) return '*'.repeat(Math.max(value.length, 4));
+  return `${value.slice(0, 4)}${'*'.repeat(Math.max(4, value.length - 6))}${value.slice(-2)}`;
+}
+
+function normalizeSupportedAiAgentId(rawValue) {
+  const safeAgentId = String(rawValue || '').trim();
+  if (!safeAgentId || !supportedAiAgentsById.has(safeAgentId)) {
+    return '';
+  }
+  return safeAgentId;
+}
+
+function buildAiAgentTutorial(agent) {
+  const safeAgentId = normalizeSupportedAiAgentId(agent && agent.id);
+  const byType = String(agent && agent.integrationType ? agent.integrationType : '').toLowerCase();
+  const fallbackTutorial =
+    byType === 'api_key'
+      ? {
+          title: `Integracion ${String((agent && agent.name) || 'agente')}`,
+          steps: [
+            'Consigue una API key del proveedor.',
+            'Activa la integracion en CodexWeb.',
+            'Pega la API key y guarda cambios.',
+            'Verifica que el estado quede en "Listo".'
+          ],
+          notes: ['Si cambias la API key, vuelve a guardarla en este panel.']
+        }
+      : byType === 'oauth'
+        ? {
+            title: `Integracion ${String((agent && agent.name) || 'agente')}`,
+            steps: [
+              'Inicia sesion en el producto oficial del agente.',
+              'Activa la integracion en CodexWeb.',
+              'Guarda cambios en Settings.',
+              'Selecciona este agente en el desplegable si sera el principal.'
+            ],
+            notes: ['En este panel no se solicita API key para este agente.']
+          }
+        : {
+            title: `Integracion ${String((agent && agent.name) || 'agente')}`,
+            steps: [
+              'Instala o despliega el agente en tu entorno.',
+              'Activa la integracion en CodexWeb.',
+              'Configura endpoint o parametros requeridos.',
+              'Guarda y valida conectividad.'
+            ],
+            notes: []
+          };
+
+  const candidate = safeAgentId ? aiAgentTutorialsById[safeAgentId] : null;
+  const tutorial = candidate || fallbackTutorial;
+  const steps = Array.isArray(tutorial.steps)
+    ? tutorial.steps
+        .map((entry) => String(entry || '').trim())
+        .filter(Boolean)
+        .slice(0, 8)
+    : [];
+  const notes = Array.isArray(tutorial.notes)
+    ? tutorial.notes
+        .map((entry) => String(entry || '').trim())
+        .filter(Boolean)
+        .slice(0, 4)
+    : [];
+  const title = String(tutorial.title || '').trim() || `Integracion ${String((agent && agent.name) || 'agente')}`;
+  return {
+    title,
+    steps,
+    notes
+  };
+}
+
+function normalizeUserAgentIntegrationRow(rawValue) {
+  const row = rawValue && typeof rawValue === 'object' ? rawValue : {};
+  const agentId = String(row.agent_id || '').trim();
+  const apiKey = String(row.api_key || '').trim();
+  const baseUrl = sanitizeHttpUrl(row.base_url, '');
+  return {
+    agentId,
+    enabled: Number(row.enabled) === 1,
+    apiKey,
+    baseUrl,
+    updatedAt: String(row.updated_at || '')
+  };
+}
+
+function isCodexCliLinkedWithChatGptForUser(userId) {
+  const details = getCodexAuthDetailsForUser(userId, '');
+  if (!details || typeof details !== 'object') {
+    return false;
+  }
+  const authMethod = String(details.authMethod || '').trim().toLowerCase();
+  if (authMethod === 'chatgpt') {
+    return true;
+  }
+  const authMode = String(details.authMode || '').trim().toLowerCase();
+  if (authMode.includes('chatgpt')) {
+    return true;
+  }
+  if (!details.hasRefreshToken) {
+    return false;
+  }
+  return Boolean(
+    String(details.email || '').trim() ||
+      String(details.accountId || '').trim() ||
+      String(details.subject || '').trim()
+  );
+}
+
+function getAiAgentSerializationOptionsForUser(userId) {
+  const forceEnabledAgentIds = new Set();
+  if (isCodexCliLinkedWithChatGptForUser(userId)) {
+    forceEnabledAgentIds.add('codex-cli');
+  }
+  return {
+    forceEnabledAgentIds
+  };
+}
+
+function serializeAiAgentIntegration(agent, integrationRow, options = {}) {
+  const normalized = normalizeUserAgentIntegrationRow(integrationRow);
+  const forceEnabled = Boolean(options && options.forceEnabled);
+  const hasApiKey = Boolean(normalized.apiKey);
+  const requiresApiKey = String(agent.integrationType || '') === 'api_key';
+  const configured = requiresApiKey ? hasApiKey : true;
+  return {
+    enabled: forceEnabled ? true : normalized.enabled,
+    configured,
+    hasApiKey,
+    apiKeyMasked: hasApiKey ? maskSecretValue(normalized.apiKey) : '',
+    baseUrl: normalized.baseUrl,
+    updatedAt: normalized.updatedAt
+  };
+}
+
+function serializeAiAgentSetting(agent, integrationRow, options = {}) {
+  const forceEnabled =
+    options &&
+    options.forceEnabledAgentIds &&
+    typeof options.forceEnabledAgentIds.has === 'function' &&
+    options.forceEnabledAgentIds.has(agent.id);
+  return {
+    id: agent.id,
+    name: agent.name,
+    vendor: agent.vendor,
+    description: agent.description,
+    pricing: agent.pricing,
+    isFree: agent.pricing === 'free',
+    integrationType: agent.integrationType,
+    docsUrl: agent.docsUrl,
+    supportsBaseUrl: Boolean(agent.supportsBaseUrl),
+    integration: serializeAiAgentIntegration(agent, integrationRow, { forceEnabled }),
+    tutorial: buildAiAgentTutorial(agent)
+  };
+}
+
+function serializeAiAgentSettingsForUser(userId, options = null) {
+  const serializationOptions = options || getAiAgentSerializationOptionsForUser(userId);
+  const rows = listUserAgentIntegrationsStmt.all(userId);
+  const rowByAgentId = new Map();
+  rows.forEach((entry) => {
+    const normalized = normalizeUserAgentIntegrationRow(entry);
+    if (!normalized.agentId) return;
+    rowByAgentId.set(normalized.agentId, normalized);
+  });
+  return supportedAiAgents.map((agent) =>
+    serializeAiAgentSetting(agent, rowByAgentId.get(agent.id) || null, serializationOptions)
+  );
+}
+
+function getSerializedAiAgentSettingForUser(userId, agentId, options = null) {
+  const serializationOptions = options || getAiAgentSerializationOptionsForUser(userId);
+  const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  if (!safeAgentId) return null;
+  const agent = supportedAiAgentsById.get(safeAgentId);
+  if (!agent) return null;
+  const existing = getUserAgentIntegrationStmt.get(userId, safeAgentId);
+  return serializeAiAgentSetting(agent, existing, serializationOptions);
+}
+
+function isSerializedAiAgentSelectable(agent) {
+  if (!agent || typeof agent !== 'object') return false;
+  const integration = agent.integration && typeof agent.integration === 'object' ? agent.integration : null;
+  return Boolean(integration && integration.enabled && integration.configured);
+}
+
+function getRawUserActiveAiAgentId(userId) {
+  const row = getUserActiveAiAgentIdStmt.get(userId);
+  return String((row && row.active_ai_agent_id) || '').trim();
+}
+
+function getUserActiveAiAgentId(userId) {
+  return normalizeSupportedAiAgentId(getRawUserActiveAiAgentId(userId));
+}
+
+function setUserActiveAiAgentId(userId, agentId) {
+  const normalized = normalizeSupportedAiAgentId(agentId);
+  updateUserActiveAiAgentIdStmt.run(normalized || '', userId);
+  return normalized || '';
+}
+
+function serializeAiAgentSettingsPayloadForUser(userId) {
+  const serializationOptions = getAiAgentSerializationOptionsForUser(userId);
+  const agents = serializeAiAgentSettingsForUser(userId, serializationOptions);
+  const selectableIds = new Set(
+    agents.filter((agent) => isSerializedAiAgentSelectable(agent)).map((agent) => agent.id)
+  );
+  const storedRaw = getRawUserActiveAiAgentId(userId);
+  const storedActive = normalizeSupportedAiAgentId(storedRaw);
+  const activeAgentId =
+    storedActive && selectableIds.has(storedActive)
+      ? storedActive
+      : '';
+  if (storedRaw !== activeAgentId) {
+    updateUserActiveAiAgentIdStmt.run(activeAgentId, userId);
+  }
+  return {
+    agents,
+    activeAgentId
+  };
+}
+
 function getOwnedConversationOrNull(conversationId, userId) {
   const conversation = getConversationStmt.get(conversationId);
   if (!conversation || conversation.user_id !== userId) {
@@ -5235,6 +5831,144 @@ app.patch('/api/settings/notifications', requireAuth, (req, res) => {
   return res.json({
     ok: true,
     notifications
+  });
+});
+
+app.get('/api/settings/ai-agents', requireAuth, (req, res) => {
+  const payload = serializeAiAgentSettingsPayloadForUser(req.session.userId);
+  return res.json({
+    ok: true,
+    fetchedAt: nowIso(),
+    agents: payload.agents,
+    activeAgentId: payload.activeAgentId
+  });
+});
+
+app.patch('/api/settings/ai-agents/active', requireAuth, (req, res) => {
+  const wasProvided = req.body && Object.prototype.hasOwnProperty.call(req.body, 'agentId');
+  if (!wasProvided) {
+    return res.status(400).json({ error: 'Falta agentId' });
+  }
+  if (typeof req.body.agentId !== 'string') {
+    return res.status(400).json({ error: 'agentId invalido' });
+  }
+  const requestedRaw = String(req.body.agentId || '').trim();
+  const requestedAgentId = normalizeSupportedAiAgentId(requestedRaw);
+  if (requestedRaw && !requestedAgentId) {
+    return res.status(404).json({ error: 'Agente no soportado' });
+  }
+  if (!requestedAgentId) {
+    setUserActiveAiAgentId(req.session.userId, '');
+    return res.json({
+      ok: true,
+      activeAgentId: ''
+    });
+  }
+  const payload = serializeAiAgentSettingsPayloadForUser(req.session.userId);
+  const selectedAgent = payload.agents.find((entry) => entry.id === requestedAgentId) || null;
+  if (!isSerializedAiAgentSelectable(selectedAgent)) {
+    return res.status(400).json({
+      error: 'Solo puedes seleccionar agentes activados y configurados'
+    });
+  }
+  setUserActiveAiAgentId(req.session.userId, requestedAgentId);
+  return res.json({
+    ok: true,
+    activeAgentId: requestedAgentId
+  });
+});
+
+app.patch('/api/settings/ai-agents/:agentId', requireAuth, (req, res) => {
+  const safeAgentId = normalizeSupportedAiAgentId((req.params && req.params.agentId) || '');
+  if (!safeAgentId) {
+    return res.status(404).json({ error: 'Agente no soportado' });
+  }
+
+  const agent = supportedAiAgentsById.get(safeAgentId);
+  const current = normalizeUserAgentIntegrationRow(
+    getUserAgentIntegrationStmt.get(req.session.userId, safeAgentId)
+  );
+  const enabledWasProvided =
+    req.body && Object.prototype.hasOwnProperty.call(req.body, 'enabled');
+  const apiKeyWasProvided =
+    req.body && Object.prototype.hasOwnProperty.call(req.body, 'apiKey');
+  const baseUrlWasProvided =
+    req.body && Object.prototype.hasOwnProperty.call(req.body, 'baseUrl');
+
+  if (!enabledWasProvided && !apiKeyWasProvided && !baseUrlWasProvided) {
+    return res.status(400).json({ error: 'No se recibieron cambios para guardar' });
+  }
+
+  let nextEnabled = current.enabled;
+  if (enabledWasProvided) {
+    const rawEnabled = req.body.enabled;
+    const rawType = typeof rawEnabled;
+    if (
+      !(
+        rawType === 'boolean' ||
+        rawEnabled === 0 ||
+        rawEnabled === 1 ||
+        rawEnabled === '0' ||
+        rawEnabled === '1'
+      )
+    ) {
+      return res.status(400).json({ error: 'Valor invalido para enabled' });
+    }
+    nextEnabled = parseBooleanSetting(rawEnabled, current.enabled);
+  }
+
+  let nextApiKey = current.apiKey;
+  if (apiKeyWasProvided) {
+    if (String(agent.integrationType || '') !== 'api_key') {
+      return res.status(400).json({ error: 'Este agente no usa API key en esta integracion' });
+    }
+    if (typeof req.body.apiKey !== 'string') {
+      return res.status(400).json({ error: 'API key invalida' });
+    }
+    const normalizedApiKey = String(req.body.apiKey || '').trim();
+    if (normalizedApiKey.length > 4000) {
+      return res.status(400).json({ error: 'API key demasiado larga' });
+    }
+    nextApiKey = normalizedApiKey;
+  }
+
+  let nextBaseUrl = current.baseUrl;
+  if (baseUrlWasProvided) {
+    if (!agent.supportsBaseUrl) {
+      return res.status(400).json({ error: 'Este agente no permite base URL personalizada' });
+    }
+    if (typeof req.body.baseUrl !== 'string') {
+      return res.status(400).json({ error: 'Base URL invalida' });
+    }
+    const requestedBaseUrl = String(req.body.baseUrl || '').trim();
+    const normalizedBaseUrl = sanitizeHttpUrl(requestedBaseUrl, '');
+    if (requestedBaseUrl && !normalizedBaseUrl) {
+      return res.status(400).json({ error: 'Base URL invalida' });
+    }
+    nextBaseUrl = normalizedBaseUrl;
+  }
+
+  if (!nextEnabled && !nextApiKey && !nextBaseUrl) {
+    deleteUserAgentIntegrationStmt.run(req.session.userId, safeAgentId);
+  } else {
+    upsertUserAgentIntegrationStmt.run(
+      req.session.userId,
+      safeAgentId,
+      nextEnabled ? 1 : 0,
+      nextApiKey,
+      nextBaseUrl,
+      nowIso()
+    );
+  }
+
+  const payload = serializeAiAgentSettingsPayloadForUser(req.session.userId);
+  const serialized =
+    payload.agents.find((entry) => entry.id === safeAgentId) ||
+    getSerializedAiAgentSettingForUser(req.session.userId, safeAgentId);
+  return res.json({
+    ok: true,
+    agent: serialized,
+    activeAgentId: payload.activeAgentId
   });
 });
 

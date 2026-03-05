@@ -88,6 +88,44 @@ export interface NotificationSettings {
   includeResult: boolean;
 }
 
+export type AiAgentPricing = 'free' | 'freemium' | 'paid';
+
+export type AiAgentIntegrationType = 'api_key' | 'oauth' | 'local_cli';
+
+export interface AiAgentIntegrationState {
+  enabled: boolean;
+  configured: boolean;
+  hasApiKey: boolean;
+  apiKeyMasked: string;
+  baseUrl: string;
+  updatedAt: string;
+}
+
+export interface AiAgentTutorial {
+  title: string;
+  steps: string[];
+  notes: string[];
+}
+
+export interface AiAgentSettingsItem {
+  id: string;
+  name: string;
+  vendor: string;
+  description: string;
+  pricing: AiAgentPricing;
+  isFree: boolean;
+  integrationType: AiAgentIntegrationType;
+  docsUrl: string;
+  supportsBaseUrl: boolean;
+  integration: AiAgentIntegrationState;
+  tutorial: AiAgentTutorial;
+}
+
+export interface AiAgentSettingsPayload {
+  agents: AiAgentSettingsItem[];
+  activeAgentId: string;
+}
+
 export interface RestartState {
   attemptId: string;
   active: boolean;
