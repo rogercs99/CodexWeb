@@ -33,6 +33,14 @@ export interface Message {
   attachments?: MessageAttachment[];
 }
 
+export interface MessagesPagination {
+  limit: number;
+  hasMore: boolean;
+  nextBeforeId: number | null;
+  oldestLoadedId: number | null;
+  newestLoadedId: number | null;
+}
+
 export interface MessageAttachment {
   id: string;
   conversationId: number;
@@ -80,6 +88,9 @@ export interface ChatOptions {
     model: string;
     reasoningEffort: string;
   };
+  activeAgentId?: string;
+  activeAgentName?: string;
+  runtimeProvider?: 'codex' | 'gemini' | string;
 }
 
 export interface NotificationSettings {
@@ -344,6 +355,20 @@ export interface ToolsDeployedAppLogsResponse {
   lines: number;
   logs: string;
   fetchedAt: string;
+}
+
+export interface ToolsDeployedAppGeneratedDescription {
+  appId: string;
+  name: string;
+  description: string;
+  generatedAt: string;
+}
+
+export interface ToolsDeployedAppDescribeResponse {
+  provider: string;
+  activeAgentId: string;
+  scannedAt: string;
+  descriptions: ToolsDeployedAppGeneratedDescription[];
 }
 
 export interface ToolsGitRepoStatusCounts {

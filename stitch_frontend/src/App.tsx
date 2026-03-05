@@ -95,6 +95,28 @@ function sameIdList(a: number[], b: number[]): boolean {
   return true;
 }
 
+function normalizeModelForOptions(value: string, opts: ChatOptions): string {
+  const normalized = String(value || '').trim();
+  const models = Array.isArray(opts.models) ? opts.models : [];
+  if (normalized && models.includes(normalized)) return normalized;
+  const defaultModel = String(opts.defaults?.model || '').trim();
+  if (defaultModel && (models.length === 0 || models.includes(defaultModel))) {
+    return defaultModel;
+  }
+  return models.length > 0 ? String(models[0] || '').trim() : '';
+}
+
+function normalizeReasoningForOptions(value: string, opts: ChatOptions): string {
+  const normalized = String(value || '').trim().toLowerCase();
+  const efforts = Array.isArray(opts.reasoningEfforts) ? opts.reasoningEfforts : [];
+  if (normalized && efforts.includes(normalized)) return normalized;
+  const defaultEffort = String(opts.defaults?.reasoningEffort || '').trim().toLowerCase();
+  if (defaultEffort && (efforts.length === 0 || efforts.includes(defaultEffort))) {
+    return defaultEffort;
+  }
+  return efforts.length > 0 ? String(efforts[0] || '').trim().toLowerCase() : DEFAULT_REASONING_EFFORT;
+}
+
 interface LiveChatDraft {
   username: string;
   conversationId: number | null;
@@ -317,7 +339,10 @@ export default function App() {
   const [options, setOptions] = useState<ChatOptions>({
     models: [],
     reasoningEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh'],
-    defaults: { model: DEFAULT_MODEL, reasoningEffort: DEFAULT_REASONING_EFFORT }
+    defaults: { model: DEFAULT_MODEL, reasoningEffort: DEFAULT_REASONING_EFFORT },
+    activeAgentId: 'codex-cli',
+    activeAgentName: 'Codex CLI',
+    runtimeProvider: 'codex'
   });
   const [defaultModel, setDefaultModel] = useState(DEFAULT_MODEL);
   const [defaultReasoningEffort, setDefaultReasoningEffort] = useState(DEFAULT_REASONING_EFFORT);
@@ -773,8 +798,8 @@ export default function App() {
         setLiveReasoning(
           draftOnly ? serializeReasoning(new Map(Object.entries(draftOnly.draft.reasoningByItem || {}))) : ''
         );
-        setChatModel(defaultModel);
-        setChatReasoningEffort(defaultReasoningEffort);
+        setChatModel(normalizeModelForOptions(defaultModel, options));
+        setChatReasoningEffort(normalizeReasoningForOptions(defaultReasoningEffort, options));
         return;
       }
 
@@ -806,8 +831,18 @@ export default function App() {
           ? serializeReasoning(new Map(Object.entries(liveDraft.draft.reasoningByItem || {})))
           : recoveryPlanText
       );
-      setChatModel(detail.conversation.model || DEFAULT_MODEL);
-      setChatReasoningEffort(detail.conversation.reasoningEffort || DEFAULT_REASONING_EFFORT);
+      setChatModel(
+        normalizeModelForOptions(
+          String(detail.conversation.model || defaultModel || DEFAULT_MODEL),
+          options
+        )
+      );
+      setChatReasoningEffort(
+        normalizeReasoningForOptions(
+          String(detail.conversation.reasoningEffort || defaultReasoningEffort || DEFAULT_REASONING_EFFORT),
+          options
+        )
+      );
       applyTaskRecoveryToTerminal(chosenId, detail.taskRecovery || null);
     },
     [
@@ -816,6 +851,7 @@ export default function App() {
       defaultModel,
       defaultReasoningEffort,
       getLiveDraftForConversation,
+      options,
       refreshRunningConversationIds
     ]
   );
@@ -848,10 +884,12 @@ export default function App() {
             opts.defaults.reasoningEffort ||
             DEFAULT_REASONING_EFFORT;
           const rawCaps = localStorage.getItem(CAPS_KEY);
-          setDefaultModel(savedModel);
-          setDefaultReasoningEffort(savedReasoning);
-          setChatModel(savedModel);
-          setChatReasoningEffort(savedReasoning);
+          const normalizedModel = normalizeModelForOptions(savedModel, opts);
+          const normalizedReasoning = normalizeReasoningForOptions(savedReasoning, opts);
+          setDefaultModel(normalizedModel);
+          setDefaultReasoningEffort(normalizedReasoning);
+          setChatModel(normalizedModel);
+          setChatReasoningEffort(normalizedReasoning);
           if (rawCaps) {
             const parsed = JSON.parse(rawCaps);
             setCaps({ web: Boolean(parsed.web), code: Boolean(parsed.code), memory: Boolean(parsed.memory) });
@@ -921,10 +959,33 @@ export default function App() {
   }, [caps, defaultModel, defaultReasoningEffort]);
 
   useEffect(() => {
+    if (screen !== 'chat') return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const latestOptions = await getChatOptions();
+        if (cancelled) return;
+        setOptions(latestOptions);
+        setDefaultModel((prev) => normalizeModelForOptions(prev || latestOptions.defaults.model, latestOptions));
+        setDefaultReasoningEffort((prev) =>
+          normalizeReasoningForOptions(prev || latestOptions.defaults.reasoningEffort, latestOptions)
+        );
+        setChatModel((prev) => normalizeModelForOptions(prev, latestOptions));
+        setChatReasoningEffort((prev) => normalizeReasoningForOptions(prev, latestOptions));
+      } catch (_error) {
+        // ignore refresh errors when opening chat
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [screen]);
+
+  useEffect(() => {
     if (activeConversationId !== null) return;
-    setChatModel(defaultModel);
-    setChatReasoningEffort(defaultReasoningEffort);
-  }, [activeConversationId, defaultModel, defaultReasoningEffort]);
+    setChatModel(normalizeModelForOptions(defaultModel, options));
+    setChatReasoningEffort(normalizeReasoningForOptions(defaultReasoningEffort, options));
+  }, [activeConversationId, defaultModel, defaultReasoningEffort, options]);
 
   useEffect(() => {
     if (!sending || !sendStartedAtMs) {
@@ -1075,9 +1136,17 @@ export default function App() {
                 ? serializeReasoning(new Map(Object.entries(liveDraft.draft.reasoningByItem || {})))
                 : recoveryPlanText
             );
-            setChatModel(detail.conversation.model || DEFAULT_MODEL);
+            setChatModel(
+              normalizeModelForOptions(
+                String(detail.conversation.model || defaultModel || DEFAULT_MODEL),
+                options
+              )
+            );
             setChatReasoningEffort(
-              detail.conversation.reasoningEffort || DEFAULT_REASONING_EFFORT
+              normalizeReasoningForOptions(
+                String(detail.conversation.reasoningEffort || defaultReasoningEffort || DEFAULT_REASONING_EFFORT),
+                options
+              )
             );
             applyTaskRecoveryToTerminal(targetChatId, detail.taskRecovery || null);
             setPendingChatDraft(
@@ -1106,8 +1175,11 @@ export default function App() {
     [
       activeConversationId,
       applyTaskRecoveryToTerminal,
+      defaultModel,
+      defaultReasoningEffort,
       detachActiveStream,
       getLiveDraftForConversation,
+      options,
       refreshRunningConversationIds,
       sending
     ]
@@ -1145,22 +1217,35 @@ export default function App() {
     if (sending) {
       detachActiveStream('Ejecución en segundo plano para el chat anterior.');
     }
+    let effectiveOptions = options;
+    try {
+      const latestOptions = await getChatOptions();
+      effectiveOptions = latestOptions;
+      setOptions(latestOptions);
+    } catch (_error) {
+      // keep current options if refresh fails
+    }
     setActiveConversationId(null);
     setChatTitle('Nuevo chat');
     setMessages([]);
-    setChatModel(defaultModel);
-    setChatReasoningEffort(defaultReasoningEffort);
+    setChatModel(normalizeModelForOptions(defaultModel, effectiveOptions));
+    setChatReasoningEffort(normalizeReasoningForOptions(defaultReasoningEffort, effectiveOptions));
     setScreen('chat');
-  }, [defaultModel, defaultReasoningEffort, detachActiveStream, sending]);
+  }, [defaultModel, defaultReasoningEffort, detachActiveStream, options, sending]);
 
   const handleRefresh = useCallback(async () => {
     try {
+      const [latestOptions, latestAttachments] = await Promise.all([
+        getChatOptions().catch(() => options),
+        listAttachments(200)
+      ]);
+      setOptions(latestOptions);
       await loadConversationsAndPick(activeConversationId);
-      setAttachments(await listAttachments(200));
+      setAttachments(latestAttachments);
     } catch (error: any) {
       setStatus(error?.message || 'No se pudo refrescar.');
     }
-  }, [activeConversationId, loadConversationsAndPick]);
+  }, [activeConversationId, loadConversationsAndPick, options]);
 
   const handleDeleteConversations = useCallback(
     async (conversationIds: number[]) => {
@@ -1288,10 +1373,11 @@ export default function App() {
 
   const handleChatModelChange = useCallback(
     async (value: string) => {
-      setChatModel(value);
+      const normalizedValue = normalizeModelForOptions(value, options);
+      setChatModel(normalizedValue);
       if (!activeConversationId || activeConversationId <= 0) return;
       try {
-        const updated = await updateConversationSettings(activeConversationId, { model: value });
+        const updated = await updateConversationSettings(activeConversationId, { model: normalizedValue });
         setConversations((prev) =>
           prev.map((item) =>
             item.id === activeConversationId ? { ...item, model: updated.model } : item
@@ -1301,15 +1387,18 @@ export default function App() {
         setStatus(error?.message || 'No se pudo actualizar el modelo del chat.');
       }
     },
-    [activeConversationId]
+    [activeConversationId, options]
   );
 
   const handleChatReasoningChange = useCallback(
     async (value: string) => {
-      setChatReasoningEffort(value);
+      const normalizedValue = normalizeReasoningForOptions(value, options);
+      setChatReasoningEffort(normalizedValue);
       if (!activeConversationId || activeConversationId <= 0) return;
       try {
-        const updated = await updateConversationSettings(activeConversationId, { reasoningEffort: value });
+        const updated = await updateConversationSettings(activeConversationId, {
+          reasoningEffort: normalizedValue
+        });
         setConversations((prev) =>
           prev.map((item) =>
             item.id === activeConversationId
@@ -1321,7 +1410,7 @@ export default function App() {
         setStatus(error?.message || 'No se pudo actualizar el razonamiento del chat.');
       }
     },
-    [activeConversationId]
+    [activeConversationId, options]
   );
 
   const handleStop = useCallback(async () => {
@@ -1348,6 +1437,26 @@ export default function App() {
       if (sending) return;
       const trimmed = inputText.trim();
       if (!trimmed && selectedFiles.length === 0) return;
+
+      let effectiveOptions = options;
+      try {
+        const latestOptions = await getChatOptions();
+        effectiveOptions = latestOptions;
+        setOptions(latestOptions);
+      } catch (_error) {
+        // keep current options when refresh fails
+      }
+      const requestModel = normalizeModelForOptions(chatModel, effectiveOptions);
+      const requestReasoning = normalizeReasoningForOptions(
+        chatReasoningEffort,
+        effectiveOptions
+      );
+      if (requestModel !== chatModel) {
+        setChatModel(requestModel);
+      }
+      if (requestReasoning !== chatReasoningEffort) {
+        setChatReasoningEffort(requestReasoning);
+      }
 
       const now = Date.now();
       const startedAtIso = new Date(now).toISOString();
@@ -1483,8 +1592,8 @@ export default function App() {
 
         const response = await startChatStream({
           message: trimmed,
-          model: chatModel,
-          reasoningEffort: chatReasoningEffort,
+          model: requestModel,
+          reasoningEffort: requestReasoning,
           conversationId: activeConversationId,
           attachments: uploaded,
           signal: controller.signal
@@ -1502,6 +1611,18 @@ export default function App() {
             if (!isCurrentSession()) return;
             const nextId = Number(payload?.conversationId);
             trackRunningConversation(nextId);
+          },
+          chat_agent: (payload) => {
+            if (!isCurrentSession()) return;
+            const nextAgentId = String(payload?.id || '').trim();
+            const nextAgentName = String(payload?.name || '').trim();
+            const nextRuntime = String(payload?.provider || '').trim();
+            setOptions((prev) => ({
+              ...prev,
+              activeAgentId: nextAgentId || prev.activeAgentId,
+              activeAgentName: nextAgentName || prev.activeAgentName,
+              runtimeProvider: nextRuntime || prev.runtimeProvider
+            }));
           },
           assistant_delta: (payload) => {
             if (!isCurrentSession()) return;
@@ -1744,6 +1865,7 @@ export default function App() {
       chatReasoningEffort,
       deleteDraftSnapshot,
       loadConversationsAndPick,
+      options,
       persistActiveDraftNow,
       resetTransientStreamState,
       resolveActiveUsername,
@@ -1874,6 +1996,7 @@ export default function App() {
             runningConversationIds.includes(activeConversationId)
           }
           selectedFiles={selectedFiles}
+          activeAgentName={String(options.activeAgentName || 'Codex CLI')}
           model={chatModel}
           reasoningEffort={chatReasoningEffort}
           options={options}

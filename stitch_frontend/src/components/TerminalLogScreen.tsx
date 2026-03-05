@@ -1,6 +1,7 @@
 import {
   Activity,
   BarChart3,
+  CheckSquare,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -16,6 +17,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   actionToolsDeployedApp,
+  describeToolsDeployedApps,
   getCodexRuns,
   getToolsDeployedAppLogs,
   getToolsDeployedApps,
@@ -223,6 +225,13 @@ export default function TerminalLogScreen({
     null
   );
   const [deployLogsByApp, setDeployLogsByApp] = useState<Record<string, DeployLogsState>>({});
+  const [selectingDeployedApps, setSelectingDeployedApps] = useState(false);
+  const [selectedDeployedApps, setSelectedDeployedApps] = useState<Record<string, true>>({});
+  const [generatedDeployedDescriptions, setGeneratedDeployedDescriptions] = useState<
+    Record<string, { description: string; generatedAt: string }>
+  >({});
+  const [describingDeployedAppId, setDescribingDeployedAppId] = useState<string | null>(null);
+  const [describingSelectedApps, setDescribingSelectedApps] = useState(false);
 
   const loadRuns = useCallback(async (silent = false) => {
     if (!silent) {
@@ -601,6 +610,28 @@ export default function TerminalLogScreen({
       }));
   }, [conversationById, searchData]);
 
+  const deployedAppIds = useMemo(() => deployedApps.map((app) => app.id), [deployedApps]);
+  const selectedDeployedAppIds = useMemo(
+    () => deployedAppIds.filter((appId) => Boolean(selectedDeployedApps[appId])),
+    [deployedAppIds, selectedDeployedApps]
+  );
+  const selectedDeployedCount = selectedDeployedAppIds.length;
+  const allDeployedAppsSelected = deployedAppIds.length > 0 && selectedDeployedCount === deployedAppIds.length;
+
+  useEffect(() => {
+    const validIds = new Set(deployedApps.map((app) => app.id));
+    setSelectedDeployedApps((prev) => {
+      const nextEntries = Object.entries(prev).filter(([appId]) => validIds.has(appId));
+      if (nextEntries.length === Object.keys(prev).length) return prev;
+      return Object.fromEntries(nextEntries) as Record<string, true>;
+    });
+    setGeneratedDeployedDescriptions((prev) => {
+      const nextEntries = Object.entries(prev).filter(([appId]) => validIds.has(appId));
+      if (nextEntries.length === Object.keys(prev).length) return prev;
+      return Object.fromEntries(nextEntries) as Record<string, { description: string; generatedAt: string }>;
+    });
+  }, [deployedApps]);
+
   const stopOneRun = async (conversationId: number) => {
     setStoppingConversationId(conversationId);
     setRunsError('');
@@ -816,6 +847,64 @@ export default function TerminalLogScreen({
       setDeployedAppsError(error instanceof Error ? error.message : 'No se pudo ejecutar accion de app');
     } finally {
       setDeployActionBusy(null);
+    }
+  };
+
+  const toggleSelectDeployedApp = (appId: string) => {
+    setSelectedDeployedApps((prev) => {
+      if (prev[appId]) {
+        const next = { ...prev };
+        delete next[appId];
+        return next;
+      }
+      return { ...prev, [appId]: true };
+    });
+  };
+
+  const runDescribeDeployedApps = async (appIds: string[], mode: 'single' | 'bulk') => {
+    const normalizedIds = Array.isArray(appIds)
+      ? appIds
+          .map((entry) => String(entry || '').trim())
+          .filter(Boolean)
+      : [];
+    if (normalizedIds.length === 0) return;
+    setDeployNotice('');
+    setDeployedAppsError('');
+    if (mode === 'single') {
+      setDescribingDeployedAppId(normalizedIds[0] || null);
+    } else {
+      setDescribingSelectedApps(true);
+    }
+    try {
+      const payload = await describeToolsDeployedApps(normalizedIds);
+      const items = Array.isArray(payload.descriptions) ? payload.descriptions : [];
+      if (items.length === 0) {
+        throw new Error('La IA no devolvio descripciones para las apps seleccionadas.');
+      }
+      setGeneratedDeployedDescriptions((prev) => {
+        const next = { ...prev };
+        items.forEach((item) => {
+          const appId = String(item.appId || '').trim();
+          const description = String(item.description || '').trim();
+          if (!appId || !description) return;
+          next[appId] = {
+            description,
+            generatedAt: String(item.generatedAt || '') || new Date().toISOString()
+          };
+        });
+        return next;
+      });
+      setDeployNotice(
+        `Descripcion generada para ${items.length} app(s) con ${String(payload.provider || 'IA configurada')}.`
+      );
+    } catch (error) {
+      setDeployedAppsError(error instanceof Error ? error.message : 'No se pudieron generar descripciones');
+    } finally {
+      if (mode === 'single') {
+        setDescribingDeployedAppId(null);
+      } else {
+        setDescribingSelectedApps(false);
+      }
     }
   };
 
@@ -1668,6 +1757,68 @@ export default function TerminalLogScreen({
               <p className="text-xs text-zinc-500">Listado del sistema con acciones de inicio/parada/reinicio y logs.</p>
             </div>
 
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectingDeployedApps((prev) => {
+                    const next = !prev;
+                    if (!next) {
+                      setSelectedDeployedApps({});
+                    }
+                    return next;
+                  });
+                }}
+                className={`text-xs px-2.5 py-1.5 rounded-lg border ${
+                  selectingDeployedApps
+                    ? 'border-blue-500/40 bg-blue-500/10 text-blue-200'
+                    : 'border-zinc-700 text-zinc-200'
+                }`}
+              >
+                <span className="inline-flex items-center gap-1">
+                  <CheckSquare size={12} />
+                  {selectingDeployedApps ? 'Cancelar seleccion' : 'Seleccionar aplicaciones'}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  void runDescribeDeployedApps(selectedDeployedAppIds, 'bulk');
+                }}
+                disabled={!selectingDeployedApps || selectedDeployedCount === 0 || describingSelectedApps}
+                className={`text-xs px-2.5 py-1.5 rounded-lg border ${
+                  selectingDeployedApps && selectedDeployedCount > 0
+                    ? 'border-cyan-500/40 bg-cyan-500/10 text-cyan-200'
+                    : 'border-zinc-700 text-zinc-500'
+                } disabled:opacity-50`}
+              >
+                {describingSelectedApps
+                  ? 'Generando descripcion...'
+                  : `Generar descripcion seleccionadas (${selectedDeployedCount})`}
+              </button>
+
+              {selectingDeployedApps ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (allDeployedAppsSelected) {
+                      setSelectedDeployedApps({});
+                      return;
+                    }
+                    const allNext: Record<string, true> = {};
+                    deployedAppIds.forEach((appId) => {
+                      allNext[appId] = true;
+                    });
+                    setSelectedDeployedApps(allNext);
+                  }}
+                  className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500"
+                >
+                  {allDeployedAppsSelected ? 'Quitar seleccion total' : 'Seleccionar todas'}
+                </button>
+              ) : null}
+            </div>
+
             {deployNotice ? <p className="text-xs text-emerald-300">{deployNotice}</p> : null}
             {deployedAppsError ? <p className="text-xs text-red-300">{deployedAppsError}</p> : null}
             {deployedAppsScannedAt ? (
@@ -1696,26 +1847,43 @@ export default function TerminalLogScreen({
                         : 'text-amber-300';
                 const busyForApp = deployActionBusy?.appId === app.id;
                 const logsState = deployLogsByApp[app.id];
+                const isSelected = Boolean(selectedDeployedApps[app.id]);
+                const generatedDescription = generatedDeployedDescriptions[app.id];
+                const describeBusy = describingDeployedAppId === app.id;
                 return (
                   <article key={app.id} className="rounded-xl border border-zinc-800 bg-black/40 p-3">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setExpandedDeployedApps((prev) => ({ ...prev, [app.id]: !prev[app.id] }));
-                      }}
-                      onMouseEnter={() => openDeployedApp(app.id)}
-                      onFocus={() => openDeployedApp(app.id)}
-                      className="w-full text-left flex items-center justify-between gap-3"
-                    >
-                      <div className="min-w-0">
-                        <p className="text-sm text-zinc-100 truncate">{app.name}</p>
-                        <p className="text-xs text-zinc-500 mt-1 truncate">
-                          {formatDeployedSource(app.source)} · {statusText}
-                          {app.pid ? ` · pid ${app.pid}` : ''} {app.uptime ? ` · uptime ${app.uptime}` : ''}
-                        </p>
-                      </div>
-                      {isOpen ? <ChevronDown size={16} className="text-zinc-500" /> : <ChevronRight size={16} className="text-zinc-500" />}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      {selectingDeployedApps ? (
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => {
+                            toggleSelectDeployedApp(app.id);
+                          }}
+                          className="h-4 w-4 accent-cyan-400"
+                          aria-label={isSelected ? `${app.name} seleccionada` : `Seleccionar ${app.name}`}
+                        />
+                      ) : null}
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setExpandedDeployedApps((prev) => ({ ...prev, [app.id]: !prev[app.id] }));
+                        }}
+                        onMouseEnter={() => openDeployedApp(app.id)}
+                        onFocus={() => openDeployedApp(app.id)}
+                        className="w-full text-left flex items-center justify-between gap-3"
+                      >
+                        <div className="min-w-0">
+                          <p className="text-sm text-zinc-100 truncate">{app.name}</p>
+                          <p className="text-xs text-zinc-500 mt-1 truncate">
+                            {formatDeployedSource(app.source)} · {statusText}
+                            {app.pid ? ` · pid ${app.pid}` : ''} {app.uptime ? ` · uptime ${app.uptime}` : ''}
+                          </p>
+                        </div>
+                        {isOpen ? <ChevronDown size={16} className="text-zinc-500" /> : <ChevronRight size={16} className="text-zinc-500" />}
+                      </button>
+                    </div>
 
                     {isOpen ? (
                       <div className="mt-3 pt-3 border-t border-zinc-800 space-y-3">
@@ -1734,8 +1902,19 @@ export default function TerminalLogScreen({
                           </article>
                         </div>
 
+                        {generatedDescription ? (
+                          <article className="rounded-lg border border-cyan-500/30 bg-cyan-500/5 p-2.5">
+                            <p className="text-[11px] uppercase text-cyan-300">
+                              descripcion ia · {formatTime(generatedDescription.generatedAt)}
+                            </p>
+                            <p className="text-xs text-zinc-200 mt-1 whitespace-pre-wrap break-words">
+                              {generatedDescription.description}
+                            </p>
+                          </article>
+                        ) : null}
+
                         {app.description ? (
-                          <p className="text-xs text-zinc-300 break-all">detalle: {app.description}</p>
+                          <p className="text-xs text-zinc-300 break-all">detalle del sistema: {app.description}</p>
                         ) : null}
                         {app.location ? (
                           <p className="text-xs text-zinc-500 break-all">ubicacion: {app.location}</p>
@@ -1782,6 +1961,17 @@ export default function TerminalLogScreen({
                             } disabled:opacity-50`}
                           >
                             {busyForApp && deployActionBusy?.action === 'restart' ? 'Reiniciando...' : 'Reiniciar'}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void runDescribeDeployedApps([app.id], 'single');
+                            }}
+                            disabled={busyForApp || describeBusy || describingSelectedApps}
+                            className="text-xs px-2.5 py-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 disabled:opacity-50"
+                          >
+                            {describeBusy ? 'Generando descripcion...' : 'Generar descripcion'}
                           </button>
 
                           <button

@@ -19,6 +19,7 @@ const port = process.env.PORT || 3000;
 const host = process.env.HOST || '127.0.0.1';
 const defaultWebhookUrl = String(process.env.WEBHOOK_URL || '').trim();
 let resolvedCodexPath = null;
+let resolvedGeminiPath = null;
 const sentMilestones = new Set();
 const DEFAULT_CHAT_MODEL = 'gpt-5.3-codex';
 const DEFAULT_REASONING_EFFORT = 'xhigh';
@@ -42,114 +43,14 @@ const supportedAiAgents = [
     supportsBaseUrl: false
   },
   {
-    id: 'claude-code',
-    name: 'Claude Code',
-    vendor: 'Anthropic',
-    description: 'Agente CLI de Anthropic para desarrollo asistido.',
-    pricing: 'paid',
-    integrationType: 'api_key',
-    docsUrl: 'https://docs.anthropic.com/en/docs/claude-code/overview',
-    supportsBaseUrl: false
-  },
-  {
     id: 'gemini-cli',
     name: 'Gemini CLI',
     vendor: 'Google',
-    description: 'CLI de Gemini para trabajar en terminal y scripting.',
+    description: 'Agente de terminal de Gemini con ejecucion de comandos y cambios en archivos.',
     pricing: 'freemium',
     integrationType: 'api_key',
-    docsUrl: 'https://ai.google.dev/gemini-api/docs/quickstart',
+    docsUrl: 'https://github.com/google-gemini/gemini-cli',
     supportsBaseUrl: false
-  },
-  {
-    id: 'cursor-agent',
-    name: 'Cursor Agent',
-    vendor: 'Cursor',
-    description: 'Agente dentro de Cursor para cambios multiarchivo.',
-    pricing: 'freemium',
-    integrationType: 'oauth',
-    docsUrl: 'https://docs.cursor.com/get-started/installation',
-    supportsBaseUrl: false
-  },
-  {
-    id: 'windsurf-cascade',
-    name: 'Windsurf Cascade',
-    vendor: 'Codeium',
-    description: 'Agente de edicion y ejecucion contextual en IDE.',
-    pricing: 'freemium',
-    integrationType: 'oauth',
-    docsUrl: 'https://docs.windsurf.com/windsurf/getting-started',
-    supportsBaseUrl: false
-  },
-  {
-    id: 'github-copilot',
-    name: 'GitHub Copilot',
-    vendor: 'GitHub',
-    description: 'Asistente de codigo con modo chat y agentes.',
-    pricing: 'freemium',
-    integrationType: 'oauth',
-    docsUrl: 'https://docs.github.com/en/copilot',
-    supportsBaseUrl: false
-  },
-  {
-    id: 'cline',
-    name: 'Cline',
-    vendor: 'Open Source',
-    description: 'Agente OSS para VS Code con soporte multiproveedor.',
-    pricing: 'free',
-    integrationType: 'api_key',
-    docsUrl: 'https://github.com/cline/cline',
-    supportsBaseUrl: true
-  },
-  {
-    id: 'roo-code',
-    name: 'Roo Code',
-    vendor: 'Open Source',
-    description: 'Agente OSS para tareas de codigo en VS Code.',
-    pricing: 'free',
-    integrationType: 'api_key',
-    docsUrl: 'https://github.com/RooVetGit/Roo-Code',
-    supportsBaseUrl: true
-  },
-  {
-    id: 'continue',
-    name: 'Continue',
-    vendor: 'Continue',
-    description: 'Agente/extensible para IDE con modelos locales y remotos.',
-    pricing: 'free',
-    integrationType: 'api_key',
-    docsUrl: 'https://docs.continue.dev/',
-    supportsBaseUrl: true
-  },
-  {
-    id: 'aider',
-    name: 'Aider',
-    vendor: 'Open Source',
-    description: 'Pair-programmer en terminal para cambios en git.',
-    pricing: 'free',
-    integrationType: 'api_key',
-    docsUrl: 'https://aider.chat/docs/',
-    supportsBaseUrl: true
-  },
-  {
-    id: 'openhands',
-    name: 'OpenHands',
-    vendor: 'OpenHands',
-    description: 'Agente OSS para tareas autonomas de desarrollo.',
-    pricing: 'free',
-    integrationType: 'api_key',
-    docsUrl: 'https://docs.all-hands.dev/',
-    supportsBaseUrl: true
-  },
-  {
-    id: 'tabbyml',
-    name: 'Tabby',
-    vendor: 'TabbyML',
-    description: 'Asistente OSS self-hosted para completado y chat.',
-    pricing: 'free',
-    integrationType: 'local_cli',
-    docsUrl: 'https://tabby.tabbyml.com/docs/',
-    supportsBaseUrl: true
   }
 ];
 const supportedAiAgentsById = new Map(
@@ -163,154 +64,26 @@ const aiAgentTutorialsById = {
       'En Settings > Integraciones IA > Codex CLI, pulsa "Iniciar sesion con ChatGPT".',
       'Abre el enlace de verificacion, pega el codigo y confirma.',
       'Vuelve a CodexWeb, refresca y verifica estado "Conectado".',
-      'Activa la integracion de Codex CLI en Agentes IA y guarda.'
+      'Activa la integracion y seleccionalo en "Agente en uso".'
     ],
     notes: [
       'No necesitas API key para esta integracion cuando usas login ChatGPT.',
-      'Si usas API key en Codex CLI, valida permisos antes de ejecutar tareas.'
-    ]
-  },
-  'claude-code': {
-    title: 'Integracion Claude Code',
-    steps: [
-      'Crea una API key en Anthropic Console para tu cuenta.',
-      'En CodexWeb > Settings > Agentes IA, abre Claude Code.',
-      'Activa la integracion y pega la API key en el campo.',
-      'Pulsa Guardar y confirma estado "Listo".',
-      'Haz una prueba corta para validar que responde sin errores.'
-    ],
-    notes: [
-      'Si rotas la clave, reemplazala aqui y guarda de nuevo.'
+      'Codex CLI funciona en modo agente y puede ejecutar comandos del sistema.'
     ]
   },
   'gemini-cli': {
-    title: 'Integracion Gemini CLI',
+    title: 'Integracion Gemini CLI (modo agente)',
     steps: [
-      'Crea una API key en Google AI Studio o Google Cloud.',
-      'Abre Gemini CLI dentro de Agentes IA en CodexWeb.',
-      'Activa la integracion y pega la API key.',
-      'Guarda cambios y revisa que el estado quede "Listo".',
-      'Ejecuta una prueba breve para confirmar conectividad.'
+      'Instala Gemini CLI en el servidor: npm install -g @google/gemini-cli',
+      'Crea una API key en Google AI Studio.',
+      'En CodexWeb > Settings > Integraciones IA > Gemini CLI, activa la integracion.',
+      'Pega la API key, guarda y selecciona Gemini CLI en "Agente en uso".',
+      'Abre un chat nuevo y prueba una tarea de sistema (por ejemplo, listar archivos del proyecto).'
     ],
     notes: [
-      'Revisa cuota y limites de tu proyecto en Google para evitar bloqueos.'
-    ]
-  },
-  'cursor-agent': {
-    title: 'Integracion Cursor Agent',
-    steps: [
-      'Instala Cursor y entra con tu cuenta en el editor.',
-      'Activa Cursor Agent desde su configuracion interna.',
-      'En CodexWeb, activa la integracion de Cursor Agent.',
-      'Guarda para dejarlo registrado como agente disponible.',
-      'Si lo usaras como agente principal, selecciona Cursor en el desplegable.'
-    ],
-    notes: [
-      'Esta integracion en CodexWeb no requiere API key en este panel.'
-    ]
-  },
-  'windsurf-cascade': {
-    title: 'Integracion Windsurf Cascade',
-    steps: [
-      'Instala Windsurf e inicia sesion en tu cuenta Codeium.',
-      'Habilita Cascade dentro del IDE y valida permisos.',
-      'En CodexWeb, activa Windsurf Cascade en Agentes IA.',
-      'Guarda y comprueba que quede marcado como "Listo".',
-      'Selecciona Windsurf en el desplegable si quieres usarlo por defecto.'
-    ],
-    notes: [
-      'En este panel no necesitas API key para Windsurf Cascade.'
-    ]
-  },
-  'github-copilot': {
-    title: 'Integracion GitHub Copilot',
-    steps: [
-      'Activa GitHub Copilot en tu cuenta GitHub y editor.',
-      'Verifica que tu licencia y organizacion permiten el uso.',
-      'En CodexWeb, activa la integracion GitHub Copilot.',
-      'Guarda para registrarlo en tu cuenta de CodexWeb.',
-      'Selecciona Copilot en el desplegable si sera tu agente de uso.'
-    ],
-    notes: [
-      'Si no aparece disponible en tu editor, revisa permisos de la cuenta.'
-    ]
-  },
-  cline: {
-    title: 'Integracion Cline',
-    steps: [
-      'Instala Cline en VS Code.',
-      'Consigue una API key del proveedor que vas a usar.',
-      'En CodexWeb, activa Cline y pega la API key.',
-      'Opcional: define Base URL si usas proxy o endpoint propio.',
-      'Guarda y valida estado "Listo".'
-    ],
-    notes: [
-      'Si usas OpenRouter o endpoint propio, Base URL debe iniciar por https://'
-    ]
-  },
-  'roo-code': {
-    title: 'Integracion Roo Code',
-    steps: [
-      'Instala Roo Code en VS Code.',
-      'Genera una API key del proveedor compatible.',
-      'En CodexWeb, activa Roo Code e introduce la API key.',
-      'Opcional: configura Base URL personalizada.',
-      'Guarda y comprueba que quede en estado "Listo".'
-    ],
-    notes: [
-      'Usa claves separadas por entorno para facilitar rotacion.'
-    ]
-  },
-  continue: {
-    title: 'Integracion Continue',
-    steps: [
-      'Instala Continue en tu IDE.',
-      'Prepara la API key del proveedor de modelo.',
-      'En CodexWeb, activa Continue y pega la API key.',
-      'Si usas backend propio, completa Base URL.',
-      'Guarda y verifica estado "Listo".'
-    ],
-    notes: [
-      'Si el proveedor cambia de endpoint, actualiza Base URL y vuelve a guardar.'
-    ]
-  },
-  aider: {
-    title: 'Integracion Aider',
-    steps: [
-      'Instala Aider en el servidor o equipo de trabajo.',
-      'Crea API key para el modelo que usara Aider.',
-      'En CodexWeb, activa Aider y pega la API key.',
-      'Configura Base URL solo si usas endpoint no estandar.',
-      'Guarda y ejecuta una prueba corta en repo de test.'
-    ],
-    notes: [
-      'Aider funciona mejor con repos Git limpios o con commits frecuentes.'
-    ]
-  },
-  openhands: {
-    title: 'Integracion OpenHands',
-    steps: [
-      'Despliega OpenHands segun su guia oficial.',
-      'Genera API key o credencial de acceso del backend.',
-      'En CodexWeb, activa OpenHands y pega la API key.',
-      'Completa Base URL con el endpoint del servicio.',
-      'Guarda y confirma estado "Listo".'
-    ],
-    notes: [
-      'Asegura que el endpoint sea accesible desde el servidor de CodexWeb.'
-    ]
-  },
-  tabbyml: {
-    title: 'Integracion Tabby',
-    steps: [
-      'Instala o levanta Tabby en tu infraestructura.',
-      'Define la URL publica o interna de Tabby.',
-      'En CodexWeb, activa Tabby.',
-      'Completa Base URL con la URL de Tabby y guarda.',
-      'Verifica conectividad y logs del servicio Tabby.'
-    ],
-    notes: [
-      'Tabby no usa API key en este formulario cuando operas self-hosted.'
+      'Si el binario no esta en PATH, define GEMINI_CMD con la ruta del ejecutable.',
+      'Gemini se ejecuta en modo agente con acceso a archivos y comandos de terminal.',
+      'Para acceso total del sistema define GEMINI_INCLUDE_DIRECTORIES=/ (modo root del host).'
     ]
   }
 };
@@ -327,9 +100,31 @@ const chatGptModelOptions = [
   'o3',
   'o4-mini'
 ];
-const allowedReasoningEfforts = new Set(['minimal', 'low', 'medium', 'high', 'xhigh']);
+const geminiModelOptions = [
+  'gemini-2.5-flash',
+  'gemini-2.5-pro',
+  'gemini-2.0-flash'
+];
+const DEFAULT_GEMINI_CHAT_MODEL = geminiModelOptions[0];
+const chatReasoningEffortOptions = ['minimal', 'low', 'medium', 'high', 'xhigh'];
+const allowedReasoningEfforts = new Set(chatReasoningEffortOptions);
+const supportedChatRuntimeAgentIds = new Set(['codex-cli', 'gemini-cli']);
+const geminiReasoningInstructionsByEffort = {
+  minimal:
+    'Responde de forma muy breve y directa. Evita exploraciones largas y ve al punto.',
+  low:
+    'Mantén una respuesta compacta con razonamiento corto y práctico, priorizando la solución.',
+  medium:
+    'Equilibra claridad y detalle, explicando decisiones relevantes sin extenderte en exceso.',
+  high:
+    'Analiza con mayor profundidad, explicando trade-offs y verificaciones importantes.',
+  xhigh:
+    'Haz un análisis profundo, con validaciones explícitas, posibles riesgos y alternativas.'
+};
 const uploadsDir = path.join(__dirname, 'uploads');
 const pendingUploadsDir = path.join(uploadsDir, 'pending');
+const uploadsDirUrlPath = uploadsDir.replace(/\\/g, '/');
+const legacyUploadsRouteBasePath = uploadsDirUrlPath.startsWith('/') ? uploadsDirUrlPath : `/${uploadsDirUrlPath}`;
 const codexUsersRootDir = path.join(__dirname, '.codex_users');
 const restartStatePath = path.join(__dirname, 'restart-state.json');
 const restartLogLimit = 200;
@@ -338,14 +133,6 @@ const maxAttachmentSizeBytes = 500 * 1024 * 1024;
 const maxAttachmentSizeMb = Math.floor(maxAttachmentSizeBytes / (1024 * 1024));
 const maxJsonBodyBytes = 2 * 1024 * 1024;
 const maxJsonBodyMb = Math.floor(maxJsonBodyBytes / (1024 * 1024));
-const configuredChatMaxOutputTokens = Number.parseInt(
-  String(process.env.CHAT_MAX_OUTPUT_TOKENS || '12000'),
-  10
-);
-const chatMaxOutputTokens =
-  Number.isInteger(configuredChatMaxOutputTokens) && configuredChatMaxOutputTokens > 0
-    ? configuredChatMaxOutputTokens
-    : null;
 const configuredAutoContinuationLimit = Number.parseInt(
   String(process.env.CHAT_AUTO_CONTINUATIONS || '2'),
   10
@@ -370,6 +157,17 @@ const chatRequestTimeoutMs =
   Number.isInteger(configuredChatRequestTimeoutMs) && configuredChatRequestTimeoutMs >= 60 * 1000
     ? configuredChatRequestTimeoutMs
     : 1000 * 60 * 20;
+const geminiIncludeDirectories = (() => {
+  const parsed = String(process.env.GEMINI_INCLUDE_DIRECTORIES || '/')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  if (parsed.length === 0) {
+    return ['/'];
+  }
+  return parsed.filter((value, index, list) => list.indexOf(value) === index);
+})();
 const codexQuotaCacheTtlMs = 15000;
 const adminUsers = new Set(
   String(process.env.ADMIN_USERS || '')
@@ -525,6 +323,8 @@ const deployedAppsScanTtlMs = 12000;
 const deployedAppsMaxSystemdUnits = 80;
 const deployedAppsDefaultLogLines = 180;
 const deployedAppsMaxLogLines = 1000;
+const deployedAppsDescribeMaxItems = 20;
+const deployedAppsDescribeTimeoutMs = 1000 * 60 * 2;
 const gitToolsIgnoredDirs = new Set([
   '.git',
   '.hg',
@@ -2505,6 +2305,205 @@ function getDeployedAppLogs(appId, rawLines) {
   };
 }
 
+function normalizeGeneratedDeployedDescription(rawValue, maxChars = 260) {
+  const compact = String(rawValue || '')
+    .replace(/\s+/g, ' ')
+    .replace(/^[\-*#\d.\s]+/, '')
+    .trim();
+  if (!compact) return '';
+  if (compact.length <= maxChars) return compact;
+  return `${compact.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function formatDeployedStatusForDescription(status) {
+  const normalized = String(status || '')
+    .trim()
+    .toLowerCase();
+  if (normalized === 'running') return 'en ejecucion';
+  if (normalized === 'stopped') return 'detenida';
+  if (normalized === 'error') return 'con errores';
+  return 'en estado desconocido';
+}
+
+function formatDeployedSourceForDescription(source) {
+  const normalized = String(source || '')
+    .trim()
+    .toLowerCase();
+  if (normalized === 'docker') return 'Docker';
+  if (normalized === 'systemd') return 'systemd';
+  if (normalized === 'pm2') return 'PM2';
+  return normalized || 'orquestador desconocido';
+}
+
+function buildFallbackDeployedAppDescription(app) {
+  const safeApp = app && typeof app === 'object' ? app : {};
+  const sourceLabel = formatDeployedSourceForDescription(safeApp.source);
+  const statusLabel = formatDeployedStatusForDescription(safeApp.status);
+  const rawDetail = normalizeGeneratedDeployedDescription(safeApp.description, 110);
+  const detailSuffix = rawDetail ? ` Se asocia con: ${rawDetail}.` : '';
+  const locationHint = normalizeGeneratedDeployedDescription(safeApp.location, 80);
+  const locationSuffix = locationHint ? ` Ubicacion: ${locationHint}.` : '';
+  const text = `${String(safeApp.name || 'App')} es un servicio gestionado con ${sourceLabel} y ahora esta ${statusLabel}.${detailSuffix}${locationSuffix}`;
+  return normalizeGeneratedDeployedDescription(text, 260);
+}
+
+function buildDeployedAppsDescribePrompt(apps, activeAgentId = '') {
+  const list = Array.isArray(apps) ? apps : [];
+  const lines = [
+    'Eres un asistente tecnico de CodexWeb.',
+    'Genera una descripcion corta y util para usuario final de cada app desplegada.',
+    'Responde SOLO JSON valido (sin markdown, sin texto extra).',
+    'Formato obligatorio exacto:',
+    '{"descriptions":[{"appId":"<id>","description":"<texto>"}]}',
+    '',
+    'Reglas:',
+    '- idioma: espanol neutro',
+    '- cada descripcion: 1 frase (maximo 220 caracteres)',
+    '- explica para que sirve la app usando nombre, source, estado y metadatos disponibles',
+    '- no inventes datos no visibles',
+    '- devuelve una entrada por cada app',
+    activeAgentId ? `- contexto: agente activo en CodexWeb = ${activeAgentId}` : '- contexto: agente activo no definido',
+    '',
+    'Apps:'
+  ];
+
+  list.forEach((app, index) => {
+    lines.push(`${index + 1}. appId=${String(app.id || '')}`);
+    lines.push(`   name=${String(app.name || '')}`);
+    lines.push(`   source=${String(app.source || '')}`);
+    lines.push(`   status=${String(app.status || '')}`);
+    lines.push(`   detailStatus=${String(app.detailStatus || '')}`);
+    lines.push(`   description=${String(app.description || '')}`);
+    lines.push(`   location=${String(app.location || '')}`);
+    lines.push(`   uptime=${String(app.uptime || '')}`);
+    lines.push(`   pid=${String(app.pid || '')}`);
+  });
+
+  return lines.join('\n');
+}
+
+function tryParseGeneratedDeployedDescriptions(rawOutput, appsById) {
+  const knownApps = appsById instanceof Map ? appsById : new Map();
+  const value = String(rawOutput || '').trim();
+  if (!value) return [];
+
+  const parseCandidate = (candidate) => {
+    try {
+      return JSON.parse(candidate);
+    } catch (_error) {
+      return null;
+    }
+  };
+
+  const candidates = [];
+  candidates.push(value);
+  const unfenced = value
+    .replace(/```json/gi, '')
+    .replace(/```/g, '')
+    .trim();
+  if (unfenced && unfenced !== value) {
+    candidates.push(unfenced);
+  }
+  const firstBrace = unfenced.indexOf('{');
+  const lastBrace = unfenced.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(unfenced.slice(firstBrace, lastBrace + 1));
+  }
+
+  let parsed = null;
+  for (const candidate of candidates) {
+    parsed = parseCandidate(candidate);
+    if (parsed && typeof parsed === 'object') break;
+  }
+  if (!parsed || typeof parsed !== 'object') return [];
+
+  const rawItems = Array.isArray(parsed.descriptions)
+    ? parsed.descriptions
+    : Array.isArray(parsed.items)
+      ? parsed.items
+      : [];
+  if (rawItems.length === 0) return [];
+
+  const seen = new Set();
+  const normalized = [];
+  rawItems.forEach((item) => {
+    if (!item || typeof item !== 'object') return;
+    const appId = String(item.appId || item.id || '').trim();
+    if (!appId || seen.has(appId) || !knownApps.has(appId)) return;
+    const description = normalizeGeneratedDeployedDescription(item.description || item.text || '');
+    if (!description) return;
+    seen.add(appId);
+    normalized.push({ appId, description });
+  });
+  return normalized;
+}
+
+async function generateDeployedAppsDescriptionsWithCodex(payload = {}) {
+  const userId = getSafeUserId(payload.userId);
+  const username = String(payload.username || '').trim();
+  const activeAgentId = String(payload.activeAgentId || '').trim();
+  const apps = Array.isArray(payload.apps) ? payload.apps : [];
+  if (!userId) {
+    throw new Error('INVALID_USER_ID');
+  }
+  if (apps.length === 0) {
+    return [];
+  }
+
+  const codexPath = await resolveCodexPath();
+  const prompt = buildDeployedAppsDescribePrompt(apps, activeAgentId);
+  const args = [
+    '-c',
+    'shell_environment_policy.inherit=all',
+    'exec',
+    '--skip-git-repo-check',
+    '--sandbox',
+    'danger-full-access',
+    '--color',
+    'never',
+    prompt
+  ];
+
+  let stdout = '';
+  let stderr = '';
+  try {
+    const result = await execFileAsync(codexPath, args, {
+      env: getCodexEnvForUser(userId, { username }),
+      cwd: process.cwd(),
+      timeout: deployedAppsDescribeTimeoutMs,
+      maxBuffer: 1024 * 1024 * 6
+    });
+    stdout = String((result && result.stdout) || '');
+    stderr = String((result && result.stderr) || '');
+  } catch (error) {
+    stdout = String((error && error.stdout) || '');
+    stderr = String((error && error.stderr) || (error && error.message) || '');
+    if (!stdout.trim() && !stderr.trim()) {
+      throw error;
+    }
+  }
+
+  const cleanedStdout = truncateRawText(stripAnsi(stdout).trim(), 120000);
+  const cleanedStderr = truncateRawText(stripAnsi(stderr).trim(), 120000);
+  const combinedOutput = [cleanedStdout, cleanedStderr].filter(Boolean).join('\n').trim();
+  const appsById = new Map(
+    apps.map((app) => [String((app && app.id) || '').trim(), app])
+  );
+  const parsed = tryParseGeneratedDeployedDescriptions(combinedOutput, appsById);
+  const parsedById = new Map(parsed.map((entry) => [entry.appId, entry.description]));
+
+  return apps.map((app) => {
+    const appId = String((app && app.id) || '').trim();
+    const parsedDescription = parsedById.get(appId);
+    const description = parsedDescription || buildFallbackDeployedAppDescription(app);
+    return {
+      appId,
+      name: String((app && app.name) || '').trim() || appId,
+      description
+    };
+  });
+}
+
 function parseGitPorcelainPath(line) {
   const raw = String(line || '');
   if (raw.length < 4) return '';
@@ -4250,6 +4249,27 @@ async function resolveCodexPath() {
   return resolvedCodexPath;
 }
 
+async function resolveGeminiPath() {
+  if (resolvedGeminiPath) {
+    return resolvedGeminiPath;
+  }
+  if (process.env.GEMINI_CMD && process.env.GEMINI_CMD.trim()) {
+    resolvedGeminiPath = process.env.GEMINI_CMD.trim();
+    return resolvedGeminiPath;
+  }
+  let discovered = null;
+  try {
+    discovered = await resolveWhichPath('gemini');
+  } catch (_error) {
+    discovered = null;
+  }
+  if (!discovered) {
+    throw new Error('GEMINI_NOT_FOUND');
+  }
+  resolvedGeminiPath = discovered;
+  return resolvedGeminiPath;
+}
+
 function scheduleApplicationRestart(attemptId) {
   const relaunchArgs = [...process.execArgv, ...process.argv.slice(1)];
   if (relaunchArgs.length === 0) {
@@ -4671,7 +4691,22 @@ const listMessagesStmt = db.prepare(`
   WHERE conversation_id = ?
   ORDER BY created_at ASC, id ASC
 `);
-const listMessageAttachmentsByConversationStmt = db.prepare(`
+const listMessagesPageDescStmt = db.prepare(`
+  SELECT id, role, content, created_at
+  FROM messages
+  WHERE conversation_id = ?
+  ORDER BY created_at DESC, id DESC
+  LIMIT ?
+`);
+const listMessagesBeforeIdPageDescStmt = db.prepare(`
+  SELECT id, role, content, created_at
+  FROM messages
+  WHERE conversation_id = ?
+    AND id < ?
+  ORDER BY created_at DESC, id DESC
+  LIMIT ?
+`);
+const listMessageAttachmentsByConversationRangeStmt = db.prepare(`
   SELECT
     message_id,
     conversation_id,
@@ -4682,6 +4717,7 @@ const listMessageAttachmentsByConversationStmt = db.prepare(`
     created_at
   FROM message_attachments
   WHERE conversation_id = ?
+    AND message_id BETWEEN ? AND ?
   ORDER BY id ASC
 `);
 const insertMessageAttachmentStmt = db.prepare(`
@@ -5221,6 +5257,16 @@ function requireAuth(req, res, next) {
   next();
 }
 
+app.get('/uploads/:conversationId/:storedName', requireAuth, (req, res) => {
+  return serveManagedAttachmentFromParams(req, res, req.params.conversationId, req.params.storedName);
+});
+
+if (legacyUploadsRouteBasePath !== '/uploads') {
+  app.get(`${legacyUploadsRouteBasePath}/:conversationId/:storedName`, requireAuth, (req, res) => {
+    return serveManagedAttachmentFromParams(req, res, req.params.conversationId, req.params.storedName);
+  });
+}
+
 function buildConversationTitle(message) {
   const compact = String(message || '').replace(/\s+/g, ' ').trim();
   if (!compact) return 'Nuevo chat';
@@ -5342,15 +5388,18 @@ function buildAiAgentTutorial(agent) {
 
 function normalizeUserAgentIntegrationRow(rawValue) {
   const row = rawValue && typeof rawValue === 'object' ? rawValue : {};
-  const agentId = String(row.agent_id || '').trim();
-  const apiKey = String(row.api_key || '').trim();
-  const baseUrl = sanitizeHttpUrl(row.base_url, '');
+  const agentId = String(row.agent_id ?? row.agentId ?? '').trim();
+  const apiKey = String(row.api_key ?? row.apiKey ?? '').trim();
+  const baseUrl = sanitizeHttpUrl(row.base_url ?? row.baseUrl ?? '', '');
+  const updatedAt = String(row.updated_at ?? row.updatedAt ?? '').trim();
+  const enabled =
+    typeof row.enabled === 'boolean' ? row.enabled : Number(row.enabled) === 1;
   return {
     agentId,
-    enabled: Number(row.enabled) === 1,
+    enabled,
     apiKey,
     baseUrl,
-    updatedAt: String(row.updated_at || '')
+    updatedAt
   };
 }
 
@@ -5495,6 +5544,91 @@ function serializeAiAgentSettingsPayloadForUser(userId) {
   };
 }
 
+function getChatAgentModelOptions(agentId) {
+  const safeAgentId = String(agentId || '').trim();
+  if (safeAgentId === 'gemini-cli') {
+    return [...geminiModelOptions];
+  }
+  const cachedModels = loadCodexModelsFromCache();
+  return [...chatGptModelOptions, ...cachedModels].filter(
+    (slug, index, list) => list.indexOf(slug) === index
+  );
+}
+
+function getChatAgentDefaultModel(agentId) {
+  const safeAgentId = String(agentId || '').trim();
+  if (safeAgentId === 'gemini-cli') {
+    return DEFAULT_GEMINI_CHAT_MODEL;
+  }
+  return DEFAULT_CHAT_MODEL;
+}
+
+function normalizeChatAgentModel(agentId, rawModel) {
+  const fallbackModel = getChatAgentDefaultModel(agentId);
+  const normalized = sanitizeConversationModel(rawModel);
+  if (!normalized) return fallbackModel;
+  if (agentId === 'gemini-cli') {
+    if (normalized.startsWith('gemini-')) {
+      return normalized;
+    }
+    return fallbackModel;
+  }
+  return normalized;
+}
+
+function resolveChatAgentRuntimeForUser(userId) {
+  const payload = serializeAiAgentSettingsPayloadForUser(userId);
+  const requestedAgentId = normalizeSupportedAiAgentId(payload.activeAgentId);
+  let effectiveAgentId = requestedAgentId;
+  if (!effectiveAgentId || !supportedChatRuntimeAgentIds.has(effectiveAgentId)) {
+    effectiveAgentId = 'codex-cli';
+  }
+  const selectedEntry =
+    payload.agents.find((entry) => entry.id === requestedAgentId) || null;
+  const selectedIsSelectable = isSerializedAiAgentSelectable(selectedEntry);
+  if (!selectedIsSelectable && effectiveAgentId !== 'codex-cli') {
+    effectiveAgentId = 'codex-cli';
+  }
+  const effectiveAgent = supportedAiAgentsById.get(effectiveAgentId);
+  const models = getChatAgentModelOptions(effectiveAgentId);
+  const defaultModel = getChatAgentDefaultModel(effectiveAgentId);
+  return {
+    requestedAgentId,
+    activeAgentId: effectiveAgentId,
+    activeAgentName:
+      String((effectiveAgent && effectiveAgent.name) || '').trim() || effectiveAgentId || 'Codex CLI',
+    runtimeProvider: effectiveAgentId === 'gemini-cli' ? 'gemini' : 'codex',
+    models,
+    reasoningEfforts: [...chatReasoningEffortOptions],
+    defaults: {
+      model: defaultModel,
+      reasoningEffort: DEFAULT_REASONING_EFFORT
+    }
+  };
+}
+
+function getGeminiUserIntegrationForUser(userId) {
+  const row = getUserAgentIntegrationStmt.get(userId, 'gemini-cli');
+  return normalizeUserAgentIntegrationRow(row);
+}
+
+function buildGeminiPromptWithReasoning(prompt, reasoningEffort) {
+  const normalizedReasoning = sanitizeReasoningEffort(reasoningEffort, DEFAULT_REASONING_EFFORT);
+  const guidance =
+    geminiReasoningInstructionsByEffort[normalizedReasoning] ||
+    geminiReasoningInstructionsByEffort[DEFAULT_REASONING_EFFORT];
+  return [
+    'Modo agente operativo (root): puedes leer/escribir archivos y ejecutar comandos del sistema.',
+    'Si el usuario pide estado de procesos/servicios/puertos/sistema, verifica con comandos reales antes de responder.',
+    'No digas que no tienes acceso al sistema salvo que un comando falle; en ese caso reporta el comando y el error.',
+    `Instruccion de razonamiento (${normalizedReasoning}): ${guidance}`,
+    '',
+    String(prompt || '').trim()
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
 function getOwnedConversationOrNull(conversationId, userId) {
   const conversation = getConversationStmt.get(conversationId);
   if (!conversation || conversation.user_id !== userId) {
@@ -5525,6 +5659,54 @@ function parseAttachmentId(rawId) {
   const storedName = sanitizeFilename(decoded.slice(separator + 1));
   if (!storedName) return null;
   return { conversationId, storedName };
+}
+
+function resolveManagedAttachmentFileForRequest(req, conversationIdValue, storedNameValue) {
+  const conversationId = Number(conversationIdValue);
+  if (!Number.isInteger(conversationId) || conversationId <= 0) {
+    return { errorStatus: 400, error: 'conversation_id inválido' };
+  }
+
+  const conversation = getConversationStmt.get(conversationId);
+  if (!conversation) {
+    return { errorStatus: 404, error: 'Conversación no encontrada' };
+  }
+  if (!canManageConversation(req, conversation)) {
+    return { errorStatus: 403, error: 'No autorizado para abrir este adjunto' };
+  }
+
+  const storedName = sanitizeFilename(storedNameValue || '');
+  if (!storedName) {
+    return { errorStatus: 400, error: 'attachment_id inválido' };
+  }
+
+  const conversationDir = path.join(uploadsDir, String(conversationId));
+  const filePath = path.join(conversationDir, storedName);
+  const relativeFromConversationDir = path.relative(conversationDir, filePath);
+  if (
+    relativeFromConversationDir.startsWith('..') ||
+    path.isAbsolute(relativeFromConversationDir)
+  ) {
+    return { errorStatus: 400, error: 'attachment_id inválido' };
+  }
+  if (!fs.existsSync(filePath)) {
+    return { errorStatus: 404, error: 'Adjunto no encontrado' };
+  }
+
+  return {
+    conversationId,
+    storedName,
+    filePath
+  };
+}
+
+function serveManagedAttachmentFromParams(req, res, conversationIdValue, storedNameValue) {
+  const resolved = resolveManagedAttachmentFileForRequest(req, conversationIdValue, storedNameValue);
+  if (resolved.errorStatus) {
+    return res.status(resolved.errorStatus).json({ error: resolved.error });
+  }
+  res.type(inferMimeTypeFromFilename(resolved.storedName));
+  return res.sendFile(resolved.filePath);
 }
 
 function removePendingUploadsForConversation(conversationId) {
@@ -6082,12 +6264,69 @@ app.get('/api/conversations/:id/messages', requireAuth, (req, res) => {
   if (!conversation) {
     return res.status(404).json({ error: 'Conversación no encontrada' });
   }
-  const messageRows = listMessagesStmt.all(conversationId);
-  const attachmentRows = listMessageAttachmentsByConversationStmt.all(conversationId);
+
+  const maxMessagesPageSize = 200;
+  const rawLimit = Number.parseInt(String(req.query.limit || ''), 10);
+  const hasLimitParam = String(req.query.limit || '').trim() !== '';
+  const safeLimit =
+    Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, maxMessagesPageSize) : null;
+  if (hasLimitParam && safeLimit === null) {
+    return res.status(400).json({ error: 'limit inválido' });
+  }
+
+  const rawBeforeIdValue = req.query.beforeId ?? req.query.before_id ?? req.query.before;
+  const rawBeforeId = Number.parseInt(String(rawBeforeIdValue || ''), 10);
+  const hasBeforeIdParam = String(rawBeforeIdValue || '').trim() !== '';
+  const safeBeforeId =
+    Number.isInteger(rawBeforeId) && rawBeforeId > 0 ? rawBeforeId : null;
+  if (hasBeforeIdParam && safeBeforeId === null) {
+    return res.status(400).json({ error: 'beforeId inválido' });
+  }
+
+  const includeMetaRaw = String(req.query.includeMeta || '').trim().toLowerCase();
+  const includeMeta =
+    includeMetaRaw === '' ||
+    (includeMetaRaw !== '0' && includeMetaRaw !== 'false' && includeMetaRaw !== 'no');
+
+  let messageRows = [];
+  let hasMoreMessages = false;
+  if (safeLimit !== null) {
+    const pageFetchSize = safeLimit + 1;
+    const rowsDesc =
+      safeBeforeId !== null
+        ? listMessagesBeforeIdPageDescStmt.all(conversationId, safeBeforeId, pageFetchSize)
+        : listMessagesPageDescStmt.all(conversationId, pageFetchSize);
+    hasMoreMessages = rowsDesc.length > safeLimit;
+    const limitedRows = hasMoreMessages ? rowsDesc.slice(0, safeLimit) : rowsDesc;
+    messageRows = limitedRows.reverse();
+  } else {
+    messageRows = listMessagesStmt.all(conversationId);
+  }
+
+  const messageIds = messageRows
+    .map((row) => Number(row && row.id))
+    .filter((id) => Number.isInteger(id) && id > 0);
+  const messageIdSet = new Set(messageIds);
+  let minMessageId = null;
+  let maxMessageId = null;
+  messageIds.forEach((id) => {
+    if (!Number.isInteger(id) || id <= 0) return;
+    if (minMessageId === null || id < minMessageId) {
+      minMessageId = id;
+    }
+    if (maxMessageId === null || id > maxMessageId) {
+      maxMessageId = id;
+    }
+  });
+  const attachmentRows =
+    minMessageId !== null && maxMessageId !== null
+      ? listMessageAttachmentsByConversationRangeStmt.all(conversationId, minMessageId, maxMessageId)
+      : [];
   const attachmentsByMessageId = new Map();
   attachmentRows.forEach((row) => {
     const messageId = Number(row && row.message_id);
     if (!Number.isInteger(messageId) || messageId <= 0) return;
+    if (!messageIdSet.has(messageId)) return;
     const storedName = sanitizeFilename((row && row.stored_name) || '');
     if (!storedName) return;
     const filePath = path.join(uploadsDir, String(conversationId), storedName);
@@ -6115,32 +6354,47 @@ app.get('/api/conversations/:id/messages', requireAuth, (req, res) => {
       attachments
     };
   });
-  const runIsActive = hasActiveChatRun(req.session.userId, conversationId);
-  if (!runIsActive) {
-    closeOpenDraftsByConversationStmt.run(nowIso(), req.session.userId, conversationId);
-  }
-  const liveDraft = runIsActive
-    ? getOpenLiveDraftForConversationStmt.get(req.session.userId, conversationId)
-    : null;
+  const oldestLoadedId = messageIds.length > 0 ? messageIds[0] : null;
+  const newestLoadedId = messageIds.length > 0 ? messageIds[messageIds.length - 1] : null;
+  const responseLimit = safeLimit !== null ? safeLimit : messageIds.length;
+  const pagination = {
+    limit: responseLimit,
+    hasMore: safeLimit !== null ? hasMoreMessages : false,
+    nextBeforeId: safeLimit !== null && hasMoreMessages ? oldestLoadedId : null,
+    oldestLoadedId,
+    newestLoadedId
+  };
+
+  let liveDraft = null;
   let parsedReasoning = {};
-  if (liveDraft && liveDraft.reasoning_json) {
-    try {
-      const decoded = JSON.parse(liveDraft.reasoning_json);
-      if (decoded && typeof decoded === 'object') {
-        parsedReasoning = decoded;
-      }
-    } catch (_error) {
-      parsedReasoning = {};
+  let taskRecovery = null;
+  if (includeMeta) {
+    const runIsActive = hasActiveChatRun(req.session.userId, conversationId);
+    if (!runIsActive) {
+      closeOpenDraftsByConversationStmt.run(nowIso(), req.session.userId, conversationId);
     }
+    liveDraft = runIsActive
+      ? getOpenLiveDraftForConversationStmt.get(req.session.userId, conversationId)
+      : null;
+    if (liveDraft && liveDraft.reasoning_json) {
+      try {
+        const decoded = JSON.parse(liveDraft.reasoning_json);
+        if (decoded && typeof decoded === 'object') {
+          parsedReasoning = decoded;
+        }
+      } catch (_error) {
+        parsedReasoning = {};
+      }
+    }
+    const latestTaskRun = getLatestTaskRunForConversationStmt.get(req.session.userId, conversationId) || null;
+    const latestTaskCommands =
+      latestTaskRun && Number.isInteger(Number(latestTaskRun.id))
+        ? listTaskRunCommandsStmt.all(Number(latestTaskRun.id), 220)
+        : [];
+    taskRecovery = latestTaskRun
+      ? serializeTaskRecovery(latestTaskRun, latestTaskCommands, serializeReasoningMapToText(parsedReasoning))
+      : null;
   }
-  const latestTaskRun = getLatestTaskRunForConversationStmt.get(req.session.userId, conversationId) || null;
-  const latestTaskCommands =
-    latestTaskRun && Number.isInteger(Number(latestTaskRun.id))
-      ? listTaskRunCommandsStmt.all(Number(latestTaskRun.id), 220)
-      : [];
-  const taskRecovery = latestTaskRun
-    ? serializeTaskRecovery(latestTaskRun, latestTaskCommands, serializeReasoningMapToText(parsedReasoning))
-    : null;
   return res.json({
     ok: true,
     conversation: {
@@ -6150,6 +6404,7 @@ app.get('/api/conversations/:id/messages', requireAuth, (req, res) => {
       reasoningEffort: sanitizeReasoningEffort(conversation.reasoning_effort, DEFAULT_REASONING_EFFORT)
     },
     messages,
+    pagination,
     liveDraft: liveDraft
       ? {
           requestId: liveDraft.request_id || '',
@@ -6312,19 +6567,16 @@ app.delete('/api/conversations/:id', requireAuth, (req, res) => {
   return res.json({ ok: true, deleted: { conversationId } });
 });
 
-app.get('/api/chat/options', requireAuth, (_req, res) => {
-  const models = loadCodexModelsFromCache();
-  const mergedModels = [...chatGptModelOptions, ...models].filter(
-    (slug, index, list) => list.indexOf(slug) === index
-  );
+app.get('/api/chat/options', requireAuth, (req, res) => {
+  const runtime = resolveChatAgentRuntimeForUser(req.session.userId);
   return res.json({
     ok: true,
-    models: mergedModels,
-    reasoningEfforts: ['minimal', 'low', 'medium', 'high', 'xhigh'],
-    defaults: {
-      model: DEFAULT_CHAT_MODEL,
-      reasoningEffort: DEFAULT_REASONING_EFFORT
-    }
+    activeAgentId: runtime.activeAgentId,
+    activeAgentName: runtime.activeAgentName,
+    runtimeProvider: runtime.runtimeProvider,
+    models: runtime.models,
+    reasoningEfforts: runtime.reasoningEfforts,
+    defaults: runtime.defaults
   });
 });
 
@@ -6589,6 +6841,72 @@ app.get('/api/tools/deployed-apps', requireAuth, (req, res) => {
     scannedAt: snapshot.scannedAt,
     apps: snapshot.apps
   });
+});
+
+app.post('/api/tools/deployed-apps/describe', requireAuth, async (req, res) => {
+  const rawIds =
+    req.body && Array.isArray(req.body.appIds)
+      ? req.body.appIds
+      : [];
+  const requestedIds = Array.from(
+    new Set(
+      rawIds
+        .map((entry) => String(entry || '').trim())
+        .filter(Boolean)
+    )
+  ).slice(0, deployedAppsDescribeMaxItems);
+  if (requestedIds.length === 0) {
+    return res.status(400).json({ error: 'Selecciona al menos una app para generar descripcion.' });
+  }
+
+  const snapshot = collectDeployedAppsSnapshot(true);
+  const appById = new Map(
+    snapshot.apps.map((app) => [String((app && app.id) || '').trim(), app])
+  );
+  const selectedApps = requestedIds
+    .map((appId) => appById.get(appId))
+    .filter(Boolean);
+  if (selectedApps.length === 0) {
+    return res.status(404).json({ error: 'No se encontraron apps desplegadas para los IDs seleccionados.' });
+  }
+  const missingAppIds = requestedIds.filter((appId) => !appById.has(appId));
+  const activeAgentId = getUserActiveAiAgentId(req.session.userId) || '';
+  const provider = 'codex-cli';
+  const generatedAt = nowIso();
+
+  try {
+    const descriptions = await generateDeployedAppsDescriptionsWithCodex({
+      userId: req.session.userId,
+      username: req.session && typeof req.session.username === 'string' ? req.session.username : '',
+      activeAgentId,
+      apps: selectedApps
+    });
+
+    return res.json({
+      ok: true,
+      provider,
+      activeAgentId,
+      scannedAt: snapshot.scannedAt,
+      generatedAt,
+      missingAppIds,
+      descriptions: descriptions.map((entry) => ({
+        appId: entry.appId,
+        name: entry.name,
+        description: entry.description,
+        generatedAt
+      }))
+    });
+  } catch (error) {
+    if (error && error.message === 'CODEX_NOT_FOUND') {
+      return res.status(503).json({
+        error: 'No se encontro Codex CLI en el servidor para generar descripciones.'
+      });
+    }
+    const reason = truncateForNotify(error && error.message ? error.message : 'describe_failed', 220);
+    return res.status(500).json({
+      error: `No se pudo generar la descripcion con IA: ${reason}`
+    });
+  }
 });
 
 app.post('/api/tools/deployed-apps/:appId/action', requireAuth, (req, res) => {
@@ -7220,10 +7538,14 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   if (reasoningWasProvided && requestedReasoningEffort && !allowedReasoningEfforts.has(requestedReasoningEffort)) {
     return res.status(400).json({ error: 'Nivel de razonamiento inválido' });
   }
-  let selectedModel = requestedModel || DEFAULT_CHAT_MODEL;
+  const chatRuntime = resolveChatAgentRuntimeForUser(req.session.userId);
+  let selectedModel = normalizeChatAgentModel(
+    chatRuntime.activeAgentId,
+    requestedModel || chatRuntime.defaults.model
+  );
   let selectedReasoningEffort = sanitizeReasoningEffort(
     requestedReasoningEffort,
-    DEFAULT_REASONING_EFFORT
+    chatRuntime.defaults.reasoningEffort
   );
   let conversationId = null;
   let persistedAttachments = [];
@@ -7309,17 +7631,29 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Conversación no encontrada' });
     }
     conversationId = requestedConversationId;
+    const storedConversationModel = String(
+      ownedConversation.model || chatRuntime.defaults.model || DEFAULT_CHAT_MODEL
+    );
+    const storedConversationReasoning = sanitizeReasoningEffort(
+      ownedConversation.reasoning_effort,
+      chatRuntime.defaults.reasoningEffort
+    );
     selectedModel = modelWasProvided
-      ? requestedModel || DEFAULT_CHAT_MODEL
-      : String(ownedConversation.model || DEFAULT_CHAT_MODEL);
+      ? normalizeChatAgentModel(chatRuntime.activeAgentId, requestedModel || chatRuntime.defaults.model)
+      : normalizeChatAgentModel(chatRuntime.activeAgentId, storedConversationModel);
     selectedReasoningEffort = reasoningWasProvided
       ? sanitizeReasoningEffort(
           requestedReasoningEffort,
-          sanitizeReasoningEffort(ownedConversation.reasoning_effort, DEFAULT_REASONING_EFFORT)
+          storedConversationReasoning
         )
-      : sanitizeReasoningEffort(ownedConversation.reasoning_effort, DEFAULT_REASONING_EFFORT);
+      : storedConversationReasoning;
 
-    if (modelWasProvided || reasoningWasProvided) {
+    if (
+      modelWasProvided ||
+      reasoningWasProvided ||
+      selectedModel !== storedConversationModel ||
+      selectedReasoningEffort !== storedConversationReasoning
+    ) {
       updateConversationSettingsStmt.run(selectedModel, selectedReasoningEffort, conversationId);
     }
   } else {
@@ -7394,6 +7728,295 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     const promptWithHistory = buildPromptWithConversationHistory(prompt, conversationMessages);
     const promptWithRepoContext = buildPromptWithRepoContext(promptWithHistory, prompt);
     const executionPrompt = buildPromptWithAttachments(promptWithRepoContext, persistedAttachments);
+    if (chatRuntime.runtimeProvider === 'gemini') {
+      const geminiIntegration = getGeminiUserIntegrationForUser(req.session.userId);
+      if (!geminiIntegration.apiKey) {
+        throw createClientRequestError(
+          'Gemini está seleccionado pero falta API key en Integraciones IA.',
+          400
+        );
+      }
+      let geminiPath = '';
+      try {
+        geminiPath = await resolveGeminiPath();
+      } catch (_error) {
+        throw createClientRequestError(
+          'Gemini CLI no está instalado en el servidor. Instala `@google/gemini-cli` o configura `GEMINI_CMD`.',
+          400
+        );
+      }
+
+      const assistantMessage = insertMessageStmt.run(conversationId, 'assistant', '');
+      assistantMessageId = Number(assistantMessage.lastInsertRowid);
+      const draftCreatedAt = nowIso();
+      closeOpenDraftsByConversationStmt.run(draftCreatedAt, req.session.userId, conversationId);
+      const draftInsert = insertLiveDraftStmt.run(
+        req.session.userId,
+        conversationId,
+        assistantMessageId,
+        liveDraftRequestId,
+        prompt,
+        '',
+        '{}',
+        0,
+        draftCreatedAt,
+        draftCreatedAt
+      );
+      liveDraftId = Number(draftInsert.lastInsertRowid);
+
+      res.status(200);
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.setHeader('X-Conversation-Id', String(conversationId));
+      req.setTimeout(0);
+      res.setTimeout(0);
+      if (req.socket && typeof req.socket.setTimeout === 'function') {
+        req.socket.setTimeout(0);
+      }
+      if (res.socket && typeof res.socket.setTimeout === 'function') {
+        res.socket.setTimeout(0);
+      }
+      if (req.socket && typeof req.socket.setKeepAlive === 'function') {
+        req.socket.setKeepAlive(true);
+      }
+      if (req.socket && typeof req.socket.setNoDelay === 'function') {
+        req.socket.setNoDelay(true);
+      }
+      if (res.socket && typeof res.socket.setKeepAlive === 'function') {
+        res.socket.setKeepAlive(true);
+      }
+      if (res.socket && typeof res.socket.setNoDelay === 'function') {
+        res.socket.setNoDelay(true);
+      }
+      res.flushHeaders();
+
+      let clientDisconnected = false;
+      const handleGeminiClientDisconnect = () => {
+        clientDisconnected = true;
+      };
+      req.on('aborted', handleGeminiClientDisconnect);
+      req.on('close', handleGeminiClientDisconnect);
+      res.on('close', handleGeminiClientDisconnect);
+      res.on('error', handleGeminiClientDisconnect);
+
+      sendSseComment(res, 'ok');
+      sendSse(res, 'conversation', { conversationId });
+      sendSse(res, 'chat_agent', {
+        id: chatRuntime.activeAgentId,
+        name: chatRuntime.activeAgentName,
+        provider: chatRuntime.runtimeProvider
+      });
+      sendSse(res, 'reasoning_step', {
+        itemId: 'agent_runtime',
+        text: `Agente activo: ${chatRuntime.activeAgentName} (modo agente)`
+      });
+
+      const geminiArgs = ['-p', buildGeminiPromptWithReasoning(executionPrompt, selectedReasoningEffort)];
+      if (selectedModel) {
+        geminiArgs.push('-m', selectedModel);
+      }
+      geminiArgs.push('--approval-mode', 'yolo', '--sandbox', 'false');
+      geminiIncludeDirectories.forEach((directory) => {
+        geminiArgs.push('--include-directories', directory);
+      });
+      const geminiEnv = {
+        ...process.env,
+        GEMINI_API_KEY: String(geminiIntegration.apiKey || '').trim()
+      };
+
+      let geminiProcess = null;
+      let activeRun = null;
+      let finished = false;
+      let stdoutText = '';
+      let stderrText = '';
+
+      const finalizeGeminiRequest = ({ ok, exitCode, closeReason, output }) => {
+        if (finished) return;
+        finished = true;
+        const safeOutput = String(output || '').trim() || '(Sin salida de Gemini CLI)';
+        const runWasKilled = Boolean(activeRun && activeRun.killRequested);
+        const safeExitCode = Number.isInteger(exitCode) ? Number(exitCode) : runWasKilled ? 130 : 1;
+        const effectiveCloseReason = runWasKilled
+          ? String(activeRun && activeRun.killReason ? activeRun.killReason : closeReason || 'killed_by_user')
+          : String(closeReason || (ok ? 'completed' : 'provider_error'));
+        const success = Boolean(ok) && !runWasKilled;
+        if (activeRun) {
+          clearActiveChatRun(activeRun);
+        }
+
+        if (assistantMessageId) {
+          updateMessageContentStmt.run(safeOutput, assistantMessageId);
+        } else {
+          const fallbackMessage = insertMessageStmt.run(conversationId, 'assistant', safeOutput);
+          assistantMessageId = Number(fallbackMessage.lastInsertRowid);
+        }
+        if (liveDraftId) {
+          try {
+            updateLiveDraftSnapshotStmt.run(
+              conversationId,
+              assistantMessageId,
+              safeOutput,
+              '{}',
+              1,
+              nowIso(),
+              liveDraftId,
+              req.session.userId
+            );
+          } catch (_draftError) {
+            // ignore fallback draft update errors
+          }
+        }
+
+        if (!clientDisconnected) {
+          const chunkSize = 1600;
+          for (let index = 0; index < safeOutput.length; index += chunkSize) {
+            const chunk = safeOutput.slice(index, index + chunkSize);
+            if (!chunk) continue;
+            if (!sendSse(res, 'assistant_delta', { text: chunk })) {
+              clientDisconnected = true;
+              break;
+            }
+          }
+          if (!clientDisconnected) {
+            sendSse(res, 'done', {
+              ok: success,
+              conversationId,
+              exitCode: safeExitCode,
+              closeReason: effectiveCloseReason,
+              usage: null,
+              structured: false
+            });
+            if (!res.writableEnded && !res.destroyed) {
+              res.end();
+            }
+          }
+        }
+
+        const finishedAt = nowIso();
+        const durationMs = Math.max(0, Date.now() - requestStartedAtMs);
+        finalizeTaskRun({
+          status: success ? 'success' : 'failed',
+          closeReason: effectiveCloseReason,
+          resultSummary: safeOutput,
+          planText: '',
+          finishedAt,
+          durationMs,
+          usage: null,
+          structured: false,
+          clientDisconnected
+        });
+        if (userNotificationSettings.notifyOnFinish) {
+          const message = buildChatCompletionDiscordMessage({
+            status: success ? 'ok' : 'error',
+            username,
+            conversationId,
+            finishedAt,
+            durationMs,
+            closeReason: effectiveCloseReason,
+            includeResult: userNotificationSettings.includeResult,
+            result: safeOutput
+          });
+          if (message) {
+            void notify(message, {
+              webhookUrl: userNotificationSettings.discordWebhookUrl
+            });
+          }
+        }
+        if (success) {
+          void notify(
+            `Chat ejecutado OK user=${username} conv=${conversationId} agent=${chatRuntime.activeAgentId} result=${truncateForNotify(
+              safeOutput,
+              1000
+            )}`
+          );
+          return;
+        }
+        void notify(
+          `Error en chat user=${username} conv=${conversationId} agent=${chatRuntime.activeAgentId}: ${truncateForNotify(
+            safeOutput,
+            240
+          )}`
+        );
+      };
+
+      try {
+        geminiProcess = spawn(geminiPath, geminiArgs, {
+          cwd: process.cwd(),
+          env: geminiEnv,
+          stdio: ['ignore', 'pipe', 'pipe']
+        });
+      } catch (error) {
+        const reason = truncateForNotify(error && error.message ? error.message : 'gemini_spawn_error', 200);
+        finalizeGeminiRequest({
+          ok: false,
+          exitCode: 1,
+          closeReason: 'spawn_error',
+          output: `No se pudo iniciar Gemini CLI: ${reason}`
+        });
+        return;
+      }
+
+      activeRun = registerActiveChatRun(req.session.userId, conversationId, geminiProcess);
+
+      geminiProcess.stdout.on('data', (chunk) => {
+        stdoutText += String(chunk || '');
+      });
+      geminiProcess.stderr.on('data', (chunk) => {
+        stderrText += String(chunk || '');
+      });
+      geminiProcess.on('error', (error) => {
+        const codeNotFound =
+          error && (error.code === 'ENOENT' || error.errno === 'ENOENT');
+        const reason = truncateForNotify(error && error.message ? error.message : 'gemini_exec_error', 220);
+        finalizeGeminiRequest({
+          ok: false,
+          exitCode: codeNotFound ? 127 : 1,
+          closeReason: codeNotFound ? 'gemini_not_found' : 'spawn_error',
+          output: codeNotFound
+            ? 'No se encontró el binario `gemini` en el servidor. Instala Gemini CLI o define GEMINI_CMD.'
+            : `No se pudo iniciar Gemini CLI: ${reason}`
+        });
+      });
+      geminiProcess.on('close', (code, signal) => {
+        const normalizedExitCode = Number.isInteger(code) ? Number(code) : signal ? 130 : 1;
+        const cleanStdout = String(stdoutText || '').trim();
+        const cleanStderr = String(stderrText || '').trim();
+        const stderrTail = cleanStderr
+          ? cleanStderr
+              .split(/\r?\n/)
+              .map((entry) => entry.trim())
+              .filter(Boolean)
+              .slice(-1)[0] || ''
+          : '';
+        const runWasKilled = Boolean(activeRun && activeRun.killRequested);
+        const success = normalizedExitCode === 0 && !runWasKilled;
+        let output = cleanStdout;
+        let closeReason = success ? 'completed' : 'provider_error';
+
+        if (runWasKilled) {
+          closeReason = String(activeRun && activeRun.killReason ? activeRun.killReason : 'killed_by_user');
+        }
+        if (!success) {
+          output =
+            output ||
+            stderrTail ||
+            (signal
+              ? `Gemini CLI terminó por señal ${signal}.`
+              : `Gemini CLI terminó con código ${normalizedExitCode}.`);
+        }
+
+        finalizeGeminiRequest({
+          ok: success,
+          exitCode: normalizedExitCode,
+          closeReason,
+          output
+        });
+      });
+      return;
+    }
+
     const codexPath = await resolveCodexPath();
     const args = [
       '-c',
@@ -7560,6 +8183,11 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     });
     sendSseCommentSafe('ok');
     sendSseSafe('conversation', { conversationId });
+    sendSseSafe('chat_agent', {
+      id: chatRuntime.activeAgentId,
+      name: chatRuntime.activeAgentName,
+      provider: chatRuntime.runtimeProvider
+    });
     let heartbeatTimer = null;
     const stopHeartbeat = () => {
       if (heartbeatTimer !== null) {
@@ -8441,15 +9069,17 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       return res.status(clientStatus).json({ error: clientMessage });
     }
 
-    const codeNotFound = Boolean(error && error.message === 'CODEX_NOT_FOUND');
+    const usingCodexRuntime = chatRuntime.runtimeProvider !== 'gemini';
+    const providerLabel = usingCodexRuntime ? 'Codex' : 'Gemini';
+    const codeNotFound = usingCodexRuntime && Boolean(error && error.message === 'CODEX_NOT_FOUND');
     const shortError = codeNotFound
       ? 'codex no encontrado'
       : truncateForNotify(error && error.message ? error.message : 'exec_error', 120);
     void notify(`Error en chat user=${username}: ${shortError}`);
     const details = codeNotFound
       ? 'No se encontró el binario codex en el servidor.'
-      : 'No se pudo ejecutar codex en el servidor.';
-    const errorMessage = `Error ejecutando Codex local: ${details}`;
+      : `No se pudo ejecutar ${providerLabel} en el servidor.`;
+    const errorMessage = `Error ejecutando ${providerLabel}: ${details}`;
     finalizeTaskRun({
       status: 'failed',
       closeReason: codeNotFound ? 'codex_not_found' : 'exec_error',
@@ -8499,7 +9129,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         // ignore draft write errors in fallback path
       }
     }
-    return res.status(500).json({ error: `Error ejecutando Codex local. ${details}` });
+    return res.status(500).json({ error: `Error ejecutando ${providerLabel}. ${details}` });
   }
 });
 
@@ -8543,6 +9173,14 @@ const server = app.listen(port, host, () => {
     .catch((error) => {
       const reason = truncateForNotify(error && error.message ? error.message : 'CODEX_NOT_FOUND', 120);
       console.warn(`No se pudo precargar ruta de codex: ${reason}`);
+    });
+  resolveGeminiPath()
+    .then((geminiPath) => {
+      console.log(`Gemini CLI detectado en ${geminiPath}`);
+    })
+    .catch((error) => {
+      const reason = truncateForNotify(error && error.message ? error.message : 'GEMINI_NOT_FOUND', 120);
+      console.warn(`No se pudo precargar ruta de gemini: ${reason}`);
     });
   notifyMilestone('history_persistent', 'Historial persistente implementado');
   notifyMilestone('codex_full_access', 'CodexWeb ejecuta Codex CLI con acceso total');

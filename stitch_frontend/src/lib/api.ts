@@ -11,6 +11,7 @@ import type {
   MessageAttachment,
   Message,
   ToolsDeployedAppActionResponse,
+  ToolsDeployedAppDescribeResponse,
   ToolsDeployedAppLogsResponse,
   ToolsDeployedAppsPayload,
   ToolsGitPushResult,
@@ -161,7 +162,24 @@ export async function updateConversationSettings(
 }
 
 export async function getChatOptions(): Promise<ChatOptions> {
-  return api('/api/chat/options');
+  const data = await api<ChatOptions & {
+    activeAgentId?: string;
+    activeAgentName?: string;
+    runtimeProvider?: string;
+  }>('/api/chat/options');
+  return {
+    models: Array.isArray(data.models) ? data.models.map((item) => String(item || '').trim()).filter(Boolean) : [],
+    reasoningEfforts: Array.isArray(data.reasoningEfforts)
+      ? data.reasoningEfforts.map((item) => String(item || '').trim().toLowerCase()).filter(Boolean)
+      : ['minimal', 'low', 'medium', 'high', 'xhigh'],
+    defaults: {
+      model: String(data.defaults?.model || '').trim(),
+      reasoningEffort: String(data.defaults?.reasoningEffort || '').trim().toLowerCase()
+    },
+    activeAgentId: String(data.activeAgentId || '').trim(),
+    activeAgentName: String(data.activeAgentName || '').trim(),
+    runtimeProvider: String(data.runtimeProvider || '').trim()
+  };
 }
 
 export async function getNotificationSettings(): Promise<NotificationSettings> {
@@ -301,6 +319,21 @@ export async function getToolsDeployedAppLogs(
 ): Promise<ToolsDeployedAppLogsResponse> {
   const safeLines = Number.isInteger(lines) ? Math.min(Math.max(lines, 20), 1000) : 180;
   return api(`/api/tools/deployed-apps/${encodeURIComponent(String(appId || ''))}/logs?lines=${safeLines}`);
+}
+
+export async function describeToolsDeployedApps(
+  appIds: string[]
+): Promise<ToolsDeployedAppDescribeResponse> {
+  const normalized = Array.isArray(appIds)
+    ? appIds
+        .map((entry) => String(entry || '').trim())
+        .filter(Boolean)
+    : [];
+  return api('/api/tools/deployed-apps/describe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ appIds: normalized })
+  });
 }
 
 export async function getToolsGitRepos(forceRefresh = false): Promise<ToolsGitReposPayload> {

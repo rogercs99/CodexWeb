@@ -31,6 +31,21 @@ function normalizeTitle(value: string) {
   return trimmed || 'Nuevo chat';
 }
 
+function normalizeMessageLinkHref(href?: string) {
+  const raw = String(href || '').trim();
+  if (!raw) return '';
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) return raw;
+  if (raw.startsWith('#')) return raw;
+
+  const normalizedPath = raw.replace(/\\/g, '/');
+  const uploadsMarker = '/uploads/';
+  const markerIndex = normalizedPath.toLowerCase().indexOf(uploadsMarker);
+  if (markerIndex >= 0) {
+    return normalizedPath.slice(markerIndex);
+  }
+  return raw;
+}
+
 function truncateTitle(value: string, maxLength = TITLE_MAX_LENGTH) {
   if (value.length <= maxLength) return value;
   return `${value.slice(0, maxLength - 1).trimEnd()}…`;
@@ -162,16 +177,22 @@ function MarkdownMessage({ content }: { content: string }) {
           ul: ({ children }) => <ul className="my-2 list-disc pl-5 space-y-1">{children}</ul>,
           ol: ({ children }) => <ol className="my-2 list-decimal pl-5 space-y-1">{children}</ol>,
           li: ({ children }) => <li className="my-0 leading-relaxed">{children}</li>,
-          a: ({ href, children }) => (
-            <a
-              href={href}
-              target="_blank"
-              rel="noreferrer"
-              className="text-blue-300 underline underline-offset-2 break-all"
-            >
-              {children}
-            </a>
-          ),
+          a: ({ href, children }) => {
+            const normalizedHref = normalizeMessageLinkHref(href);
+            if (!normalizedHref) {
+              return <span className="text-blue-300 break-all">{children}</span>;
+            }
+            return (
+              <a
+                href={normalizedHref}
+                target="_blank"
+                rel="noreferrer"
+                className="text-blue-300 underline underline-offset-2 break-all"
+              >
+                {children}
+              </a>
+            );
+          },
           code: ({ className, children }) => {
             const raw = String(children || '').replace(/\n$/, '');
             const langMatch = /language-([a-zA-Z0-9_-]+)/.exec(String(className || ''));
@@ -211,6 +232,7 @@ export default function ChatScreen({
   onClearFiles,
   onRefresh,
   onNavigate,
+  activeAgentName,
   model,
   reasoningEffort,
   options,
@@ -237,6 +259,7 @@ export default function ChatScreen({
   onClearFiles: () => void;
   onRefresh: () => void;
   onNavigate: (screen: Screen) => void;
+  activeAgentName: string;
   onModelChange: (value: string) => void;
   onReasoningChange: (value: string) => void;
 }) {
@@ -397,6 +420,7 @@ export default function ChatScreen({
                 <span className="truncate">{shortTitle}</span>
               </button>
               <p className="text-xs text-zinc-500">{headerStatus}</p>
+              <p className="text-[11px] text-zinc-400">IA activa: {activeAgentName || 'Codex CLI'}</p>
             </div>
             <div className="flex items-center gap-1 shrink-0">
               <button
@@ -422,9 +446,9 @@ export default function ChatScreen({
               value={model}
               onChange={(event) => onModelChange(event.target.value)}
               className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-200"
-              aria-label="Modelo del chat"
+              aria-label={`Modelo para ${activeAgentName || 'IA activa'}`}
             >
-              <option value="">Automatico (default CLI)</option>
+              <option value="">Automatico ({activeAgentName || 'IA activa'})</option>
               {options.models.map((item) => (
                 <option key={item} value={item}>{item}</option>
               ))}
@@ -433,7 +457,7 @@ export default function ChatScreen({
               value={reasoningEffort}
               onChange={(event) => onReasoningChange(event.target.value)}
               className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-200"
-              aria-label="Nivel de razonamiento del chat"
+              aria-label={`Nivel de razonamiento para ${activeAgentName || 'IA activa'}`}
             >
               {options.reasoningEfforts.map((item) => (
                 <option key={item} value={item}>{item}</option>
