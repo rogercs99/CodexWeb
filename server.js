@@ -339,10 +339,16 @@ function getUserCodexSessionsDir(userId) {
   return path.join(getUserCodexHome(userId), 'sessions');
 }
 
-function getCodexEnvForUser(userId) {
+function getCodexEnvForUser(userId, options = {}) {
+  const username =
+    options && typeof options.username === 'string'
+      ? options.username
+      : '';
+  const gitIdentity = buildGitIdentityFromUsername(username);
   return {
     ...process.env,
-    CODEX_HOME: getUserCodexHome(userId)
+    CODEX_HOME: getUserCodexHome(userId),
+    ...buildGitIdentityEnv(gitIdentity)
   };
 }
 
@@ -559,9 +565,9 @@ function getActiveCodexLoginFlow(userId) {
   return flow;
 }
 
-async function getCodexAuthStatusForUser(userId) {
+async function getCodexAuthStatusForUser(userId, options = {}) {
   const codexPath = await resolveCodexPath();
-  const env = getCodexEnvForUser(userId);
+  const env = getCodexEnvForUser(userId, options);
   try {
     const result = await execFileAsync(codexPath, ['login', 'status'], {
       env,
@@ -1250,12 +1256,8 @@ function sanitizeGitIdentityName(rawName) {
   return value.length > 80 ? value.slice(0, 80).trim() : value;
 }
 
-function buildGitIdentityFromRequest(req) {
-  const username =
-    req && req.session && typeof req.session.username === 'string'
-      ? req.session.username
-      : '';
-  const name = sanitizeGitIdentityName(username) || 'CodexWeb';
+function buildGitIdentityFromUsername(rawUsername) {
+  const name = sanitizeGitIdentityName(rawUsername) || 'CodexWeb';
   const localPart = String(name || 'codexweb')
     .toLowerCase()
     .replace(/[^a-z0-9._-]+/g, '-')
@@ -1265,6 +1267,32 @@ function buildGitIdentityFromRequest(req) {
   return {
     name,
     email: `${safeLocalPart}@codexweb.local`
+  };
+}
+
+function buildGitIdentityFromRequest(req) {
+  const username =
+    req && req.session && typeof req.session.username === 'string'
+      ? req.session.username
+      : '';
+  return buildGitIdentityFromUsername(username);
+}
+
+function normalizeGitIdentity(identity) {
+  const source = identity && typeof identity === 'object' ? identity : {};
+  const name = sanitizeGitIdentityName(source.name) || 'CodexWeb';
+  const emailRaw = String(source.email || '').trim().toLowerCase();
+  const email = emailRaw || 'codexweb@codexweb.local';
+  return { name, email };
+}
+
+function buildGitIdentityEnv(identity) {
+  const safeIdentity = normalizeGitIdentity(identity);
+  return {
+    GIT_AUTHOR_NAME: safeIdentity.name,
+    GIT_AUTHOR_EMAIL: safeIdentity.email,
+    GIT_COMMITTER_NAME: safeIdentity.name,
+    GIT_COMMITTER_EMAIL: safeIdentity.email
   };
 }
 
@@ -1358,6 +1386,71 @@ async function runGitInRepoAsync(repoPath, args, options = {}) {
       stderr: String((error && error.stderr) || (error && error.message) || '')
     };
   }
+}
+
+function extractGitConfigValue(result) {
+  if (!result || typeof result !== 'object') return '';
+  return String(result.stdout || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => String(line || '').trim())
+    .find(Boolean) || '';
+}
+
+function isGitIdentityUnknownError(rawText) {
+  const text = String(rawText || '').toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes('author identity unknown') ||
+    text.includes('please tell me who you are') ||
+    text.includes('unable to auto-detect email address') ||
+    text.includes('fatal: no email was given and auto-detection is disabled')
+  );
+}
+
+function ensureGitIdentityForRepo(repoPath, gitIdentity) {
+  const safeRepoPath = String(repoPath || '').trim() || repoRootDir;
+  const requested = normalizeGitIdentity(gitIdentity);
+  const existingName = extractGitConfigValue(
+    runGitInRepoSync(safeRepoPath, ['config', '--local', '--get', 'user.name'], { allowNonZero: true })
+  );
+  const existingEmail = extractGitConfigValue(
+    runGitInRepoSync(safeRepoPath, ['config', '--local', '--get', 'user.email'], { allowNonZero: true })
+  );
+
+  const targetName = existingName || requested.name;
+  const targetEmail = existingEmail || requested.email;
+
+  if (!existingName) {
+    const setNameResult = runGitInRepoSync(safeRepoPath, ['config', '--local', 'user.name', targetName]);
+    if (!setNameResult.ok) {
+      return {
+        ok: false,
+        error: truncateForNotify(setNameResult.stderr || setNameResult.stdout || 'git_config_name_failed', 180),
+        identity: requested
+      };
+    }
+  }
+
+  if (!existingEmail) {
+    const setEmailResult = runGitInRepoSync(safeRepoPath, ['config', '--local', 'user.email', targetEmail]);
+    if (!setEmailResult.ok) {
+      return {
+        ok: false,
+        error: truncateForNotify(setEmailResult.stderr || setEmailResult.stdout || 'git_config_email_failed', 180),
+        identity: requested
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    identity: {
+      name: targetName,
+      email: targetEmail
+    },
+    configured: !existingName || !existingEmail
+  };
 }
 
 function parseGitPorcelainPath(line) {
@@ -5002,7 +5095,15 @@ app.post('/api/tools/git/repos/:repoId/push', requireAuth, async (req, res) => {
 
   const commitMessage = normalizeGitCommitMessage(req.body && req.body.commitMessage, repo.name);
   const gitIdentity = buildGitIdentityFromRequest(req);
-  const addResult = await runGitInRepoAsync(repo.absolutePath, ['add', '-A']);
+  const ensuredIdentity = ensureGitIdentityForRepo(repo.absolutePath, gitIdentity);
+  if (!ensuredIdentity.ok) {
+    return res.status(500).json({
+      error: `No se pudo preparar identidad Git del repo: ${ensuredIdentity.error || 'git_identity_failed'}`
+    });
+  }
+  const gitIdentityEnv = buildGitIdentityEnv(ensuredIdentity.identity);
+
+  const addResult = await runGitInRepoAsync(repo.absolutePath, ['add', '-A'], { env: gitIdentityEnv });
   if (!addResult.ok) {
     const reason = truncateForNotify(addResult.stderr || addResult.stdout || 'git_add_failed', 220);
     return res.status(500).json({ error: `No se pudo preparar cambios: ${reason}` });
@@ -5023,14 +5124,20 @@ app.post('/api/tools/git/repos/:repoId/push', requireAuth, async (req, res) => {
   let commitOutput = '';
 
   if (Number(stagedCheck.code) === 1) {
-    const commitResult = await runGitInRepoAsync(repo.absolutePath, ['commit', '-m', commitMessage], {
-      env: {
-        GIT_AUTHOR_NAME: gitIdentity.name,
-        GIT_AUTHOR_EMAIL: gitIdentity.email,
-        GIT_COMMITTER_NAME: gitIdentity.name,
-        GIT_COMMITTER_EMAIL: gitIdentity.email
-      }
+    let commitResult = await runGitInRepoAsync(repo.absolutePath, ['commit', '-m', commitMessage], {
+      env: gitIdentityEnv
     });
+    if (!commitResult.ok && isGitIdentityUnknownError(`${commitResult.stderr}\n${commitResult.stdout}`)) {
+      const retryIdentity = ensureGitIdentityForRepo(repo.absolutePath, gitIdentity);
+      if (!retryIdentity.ok) {
+        return res.status(500).json({
+          error: `No se pudo configurar identidad Git para commit: ${retryIdentity.error || 'git_identity_retry_failed'}`
+        });
+      }
+      commitResult = await runGitInRepoAsync(repo.absolutePath, ['commit', '-m', commitMessage], {
+        env: buildGitIdentityEnv(retryIdentity.identity)
+      });
+    }
     if (!commitResult.ok) {
       const reason = truncateForNotify(commitResult.stderr || commitResult.stdout || 'git_commit_failed', 220);
       return res.status(500).json({ error: `No se pudo crear commit: ${reason}` });
@@ -5072,7 +5179,8 @@ app.post('/api/tools/git/repos/:repoId/push', requireAuth, async (req, res) => {
 
   const pushResult = await runGitInRepoAsync(repo.absolutePath, pushArgs, {
     timeoutMs: gitToolsCommandTimeoutMs,
-    allowNonZero: false
+    allowNonZero: false,
+    env: gitIdentityEnv
   });
   if (!pushResult.ok) {
     const reason = truncateForNotify(pushResult.stderr || pushResult.stdout || 'git_push_failed', 260);
@@ -5113,6 +5221,12 @@ app.post('/api/tools/git/repos/:repoId/resolve-conflicts', requireAuth, (req, re
     return res.status(409).json({ error: 'Este repositorio no tiene conflictos activos.' });
   }
   const gitIdentity = buildGitIdentityFromRequest(req);
+  const ensuredIdentity = ensureGitIdentityForRepo(repo.absolutePath, gitIdentity);
+  if (!ensuredIdentity.ok) {
+    return res.status(500).json({
+      error: `No se pudo preparar identidad Git del repo: ${ensuredIdentity.error || 'git_identity_failed'}`
+    });
+  }
 
   const title = buildConversationTitle(`Resolver conflictos ${repo.name || 'repo'}`);
   const created = createConversationStmt.run(
@@ -5131,7 +5245,7 @@ app.post('/api/tools/git/repos/:repoId/resolve-conflicts', requireAuth, (req, re
     repo,
     resolver: {
       conversationId,
-      prompt: buildGitConflictResolverPrompt(repo, gitIdentity),
+      prompt: buildGitConflictResolverPrompt(repo, ensuredIdentity.identity),
       autoSend: true
     }
   });
@@ -5199,7 +5313,9 @@ app.post('/api/tasks/:id/rollback', requireAuth, (req, res) => {
 
 app.get('/api/codex/auth/status', requireAuth, async (req, res) => {
   try {
-    const auth = await getCodexAuthStatusForUser(req.session.userId);
+    const auth = await getCodexAuthStatusForUser(req.session.userId, {
+      username: req.session && typeof req.session.username === 'string' ? req.session.username : ''
+    });
     const activeFlow = getActiveCodexLoginFlow(req.session.userId);
     return res.json({
       ok: true,
@@ -5235,7 +5351,9 @@ app.post('/api/codex/auth/device/start', requireAuth, async (req, res) => {
     const codexHome = getUserCodexHome(safeUserId);
     const loginProcess = spawn(codexPath, ['login', '--device-auth'], {
       cwd: process.cwd(),
-      env: getCodexEnvForUser(safeUserId),
+      env: getCodexEnvForUser(safeUserId, {
+        username: req.session && typeof req.session.username === 'string' ? req.session.username : ''
+      }),
       stdio: ['ignore', 'pipe', 'pipe']
     });
     const loginFlow = {
@@ -5341,7 +5459,9 @@ app.post('/api/codex/auth/logout', requireAuth, async (req, res) => {
   try {
     const codexPath = await resolveCodexPath();
     await execFileAsync(codexPath, ['logout'], {
-      env: getCodexEnvForUser(safeUserId),
+      env: getCodexEnvForUser(safeUserId, {
+        username: req.session && typeof req.session.username === 'string' ? req.session.username : ''
+      }),
       cwd: process.cwd(),
       timeout: 15000,
       maxBuffer: 128 * 1024
@@ -6457,7 +6577,9 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     };
 
     codexProcess = execFile(codexPath, args, {
-      env: getCodexEnvForUser(req.session.userId),
+      env: getCodexEnvForUser(req.session.userId, {
+        username: req.session && typeof req.session.username === 'string' ? req.session.username : ''
+      }),
       cwd: process.cwd()
     });
     activeRun = registerActiveChatRun(req.session.userId, conversationId, codexProcess);
