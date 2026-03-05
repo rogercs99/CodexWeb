@@ -52,6 +52,7 @@ const DRAFT_PERSIST_THROTTLE_MS = 150;
 const DEFAULT_MODEL = 'gpt-5.3-codex';
 const DEFAULT_REASONING_EFFORT = 'xhigh';
 const DRAFT_CONVERSATION = 'draft';
+const MESSAGES_PAGE_SIZE = 60;
 
 function byDateDesc<T extends { last_message_at?: string; created_at?: string }>(items: T[]) {
   return [...items].sort((a, b) => {
@@ -93,6 +94,20 @@ function sameIdList(a: number[], b: number[]): boolean {
     if (a[i] !== b[i]) return false;
   }
   return true;
+}
+
+function prependUniqueMessages(olderMessages: Message[], currentMessages: Message[]): Message[] {
+  if (!Array.isArray(olderMessages) || olderMessages.length === 0) return currentMessages;
+  if (!Array.isArray(currentMessages) || currentMessages.length === 0) return olderMessages;
+
+  const currentIds = new Set(
+    currentMessages
+      .map((entry) => Number(entry && entry.id))
+      .filter((id) => Number.isInteger(id))
+  );
+  const uniqueOlder = olderMessages.filter((entry) => !currentIds.has(Number(entry && entry.id)));
+  if (uniqueOlder.length === 0) return currentMessages;
+  return [...uniqueOlder, ...currentMessages];
 }
 
 function normalizeModelForOptions(value: string, opts: ChatOptions): string {
@@ -331,6 +346,9 @@ export default function App() {
   const [runningConversationIds, setRunningConversationIds] = useState<number[]>([]);
   const [chatTitle, setChatTitle] = useState('Nuevo chat');
   const [messages, setMessages] = useState<Message[]>([]);
+  const [messagesHasMore, setMessagesHasMore] = useState(false);
+  const [messagesLoadingMore, setMessagesLoadingMore] = useState(false);
+  const [messagesNextBeforeId, setMessagesNextBeforeId] = useState<number | null>(null);
   const [sending, setSending] = useState(false);
   const [sendStartedAtMs, setSendStartedAtMs] = useState<number | null>(null);
   const [sendElapsedSeconds, setSendElapsedSeconds] = useState(0);
@@ -376,6 +394,10 @@ export default function App() {
   const runningConversationIdsRef = useRef<number[]>([]);
   const previousRunningConversationIdsRef = useRef<number[]>([]);
   const sendingRef = useRef(false);
+  const messagesHasMoreRef = useRef(false);
+  const messagesLoadingMoreRef = useRef(false);
+  const messagesNextBeforeIdRef = useRef<number | null>(null);
+  const messagesPaginationRequestSeqRef = useRef(0);
 
   useEffect(() => {
     activeConversationIdRef.current = activeConversationId;
@@ -388,6 +410,18 @@ export default function App() {
   useEffect(() => {
     sendingRef.current = sending;
   }, [sending]);
+
+  useEffect(() => {
+    messagesHasMoreRef.current = messagesHasMore;
+  }, [messagesHasMore]);
+
+  useEffect(() => {
+    messagesLoadingMoreRef.current = messagesLoadingMore;
+  }, [messagesLoadingMore]);
+
+  useEffect(() => {
+    messagesNextBeforeIdRef.current = messagesNextBeforeId;
+  }, [messagesNextBeforeId]);
 
   const resetTransientStreamState = useCallback(() => {
     if (draftPersistTimerRef.current !== null) {
@@ -767,8 +801,23 @@ export default function App() {
     }
   }, []);
 
+  const applyLoadedMessagesPagination = useCallback(
+    (pagination: { hasMore?: boolean; nextBeforeId?: number | null } | null | undefined) => {
+      const rawNextBeforeId = Number(pagination && pagination.nextBeforeId);
+      const nextBeforeId =
+        Number.isInteger(rawNextBeforeId) && rawNextBeforeId > 0 ? rawNextBeforeId : null;
+      const hasMore = Boolean(pagination && pagination.hasMore) && nextBeforeId !== null;
+      setMessagesHasMore(hasMore);
+      setMessagesNextBeforeId(hasMore ? nextBeforeId : null);
+      setMessagesLoadingMore(false);
+    },
+    []
+  );
+
   const loadConversationsAndPick = useCallback(
     async (preferredId?: number | null, usernameOverride?: string | null) => {
+      messagesPaginationRequestSeqRef.current += 1;
+      setMessagesLoadingMore(false);
       const [rows, runningIds]: [Conversation[], number[]] = await Promise.all([
         listConversations(),
         refreshRunningConversationIds()
@@ -798,12 +847,14 @@ export default function App() {
         setLiveReasoning(
           draftOnly ? serializeReasoning(new Map(Object.entries(draftOnly.draft.reasoningByItem || {}))) : ''
         );
+        setMessagesHasMore(false);
+        setMessagesNextBeforeId(null);
         setChatModel(normalizeModelForOptions(defaultModel, options));
         setChatReasoningEffort(normalizeReasoningForOptions(defaultReasoningEffort, options));
         return;
       }
 
-      const detail = await listMessages(chosenId);
+      const detail = await listMessages(chosenId, { limit: MESSAGES_PAGE_SIZE });
       const localDraft = getLiveDraftForConversation(chosenId, usernameOverride);
       const serverDraft =
         detail.liveDraft && typeof detail.liveDraft === 'object' ? (detail.liveDraft as LiveChatDraft) : null;
@@ -843,9 +894,11 @@ export default function App() {
           options
         )
       );
+      applyLoadedMessagesPagination(detail.pagination);
       applyTaskRecoveryToTerminal(chosenId, detail.taskRecovery || null);
     },
     [
+      applyLoadedMessagesPagination,
       applyTaskRecoveryToTerminal,
       clearTerminalForMissingChats,
       defaultModel,
@@ -1105,8 +1158,10 @@ export default function App() {
       if (next === 'chat' && targetChatId) {
         void (async () => {
           try {
+            messagesPaginationRequestSeqRef.current += 1;
+            setMessagesLoadingMore(false);
             const [detail, latestRunningIds] = await Promise.all([
-              listMessages(targetChatId),
+              listMessages(targetChatId, { limit: MESSAGES_PAGE_SIZE }),
               refreshRunningConversationIds()
             ]);
             const localDraft = getLiveDraftForConversation(targetChatId);
@@ -1148,6 +1203,7 @@ export default function App() {
                 options
               )
             );
+            applyLoadedMessagesPagination(detail.pagination);
             applyTaskRecoveryToTerminal(targetChatId, detail.taskRecovery || null);
             setPendingChatDraft(
               incomingDraft
@@ -1174,6 +1230,7 @@ export default function App() {
     },
     [
       activeConversationId,
+      applyLoadedMessagesPagination,
       applyTaskRecoveryToTerminal,
       defaultModel,
       defaultReasoningEffort,
@@ -1207,6 +1264,9 @@ export default function App() {
     }
     setUser(null);
     setMessages([]);
+    setMessagesHasMore(false);
+    setMessagesNextBeforeId(null);
+    setMessagesLoadingMore(false);
     setConversations([]);
     setRunningConversationIds([]);
     setActiveConversationId(null);
@@ -1228,6 +1288,9 @@ export default function App() {
     setActiveConversationId(null);
     setChatTitle('Nuevo chat');
     setMessages([]);
+    setMessagesHasMore(false);
+    setMessagesNextBeforeId(null);
+    setMessagesLoadingMore(false);
     setChatModel(normalizeModelForOptions(defaultModel, effectiveOptions));
     setChatReasoningEffort(normalizeReasoningForOptions(defaultReasoningEffort, effectiveOptions));
     setScreen('chat');
@@ -1246,6 +1309,39 @@ export default function App() {
       setStatus(error?.message || 'No se pudo refrescar.');
     }
   }, [activeConversationId, loadConversationsAndPick, options]);
+
+  const handleLoadOlderMessages = useCallback(async () => {
+    const targetConversationId = activeConversationIdRef.current;
+    const beforeId = messagesNextBeforeIdRef.current;
+    if (!Number.isInteger(targetConversationId) || targetConversationId <= 0) return;
+    if (!messagesHasMoreRef.current || messagesLoadingMoreRef.current) return;
+    if (!Number.isInteger(beforeId) || beforeId <= 0) return;
+
+    const requestSeq = messagesPaginationRequestSeqRef.current + 1;
+    messagesPaginationRequestSeqRef.current = requestSeq;
+    setMessagesLoadingMore(true);
+
+    try {
+      const detail = await listMessages(targetConversationId, {
+        limit: MESSAGES_PAGE_SIZE,
+        beforeId,
+        includeMeta: false
+      });
+      if (messagesPaginationRequestSeqRef.current !== requestSeq) return;
+      if (activeConversationIdRef.current !== targetConversationId) return;
+
+      setMessages((prev) => prependUniqueMessages(detail.messages || [], prev));
+      applyLoadedMessagesPagination(detail.pagination);
+    } catch (error: any) {
+      if (messagesPaginationRequestSeqRef.current !== requestSeq) return;
+      if (activeConversationIdRef.current !== targetConversationId) return;
+      setStatus(error?.message || 'No se pudieron cargar mensajes anteriores.');
+    } finally {
+      if (messagesPaginationRequestSeqRef.current !== requestSeq) return;
+      if (activeConversationIdRef.current !== targetConversationId) return;
+      setMessagesLoadingMore(false);
+    }
+  }, [applyLoadedMessagesPagination]);
 
   const handleDeleteConversations = useCallback(
     async (conversationIds: number[]) => {
@@ -1986,6 +2082,9 @@ export default function App() {
           chatTitle={chatTitle}
           conversationId={activeConversationId}
           messages={messages}
+          hasMoreMessages={messagesHasMore}
+          loadingMoreMessages={messagesLoadingMore}
+          onLoadMoreMessages={handleLoadOlderMessages}
           liveReasoning={liveReasoning}
           terminalEntries={activeChatTerminalEntries}
           sending={sending}

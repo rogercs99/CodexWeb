@@ -6,6 +6,8 @@ import BottomNav from './BottomNav';
 import type { ChatOptions, Message, Screen, TerminalEntry } from '../lib/types';
 
 const TITLE_MAX_LENGTH = 40;
+const TOP_LOAD_THRESHOLD_PX = 72;
+const STICKY_BOTTOM_THRESHOLD_PX = 140;
 function formatDate(value: string) {
   const date = value ? new Date(value) : null;
   if (!date || Number.isNaN(date.getTime())) return '';
@@ -218,6 +220,8 @@ export default function ChatScreen({
   chatTitle,
   conversationId,
   messages,
+  hasMoreMessages,
+  loadingMoreMessages,
   liveReasoning,
   terminalEntries,
   sending,
@@ -236,12 +240,15 @@ export default function ChatScreen({
   model,
   reasoningEffort,
   options,
+  onLoadMoreMessages,
   onModelChange,
   onReasoningChange
 }: {
   chatTitle: string;
   conversationId: number | null;
   messages: Message[];
+  hasMoreMessages: boolean;
+  loadingMoreMessages: boolean;
   liveReasoning: string;
   terminalEntries: TerminalEntry[];
   sending: boolean;
@@ -260,6 +267,7 @@ export default function ChatScreen({
   onRefresh: () => void;
   onNavigate: (screen: Screen) => void;
   activeAgentName: string;
+  onLoadMoreMessages: () => void;
   onModelChange: (value: string) => void;
   onReasoningChange: (value: string) => void;
 }) {
@@ -286,6 +294,10 @@ export default function ChatScreen({
     return null;
   }, [grouped]);
 
+  const firstMessageFingerprint =
+    grouped.length > 0
+      ? `${grouped[0].id}:${String(grouped[0].content || '').length}`
+      : 'none';
   const lastMessageFingerprint = grouped.length > 0 ? `${grouped[grouped.length - 1].id}:${String(grouped[grouped.length - 1].content || '').length}` : 'none';
   const lastTerminalEntry = terminalEntries.length > 0 ? terminalEntries[terminalEntries.length - 1] : null;
   const terminalFingerprint =
@@ -297,6 +309,9 @@ export default function ChatScreen({
   const hadReasoningRef = useRef(liveReasoning.trim().length > 0);
   const terminalFingerprintRef = useRef(terminalFingerprint);
   const wasSendingRef = useRef(sending);
+  const stickToBottomRef = useRef(true);
+  const prependScrollHeightRef = useRef<number | null>(null);
+  const loadingOlderRef = useRef(false);
 
   useEffect(() => {
     if (!showTitleModal) return undefined;
@@ -336,10 +351,38 @@ export default function ChatScreen({
   }, []);
 
   useEffect(() => {
+    if (!loadingMoreMessages) {
+      loadingOlderRef.current = false;
+    }
+  }, [loadingMoreMessages]);
+
+  useEffect(() => {
     const node = messagesRef.current;
     if (!node) return;
+    stickToBottomRef.current = true;
+    prependScrollHeightRef.current = null;
+    loadingOlderRef.current = false;
     node.scrollTo({ top: node.scrollHeight, behavior: 'auto' });
-  }, [chatTitle, grouped.length, lastMessageFingerprint, liveReasoning.length, terminalFingerprint]);
+  }, [conversationId]);
+
+  useEffect(() => {
+    const previousScrollHeight = prependScrollHeightRef.current;
+    if (previousScrollHeight === null) return;
+    const node = messagesRef.current;
+    if (!node) return;
+    const nextScrollHeight = node.scrollHeight;
+    if (nextScrollHeight > previousScrollHeight) {
+      node.scrollTop += nextScrollHeight - previousScrollHeight;
+    }
+    prependScrollHeightRef.current = null;
+  }, [firstMessageFingerprint, grouped.length]);
+
+  useEffect(() => {
+    const node = messagesRef.current;
+    if (!node) return;
+    if (!stickToBottomRef.current) return;
+    node.scrollTo({ top: node.scrollHeight, behavior: 'auto' });
+  }, [lastMessageFingerprint, liveReasoning.length, terminalFingerprint]);
 
   useEffect(() => {
     setShowReasoning(false);
@@ -377,6 +420,26 @@ export default function ChatScreen({
       setShowTerminal(true);
     }
   }, [terminalFingerprint, terminalEntries.length, sending, isRunning]);
+
+  const handleMessagesScroll = () => {
+    const node = messagesRef.current;
+    if (!node) return;
+
+    const distanceFromBottom = node.scrollHeight - (node.scrollTop + node.clientHeight);
+    stickToBottomRef.current = distanceFromBottom <= STICKY_BOTTOM_THRESHOLD_PX;
+
+    const shouldLoadOlder =
+      conversationId !== null &&
+      hasMoreMessages &&
+      !loadingMoreMessages &&
+      !loadingOlderRef.current &&
+      node.scrollTop <= TOP_LOAD_THRESHOLD_PX;
+    if (!shouldLoadOlder) return;
+
+    loadingOlderRef.current = true;
+    prependScrollHeightRef.current = node.scrollHeight;
+    onLoadMoreMessages();
+  };
 
   const sendCurrent = () => {
     if (sending || isRunning) return;
@@ -467,9 +530,20 @@ export default function ChatScreen({
         </div>
       </header>
 
-      <main ref={messagesRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4 pb-72 space-y-4" style={{ paddingTop: headerOffset }}>
+      <main
+        ref={messagesRef}
+        onScroll={handleMessagesScroll}
+        className="flex-1 overflow-y-auto overflow-x-hidden p-4 pb-72 space-y-4"
+        style={{ paddingTop: headerOffset }}
+      >
         {grouped.length === 0 ? (
           <div className="text-center text-zinc-500 text-sm py-10">Escribe un mensaje para iniciar la conversacion.</div>
+        ) : null}
+        {loadingMoreMessages ? (
+          <div className="text-center text-xs text-zinc-500">Cargando mensajes anteriores...</div>
+        ) : null}
+        {!loadingMoreMessages && hasMoreMessages ? (
+          <div className="text-center text-[11px] text-zinc-600">Desliza hacia arriba para cargar mas</div>
         ) : null}
         {grouped.map((message) => {
           const rawContent = String(message.content || '');

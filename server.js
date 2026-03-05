@@ -6282,6 +6282,9 @@ app.get('/api/conversations/:id/messages', requireAuth, (req, res) => {
   if (hasBeforeIdParam && safeBeforeId === null) {
     return res.status(400).json({ error: 'beforeId inválido' });
   }
+  if (safeBeforeId !== null && safeLimit === null) {
+    return res.status(400).json({ error: 'beforeId requiere limit' });
+  }
 
   const includeMetaRaw = String(req.query.includeMeta || '').trim().toLowerCase();
   const includeMeta =

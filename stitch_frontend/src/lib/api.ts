@@ -8,6 +8,7 @@ import type {
   CodexQuota,
   NotificationSettings,
   Conversation,
+  MessagesPagination,
   MessageAttachment,
   Message,
   ToolsDeployedAppActionResponse,
@@ -98,20 +99,57 @@ export async function killConversationSession(
   return api(`/api/conversations/${conversationId}/kill`, { method: 'POST' });
 }
 
-export async function listMessages(conversationId: number): Promise<{
+interface ListMessagesOptions {
+  limit?: number;
+  beforeId?: number | null;
+  includeMeta?: boolean;
+}
+
+export async function listMessages(conversationId: number, options?: ListMessagesOptions): Promise<{
   conversation: { id: number; title: string; model: string; reasoningEffort: string };
   messages: Message[];
+  pagination: MessagesPagination;
   liveDraft?: any;
   taskRecovery?: TaskRecovery | null;
 }> {
+  const queryParams = new URLSearchParams();
+  const requestedLimit = Number(options?.limit);
+  if (Number.isInteger(requestedLimit) && requestedLimit > 0) {
+    queryParams.set('limit', String(Math.floor(requestedLimit)));
+  }
+  const requestedBeforeId = Number(options?.beforeId);
+  if (Number.isInteger(requestedBeforeId) && requestedBeforeId > 0) {
+    queryParams.set('beforeId', String(Math.floor(requestedBeforeId)));
+  }
+  if (options && Object.prototype.hasOwnProperty.call(options, 'includeMeta')) {
+    queryParams.set('includeMeta', options.includeMeta ? '1' : '0');
+  }
+  const querySuffix = queryParams.toString() ? `?${queryParams.toString()}` : '';
+
   const data = await api<{
     conversation: { id: number; title: string; model: string; reasoningEffort: string };
     messages: Message[];
+    pagination?: Partial<MessagesPagination> | null;
     liveDraft?: any;
     taskRecovery?: TaskRecovery | null;
   }>(
-    `/api/conversations/${conversationId}/messages`
+    `/api/conversations/${conversationId}/messages${querySuffix}`
   );
+  const rawPagination = data.pagination && typeof data.pagination === 'object' ? data.pagination : null;
+  const pagination: MessagesPagination = {
+    limit: Math.max(1, Number(rawPagination?.limit) || 1),
+    hasMore: Boolean(rawPagination?.hasMore),
+    nextBeforeId: Number.isInteger(Number(rawPagination?.nextBeforeId))
+      ? Number(rawPagination?.nextBeforeId)
+      : null,
+    oldestLoadedId: Number.isInteger(Number(rawPagination?.oldestLoadedId))
+      ? Number(rawPagination?.oldestLoadedId)
+      : null,
+    newestLoadedId: Number.isInteger(Number(rawPagination?.newestLoadedId))
+      ? Number(rawPagination?.newestLoadedId)
+      : null
+  };
+
   return {
     conversation: data.conversation,
     messages: Array.isArray(data.messages)
@@ -131,13 +169,14 @@ export async function listMessages(conversationId: number): Promise<{
             role:
               entry?.role === 'assistant' || entry?.role === 'system' || entry?.role === 'user'
                 ? entry.role
-                : 'assistant',
+              : 'assistant',
             content: String(entry?.content || ''),
             created_at: String(entry?.created_at || ''),
             attachments: attachments.filter((file) => Boolean(file.id) && Boolean(file.name))
           } as Message;
         })
       : [],
+    pagination,
     liveDraft: data.liveDraft && typeof data.liveDraft === 'object' ? data.liveDraft : null,
     taskRecovery:
       data.taskRecovery && typeof data.taskRecovery === 'object'
