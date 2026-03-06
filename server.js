@@ -5267,6 +5267,14 @@ if (legacyUploadsRouteBasePath !== '/uploads') {
   });
 }
 
+// Backward compatibility for absolute-path links accidentally exposed in chat
+// (e.g. "/root/CodexWeb/uploads/<conversationId>/<storedName>").
+app.get(/^\/.*\/uploads\/([^/]+)\/([^/]+)$/, requireAuth, (req, res) => {
+  const conversationId = req.params[0];
+  const storedName = req.params[1];
+  return serveManagedAttachmentFromParams(req, res, conversationId, storedName);
+});
+
 function buildConversationTitle(message) {
   const compact = String(message || '').replace(/\s+/g, ' ').trim();
   if (!compact) return 'Nuevo chat';
