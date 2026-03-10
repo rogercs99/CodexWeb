@@ -11,6 +11,7 @@ const helmet = require('helmet');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
 const Database = require('better-sqlite3');
+const { google } = require('googleapis');
 
 const execFileAsync = util.promisify(execFile);
 const pipelineAsync = util.promisify(pipeline);
@@ -302,8 +303,21 @@ const repoContextStopWords = new Set([
   'y'
 ]);
 const repoRootDir = resolveRepoRootDir(__dirname);
+const workspaceFileBlockedDirNames = new Set(['.git', '.codex_users', 'node_modules']);
+const workspaceFileBlockedBaseNames = new Set([
+  'app.db',
+  'app.db-shm',
+  'app.db-wal',
+  '.env',
+  '.npmrc',
+  '.bashrc',
+  '.bash_profile',
+  '.zshrc'
+]);
+const workspaceFileBlockedExtensions = new Set(['.db', '.sqlite', '.sqlite3', '.pem', '.key']);
 let repoContextIndexCache = null;
 const taskSnapshotsRootDir = path.join(__dirname, 'tmp', 'task-snapshots');
+const storageJobsRootDir = path.join(__dirname, 'tmp', 'storage-jobs');
 const taskCommandOutputMaxChars = 12000;
 const taskResultSummaryMaxChars = 5000;
 const taskPlanMaxChars = 8000;
@@ -325,6 +339,30 @@ const deployedAppsDefaultLogLines = 180;
 const deployedAppsMaxLogLines = 1000;
 const deployedAppsDescribeMaxItems = 20;
 const deployedAppsDescribeTimeoutMs = 1000 * 60 * 2;
+const deployedAppsDescribeJobPollMaxItems = 200;
+const storageJobPollMaxItems = 240;
+const storageLocalListMaxItems = 500;
+const storageHeavyScanMaxItems = 120;
+const storageHeavyScanMaxDepth = 7;
+const storageBackupRetentionDays = 4;
+const storageUploadJobMaxFiles = 40;
+const storageJobLogMaxChars = 12000;
+const driveScopes = ['https://www.googleapis.com/auth/drive'];
+const driveOauthFallbackRedirectUri = 'urn:ietf:wg:oauth:2.0:oob';
+const storageProtectedMutationRoots = new Set([
+  '/',
+  '/bin',
+  '/boot',
+  '/dev',
+  '/etc',
+  '/lib',
+  '/lib64',
+  '/proc',
+  '/run',
+  '/sbin',
+  '/sys',
+  '/usr'
+]);
 const gitToolsIgnoredDirs = new Set([
   '.git',
   '.hg',
@@ -354,6 +392,8 @@ let deployedAppsCache = {
   scannedAtMs: 0,
   apps: []
 };
+const activeDeployedDescriptionWorkers = new Set();
+const activeStorageJobWorkers = new Set();
 
 const sessionSecret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 
@@ -366,6 +406,7 @@ fs.mkdirSync(uploadsDir, { recursive: true });
 fs.mkdirSync(pendingUploadsDir, { recursive: true });
 fs.mkdirSync(codexUsersRootDir, { recursive: true });
 fs.mkdirSync(taskSnapshotsRootDir, { recursive: true });
+fs.mkdirSync(storageJobsRootDir, { recursive: true });
 
 const observabilityState = {
   startedAtMs: Date.now(),
@@ -390,6 +431,555 @@ function truncateForNotify(text, maxLen = 300) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function resolveCredentialsEncryptionKey() {
+  const configured = String(process.env.CREDENTIALS_ENCRYPTION_KEY || '').trim();
+  let source = configured;
+  if (!source) {
+    const uid = typeof process.getuid === 'function' ? String(process.getuid()) : '0';
+    source = `${os.hostname()}:${path.resolve(__dirname, dbPath)}:${uid}`;
+  }
+  if (/^[A-Za-z0-9+/=]+$/.test(source) && source.length >= 40) {
+    try {
+      const decoded = Buffer.from(source, 'base64');
+      if (decoded.length >= 32) {
+        return decoded.subarray(0, 32);
+      }
+    } catch (_error) {
+      // fallback to SHA-256 below.
+    }
+  }
+  return crypto.createHash('sha256').update(source, 'utf8').digest();
+}
+
+const credentialsEncryptionKey = resolveCredentialsEncryptionKey();
+
+function encryptSecretText(rawValue) {
+  const plain = String(rawValue || '');
+  if (!plain) return '';
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', credentialsEncryptionKey, iv);
+  const encrypted = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${iv.toString('base64')}.${tag.toString('base64')}.${encrypted.toString('base64')}`;
+}
+
+function decryptSecretText(rawCipher) {
+  const value = String(rawCipher || '').trim();
+  if (!value) return '';
+  const parts = value.split('.');
+  if (parts.length !== 3) {
+    throw new Error('cipher_text_invalid');
+  }
+  const iv = Buffer.from(parts[0], 'base64');
+  const tag = Buffer.from(parts[1], 'base64');
+  const encrypted = Buffer.from(parts[2], 'base64');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', credentialsEncryptionKey, iv);
+  decipher.setAuthTag(tag);
+  const plain = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  return plain.toString('utf8');
+}
+
+function normalizeDriveAuthMode(rawMode) {
+  const value = String(rawMode || '')
+    .trim()
+    .toLowerCase();
+  if (value === 'oauth_client' || value === 'oauth') return 'oauth_client';
+  return 'service_account';
+}
+
+function normalizeDriveAccountStatus(rawStatus) {
+  const value = String(rawStatus || '')
+    .trim()
+    .toLowerCase();
+  if (value === 'active' || value === 'needs_oauth' || value === 'error' || value === 'pending') {
+    return value;
+  }
+  return 'pending';
+}
+
+function normalizeStorageJobStatus(rawStatus) {
+  const value = String(rawStatus || '')
+    .trim()
+    .toLowerCase();
+  if (value === 'pending' || value === 'running' || value === 'completed' || value === 'error') {
+    return value;
+  }
+  return 'pending';
+}
+
+function normalizeStorageJobType(rawType) {
+  const value = String(rawType || '')
+    .trim()
+    .toLowerCase();
+  if (value === 'drive_upload_files' || value === 'deployed_backup_create' || value === 'deployed_backup_restore') {
+    return value;
+  }
+  return '';
+}
+
+function sanitizeDriveAccountAlias(rawAlias) {
+  const compact = String(rawAlias || '')
+    .replace(/[\r\n\t]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!compact) return '';
+  return compact.length > 80 ? compact.slice(0, 80).trim() : compact;
+}
+
+function buildDriveAccountId() {
+  return `drv_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;
+}
+
+function buildStorageJobId(prefix = 'job') {
+  const safePrefix = String(prefix || 'job')
+    .replace(/[^a-z0-9_-]+/gi, '')
+    .slice(0, 20) || 'job';
+  return `${safePrefix}_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;
+}
+
+function appendStorageJobLogText(previousLog, message) {
+  const line = String(message || '').trim();
+  if (!line) return String(previousLog || '').slice(-storageJobLogMaxChars);
+  const timestamp = nowIso();
+  const next = `${String(previousLog || '').trim()}\n[${timestamp}] ${line}`.trim();
+  if (next.length <= storageJobLogMaxChars) return next;
+  return next.slice(next.length - storageJobLogMaxChars);
+}
+
+function normalizeAbsoluteStoragePath(rawPath, fallbackPath = repoRootDir) {
+  const value = String(rawPath || '').trim();
+  const target = value || String(fallbackPath || repoRootDir);
+  if (!target || target.includes('\0')) return '';
+  const expanded = target.startsWith('~/') ? path.join(os.homedir(), target.slice(2)) : target;
+  try {
+    return path.resolve(expanded);
+  } catch (_error) {
+    return '';
+  }
+}
+
+function pathExistsSyncSafe(absolutePath) {
+  const target = String(absolutePath || '').trim();
+  if (!target) return false;
+  try {
+    fs.accessSync(target, fs.constants.R_OK);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function isPathWithin(basePath, candidatePath) {
+  const base = normalizeAbsoluteStoragePath(basePath);
+  const candidate = normalizeAbsoluteStoragePath(candidatePath);
+  if (!base || !candidate) return false;
+  if (base === candidate) return true;
+  const rel = path.relative(base, candidate);
+  return Boolean(rel) && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+function isStorageMutationPathProtected(absolutePath) {
+  const target = normalizeAbsoluteStoragePath(absolutePath);
+  if (!target) return true;
+  if (storageProtectedMutationRoots.has(target)) return true;
+  for (const root of storageProtectedMutationRoots) {
+    if (root === '/' || !root) continue;
+    if (isPathWithin(root, target)) return true;
+  }
+  if (isPathWithin(repoRootDir, target)) {
+    const rel = normalizeRepoRelativePath(path.relative(repoRootDir, target).split(path.sep).join('/'));
+    if (rel && !isWorkspaceFileDownloadAllowed(rel)) return true;
+  }
+  return false;
+}
+
+function assertStorageMutationPathAllowed(absolutePath) {
+  const target = normalizeAbsoluteStoragePath(absolutePath);
+  if (!target) {
+    throw createClientRequestError('Ruta inválida', 400);
+  }
+  if (isStorageMutationPathProtected(target)) {
+    throw createClientRequestError('Ruta bloqueada para acciones de escritura por seguridad', 403);
+  }
+  return target;
+}
+
+function resolveStorageDirectoryPathForRequest(rawPath) {
+  const absolutePath = normalizeAbsoluteStoragePath(rawPath, repoRootDir);
+  if (!absolutePath) {
+    throw createClientRequestError('Ruta inválida', 400);
+  }
+  let stats = null;
+  try {
+    stats = fs.statSync(absolutePath);
+  } catch (_error) {
+    stats = null;
+  }
+  if (!stats || !stats.isDirectory()) {
+    throw createClientRequestError('La ruta indicada no es un directorio accesible', 404);
+  }
+  return absolutePath;
+}
+
+function normalizeStorageSortField(rawSort) {
+  const value = String(rawSort || '')
+    .trim()
+    .toLowerCase();
+  if (value === 'size' || value === 'mtime') return value;
+  return 'name';
+}
+
+function normalizeStorageSortOrder(rawOrder) {
+  return String(rawOrder || '')
+    .trim()
+    .toLowerCase() === 'asc'
+    ? 'asc'
+    : 'desc';
+}
+
+function getDirectorySizeWithDu(absolutePath) {
+  const target = normalizeAbsoluteStoragePath(absolutePath);
+  if (!target) return null;
+  if (!commandExistsSync('du')) return null;
+  const result = runSystemCommandSync('du', ['-sb', target], {
+    allowNonZero: true,
+    timeoutMs: 15000,
+    maxBuffer: 1024 * 1024 * 2
+  });
+  if (!result || !result.ok) return null;
+  const firstLine = String(result.stdout || '')
+    .trim()
+    .split('\n')
+    .find((line) => line.trim());
+  if (!firstLine) return null;
+  const sizeRaw = Number.parseInt(firstLine.split(/\s+/)[0], 10);
+  return Number.isFinite(sizeRaw) && sizeRaw >= 0 ? sizeRaw : null;
+}
+
+function listStorageLocalDirectory(payload = {}) {
+  const directoryPath = resolveStorageDirectoryPathForRequest(payload.path);
+  const sortBy = normalizeStorageSortField(payload.sortBy);
+  const sortOrder = normalizeStorageSortOrder(payload.sortOrder);
+  const includeDirSize = payload.includeDirSize !== false;
+  const rawLimit = Number.parseInt(String(payload.limit || ''), 10);
+  const limit = Number.isInteger(rawLimit)
+    ? Math.min(Math.max(rawLimit, 1), storageLocalListMaxItems)
+    : 220;
+
+  let entries = [];
+  try {
+    entries = fs.readdirSync(directoryPath, { withFileTypes: true });
+  } catch (_error) {
+    entries = [];
+  }
+
+  const mapped = entries.map((entry) => {
+    const name = String(entry && entry.name ? entry.name : '').trim();
+    const absolutePath = path.join(directoryPath, name);
+    let stats = null;
+    try {
+      stats = fs.lstatSync(absolutePath);
+    } catch (_error) {
+      stats = null;
+    }
+    const isDir = Boolean(stats && stats.isDirectory());
+    const isFile = Boolean(stats && stats.isFile());
+    const isSymlink = Boolean(stats && stats.isSymbolicLink());
+    return {
+      name,
+      path: absolutePath,
+      type: isDir ? 'directory' : isFile ? 'file' : isSymlink ? 'symlink' : 'other',
+      sizeBytes: isFile ? Number(stats.size || 0) : null,
+      mtime: stats && stats.mtime ? stats.mtime.toISOString() : '',
+      mtimeMs: stats && Number.isFinite(Number(stats.mtimeMs)) ? Number(stats.mtimeMs) : 0
+    };
+  });
+
+  if (includeDirSize) {
+    mapped
+      .filter((entry) => entry.type === 'directory')
+      .slice(0, 18)
+      .forEach((entry) => {
+        entry.sizeBytes = getDirectorySizeWithDu(entry.path);
+      });
+  }
+
+  const compareValue = (entry) => {
+    if (sortBy === 'size') return Number(entry.sizeBytes || 0);
+    if (sortBy === 'mtime') return Number(entry.mtimeMs || 0);
+    return String(entry.name || '').toLowerCase();
+  };
+
+  mapped.sort((a, b) => {
+    const left = compareValue(a);
+    const right = compareValue(b);
+    if (left < right) return sortOrder === 'asc' ? -1 : 1;
+    if (left > right) return sortOrder === 'asc' ? 1 : -1;
+    return String(a.name || '').localeCompare(String(b.name || ''));
+  });
+
+  const trimmed = mapped.slice(0, limit);
+  const parentPath = directoryPath === path.parse(directoryPath).root ? '' : path.dirname(directoryPath);
+  return {
+    path: directoryPath,
+    parentPath,
+    sortBy,
+    sortOrder,
+    totalEntries: mapped.length,
+    entries: trimmed.map((entry) => ({
+      name: entry.name,
+      path: entry.path,
+      type: entry.type,
+      sizeBytes: Number.isFinite(Number(entry.sizeBytes)) ? Number(entry.sizeBytes) : null,
+      modifiedAt: entry.mtime
+    }))
+  };
+}
+
+function scanStorageHeavyPaths(payload = {}) {
+  const rootPath = resolveStorageDirectoryPathForRequest(payload.path);
+  const rawLimit = Number.parseInt(String(payload.limit || ''), 10);
+  const limit = Number.isInteger(rawLimit)
+    ? Math.min(Math.max(rawLimit, 1), storageHeavyScanMaxItems)
+    : 36;
+  const rawDepth = Number.parseInt(String(payload.maxDepth || ''), 10);
+  const maxDepth = Number.isInteger(rawDepth)
+    ? Math.min(Math.max(rawDepth, 1), storageHeavyScanMaxDepth)
+    : 3;
+  const entries = [];
+
+  if (commandExistsSync('du')) {
+    const args = ['-x', '-B1', '-d', String(maxDepth), rootPath];
+    const result = runSystemCommandSync('du', args, {
+      allowNonZero: true,
+      timeoutMs: 1000 * 60 * 2,
+      maxBuffer: 1024 * 1024 * 16
+    });
+    const rows = String(result.stdout || '')
+      .replace(/\r/g, '')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    rows.forEach((line) => {
+      const match = /^(\d+)\s+(.+)$/.exec(line);
+      if (!match) return;
+      const sizeBytes = Number.parseInt(match[1], 10);
+      const absolutePath = normalizeAbsoluteStoragePath(match[2]);
+      if (!absolutePath || !Number.isFinite(sizeBytes)) return;
+      entries.push({
+        path: absolutePath,
+        sizeBytes,
+        type: pathExistsSyncSafe(absolutePath) && fs.existsSync(absolutePath) && fs.statSync(absolutePath).isDirectory()
+          ? 'directory'
+          : 'file'
+      });
+    });
+  }
+
+  if (entries.length === 0) {
+    let queue = [{ absolutePath: rootPath, depth: 0 }];
+    const visited = new Set();
+    while (queue.length > 0 && entries.length < limit * 4) {
+      const current = queue.shift();
+      if (!current) continue;
+      const absolutePath = current.absolutePath;
+      if (!absolutePath || visited.has(absolutePath)) continue;
+      visited.add(absolutePath);
+      let stats = null;
+      try {
+        stats = fs.statSync(absolutePath);
+      } catch (_error) {
+        stats = null;
+      }
+      if (!stats) continue;
+      if (stats.isFile()) {
+        entries.push({
+          path: absolutePath,
+          sizeBytes: Number(stats.size || 0),
+          type: 'file'
+        });
+        continue;
+      }
+      const dirSize = getDirectorySizeWithDu(absolutePath);
+      entries.push({
+        path: absolutePath,
+        sizeBytes: Number.isFinite(Number(dirSize)) ? Number(dirSize) : 0,
+        type: 'directory'
+      });
+      if (!stats.isDirectory() || current.depth >= maxDepth) continue;
+      let children = [];
+      try {
+        children = fs.readdirSync(absolutePath, { withFileTypes: true });
+      } catch (_error) {
+        children = [];
+      }
+      children.forEach((entry) => {
+        const name = String(entry && entry.name ? entry.name : '').trim();
+        if (!name || name === '.' || name === '..') return;
+        queue.push({
+          absolutePath: path.join(absolutePath, name),
+          depth: current.depth + 1
+        });
+      });
+    }
+  }
+
+  entries.sort((a, b) => Number(b.sizeBytes || 0) - Number(a.sizeBytes || 0));
+  const top = entries
+    .filter((entry) => entry.path !== rootPath)
+    .slice(0, limit)
+    .map((entry) => ({
+      path: entry.path,
+      name: path.basename(entry.path),
+      type: entry.type,
+      sizeBytes: Number(entry.sizeBytes || 0)
+    }));
+  const totalBytes = top.reduce((sum, entry) => sum + Number(entry.sizeBytes || 0), 0);
+  return {
+    path: rootPath,
+    scannedAt: nowIso(),
+    maxDepth,
+    limit,
+    totalBytes,
+    entries: top
+  };
+}
+
+function parseStoragePathList(rawPaths, maxItems = storageUploadJobMaxFiles) {
+  const values = Array.isArray(rawPaths) ? rawPaths : [];
+  const unique = [];
+  const seen = new Set();
+  values.forEach((entry) => {
+    const absolutePath = normalizeAbsoluteStoragePath(entry);
+    if (!absolutePath || seen.has(absolutePath)) return;
+    seen.add(absolutePath);
+    unique.push(absolutePath);
+  });
+  return unique.slice(0, maxItems);
+}
+
+function sanitizeDriveFileName(rawName, fallbackName = 'archivo') {
+  const compact = String(rawName || '')
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const fallback = String(fallbackName || 'archivo')
+    .replace(/[\\/:*?"<>|]+/g, '-')
+    .trim() || 'archivo';
+  if (!compact) return fallback;
+  return compact.length > 120 ? compact.slice(0, 120).trim() : compact;
+}
+
+function sanitizeDriveQueryLiteral(rawValue) {
+  return String(rawValue || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'");
+}
+
+function buildBackupFileName(appName, appId, createdAtIso) {
+  const stamp = String(createdAtIso || nowIso()).replace(/[-:.TZ]/g, '').slice(0, 14);
+  const safeName = sanitizeDriveFileName(appName || appId || 'app-backup', 'app-backup').replace(/\s+/g, '_');
+  return `${safeName}_${stamp}.tar.gz`;
+}
+
+function detectGoogleCredentialType(rawCredentials) {
+  const credentials = rawCredentials && typeof rawCredentials === 'object' ? rawCredentials : {};
+  if (String(credentials.type || '').trim() === 'service_account') {
+    return 'service_account';
+  }
+  if (credentials.installed || credentials.web) {
+    return 'oauth_client';
+  }
+  if (credentials.client_id && credentials.client_secret) {
+    return 'oauth_client';
+  }
+  return '';
+}
+
+function normalizeDriveCredentialPayload(rawValue) {
+  const parsed =
+    rawValue && typeof rawValue === 'object'
+      ? rawValue
+      : (() => {
+          try {
+            return JSON.parse(String(rawValue || '{}'));
+          } catch (_error) {
+            return {};
+          }
+        })();
+  const credentialType = detectGoogleCredentialType(parsed);
+  if (!credentialType) {
+    throw createClientRequestError(
+      'JSON de credenciales no reconocido. Usa service account o OAuth client de Google.',
+      400
+    );
+  }
+
+  if (credentialType === 'service_account') {
+    const clientEmail = String(parsed.client_email || '').trim();
+    const privateKey = String(parsed.private_key || '').trim();
+    if (!clientEmail || !privateKey) {
+      throw createClientRequestError('Credenciales service account incompletas (client_email/private_key).', 400);
+    }
+    return {
+      credentialType,
+      authMode: 'service_account',
+      normalized: parsed,
+      details: {
+        credentialType,
+        projectId: String(parsed.project_id || '').trim(),
+        clientEmail
+      }
+    };
+  }
+
+  const oauthConfig = parsed.installed || parsed.web || parsed;
+  const clientId = String(oauthConfig.client_id || '').trim();
+  const clientSecret = String(oauthConfig.client_secret || '').trim();
+  const redirectUris = Array.isArray(oauthConfig.redirect_uris)
+    ? oauthConfig.redirect_uris.map((entry) => String(entry || '').trim()).filter(Boolean)
+    : [];
+  if (!clientId || !clientSecret) {
+    throw createClientRequestError('Credenciales OAuth incompletas (client_id/client_secret).', 400);
+  }
+  return {
+    credentialType: 'oauth_client',
+    authMode: 'oauth_client',
+    normalized:
+      parsed.installed || parsed.web
+        ? parsed
+        : {
+            installed: {
+              client_id: clientId,
+              client_secret: clientSecret,
+              redirect_uris: redirectUris.length > 0 ? redirectUris : [driveOauthFallbackRedirectUri]
+            }
+          },
+    details: {
+      credentialType: 'oauth_client',
+      clientId,
+      redirectUris: redirectUris.length > 0 ? redirectUris : [driveOauthFallbackRedirectUri]
+    }
+  };
+}
+
+function extractDriveOauthClientConfig(credentialsObject, preferredRedirectUri = '') {
+  const payload = credentialsObject && typeof credentialsObject === 'object' ? credentialsObject : {};
+  const oauthConfig = payload.installed || payload.web || payload;
+  const redirectUris = Array.isArray(oauthConfig.redirect_uris)
+    ? oauthConfig.redirect_uris.map((entry) => String(entry || '').trim()).filter(Boolean)
+    : [];
+  const fallbackRedirectUri = preferredRedirectUri && redirectUris.includes(preferredRedirectUri)
+    ? preferredRedirectUri
+    : redirectUris[0] || driveOauthFallbackRedirectUri;
+  return {
+    clientId: String(oauthConfig.client_id || '').trim(),
+    clientSecret: String(oauthConfig.client_secret || '').trim(),
+    redirectUri: fallbackRedirectUri,
+    redirectUris
+  };
 }
 
 function resolveRepoRootDir(startDir) {
@@ -956,15 +1546,41 @@ function buildCodexQuotaSnapshot(rawRateLimits, source, observedAt) {
     return null;
   }
   const observedAtValue = String(observedAt || '').trim() || nowIso();
+
+  const primaryQuota = normalized.primary ? {
+    used: normalized.primary.usedPercent,
+    limit: 100, // Representing 100% of the window
+    remaining: normalized.primary.remainingPercent,
+    unit: "percent_of_window",
+    windowMinutes: normalized.primary.windowMinutes,
+    resetAt: normalized.primary.resetAt
+  } : null;
+
+  const secondaryQuota = normalized.secondary ? {
+    used: normalized.secondary.usedPercent,
+    limit: 100,
+    remaining: normalized.secondary.remainingPercent,
+    unit: "percent_of_window",
+    windowMinutes: normalized.secondary.windowMinutes,
+    resetAt: normalized.secondary.resetAt
+  } : null;
+
+  const creditsQuota = normalized.credits ? {
+    remaining: normalized.credits.balance,
+    unit: "credits",
+    hasCredits: normalized.credits.hasCredits,
+    unlimited: normalized.credits.unlimited
+  } : null;
+
   return {
     source: String(source || 'unknown'),
     observedAt: observedAtValue,
     fetchedAt: nowIso(),
     limitId: normalized.limitId,
     planType: normalized.planType,
-    primary: normalized.primary,
-    secondary: normalized.secondary,
-    credits: normalized.credits
+    primary: primaryQuota,
+    secondary: secondaryQuota,
+    credits: creditsQuota,
   };
 }
 
@@ -1490,6 +2106,120 @@ function resolveRepoPathFromRelative(relativePath) {
   return resolved;
 }
 
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function stripOptionalFilePositionSuffix(filePath) {
+  const source = String(filePath || '').trim();
+  if (!source) return '';
+  const noFragment = source.split('#')[0];
+  const match = /^(.*):(\d+)(?::(\d+))?$/.exec(noFragment);
+  if (!match) return noFragment;
+  const basePath = String(match[1] || '').trim();
+  if (!basePath || !basePath.startsWith('/')) return noFragment;
+  return basePath;
+}
+
+function resolveWorkspaceFileCandidate(rawPath) {
+  const source = String(rawPath || '')
+    .replace(/\\/g, '/')
+    .trim();
+  if (!source || source.includes('\0')) return '';
+  if (source.startsWith('/')) {
+    return path.resolve(source);
+  }
+  return resolveRepoPathFromRelative(source);
+}
+
+function isWorkspaceFileDownloadAllowed(relativePath) {
+  const normalized = normalizeRepoRelativePath(relativePath).toLowerCase();
+  if (!normalized) return false;
+  if (normalized === 'uploads' || normalized.startsWith('uploads/')) return false;
+  if (normalized === 'tmp/task-snapshots' || normalized.startsWith('tmp/task-snapshots/')) return false;
+
+  const segments = normalized.split('/').filter(Boolean);
+  if (segments.length === 0) return false;
+
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    const segment = segments[index];
+    if (!segment) continue;
+    if (workspaceFileBlockedDirNames.has(segment)) return false;
+    if (segment.startsWith('.') && segment !== '.github') return false;
+  }
+
+  const baseName = segments[segments.length - 1];
+  if (!baseName || baseName.startsWith('.')) return false;
+  if (workspaceFileBlockedBaseNames.has(baseName)) return false;
+  if (baseName.startsWith('.env')) return false;
+  const ext = path.posix.extname(baseName);
+  if (workspaceFileBlockedExtensions.has(ext)) return false;
+  return true;
+}
+
+function resolveWorkspaceFileForRequest(rawPath) {
+  const source = String(rawPath || '')
+    .replace(/\\/g, '/')
+    .trim();
+  if (!source) {
+    return { errorStatus: 400, error: 'path inválido' };
+  }
+
+  const candidates = [source];
+  const stripped = stripOptionalFilePositionSuffix(source);
+  if (stripped && stripped !== source) {
+    candidates.push(stripped);
+  }
+
+  let sawPathInsideRepo = false;
+  for (const candidate of candidates) {
+    const absolutePath = resolveWorkspaceFileCandidate(candidate);
+    if (!absolutePath) continue;
+
+    const rel = path.relative(repoRootDir, absolutePath);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+      continue;
+    }
+
+    const normalizedRel = normalizeRepoRelativePath(rel.split(path.sep).join('/'));
+    if (!normalizedRel) continue;
+    sawPathInsideRepo = true;
+
+    if (!isWorkspaceFileDownloadAllowed(normalizedRel)) {
+      return { errorStatus: 403, error: 'Ruta de archivo bloqueada por seguridad' };
+    }
+
+    let stats = null;
+    try {
+      stats = fs.statSync(absolutePath);
+    } catch (_error) {
+      stats = null;
+    }
+    if (!stats || !stats.isFile()) {
+      continue;
+    }
+
+    return {
+      filePath: absolutePath,
+      fileName: path.basename(absolutePath)
+    };
+  }
+
+  if (!sawPathInsideRepo) {
+    return { errorStatus: 400, error: 'Ruta fuera del workspace' };
+  }
+  return { errorStatus: 404, error: 'Archivo no encontrado' };
+}
+
+function serveWorkspaceFile(rawPath, res) {
+  const resolved = resolveWorkspaceFileForRequest(rawPath);
+  if (resolved.errorStatus) {
+    return res.status(resolved.errorStatus).json({ error: resolved.error });
+  }
+  res.type(inferMimeTypeFromFilename(resolved.fileName));
+  return res.sendFile(resolved.filePath);
+}
+
 function runGitStdoutSync(args) {
   try {
     return String(
@@ -1864,6 +2594,72 @@ function normalizeDeployedStatus(rawValue, fallback = 'unknown') {
   return fallback;
 }
 
+function classifyDeployedAppCategory(source, locator, location) {
+  const normalizedSource = String(source || '')
+    .trim()
+    .toLowerCase();
+  if (normalizedSource === 'docker') {
+    return { category: 'docker', isSystem: false };
+  }
+  if (normalizedSource === 'pm2') {
+    return { category: 'user', isSystem: false };
+  }
+  if (normalizedSource === 'systemd') {
+    const locatorValue = String(locator || '')
+      .trim()
+      .toLowerCase();
+    const locationValue = String(location || '')
+      .trim()
+      .toLowerCase();
+    const isUserScoped =
+      locatorValue.startsWith('user@') ||
+      locationValue.includes('/.config/systemd/user') ||
+      locationValue.includes('/run/user/') ||
+      locationValue.includes('/home/');
+    return {
+      category: isUserScoped ? 'user' : 'system',
+      isSystem: !isUserScoped
+    };
+  }
+  return { category: 'custom', isSystem: false };
+}
+
+function computeDeployedStatusFlags(statusValue, detailStatusValue) {
+  const normalizedStatus = normalizeDeployedStatus(statusValue, 'unknown');
+  const detail = String(detailStatusValue || '')
+    .trim()
+    .toLowerCase();
+  const isRunning = normalizedStatus === 'running';
+  const isStopped =
+    normalizedStatus === 'stopped' ||
+    normalizedStatus === 'error' ||
+    /(inactive|exited|dead|failed|error|stopped|shutdown)/.test(detail);
+  return {
+    normalizedStatus,
+    isRunning,
+    isStopped
+  };
+}
+
+function buildDeployedAppSearchableText(payload) {
+  const safe = payload && typeof payload === 'object' ? payload : {};
+  return [
+    safe.name,
+    safe.source,
+    safe.status,
+    safe.normalizedStatus,
+    safe.detailStatus,
+    safe.description,
+    safe.location,
+    safe.category,
+    safe.isSystem ? 'system' : 'non-system'
+  ]
+    .map((entry) => String(entry || '').trim())
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+}
+
 function buildDeployedAppSummary(payload, scannedAtIso) {
   const source = String(payload && payload.source ? payload.source : '')
     .trim()
@@ -1875,15 +2671,27 @@ function buildDeployedAppSummary(payload, scannedAtIso) {
   }
   const id = buildDeployedAppId(source, locator);
   if (!id) return null;
-  const status = normalizeDeployedStatus(payload && payload.status ? payload.status : 'unknown');
+  const detailStatus = String((payload && payload.detailStatus) || '').trim();
+  const status = normalizeDeployedStatus(payload && payload.status ? payload.status : detailStatus || 'unknown');
+  const statusFlags = computeDeployedStatusFlags(status, detailStatus);
+  const categoryInfo = classifyDeployedAppCategory(
+    source,
+    locator,
+    String((payload && payload.location) || '').trim()
+  );
   const pidRaw = Number(payload && payload.pid);
   const pid = Number.isInteger(pidRaw) && pidRaw > 0 ? pidRaw : null;
-  return {
+  const summary = {
     id,
     source,
     name,
     status,
-    detailStatus: String((payload && payload.detailStatus) || '').trim(),
+    normalizedStatus: statusFlags.normalizedStatus,
+    isRunning: statusFlags.isRunning,
+    isStopped: statusFlags.isStopped,
+    isSystem: categoryInfo.isSystem,
+    category: categoryInfo.category,
+    detailStatus,
     description: String((payload && payload.description) || '').trim(),
     pid,
     location: String((payload && payload.location) || '').trim(),
@@ -1892,8 +2700,14 @@ function buildDeployedAppSummary(payload, scannedAtIso) {
     canStop: Boolean(payload && payload.canStop),
     canRestart: Boolean(payload && payload.canRestart),
     hasLogs: Boolean(payload && payload.hasLogs),
+    descriptionJobStatus: 'idle',
+    aiDescription: '',
+    aiDescriptionGeneratedAt: '',
+    aiDescriptionProvider: '',
     scannedAt: scannedAtIso
   };
+  summary.searchableText = buildDeployedAppSearchableText(summary);
+  return summary;
 }
 
 function collectDockerDeployedApps(scannedAtIso) {
@@ -2501,6 +3315,298 @@ async function generateDeployedAppsDescriptionsWithCodex(payload = {}) {
       name: String((app && app.name) || '').trim() || appId,
       description
     };
+  });
+}
+
+function normalizeDeployedDescriptionJobStatus(rawStatus, fallback = 'pending') {
+  const value = String(rawStatus || '')
+    .trim()
+    .toLowerCase();
+  if (value === 'pending' || value === 'running' || value === 'completed' || value === 'error') {
+    return value;
+  }
+  return fallback;
+}
+
+function normalizeDeployedDescriptionJobAppIds(rawValue) {
+  return Array.from(
+    new Set(
+      safeParseJsonArray(rawValue)
+        .map((entry) => String(entry || '').trim())
+        .filter(Boolean)
+    )
+  ).slice(0, deployedAppsDescribeMaxItems);
+}
+
+function normalizeDeployedDescriptionResult(rawValue) {
+  const data = safeParseJsonObject(rawValue);
+  const descriptionsRaw = Array.isArray(data.descriptions) ? data.descriptions : [];
+  const descriptions = descriptionsRaw
+    .map((entry) => {
+      const appId = String(entry && entry.appId ? entry.appId : '').trim();
+      const name = String(entry && entry.name ? entry.name : '').trim();
+      const description = normalizeGeneratedDeployedDescription(entry && entry.description ? entry.description : '', 320);
+      const generatedAt = String(entry && entry.generatedAt ? entry.generatedAt : '').trim();
+      if (!appId || !description) return null;
+      return {
+        appId,
+        name: name || appId,
+        description,
+        generatedAt: generatedAt || ''
+      };
+    })
+    .filter(Boolean);
+  return {
+    scannedAt: String(data.scannedAt || '').trim(),
+    generatedAt: String(data.generatedAt || '').trim(),
+    missingAppIds: Array.from(
+      new Set(
+        (Array.isArray(data.missingAppIds) ? data.missingAppIds : [])
+          .map((entry) => String(entry || '').trim())
+          .filter(Boolean)
+      )
+    ),
+    descriptions
+  };
+}
+
+function serializeDeployedDescriptionJobRow(row) {
+  if (!row || typeof row !== 'object') return null;
+  return {
+    id: String(row.id || '').trim(),
+    status: normalizeDeployedDescriptionJobStatus(row.status, 'pending'),
+    provider: String(row.provider || '').trim(),
+    activeAgentId: String(row.active_agent_id || '').trim(),
+    appIds: normalizeDeployedDescriptionJobAppIds(row.app_ids_json),
+    error: String(row.error_text || '').trim(),
+    createdAt: String(row.created_at || '').trim(),
+    updatedAt: String(row.updated_at || '').trim(),
+    startedAt: String(row.started_at || '').trim(),
+    finishedAt: String(row.finished_at || '').trim(),
+    result: normalizeDeployedDescriptionResult(row.result_json)
+  };
+}
+
+function getDeployedDescriptionByAppIdForUser(userId) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) {
+    return new Map();
+  }
+  const rows = listDeployedAppDescriptionsForUserStmt.all(safeUserId);
+  const map = new Map();
+  rows.forEach((row) => {
+    const appId = String(row && row.app_id ? row.app_id : '').trim();
+    const description = normalizeGeneratedDeployedDescription(row && row.description ? row.description : '', 320);
+    if (!appId || !description) return;
+    map.set(appId, {
+      description,
+      provider: String(row && row.provider ? row.provider : '').trim(),
+      generatedAt: String(row && row.generated_at ? row.generated_at : '').trim(),
+      jobId: String(row && row.job_id ? row.job_id : '').trim()
+    });
+  });
+  return map;
+}
+
+function getDeployedDescriptionJobStatusByAppIdForUser(userId) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) {
+    return new Map();
+  }
+  const rows = listRecentDeployedAppDescriptionJobsForUserStmt.all(
+    safeUserId,
+    Math.max(40, deployedAppsDescribeJobPollMaxItems)
+  );
+  const map = new Map();
+  const statusPriority = (status) => {
+    if (status === 'running') return 4;
+    if (status === 'pending') return 3;
+    if (status === 'error') return 2;
+    if (status === 'completed') return 1;
+    return 0;
+  };
+
+  rows.forEach((row) => {
+    const serialized = serializeDeployedDescriptionJobRow(row);
+    if (!serialized) return;
+    const updatedMs = Date.parse(serialized.updatedAt || serialized.createdAt || '');
+    serialized.appIds.forEach((appId) => {
+      const previous = map.get(appId);
+      if (!previous) {
+        map.set(appId, {
+          status: serialized.status,
+          jobId: serialized.id,
+          updatedMs: Number.isFinite(updatedMs) ? updatedMs : 0
+        });
+        return;
+      }
+      const nextRank = statusPriority(serialized.status);
+      const prevRank = statusPriority(previous.status);
+      const previousUpdated = Number.isFinite(previous.updatedMs) ? previous.updatedMs : 0;
+      const nextUpdated = Number.isFinite(updatedMs) ? updatedMs : 0;
+      if (nextRank > prevRank || (nextRank === prevRank && nextUpdated >= previousUpdated)) {
+        map.set(appId, {
+          status: serialized.status,
+          jobId: serialized.id,
+          updatedMs: nextUpdated
+        });
+      }
+    });
+  });
+
+  return map;
+}
+
+function enrichDeployedAppsForUser(userId, rawApps) {
+  const apps = Array.isArray(rawApps) ? rawApps : [];
+  const descriptionsByAppId = getDeployedDescriptionByAppIdForUser(userId);
+  const statusByAppId = getDeployedDescriptionJobStatusByAppIdForUser(userId);
+  return apps.map((app) => {
+    const safeApp = app && typeof app === 'object' ? { ...app } : {};
+    const appId = String(safeApp.id || '').trim();
+    const descriptionMeta = appId ? descriptionsByAppId.get(appId) : null;
+    const statusMeta = appId ? statusByAppId.get(appId) : null;
+    const next = {
+      ...safeApp,
+      normalizedStatus: normalizeDeployedStatus(safeApp.status || safeApp.detailStatus || 'unknown'),
+      isRunning: Boolean(safeApp.status === 'running' || safeApp.normalizedStatus === 'running'),
+      isStopped: Boolean(
+        safeApp.status === 'stopped' ||
+          safeApp.status === 'error' ||
+          safeApp.isStopped ||
+          /(inactive|exited|failed|error|dead)/i.test(String(safeApp.detailStatus || ''))
+      ),
+      isSystem: Boolean(safeApp.isSystem),
+      category: ['system', 'user', 'docker', 'custom'].includes(String(safeApp.category || ''))
+        ? String(safeApp.category || '')
+        : 'custom',
+      descriptionJobStatus:
+        statusMeta && statusMeta.status
+          ? normalizeDeployedDescriptionJobStatus(statusMeta.status, 'idle')
+          : 'idle',
+      aiDescription: descriptionMeta ? String(descriptionMeta.description || '') : '',
+      aiDescriptionGeneratedAt: descriptionMeta ? String(descriptionMeta.generatedAt || '') : '',
+      aiDescriptionProvider: descriptionMeta ? String(descriptionMeta.provider || '') : ''
+    };
+    next.searchableText = buildDeployedAppSearchableText(next);
+    return next;
+  });
+}
+
+function buildDeployedDescriptionJobId() {
+  return `depdesc_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+}
+
+function scheduleDeployedDescriptionJob(jobId) {
+  const safeJobId = String(jobId || '').trim();
+  if (!safeJobId || activeDeployedDescriptionWorkers.has(safeJobId)) {
+    return;
+  }
+  activeDeployedDescriptionWorkers.add(safeJobId);
+  setTimeout(() => {
+    void runDeployedDescriptionJobById(safeJobId).finally(() => {
+      activeDeployedDescriptionWorkers.delete(safeJobId);
+    });
+  }, 10);
+}
+
+async function runDeployedDescriptionJobById(jobId) {
+  const safeJobId = String(jobId || '').trim();
+  if (!safeJobId) return;
+  const row = getDeployedAppDescriptionJobByIdStmt.get(safeJobId);
+  if (!row) return;
+  const userId = getSafeUserId(row.user_id);
+  if (!userId) {
+    const now = nowIso();
+    updateDeployedAppDescriptionJobErrorStmt.run('user_id_invalido', now, now, safeJobId);
+    return;
+  }
+
+  const status = normalizeDeployedDescriptionJobStatus(row.status, 'pending');
+  if (status === 'completed' || status === 'error') {
+    return;
+  }
+
+  const runningAt = nowIso();
+  updateDeployedAppDescriptionJobRunningStmt.run(runningAt, runningAt, safeJobId);
+
+  const appIds = normalizeDeployedDescriptionJobAppIds(row.app_ids_json);
+  if (appIds.length === 0) {
+    const now = nowIso();
+    const resultPayload = {
+      scannedAt: now,
+      generatedAt: now,
+      missingAppIds: [],
+      descriptions: []
+    };
+    updateDeployedAppDescriptionJobCompletedStmt.run(JSON.stringify(resultPayload), now, now, safeJobId);
+    return;
+  }
+
+  const snapshot = collectDeployedAppsSnapshot(true);
+  const appById = new Map(
+    snapshot.apps.map((entry) => [String(entry && entry.id ? entry.id : '').trim(), entry])
+  );
+  const selectedApps = appIds.map((appId) => appById.get(appId)).filter(Boolean);
+  const missingAppIds = appIds.filter((appId) => !appById.has(appId));
+  const activeAgentId = String(row.active_agent_id || '').trim();
+  const usernameRow = getUsernameByIdStmt.get(userId);
+  const username = String((usernameRow && usernameRow.username) || '').trim();
+  const generatedAt = nowIso();
+
+  try {
+    const descriptions = await generateDeployedAppsDescriptionsWithCodex({
+      userId,
+      username,
+      activeAgentId,
+      apps: selectedApps
+    });
+
+    descriptions.forEach((entry) => {
+      const appId = String(entry && entry.appId ? entry.appId : '').trim();
+      const description = normalizeGeneratedDeployedDescription(entry && entry.description ? entry.description : '', 320);
+      if (!appId || !description) return;
+      upsertDeployedAppDescriptionStmt.run(
+        userId,
+        appId,
+        String(row.provider || '').trim() || 'codex-cli',
+        description,
+        generatedAt,
+        safeJobId
+      );
+    });
+
+    const resultPayload = {
+      scannedAt: String(snapshot.scannedAt || ''),
+      generatedAt,
+      missingAppIds,
+      descriptions: descriptions.map((entry) => ({
+        appId: String(entry && entry.appId ? entry.appId : '').trim(),
+        name: String(entry && entry.name ? entry.name : '').trim(),
+        description: normalizeGeneratedDeployedDescription(entry && entry.description ? entry.description : '', 320),
+        generatedAt
+      }))
+    };
+    const finishedAt = nowIso();
+    updateDeployedAppDescriptionJobCompletedStmt.run(
+      JSON.stringify(resultPayload),
+      finishedAt,
+      finishedAt,
+      safeJobId
+    );
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'describe_failed', 800);
+    const finishedAt = nowIso();
+    updateDeployedAppDescriptionJobErrorStmt.run(reason, finishedAt, finishedAt, safeJobId);
+  }
+}
+
+function resumePendingDeployedDescriptionJobs() {
+  const rows = listPendingDeployedAppDescriptionJobsStmt.all(deployedAppsDescribeJobPollMaxItems);
+  rows.forEach((row) => {
+    const jobId = String(row && row.id ? row.id : '').trim();
+    if (!jobId) return;
+    scheduleDeployedDescriptionJob(jobId);
   });
 }
 
@@ -4508,6 +5614,42 @@ CREATE TABLE IF NOT EXISTS task_run_commands (
 
 CREATE INDEX IF NOT EXISTS idx_task_run_commands_task_position
 ON task_run_commands(task_run_id, position ASC, id ASC);
+
+CREATE TABLE IF NOT EXISTS deployed_app_description_jobs (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  app_ids_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'pending',
+  provider TEXT NOT NULL DEFAULT '',
+  active_agent_id TEXT NOT NULL DEFAULT '',
+  result_json TEXT NOT NULL DEFAULT '{}',
+  error_text TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  started_at TEXT NOT NULL DEFAULT '',
+  finished_at TEXT NOT NULL DEFAULT '',
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployed_app_description_jobs_user_created
+ON deployed_app_description_jobs(user_id, created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_deployed_app_description_jobs_status
+ON deployed_app_description_jobs(status, updated_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS deployed_app_descriptions (
+  user_id INTEGER NOT NULL,
+  app_id TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  job_id TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (user_id, app_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployed_app_descriptions_user_generated
+ON deployed_app_descriptions(user_id, generated_at DESC, app_id ASC);
 `);
 
 function hasConversationColumn(columnName) {
@@ -4634,6 +5776,12 @@ const getUserNotificationSettingsStmt = db.prepare(`
 const updateUserNotificationSettingsStmt = db.prepare(
   'UPDATE users SET discord_webhook_url = ?, discord_notify_on_finish = ?, discord_include_result = ? WHERE id = ?'
 );
+const getUsernameByIdStmt = db.prepare(`
+  SELECT username
+  FROM users
+  WHERE id = ?
+  LIMIT 1
+`);
 const getUserActiveAiAgentIdStmt = db.prepare(`
   SELECT active_ai_agent_id
   FROM users
@@ -4684,6 +5832,155 @@ const upsertUserAgentIntegrationStmt = db.prepare(`
 const deleteUserAgentIntegrationStmt = db.prepare(`
   DELETE FROM user_agent_integrations
   WHERE user_id = ? AND agent_id = ?
+`);
+const insertDeployedAppDescriptionJobStmt = db.prepare(`
+  INSERT INTO deployed_app_description_jobs (
+    id,
+    user_id,
+    app_ids_json,
+    status,
+    provider,
+    active_agent_id,
+    result_json,
+    error_text,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, '{}', '', ?, ?, '', '')
+`);
+const updateDeployedAppDescriptionJobRunningStmt = db.prepare(`
+  UPDATE deployed_app_description_jobs
+  SET
+    status = 'running',
+    started_at = CASE
+      WHEN LENGTH(started_at) > 0 THEN started_at
+      ELSE ?
+    END,
+    updated_at = ?,
+    error_text = ''
+  WHERE id = ?
+`);
+const updateDeployedAppDescriptionJobCompletedStmt = db.prepare(`
+  UPDATE deployed_app_description_jobs
+  SET
+    status = 'completed',
+    result_json = ?,
+    error_text = '',
+    finished_at = ?,
+    updated_at = ?
+  WHERE id = ?
+`);
+const updateDeployedAppDescriptionJobErrorStmt = db.prepare(`
+  UPDATE deployed_app_description_jobs
+  SET
+    status = 'error',
+    error_text = ?,
+    finished_at = ?,
+    updated_at = ?
+  WHERE id = ?
+`);
+const getDeployedAppDescriptionJobByIdStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    app_ids_json,
+    status,
+    provider,
+    active_agent_id,
+    result_json,
+    error_text,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  FROM deployed_app_description_jobs
+  WHERE id = ?
+  LIMIT 1
+`);
+const getDeployedAppDescriptionJobForUserStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    app_ids_json,
+    status,
+    provider,
+    active_agent_id,
+    result_json,
+    error_text,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  FROM deployed_app_description_jobs
+  WHERE id = ?
+    AND user_id = ?
+  LIMIT 1
+`);
+const listRecentDeployedAppDescriptionJobsForUserStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    app_ids_json,
+    status,
+    provider,
+    active_agent_id,
+    result_json,
+    error_text,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  FROM deployed_app_description_jobs
+  WHERE user_id = ?
+  ORDER BY created_at DESC, id DESC
+  LIMIT ?
+`);
+const listPendingDeployedAppDescriptionJobsStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    app_ids_json,
+    status,
+    provider,
+    active_agent_id,
+    result_json,
+    error_text,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  FROM deployed_app_description_jobs
+  WHERE status IN ('pending', 'running')
+  ORDER BY created_at ASC, id ASC
+  LIMIT ?
+`);
+const upsertDeployedAppDescriptionStmt = db.prepare(`
+  INSERT INTO deployed_app_descriptions (
+    user_id,
+    app_id,
+    provider,
+    description,
+    generated_at,
+    job_id
+  )
+  VALUES (?, ?, ?, ?, ?, ?)
+  ON CONFLICT(user_id, app_id) DO UPDATE SET
+    provider = excluded.provider,
+    description = excluded.description,
+    generated_at = excluded.generated_at,
+    job_id = excluded.job_id
+`);
+const listDeployedAppDescriptionsForUserStmt = db.prepare(`
+  SELECT
+    app_id,
+    provider,
+    description,
+    generated_at,
+    job_id
+  FROM deployed_app_descriptions
+  WHERE user_id = ?
 `);
 const listMessagesStmt = db.prepare(`
   SELECT id, role, content, created_at
@@ -5274,6 +6571,19 @@ app.get(/^\/.*\/uploads\/([^/]+)\/([^/]+)$/, requireAuth, (req, res) => {
   const storedName = req.params[1];
   return serveManagedAttachmentFromParams(req, res, conversationId, storedName);
 });
+
+app.get('/api/workspace/file', requireAuth, (req, res) => {
+  const rawPath = typeof req.query.path === 'string' ? req.query.path : '';
+  return serveWorkspaceFile(rawPath, res);
+});
+
+const repoRootUrlPath = repoRootDir.replace(/\\/g, '/');
+if (repoRootUrlPath.startsWith('/')) {
+  const repoRootRegex = new RegExp(`^${escapeRegExp(repoRootUrlPath)}(?:/.*)?$`);
+  app.get(repoRootRegex, requireAuth, (req, res) => {
+    return serveWorkspaceFile(req.path, res);
+  });
+}
 
 function buildConversationTitle(message) {
   const compact = String(message || '').replace(/\s+/g, ' ').trim();
@@ -6845,16 +8155,25 @@ app.get('/api/tools/observability', requireAuth, (_req, res) => {
 });
 
 app.get('/api/tools/deployed-apps', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
   const forceRefresh = String(req.query.refresh || '').trim() === '1';
   const snapshot = collectDeployedAppsSnapshot(forceRefresh);
+  const apps = enrichDeployedAppsForUser(safeUserId, snapshot.apps);
   return res.json({
     ok: true,
     scannedAt: snapshot.scannedAt,
-    apps: snapshot.apps
+    apps
   });
 });
 
-app.post('/api/tools/deployed-apps/describe', requireAuth, async (req, res) => {
+app.post('/api/tools/deployed-apps/describe', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
   const rawIds =
     req.body && Array.isArray(req.body.appIds)
       ? req.body.appIds
@@ -6880,47 +8199,71 @@ app.post('/api/tools/deployed-apps/describe', requireAuth, async (req, res) => {
   if (selectedApps.length === 0) {
     return res.status(404).json({ error: 'No se encontraron apps desplegadas para los IDs seleccionados.' });
   }
-  const missingAppIds = requestedIds.filter((appId) => !appById.has(appId));
   const activeAgentId = getUserActiveAiAgentId(req.session.userId) || '';
   const provider = 'codex-cli';
-  const generatedAt = nowIso();
-
-  try {
-    const descriptions = await generateDeployedAppsDescriptionsWithCodex({
-      userId: req.session.userId,
-      username: req.session && typeof req.session.username === 'string' ? req.session.username : '',
-      activeAgentId,
-      apps: selectedApps
-    });
-
-    return res.json({
-      ok: true,
-      provider,
-      activeAgentId,
+  const createdAt = nowIso();
+  const jobId = buildDeployedDescriptionJobId();
+  insertDeployedAppDescriptionJobStmt.run(
+    jobId,
+    safeUserId,
+    JSON.stringify(requestedIds),
+    'pending',
+    provider,
+    activeAgentId,
+    createdAt,
+    createdAt
+  );
+  scheduleDeployedDescriptionJob(jobId);
+  const jobRow = getDeployedAppDescriptionJobForUserStmt.get(jobId, safeUserId);
+  const serialized = serializeDeployedDescriptionJobRow(jobRow) || {
+    id: jobId,
+    status: 'pending',
+    provider,
+    activeAgentId,
+    appIds: requestedIds,
+    error: '',
+    createdAt,
+    updatedAt: createdAt,
+    startedAt: '',
+    finishedAt: '',
+    result: {
       scannedAt: snapshot.scannedAt,
-      generatedAt,
-      missingAppIds,
-      descriptions: descriptions.map((entry) => ({
-        appId: entry.appId,
-        name: entry.name,
-        description: entry.description,
-        generatedAt
-      }))
-    });
-  } catch (error) {
-    if (error && error.message === 'CODEX_NOT_FOUND') {
-      return res.status(503).json({
-        error: 'No se encontro Codex CLI en el servidor para generar descripciones.'
-      });
+      generatedAt: '',
+      missingAppIds: [],
+      descriptions: []
     }
-    const reason = truncateForNotify(error && error.message ? error.message : 'describe_failed', 220);
-    return res.status(500).json({
-      error: `No se pudo generar la descripcion con IA: ${reason}`
-    });
+  };
+  return res.json({
+    ok: true,
+    scannedAt: snapshot.scannedAt,
+    job: serialized
+  });
+});
+
+app.get('/api/tools/deployed-apps/describe/:jobId', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
   }
+  const jobId = String(req.params.jobId || '').trim();
+  if (!jobId) {
+    return res.status(400).json({ error: 'job_id inválido' });
+  }
+  const row = getDeployedAppDescriptionJobForUserStmt.get(jobId, safeUserId);
+  if (!row) {
+    return res.status(404).json({ error: 'Job no encontrado' });
+  }
+  return res.json({
+    ok: true,
+    job: serializeDeployedDescriptionJobRow(row)
+  });
 });
 
 app.post('/api/tools/deployed-apps/:appId/action', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
   const appId = String(req.params.appId || '').trim();
   const action = normalizeDeployedAppAction(req.body && req.body.action);
   if (!action) {
@@ -6948,7 +8291,8 @@ app.post('/api/tools/deployed-apps/:appId/action', requireAuth, (req, res) => {
   }
 
   const refreshedSnapshot = collectDeployedAppsSnapshot(true);
-  const refreshedApp = refreshedSnapshot.apps.find((entry) => entry.id === appSummary.id) || appSummary;
+  const enrichedApps = enrichDeployedAppsForUser(safeUserId, refreshedSnapshot.apps);
+  const refreshedApp = enrichedApps.find((entry) => entry.id === appSummary.id) || appSummary;
   const output = truncateRawText(stripAnsi([actionResult.stdout, actionResult.stderr].filter(Boolean).join('\n')).trim(), 6000);
 
   return res.json({
@@ -6961,6 +8305,10 @@ app.post('/api/tools/deployed-apps/:appId/action', requireAuth, (req, res) => {
 });
 
 app.get('/api/tools/deployed-apps/:appId/logs', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
   const appId = String(req.params.appId || '').trim();
   const appSummary = findDeployedAppById(appId, { forceRefresh: true });
   if (!appSummary) {
@@ -6975,9 +8323,12 @@ app.get('/api/tools/deployed-apps/:appId/logs', requireAuth, (req, res) => {
     return res.status(500).json({ error: `No se pudieron obtener logs: ${logsPayload.error || 'logs_failed'}` });
   }
 
+  const enrichedApp =
+    enrichDeployedAppsForUser(safeUserId, [appSummary])[0] ||
+    appSummary;
   return res.json({
     ok: true,
-    app: appSummary,
+    app: enrichedApp,
     lines: logsPayload.lines,
     logs: logsPayload.logs,
     fetchedAt: nowIso()
@@ -7842,6 +9193,64 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       let finished = false;
       let stdoutText = '';
       let stderrText = '';
+      const getGeminiFailureSummary = (stdoutValue, stderrValue) => {
+        const cleanStdout = stripAnsi(String(stdoutValue || '')).trim();
+        const cleanStderr = stripAnsi(String(stderrValue || '')).trim();
+        const combined = `${cleanStdout}\n${cleanStderr}`.trim();
+        if (!combined) return null;
+
+        const hasUnexpectedObjectError = /an unexpected critical error occurred:\s*\[object object\]/i.test(combined);
+        const hasApiError = /error when talking to gemini api|error generating content via api|apierror:/i.test(combined);
+        const hasMissingAuth = /please set an auth method/i.test(combined);
+
+        if (!hasUnexpectedObjectError && !hasApiError && !hasMissingAuth) {
+          return null;
+        }
+
+        if (/api key not valid|api_key_invalid|invalid api key/i.test(combined)) {
+          return {
+            closeReason: 'invalid_api_key',
+            message:
+              'Gemini rechazo la API key configurada. Revisa la clave en Settings > Integraciones IA > Gemini CLI.'
+          };
+        }
+
+        if (
+          /please set an auth method|GEMINI_API_KEY|GOOGLE_GENAI_USE_VERTEXAI|GOOGLE_GENAI_USE_GCA/i.test(combined)
+        ) {
+          return {
+            closeReason: 'auth_missing',
+            message:
+              'Gemini no tiene autenticacion configurada en el servidor. Configura la API key en Settings > Integraciones IA.'
+          };
+        }
+
+        if (/resource_exhausted|quota|rate limit|too many requests|429/i.test(combined)) {
+          return {
+            closeReason: 'quota_exhausted',
+            message:
+              'Gemini reporto limite de cuota o rate limit alcanzado. Espera el reset de cuota o cambia de proyecto/API key.'
+          };
+        }
+
+        const summaryLine = cleanStderr
+          .split(/\r?\n/)
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+          .find((entry) => /error when talking to gemini api|error generating content via api|apierror:/i.test(entry));
+
+        if (summaryLine) {
+          return {
+            closeReason: 'provider_error',
+            message: truncateForNotify(summaryLine, 260)
+          };
+        }
+
+        return {
+          closeReason: 'provider_error',
+          message: 'Gemini devolvio un error interno inesperado. Revisa API key y cuota de Gemini.'
+        };
+      };
 
       const finalizeGeminiRequest = ({ ok, exitCode, closeReason, output }) => {
         if (finished) return;
@@ -8002,15 +9411,21 @@ app.post('/api/chat', requireAuth, async (req, res) => {
               .slice(-1)[0] || ''
           : '';
         const runWasKilled = Boolean(activeRun && activeRun.killRequested);
-        const success = normalizedExitCode === 0 && !runWasKilled;
+        const inferredFailure = runWasKilled ? null : getGeminiFailureSummary(cleanStdout, cleanStderr);
+        const success = normalizedExitCode === 0 && !runWasKilled && !inferredFailure;
         let output = cleanStdout;
-        let closeReason = success ? 'completed' : 'provider_error';
+        let closeReason = success
+          ? 'completed'
+          : inferredFailure && inferredFailure.closeReason
+            ? inferredFailure.closeReason
+            : 'provider_error';
 
         if (runWasKilled) {
           closeReason = String(activeRun && activeRun.killReason ? activeRun.killReason : 'killed_by_user');
         }
         if (!success) {
           output =
+            (inferredFailure && inferredFailure.message) ||
             output ||
             stderrTail ||
             (signal
@@ -9174,6 +10589,7 @@ process.on('uncaughtException', (error) => {
 
 markStaleTaskRunsOnStartup();
 markRestartRecoveredOnStartup();
+resumePendingDeployedDescriptionJobs();
 
 const server = app.listen(port, host, () => {
   console.log(`CodexWeb escuchando en http://${host}:${port}`);

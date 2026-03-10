@@ -2,5 +2,12 @@ node_modules/
 .env
 app.db
 app.db-*
+chat.db
+chat.db-*
+*.corrupt.*
+db_backups_*/
+db_fix_*/
+codexweb_context_pack/
+codexweb_context_pack.zip
 npm-debug.log*
 /tmp/

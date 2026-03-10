@@ -19,6 +19,7 @@ import {
   actionToolsDeployedApp,
   describeToolsDeployedApps,
   getCodexRuns,
+  getToolsDeployedAppDescribeJob,
   getToolsDeployedAppLogs,
   getToolsDeployedApps,
   getTaskDashboard,
@@ -227,6 +228,9 @@ export default function TerminalLogScreen({
   const [deployLogsByApp, setDeployLogsByApp] = useState<Record<string, DeployLogsState>>({});
   const [selectingDeployedApps, setSelectingDeployedApps] = useState(false);
   const [selectedDeployedApps, setSelectedDeployedApps] = useState<Record<string, true>>({});
+  const [deployedSearchQuery, setDeployedSearchQuery] = useState('');
+  const [deployedStatusFilter, setDeployedStatusFilter] = useState<'all' | 'running' | 'stopped' | 'failing'>('all');
+  const [deployedTypeFilter, setDeployedTypeFilter] = useState<'all' | 'system' | 'non-system'>('all');
   const [generatedDeployedDescriptions, setGeneratedDeployedDescriptions] = useState<
     Record<string, { description: string; generatedAt: string }>
   >({});
@@ -610,7 +614,47 @@ export default function TerminalLogScreen({
       }));
   }, [conversationById, searchData]);
 
-  const deployedAppIds = useMemo(() => deployedApps.map((app) => app.id), [deployedApps]);
+  const filteredDeployedApps = useMemo(() => {
+    const query = deployedSearchQuery.trim().toLowerCase();
+    return deployedApps.filter((app) => {
+      const detail = String(app.detailStatus || '').toLowerCase();
+      const sourceStatus = String(app.status || '').toLowerCase();
+      const normalizedStatus = String(app.normalizedStatus || sourceStatus || '').toLowerCase();
+      const isFailing =
+        app.status === 'error' ||
+        app.normalizedStatus === 'error' ||
+        /(error|failed|inactive|exited|dead|unhealthy)/.test(detail);
+
+      if (deployedStatusFilter === 'running' && !app.isRunning && normalizedStatus !== 'running') {
+        return false;
+      }
+      if (deployedStatusFilter === 'stopped' && !(app.isStopped || normalizedStatus === 'stopped')) {
+        return false;
+      }
+      if (deployedStatusFilter === 'failing' && !isFailing) {
+        return false;
+      }
+
+      if (deployedTypeFilter === 'system' && !app.isSystem) {
+        return false;
+      }
+      if (deployedTypeFilter === 'non-system' && app.isSystem) {
+        return false;
+      }
+
+      if (!query) return true;
+      const searchable = String(app.searchableText || '').toLowerCase();
+      if (searchable.includes(query)) return true;
+      return (
+        String(app.name || '').toLowerCase().includes(query) ||
+        String(app.source || '').toLowerCase().includes(query) ||
+        detail.includes(query) ||
+        sourceStatus.includes(query)
+      );
+    });
+  }, [deployedApps, deployedSearchQuery, deployedStatusFilter, deployedTypeFilter]);
+
+  const deployedAppIds = useMemo(() => filteredDeployedApps.map((app) => app.id), [filteredDeployedApps]);
   const selectedDeployedAppIds = useMemo(
     () => deployedAppIds.filter((appId) => Boolean(selectedDeployedApps[appId])),
     [deployedAppIds, selectedDeployedApps]
@@ -712,6 +756,27 @@ export default function TerminalLogScreen({
     if (normalized === 'docker') return 'docker';
     if (normalized === 'pm2') return 'pm2';
     return normalized || 'source';
+  };
+
+  const formatDeployedCategory = (category: string) => {
+    const normalized = String(category || '')
+      .trim()
+      .toLowerCase();
+    if (normalized === 'system') return 'system';
+    if (normalized === 'user') return 'user';
+    if (normalized === 'docker') return 'docker';
+    return 'custom';
+  };
+
+  const formatDescriptionJobStatus = (status: string) => {
+    const normalized = String(status || '')
+      .trim()
+      .toLowerCase();
+    if (normalized === 'pending') return 'pendiente';
+    if (normalized === 'running') return 'en progreso';
+    if (normalized === 'completed') return 'completado';
+    if (normalized === 'error') return 'error';
+    return 'sin job';
   };
 
   const openRunGroup = (key: string) => {
@@ -861,6 +926,27 @@ export default function TerminalLogScreen({
     });
   };
 
+  const waitForDeployedDescribeJob = async (jobId: string) => {
+    const safeJobId = String(jobId || '').trim();
+    if (!safeJobId) {
+      throw new Error('No se recibió jobId para la generación de descripción.');
+    }
+    let latest = await getToolsDeployedAppDescribeJob(safeJobId);
+    if (latest.status === 'completed' || latest.status === 'error') {
+      return latest;
+    }
+    for (let attempt = 0; attempt < 90; attempt += 1) {
+      await new Promise((resolve) => {
+        window.setTimeout(resolve, 1300);
+      });
+      latest = await getToolsDeployedAppDescribeJob(safeJobId);
+      if (latest.status === 'completed' || latest.status === 'error') {
+        return latest;
+      }
+    }
+    return latest;
+  };
+
   const runDescribeDeployedApps = async (appIds: string[], mode: 'single' | 'bulk') => {
     const normalizedIds = Array.isArray(appIds)
       ? appIds
@@ -877,9 +963,20 @@ export default function TerminalLogScreen({
     }
     try {
       const payload = await describeToolsDeployedApps(normalizedIds);
-      const items = Array.isArray(payload.descriptions) ? payload.descriptions : [];
+      const jobId = String(payload?.job?.id || '').trim();
+      if (!jobId) {
+        throw new Error('No se pudo crear el job de descripción.');
+      }
+      setDeployNotice(`Job de descripción ${jobId} creado. Procesando en segundo plano...`);
+      await loadDeployedAppsView(true, true);
+
+      const job = await waitForDeployedDescribeJob(jobId);
+      if (job.status === 'error') {
+        throw new Error(job.error || 'El job de descripción terminó con error.');
+      }
+      const items = Array.isArray(job.result?.descriptions) ? job.result.descriptions : [];
       if (items.length === 0) {
-        throw new Error('La IA no devolvio descripciones para las apps seleccionadas.');
+        throw new Error('El job terminó sin descripciones para las apps seleccionadas.');
       }
       setGeneratedDeployedDescriptions((prev) => {
         const next = { ...prev };
@@ -895,8 +992,9 @@ export default function TerminalLogScreen({
         return next;
       });
       setDeployNotice(
-        `Descripcion generada para ${items.length} app(s) con ${String(payload.provider || 'IA configurada')}.`
+        `Descripción completada para ${items.length} app(s) con ${String(job.provider || 'IA configurada')}.`
       );
+      await loadDeployedAppsView(true, true);
     } catch (error) {
       setDeployedAppsError(error instanceof Error ? error.message : 'No se pudieron generar descripciones');
     } finally {
@@ -1819,11 +1917,67 @@ export default function TerminalLogScreen({
               ) : null}
             </div>
 
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <label className="rounded-lg border border-zinc-800 bg-black/40 px-3 py-2 text-xs text-zinc-300">
+                <span className="block text-[10px] uppercase text-zinc-500 mb-1">Buscar</span>
+                <input
+                  value={deployedSearchQuery}
+                  onChange={(event) => setDeployedSearchQuery(event.target.value)}
+                  placeholder="Nombre, source, detalle, estado..."
+                  className="w-full bg-transparent text-xs text-zinc-100 placeholder:text-zinc-500 outline-none"
+                />
+              </label>
+
+              <label className="rounded-lg border border-zinc-800 bg-black/40 px-3 py-2 text-xs text-zinc-300">
+                <span className="block text-[10px] uppercase text-zinc-500 mb-1">Estado</span>
+                <select
+                  value={deployedStatusFilter}
+                  onChange={(event) =>
+                    setDeployedStatusFilter(
+                      event.target.value === 'running' ||
+                      event.target.value === 'stopped' ||
+                      event.target.value === 'failing'
+                        ? event.target.value
+                        : 'all'
+                    )
+                  }
+                  className="w-full bg-transparent text-xs text-zinc-100 outline-none"
+                >
+                  <option value="all">Todas</option>
+                  <option value="running">Ejecutando</option>
+                  <option value="stopped">Paradas</option>
+                  <option value="failing">Fallando / inactive / exited</option>
+                </select>
+              </label>
+
+              <label className="rounded-lg border border-zinc-800 bg-black/40 px-3 py-2 text-xs text-zinc-300">
+                <span className="block text-[10px] uppercase text-zinc-500 mb-1">Tipo</span>
+                <select
+                  value={deployedTypeFilter}
+                  onChange={(event) =>
+                    setDeployedTypeFilter(
+                      event.target.value === 'system' || event.target.value === 'non-system'
+                        ? event.target.value
+                        : 'all'
+                    )
+                  }
+                  className="w-full bg-transparent text-xs text-zinc-100 outline-none"
+                >
+                  <option value="all">Todas</option>
+                  <option value="system">Solo sistema</option>
+                  <option value="non-system">No sistema</option>
+                </select>
+              </label>
+            </div>
+
             {deployNotice ? <p className="text-xs text-emerald-300">{deployNotice}</p> : null}
             {deployedAppsError ? <p className="text-xs text-red-300">{deployedAppsError}</p> : null}
             {deployedAppsScannedAt ? (
               <p className="text-[10px] text-zinc-600">ultimo escaneo {formatTime(deployedAppsScannedAt)}</p>
             ) : null}
+            <p className="text-[10px] text-zinc-600">
+              mostrando {filteredDeployedApps.length} de {deployedApps.length} app(s)
+            </p>
 
             {deployedAppsLoading && deployedApps.length === 0 ? (
               <p className="text-sm text-zinc-500">Buscando apps desplegadas...</p>
@@ -1833,25 +1987,44 @@ export default function TerminalLogScreen({
               <p className="text-sm text-zinc-500">No se detectaron apps desplegadas gestionables en este entorno.</p>
             ) : null}
 
+            {!deployedAppsLoading && deployedApps.length > 0 && filteredDeployedApps.length === 0 ? (
+              <p className="text-sm text-zinc-500">No hay apps que coincidan con los filtros actuales.</p>
+            ) : null}
+
             <div className="space-y-2">
-              {deployedApps.map((app) => {
+              {filteredDeployedApps.map((app) => {
                 const isOpen = Boolean(expandedDeployedApps[app.id]);
                 const statusText = formatDeployedStatus(app.status);
+                const isFailing =
+                  app.status === 'error' ||
+                  app.normalizedStatus === 'error' ||
+                  app.isStopped ||
+                  /(inactive|exited|failed|dead|error|unhealthy)/i.test(String(app.detailStatus || ''));
                 const statusClass =
-                  app.status === 'running'
+                  app.isRunning || app.status === 'running'
                     ? 'text-emerald-300'
-                    : app.status === 'error'
+                    : isFailing
                       ? 'text-red-300'
                       : app.status === 'stopped'
-                        ? 'text-zinc-400'
+                        ? 'text-red-300'
                         : 'text-amber-300';
                 const busyForApp = deployActionBusy?.appId === app.id;
                 const logsState = deployLogsByApp[app.id];
                 const isSelected = Boolean(selectedDeployedApps[app.id]);
-                const generatedDescription = generatedDeployedDescriptions[app.id];
-                const describeBusy = describingDeployedAppId === app.id;
+                const generatedDescription =
+                  generatedDeployedDescriptions[app.id] ||
+                  (app.aiDescription
+                    ? { description: app.aiDescription, generatedAt: app.aiDescriptionGeneratedAt || '' }
+                    : undefined);
+                const describeBusy =
+                  describingDeployedAppId === app.id ||
+                  app.descriptionJobStatus === 'pending' ||
+                  app.descriptionJobStatus === 'running';
+                const cardClass = isFailing
+                  ? 'rounded-xl border border-red-500/40 bg-red-500/5 p-3'
+                  : 'rounded-xl border border-zinc-800 bg-black/40 p-3';
                 return (
-                  <article key={app.id} className="rounded-xl border border-zinc-800 bg-black/40 p-3">
+                  <article key={app.id} className={cardClass}>
                     <div className="flex items-center gap-2">
                       {selectingDeployedApps ? (
                         <input
@@ -1875,9 +2048,22 @@ export default function TerminalLogScreen({
                         className="w-full text-left flex items-center justify-between gap-3"
                       >
                         <div className="min-w-0">
-                          <p className="text-sm text-zinc-100 truncate">{app.name}</p>
-                          <p className="text-xs text-zinc-500 mt-1 truncate">
-                            {formatDeployedSource(app.source)} · {statusText}
+                          <div className="flex items-center gap-2">
+                            <p className="text-sm text-zinc-100 truncate">{app.name}</p>
+                            <span
+                              className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] uppercase tracking-wide border ${
+                                isFailing
+                                  ? 'border-red-400/60 bg-red-500/20 text-red-200'
+                                  : app.isRunning
+                                    ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-200'
+                                    : 'border-zinc-600 bg-zinc-700/20 text-zinc-300'
+                              }`}
+                            >
+                              {statusText}
+                            </span>
+                          </div>
+                          <p className={`text-xs mt-1 truncate ${isFailing ? 'text-red-300' : 'text-zinc-500'}`}>
+                            {formatDeployedSource(app.source)} · {formatDeployedCategory(app.category)}
                             {app.pid ? ` · pid ${app.pid}` : ''} {app.uptime ? ` · uptime ${app.uptime}` : ''}
                           </p>
                         </div>
@@ -1889,15 +2075,15 @@ export default function TerminalLogScreen({
                       <div className="mt-3 pt-3 border-t border-zinc-800 space-y-3">
                         <div className="grid grid-cols-2 gap-2">
                           <article className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5">
-                            <p className="text-[10px] uppercase text-zinc-500">source / status</p>
+                            <p className="text-[10px] uppercase text-zinc-500">source / status / tipo</p>
                             <p className={`text-xs mt-1 ${statusClass}`}>
-                              {formatDeployedSource(app.source)} / {statusText}
+                              {formatDeployedSource(app.source)} / {statusText} / {formatDeployedCategory(app.category)}
                             </p>
                           </article>
                           <article className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5">
-                            <p className="text-[10px] uppercase text-zinc-500">pid / uptime</p>
+                            <p className="text-[10px] uppercase text-zinc-500">pid / uptime / system</p>
                             <p className="text-xs text-zinc-200 mt-1">
-                              {app.pid ? app.pid : 'n/a'} / {app.uptime || 'n/a'}
+                              {app.pid ? app.pid : 'n/a'} / {app.uptime || 'n/a'} / {app.isSystem ? 'si' : 'no'}
                             </p>
                           </article>
                         </div>
@@ -1905,7 +2091,9 @@ export default function TerminalLogScreen({
                         {generatedDescription ? (
                           <article className="rounded-lg border border-cyan-500/30 bg-cyan-500/5 p-2.5">
                             <p className="text-[11px] uppercase text-cyan-300">
-                              descripcion ia · {formatTime(generatedDescription.generatedAt)}
+                              descripcion ia
+                              {app.aiDescriptionProvider ? ` · ${app.aiDescriptionProvider}` : ''}
+                              {generatedDescription.generatedAt ? ` · ${formatTime(generatedDescription.generatedAt)}` : ''}
                             </p>
                             <p className="text-xs text-zinc-200 mt-1 whitespace-pre-wrap break-words">
                               {generatedDescription.description}
@@ -1922,6 +2110,9 @@ export default function TerminalLogScreen({
                         {app.detailStatus ? (
                           <p className="text-[11px] text-zinc-500 break-all">estado raw: {app.detailStatus}</p>
                         ) : null}
+                        <p className="text-[11px] text-zinc-500 break-all">
+                          job descripcion: {formatDescriptionJobStatus(app.descriptionJobStatus)}
+                        </p>
 
                         <div className="flex items-center gap-2 flex-wrap">
                           <button

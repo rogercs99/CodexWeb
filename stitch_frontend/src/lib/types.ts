@@ -320,12 +320,24 @@ export interface ObservabilitySnapshot {
 
 export type DeployedAppSource = 'docker' | 'systemd' | 'pm2';
 export type DeployedAppStatus = 'running' | 'stopped' | 'error' | 'unknown';
+export type DeployedAppCategory = 'system' | 'user' | 'docker' | 'custom';
+export type DeployedAppDescriptionJobStatus = 'idle' | 'pending' | 'running' | 'completed' | 'error';
 
 export interface ToolsDeployedApp {
   id: string;
   source: DeployedAppSource;
   name: string;
   status: DeployedAppStatus;
+  normalizedStatus: DeployedAppStatus;
+  isRunning: boolean;
+  isStopped: boolean;
+  isSystem: boolean;
+  category: DeployedAppCategory;
+  searchableText: string;
+  descriptionJobStatus: DeployedAppDescriptionJobStatus;
+  aiDescription: string;
+  aiDescriptionGeneratedAt: string;
+  aiDescriptionProvider: string;
   detailStatus: string;
   description: string;
   pid: number | null;
@@ -364,11 +376,30 @@ export interface ToolsDeployedAppGeneratedDescription {
   generatedAt: string;
 }
 
-export interface ToolsDeployedAppDescribeResponse {
+export interface ToolsDeployedAppDescribeJobResult {
+  scannedAt: string;
+  generatedAt: string;
+  missingAppIds: string[];
+  descriptions: ToolsDeployedAppGeneratedDescription[];
+}
+
+export interface ToolsDeployedAppDescribeJob {
+  id: string;
+  status: Exclude<DeployedAppDescriptionJobStatus, 'idle'>;
   provider: string;
   activeAgentId: string;
+  appIds: string[];
+  error: string;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string;
+  finishedAt: string;
+  result: ToolsDeployedAppDescribeJobResult;
+}
+
+export interface ToolsDeployedAppDescribeResponse {
   scannedAt: string;
-  descriptions: ToolsDeployedAppGeneratedDescription[];
+  job: ToolsDeployedAppDescribeJob;
 }
 
 export interface ToolsGitRepoStatusCounts {
@@ -424,9 +455,10 @@ export interface Capabilities {
 }
 
 export interface CodexQuotaWindow {
-  totalPercent: number;
-  usedPercent: number;
-  remainingPercent: number;
+  used: number;
+  limit: number;
+  remaining: number;
+  unit: "percent_of_window";
   windowMinutes: number;
   resetAt: string;
 }

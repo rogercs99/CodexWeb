@@ -33,6 +33,38 @@ function normalizeTitle(value: string) {
   return trimmed || 'Nuevo chat';
 }
 
+function stripOptionalFilePositionSuffix(rawPath: string) {
+  const source = String(rawPath || '').trim();
+  if (!source) return '';
+  const noFragment = source.split('#')[0];
+  const match = /^(.*):(\d+)(?::(\d+))?$/.exec(noFragment);
+  if (!match) return noFragment;
+  const basePath = String(match[1] || '').trim();
+  if (!basePath || !basePath.startsWith('/')) return noFragment;
+  return basePath;
+}
+
+function isLikelyLocalFilesystemPath(rawPath: string) {
+  const source = String(rawPath || '').trim();
+  if (!source) return false;
+  if (/^[a-zA-Z]:\//.test(source)) return true;
+  return (
+    source.startsWith('/root/') ||
+    source.startsWith('/home/') ||
+    source.startsWith('/Users/') ||
+    source.startsWith('/mnt/') ||
+    source.startsWith('/var/') ||
+    source.startsWith('/opt/')
+  );
+}
+
+function buildWorkspaceFileHref(rawPath: string) {
+  const normalized = String(rawPath || '').replace(/\\/g, '/').trim();
+  if (!normalized) return '';
+  const cleanPath = stripOptionalFilePositionSuffix(normalized) || normalized;
+  return `/api/workspace/file?path=${encodeURIComponent(cleanPath)}`;
+}
+
 function normalizeMessageLinkHref(href?: string) {
   const raw = String(href || '').trim();
   if (!raw) return '';
@@ -44,6 +76,9 @@ function normalizeMessageLinkHref(href?: string) {
   const markerIndex = normalizedPath.toLowerCase().indexOf(uploadsMarker);
   if (markerIndex >= 0) {
     return normalizedPath.slice(markerIndex);
+  }
+  if (isLikelyLocalFilesystemPath(normalizedPath)) {
+    return buildWorkspaceFileHref(normalizedPath);
   }
   return raw;
 }
@@ -228,6 +263,7 @@ export default function ChatScreen({
   sendElapsedSeconds,
   isRunning,
   selectedFiles,
+  uploadProgress,
   status,
   onBack,
   onSend,
@@ -255,6 +291,14 @@ export default function ChatScreen({
   sendElapsedSeconds: number;
   isRunning: boolean;
   selectedFiles: File[];
+  uploadProgress: {
+    percent: number;
+    uploadedBytes: number;
+    totalBytes: number;
+    fileName: string;
+    fileIndex: number;
+    totalFiles: number;
+  } | null;
   model: string;
   reasoningEffort: string;
   options: ChatOptions;
@@ -450,7 +494,27 @@ export default function ChatScreen({
 
   const canSend = input.trim().length > 0 || selectedFiles.length > 0;
   const canStop = sending || isRunning;
-  const headerStatus = sending ? `Generando · ${formatElapsed(sendElapsedSeconds)}` : status || 'Sesion activa';
+  const pendingUploadBytes = selectedFiles.reduce((sum, file) => {
+    return sum + Math.max(0, Number(file?.size) || 0);
+  }, 0);
+  const composerUploadProgress = uploadProgress
+    ? { ...uploadProgress, pending: false }
+    : selectedFiles.length > 0
+    ? {
+        percent: 0,
+        uploadedBytes: 0,
+        totalBytes: Math.max(0, Math.round(pendingUploadBytes)),
+        fileName: String(selectedFiles[0]?.name || ''),
+        fileIndex: 0,
+        totalFiles: selectedFiles.length,
+        pending: true
+      }
+    : null;
+  const headerStatus = uploadProgress
+    ? `Subiendo adjuntos · ${uploadProgress.percent}%`
+    : sending
+    ? `Generando · ${formatElapsed(sendElapsedSeconds)}`
+    : status || 'Sesion activa';
 
   return (
     <div className="h-screen bg-black flex flex-col relative overflow-hidden overflow-x-hidden">
@@ -483,6 +547,24 @@ export default function ChatScreen({
                 <span className="truncate">{shortTitle}</span>
               </button>
               <p className="text-xs text-zinc-500">{headerStatus}</p>
+              {uploadProgress ? (
+                <div className="mt-1.5">
+                  <div className="flex items-center justify-between gap-2 text-[11px] text-zinc-400">
+                    <span className="truncate">
+                      {uploadProgress.fileIndex}/{uploadProgress.totalFiles} · {uploadProgress.fileName}
+                    </span>
+                    <span className="shrink-0">
+                      {formatBytes(uploadProgress.uploadedBytes)} / {formatBytes(uploadProgress.totalBytes)}
+                    </span>
+                  </div>
+                  <div className="mt-1 h-1.5 w-full rounded-full bg-zinc-800 overflow-hidden">
+                    <div
+                      className="h-full rounded-full bg-blue-500 transition-[width] duration-150 ease-out"
+                      style={{ width: `${uploadProgress.percent}%` }}
+                    />
+                  </div>
+                </div>
+              ) : null}
               <p className="text-[11px] text-zinc-400">IA activa: {activeAgentName || 'Codex CLI'}</p>
             </div>
             <div className="flex items-center gap-1 shrink-0">
@@ -649,6 +731,37 @@ export default function ChatScreen({
             <button onClick={onClearFiles} className="text-xs bg-zinc-900 border border-zinc-700 px-2 py-1 rounded-lg text-zinc-400" type="button">
               <X size={14} className="inline mr-1" /> limpiar
             </button>
+          </div>
+        ) : null}
+        {composerUploadProgress ? (
+          <div className="mb-2 rounded-xl border border-zinc-800 bg-zinc-900/85 px-3 py-2 pointer-events-auto">
+            <div className="flex items-center justify-between gap-2 text-[11px] text-zinc-300">
+              <span className="truncate">
+                {composerUploadProgress.pending
+                  ? `Listo para subir · ${composerUploadProgress.totalFiles} archivo${
+                      composerUploadProgress.totalFiles === 1 ? '' : 's'
+                    }`
+                  : `${composerUploadProgress.fileIndex}/${composerUploadProgress.totalFiles} · ${composerUploadProgress.fileName}`}
+              </span>
+              <span className="shrink-0">
+                {composerUploadProgress.pending
+                  ? '0%'
+                  : `${Math.max(0, Math.min(100, Math.round(composerUploadProgress.percent)))}%`}
+              </span>
+            </div>
+            <div className="mt-1 h-1.5 w-full rounded-full bg-zinc-800 overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-[width] duration-150 ease-out ${
+                  composerUploadProgress.pending ? 'bg-zinc-600' : 'bg-blue-500'
+                }`}
+                style={{ width: `${Math.max(0, Math.min(100, Math.round(composerUploadProgress.percent)))}%` }}
+              />
+            </div>
+            <p className="mt-1 text-[10px] text-zinc-400">
+              {composerUploadProgress.pending
+                ? `La subida empieza al enviar · ${formatBytes(composerUploadProgress.totalBytes)}`
+                : `${formatBytes(composerUploadProgress.uploadedBytes)} / ${formatBytes(composerUploadProgress.totalBytes)}`}
+            </p>
           </div>
         ) : null}
 

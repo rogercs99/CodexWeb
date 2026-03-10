@@ -12,6 +12,7 @@ import type {
   MessageAttachment,
   Message,
   ToolsDeployedAppActionResponse,
+  ToolsDeployedAppDescribeJob,
   ToolsDeployedAppDescribeResponse,
   ToolsDeployedAppLogsResponse,
   ToolsDeployedAppsPayload,
@@ -330,6 +331,47 @@ export async function getToolsObservability(): Promise<ObservabilitySnapshot> {
   return data.observability;
 }
 
+function normalizeToolsDeployedAppDescribeJob(rawValue: any): ToolsDeployedAppDescribeJob {
+  const rawResult = rawValue?.result && typeof rawValue.result === 'object' ? rawValue.result : {};
+  const descriptions = Array.isArray(rawResult.descriptions)
+    ? rawResult.descriptions
+        .map((entry: any) => ({
+          appId: String(entry?.appId || ''),
+          name: String(entry?.name || ''),
+          description: String(entry?.description || ''),
+          generatedAt: String(entry?.generatedAt || '')
+        }))
+        .filter((entry) => Boolean(entry.appId) && Boolean(entry.description))
+    : [];
+  return {
+    id: String(rawValue?.id || ''),
+    status:
+      rawValue?.status === 'running' ||
+      rawValue?.status === 'completed' ||
+      rawValue?.status === 'error'
+        ? rawValue.status
+        : 'pending',
+    provider: String(rawValue?.provider || ''),
+    activeAgentId: String(rawValue?.activeAgentId || ''),
+    appIds: Array.isArray(rawValue?.appIds)
+      ? rawValue.appIds.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+      : [],
+    error: String(rawValue?.error || ''),
+    createdAt: String(rawValue?.createdAt || ''),
+    updatedAt: String(rawValue?.updatedAt || ''),
+    startedAt: String(rawValue?.startedAt || ''),
+    finishedAt: String(rawValue?.finishedAt || ''),
+    result: {
+      scannedAt: String(rawResult?.scannedAt || ''),
+      generatedAt: String(rawResult?.generatedAt || ''),
+      missingAppIds: Array.isArray(rawResult?.missingAppIds)
+        ? rawResult.missingAppIds.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+        : [],
+      descriptions
+    }
+  };
+}
+
 export async function getToolsDeployedApps(forceRefresh = false): Promise<ToolsDeployedAppsPayload> {
   const suffix = forceRefresh ? '?refresh=1' : '';
   const data = await api<{ scannedAt: string; apps: ToolsDeployedAppsPayload['apps'] }>(
@@ -337,7 +379,58 @@ export async function getToolsDeployedApps(forceRefresh = false): Promise<ToolsD
   );
   return {
     scannedAt: String(data.scannedAt || ''),
-    apps: Array.isArray(data.apps) ? data.apps : []
+    apps: Array.isArray(data.apps)
+      ? data.apps.map((entry: any) => ({
+          id: String(entry?.id || ''),
+          source:
+            entry?.source === 'docker' || entry?.source === 'systemd' || entry?.source === 'pm2'
+              ? entry.source
+              : 'pm2',
+          name: String(entry?.name || ''),
+          status:
+            entry?.status === 'running' ||
+            entry?.status === 'stopped' ||
+            entry?.status === 'error'
+              ? entry.status
+              : 'unknown',
+          normalizedStatus:
+            entry?.normalizedStatus === 'running' ||
+            entry?.normalizedStatus === 'stopped' ||
+            entry?.normalizedStatus === 'error'
+              ? entry.normalizedStatus
+              : 'unknown',
+          isRunning: Boolean(entry?.isRunning),
+          isStopped: Boolean(entry?.isStopped),
+          isSystem: Boolean(entry?.isSystem),
+          category:
+            entry?.category === 'system' ||
+            entry?.category === 'user' ||
+            entry?.category === 'docker'
+              ? entry.category
+              : 'custom',
+          searchableText: String(entry?.searchableText || ''),
+          descriptionJobStatus:
+            entry?.descriptionJobStatus === 'pending' ||
+            entry?.descriptionJobStatus === 'running' ||
+            entry?.descriptionJobStatus === 'completed' ||
+            entry?.descriptionJobStatus === 'error'
+              ? entry.descriptionJobStatus
+              : 'idle',
+          aiDescription: String(entry?.aiDescription || ''),
+          aiDescriptionGeneratedAt: String(entry?.aiDescriptionGeneratedAt || ''),
+          aiDescriptionProvider: String(entry?.aiDescriptionProvider || ''),
+          detailStatus: String(entry?.detailStatus || ''),
+          description: String(entry?.description || ''),
+          pid: Number.isInteger(Number(entry?.pid)) ? Number(entry.pid) : null,
+          location: String(entry?.location || ''),
+          uptime: String(entry?.uptime || ''),
+          canStart: Boolean(entry?.canStart),
+          canStop: Boolean(entry?.canStop),
+          canRestart: Boolean(entry?.canRestart),
+          hasLogs: Boolean(entry?.hasLogs),
+          scannedAt: String(entry?.scannedAt || '')
+        }))
+      : []
   };
 }
 
@@ -368,11 +461,22 @@ export async function describeToolsDeployedApps(
         .map((entry) => String(entry || '').trim())
         .filter(Boolean)
     : [];
-  return api('/api/tools/deployed-apps/describe', {
+  const data = await api<ToolsDeployedAppDescribeResponse>('/api/tools/deployed-apps/describe', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ appIds: normalized })
   });
+  return {
+    scannedAt: String(data?.scannedAt || ''),
+    job: normalizeToolsDeployedAppDescribeJob(data?.job)
+  };
+}
+
+export async function getToolsDeployedAppDescribeJob(jobId: string): Promise<ToolsDeployedAppDescribeJob> {
+  const data = await api<{ job: ToolsDeployedAppDescribeJob }>(
+    `/api/tools/deployed-apps/describe/${encodeURIComponent(String(jobId || '').trim())}`
+  );
+  return normalizeToolsDeployedAppDescribeJob(data?.job);
 }
 
 export async function getToolsGitRepos(forceRefresh = false): Promise<ToolsGitReposPayload> {
@@ -432,7 +536,12 @@ export async function deleteAttachment(attachmentId: string): Promise<void> {
   await api(`/api/attachments/${encodeURIComponent(attachmentId)}`, { method: 'DELETE' });
 }
 
-export async function uploadAttachment(file: File, conversationId: number | null, signal?: AbortSignal): Promise<{ uploadId: string }> {
+export async function uploadAttachment(
+  file: File,
+  conversationId: number | null,
+  signal?: AbortSignal,
+  onProgress?: (progress: { loaded: number; total: number }) => void
+): Promise<{ uploadId: string }> {
   const headers: Record<string, string> = {
     'Content-Type': file.type || 'application/octet-stream',
     'X-File-Name': encodeURIComponent(file.name || 'file'),
@@ -442,25 +551,100 @@ export async function uploadAttachment(file: File, conversationId: number | null
     headers['X-Conversation-Id'] = String(conversationId);
   }
 
-  const response = await fetch('/api/uploads', {
-    method: 'POST',
-    credentials: 'include',
-    headers,
-    body: file,
-    signal
+  return new Promise<{ uploadId: string }>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const defaultTotal = Math.max(0, Number(file.size) || 0);
+    let settled = false;
+    let handleAbortSignal = () => {};
+
+    const settleResolve = (value: { uploadId: string }) => {
+      if (settled) return;
+      settled = true;
+      if (signal) signal.removeEventListener('abort', handleAbortSignal);
+      resolve(value);
+    };
+
+    const settleReject = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      if (signal) signal.removeEventListener('abort', handleAbortSignal);
+      reject(error);
+    };
+
+    handleAbortSignal = () => {
+      xhr.abort();
+      settleReject(new DOMException('The operation was aborted.', 'AbortError'));
+    };
+
+    if (signal?.aborted) {
+      handleAbortSignal();
+      return;
+    }
+
+    if (signal) {
+      signal.addEventListener('abort', handleAbortSignal, { once: true });
+    }
+
+    xhr.open('POST', '/api/uploads', true);
+    xhr.withCredentials = true;
+    Object.entries(headers).forEach(([key, value]) => {
+      xhr.setRequestHeader(key, value);
+    });
+
+    if (onProgress) {
+      onProgress({ loaded: 0, total: defaultTotal });
+    }
+
+    xhr.upload.onprogress = (event) => {
+      if (!onProgress) return;
+      const loaded = Math.max(0, Number(event.loaded) || 0);
+      const totalCandidate = Math.max(0, Number(event.total) || 0);
+      onProgress({
+        loaded,
+        total: totalCandidate > 0 ? totalCandidate : Math.max(defaultTotal, loaded)
+      });
+    };
+
+    xhr.onerror = () => {
+      settleReject(new Error(`No se pudo subir ${file.name}`));
+    };
+
+    xhr.onabort = () => {
+      settleReject(new DOMException('The operation was aborted.', 'AbortError'));
+    };
+
+    xhr.onload = () => {
+      let data: any = {};
+      try {
+        data = xhr.responseText ? JSON.parse(xhr.responseText) : {};
+      } catch (_error) {
+        data = {};
+      }
+
+      if (xhr.status < 200 || xhr.status >= 300) {
+        settleReject(new Error(data?.error || `No se pudo subir ${file.name}`));
+        return;
+      }
+
+      const uploadId = data?.attachment?.uploadId;
+      if (!uploadId) {
+        settleReject(new Error(`Respuesta invalida al subir ${file.name}`));
+        return;
+      }
+
+      if (onProgress) {
+        const completed = Math.max(defaultTotal, Number(file.size) || 0);
+        onProgress({
+          loaded: completed,
+          total: completed
+        });
+      }
+
+      settleResolve({ uploadId: String(uploadId) });
+    };
+
+    xhr.send(file);
   });
-
-  const data = await parseJsonSafe(response);
-  if (!response.ok) {
-    throw new Error(data?.error || `No se pudo subir ${file.name}`);
-  }
-
-  const uploadId = data?.attachment?.uploadId;
-  if (!uploadId) {
-    throw new Error(`Respuesta invalida al subir ${file.name}`);
-  }
-
-  return { uploadId: String(uploadId) };
 }
 
 export async function restartServer(): Promise<{ attemptId: string }> {

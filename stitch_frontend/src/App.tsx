@@ -53,6 +53,7 @@ const DEFAULT_MODEL = 'gpt-5.3-codex';
 const DEFAULT_REASONING_EFFORT = 'xhigh';
 const DRAFT_CONVERSATION = 'draft';
 const MESSAGES_PAGE_SIZE = 60;
+const UPLOAD_PROGRESS_SETTLE_MS = 650;
 
 function byDateDesc<T extends { last_message_at?: string; created_at?: string }>(items: T[]) {
   return [...items].sort((a, b) => {
@@ -148,6 +149,15 @@ interface NavigateData {
   chatId?: number;
   draftMessage?: string;
   autoSend?: boolean;
+}
+
+interface UploadProgressState {
+  percent: number;
+  uploadedBytes: number;
+  totalBytes: number;
+  fileName: string;
+  fileIndex: number;
+  totalFiles: number;
 }
 
 function getSafeLocalStorage(): Storage | null {
@@ -353,6 +363,7 @@ export default function App() {
   const [sendStartedAtMs, setSendStartedAtMs] = useState<number | null>(null);
   const [sendElapsedSeconds, setSendElapsedSeconds] = useState(0);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgressState | null>(null);
   const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
   const [options, setOptions] = useState<ChatOptions>({
     models: [],
@@ -440,6 +451,7 @@ export default function App() {
     setSending(false);
     setSendStartedAtMs(null);
     setSendElapsedSeconds(0);
+    setUploadProgress(null);
   }, []);
 
   const resolveActiveUsername = useCallback(
@@ -1678,12 +1690,83 @@ export default function App() {
         }
 
         const uploaded = [] as Array<{ uploadId: string }>;
-        for (const file of selectedFiles) {
-          const item = await uploadAttachment(file, activeConversationId, controller.signal);
+        const totalUploadBytes = selectedFiles.reduce((sum, file) => {
+          return sum + Math.max(0, Number(file?.size) || 0);
+        }, 0);
+        let uploadedBytesCompleted = 0;
+
+        for (let index = 0; index < selectedFiles.length; index += 1) {
+          const file = selectedFiles[index];
+          const fileSize = Math.max(0, Number(file?.size) || 0);
+          let latestLoaded = 0;
+          let latestTotal = fileSize;
+
+          setUploadProgress({
+            percent:
+              totalUploadBytes > 0
+                ? Math.min(100, Math.round((uploadedBytesCompleted / totalUploadBytes) * 100))
+                : 0,
+            uploadedBytes: Math.round(uploadedBytesCompleted),
+            totalBytes: Math.round(totalUploadBytes),
+            fileName: String(file?.name || `archivo_${index + 1}`),
+            fileIndex: index + 1,
+            totalFiles: selectedFiles.length
+          });
+
+          const item = await uploadAttachment(
+            file,
+            activeConversationId,
+            controller.signal,
+            ({ loaded, total }) => {
+              if (!isCurrentSession()) return;
+              const safeLoaded = Math.max(0, Number(loaded) || 0);
+              const safeTotalCandidate = Math.max(0, Number(total) || 0);
+              latestTotal = Math.max(fileSize, safeTotalCandidate, safeLoaded);
+              latestLoaded = Math.min(safeLoaded, latestTotal);
+              const totalBytes = totalUploadBytes > 0 ? totalUploadBytes : uploadedBytesCompleted + latestTotal;
+              const uploadedBytes = Math.min(totalBytes, uploadedBytesCompleted + latestLoaded);
+              const percent =
+                totalBytes > 0 ? Math.min(100, Math.round((uploadedBytes / totalBytes) * 100)) : 0;
+
+              setUploadProgress({
+                percent,
+                uploadedBytes: Math.round(uploadedBytes),
+                totalBytes: Math.round(totalBytes),
+                fileName: String(file?.name || `archivo_${index + 1}`),
+                fileIndex: index + 1,
+                totalFiles: selectedFiles.length
+              });
+            }
+          );
+
           if (!isCurrentSession()) return;
+
+          const completedForFile = Math.max(fileSize, latestTotal, latestLoaded);
+          uploadedBytesCompleted += completedForFile;
+          const totalBytes = totalUploadBytes > 0 ? totalUploadBytes : uploadedBytesCompleted;
+          const uploadedBytes = Math.min(totalBytes, uploadedBytesCompleted);
+          const percent =
+            totalBytes > 0 ? Math.min(100, Math.round((uploadedBytes / totalBytes) * 100)) : 100;
+
+          setUploadProgress({
+            percent,
+            uploadedBytes: Math.round(uploadedBytes),
+            totalBytes: Math.round(totalBytes),
+            fileName: String(file?.name || `archivo_${index + 1}`),
+            fileIndex: index + 1,
+            totalFiles: selectedFiles.length
+          });
+
           uploaded.push(item);
         }
 
+        if (selectedFiles.length > 0) {
+          await new Promise<void>((resolve) => {
+            window.setTimeout(resolve, UPLOAD_PROGRESS_SETTLE_MS);
+          });
+          if (!isCurrentSession()) return;
+        }
+        setUploadProgress(null);
         setSelectedFiles([]);
 
         const response = await startChatStream({
@@ -2095,6 +2178,7 @@ export default function App() {
             runningConversationIds.includes(activeConversationId)
           }
           selectedFiles={selectedFiles}
+          uploadProgress={uploadProgress}
           activeAgentName={String(options.activeAgentName || 'Codex CLI')}
           model={chatModel}
           reasoningEffort={chatReasoningEffort}
