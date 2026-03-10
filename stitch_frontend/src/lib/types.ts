@@ -88,9 +88,13 @@ export interface ChatOptions {
     model: string;
     reasoningEffort: string;
   };
+  providerId?: string;
   activeAgentId?: string;
   activeAgentName?: string;
   runtimeProvider?: 'codex' | 'gemini' | string;
+  capabilities?: string[];
+  quota?: AiProviderQuota | null;
+  permissions?: AiProviderPermissionProfile | null;
 }
 
 export interface NotificationSettings {
@@ -126,8 +130,10 @@ export interface AiAgentSettingsItem {
   pricing: AiAgentPricing;
   isFree: boolean;
   integrationType: AiAgentIntegrationType;
+  authModes?: string[];
   docsUrl: string;
   supportsBaseUrl: boolean;
+  capabilities?: string[];
   integration: AiAgentIntegrationState;
   tutorial: AiAgentTutorial;
 }
@@ -135,6 +141,56 @@ export interface AiAgentSettingsItem {
 export interface AiAgentSettingsPayload {
   agents: AiAgentSettingsItem[];
   activeAgentId: string;
+}
+
+export interface AiProviderQuota {
+  used: number | null;
+  limit: number | null;
+  remaining: number | null;
+  unit: 'requests' | 'tokens' | 'credits' | 'usd' | null;
+  resetAt: string | null;
+  available: boolean;
+}
+
+export interface AiProviderPermissionProfile {
+  agentId: string;
+  allowRoot: boolean;
+  runAsUser: string;
+  allowedPaths: string[];
+  deniedPaths: string[];
+  readOnly: boolean;
+  allowShell: boolean;
+  allowSensitiveTools: boolean;
+  allowNetwork: boolean;
+  allowGit: boolean;
+  allowBackupRestore: boolean;
+  allowedTools: string[];
+  updatedAt: string;
+}
+
+export interface AiProviderInfo {
+  id: string;
+  name: string;
+  vendor: string;
+  description: string;
+  pricing: AiAgentPricing;
+  integrationType: AiAgentIntegrationType;
+  authModes: string[];
+  docsUrl: string;
+  integration: AiAgentIntegrationState;
+  capabilities: string[];
+  models: string[];
+  defaults: {
+    model: string;
+    reasoningEffort: string;
+  };
+  quota: AiProviderQuota;
+  permissions: AiProviderPermissionProfile;
+  availability: {
+    chat: boolean;
+    configured: boolean;
+    enabled: boolean;
+  };
 }
 
 export interface RestartState {
@@ -402,6 +458,131 @@ export interface ToolsDeployedAppDescribeResponse {
   job: ToolsDeployedAppDescribeJob;
 }
 
+export interface ToolsStorageLocalEntry {
+  name: string;
+  path: string;
+  type: 'file' | 'directory' | 'symlink' | 'other';
+  sizeBytes: number | null;
+  modifiedAt: string;
+}
+
+export interface ToolsStorageLocalListPayload {
+  path: string;
+  parentPath: string;
+  sortBy: 'name' | 'size' | 'mtime';
+  sortOrder: 'asc' | 'desc';
+  totalEntries: number;
+  entries: ToolsStorageLocalEntry[];
+}
+
+export interface ToolsStorageHeavyEntry {
+  path: string;
+  name: string;
+  type: 'file' | 'directory' | 'other';
+  sizeBytes: number;
+}
+
+export interface ToolsStorageHeavyPayload {
+  path: string;
+  scannedAt: string;
+  maxDepth: number;
+  limit: number;
+  totalBytes: number;
+  entries: ToolsStorageHeavyEntry[];
+}
+
+export interface ToolsDriveAccount {
+  id: string;
+  alias: string;
+  authMode: 'service_account' | 'oauth_client';
+  rootFolderId: string;
+  status: 'pending' | 'active' | 'needs_oauth' | 'error';
+  lastError: string;
+  details: {
+    credentialType: string;
+    projectId: string;
+    clientEmail: string;
+    clientId: string;
+    redirectUris: string[];
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ToolsDriveFileItem {
+  id: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number | null;
+  createdAt: string;
+  modifiedAt: string;
+  parents: string[];
+  appProperties: Record<string, string>;
+}
+
+export interface ToolsDriveFilesPayload {
+  account: ToolsDriveAccount;
+  folderId: string;
+  nextPageToken: string;
+  files: ToolsDriveFileItem[];
+}
+
+export type ToolsStorageJobType =
+  | 'drive_upload_files'
+  | 'deployed_backup_create'
+  | 'deployed_backup_restore';
+export type ToolsStorageJobStatus = 'pending' | 'running' | 'completed' | 'error';
+
+export interface ToolsStorageJob {
+  id: string;
+  type: ToolsStorageJobType;
+  status: ToolsStorageJobStatus;
+  payload: Record<string, any>;
+  progress: Record<string, any>;
+  result: Record<string, any>;
+  error: string;
+  log: string;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string;
+  finishedAt: string;
+}
+
+export interface ToolsDeployedAppBackupItem {
+  id: string;
+  appId: string;
+  driveFileId: string;
+  accountId: string;
+  accountAlias: string;
+  name: string;
+  targetPath: string;
+  sizeBytes: number | null;
+  createdAt: string;
+  modifiedAt?: string;
+  appProperties?: Record<string, string>;
+}
+
+export interface ToolsStorageOverview {
+  localDisk: {
+    path: string;
+    totalBytes: number | null;
+    usedBytes: number | null;
+    availableBytes: number | null;
+    usagePercent: string;
+  };
+  cloud: {
+    accountId: string;
+    available: boolean;
+    error?: string;
+    quota: {
+      limit: number | null;
+      usage: number | null;
+      usageInDrive: number | null;
+    };
+  };
+  jobs: ToolsStorageJob[];
+}
+
 export interface ToolsGitRepoStatusCounts {
   staged: number;
   modified: number;
@@ -427,6 +608,7 @@ export interface ToolsGitRepoSummary {
   status: ToolsGitRepoStatusCounts;
   changedFiles: string[];
   conflictFiles: string[];
+  branches?: string[];
   scannedAt: string;
 }
 
@@ -439,6 +621,10 @@ export interface ToolsGitPushResult {
   commitCreated: boolean;
   commitMessage: string;
   commitHash: string;
+  targetBranch?: string;
+  remote?: string;
+  branchSwitched?: boolean;
+  branchCreated?: boolean;
   output: string;
 }
 
@@ -446,6 +632,17 @@ export interface ToolsGitResolvePayload {
   conversationId: number;
   prompt: string;
   autoSend: boolean;
+}
+
+export interface ToolsGitBranchesPayload {
+  repo: ToolsGitRepoSummary;
+  branches: string[];
+}
+
+export interface ToolsGitMergePayload {
+  sourceBranch: string;
+  targetBranch: string;
+  output: string;
 }
 
 export interface Capabilities {

@@ -19,6 +19,44 @@ const formatTime = (ms) => {
   return `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`;
 };
 
+const DEBUG_FLAG_KEY = 'dixit:debug';
+const debugLog = (...args) => {
+  try {
+    if (window.localStorage.getItem(DEBUG_FLAG_KEY) === '1') {
+      console.debug('[dixit]', ...args);
+    }
+  } catch {
+    // ignore debug logger failures
+  }
+};
+
+const dedupePlayers = (players = []) => {
+  const unique = new Map();
+  for (const entry of players) {
+    if (!entry || !entry.id || unique.has(entry.id)) continue;
+    unique.set(entry.id, entry);
+  }
+  return Array.from(unique.values());
+};
+
+const sanitizeStatePayload = (payload) => {
+  if (!payload || payload.type !== 'state') return payload;
+  const players = dedupePlayers(payload.players || []);
+  const playerIds = new Set(players.map((player) => player.id));
+  const pendingPlayers = (payload.pendingPlayers || []).filter((entry) => entry?.id && playerIds.has(entry.id));
+  const pendingPlayerIds = (payload.pendingPlayerIds || []).filter((id) => playerIds.has(id));
+  const you = payload.you && playerIds.has(payload.you.id) ? payload.you : null;
+  const board = Array.isArray(payload.board) ? payload.board : [];
+  return {
+    ...payload,
+    players,
+    pendingPlayers,
+    pendingPlayerIds,
+    you,
+    board,
+  };
+};
+
 async function api(path, init = {}) {
   const headers = new Headers(init.headers || {});
   if (init.body && !headers.has('Content-Type')) {
@@ -39,12 +77,14 @@ async function api(path, init = {}) {
 function useWs(enabled) {
   const [state, setState] = useState(null);
   const [connected, setConnected] = useState(false);
+  const [serverError, setServerError] = useState('');
   const socketRef = useRef(null);
 
   useEffect(() => {
     if (!enabled) {
       setConnected(false);
       setState(null);
+      setServerError('');
       socketRef.current?.close();
       socketRef.current = null;
       return undefined;
@@ -65,8 +105,19 @@ function useWs(enabled) {
       };
 
       ws.onmessage = (e) => {
-        const data = JSON.parse(e.data);
-        if (data.type === 'state') setState(data);
+        let data;
+        try {
+          data = JSON.parse(e.data);
+        } catch {
+          return;
+        }
+        if (data.type === 'state') {
+          setState(sanitizeStatePayload(data));
+          setServerError('');
+        }
+        if (data.type === 'error') {
+          setServerError(data.message || 'Error de comunicación con el servidor.');
+        }
         if (data.type === 'ended') {
           setState(null);
           alert('La partida ha sido eliminada.');
@@ -75,6 +126,7 @@ function useWs(enabled) {
 
       ws.onclose = () => {
         setConnected(false);
+        setState(null);
         if (disposed) return;
         const waitMs = Math.min(5000, 500 * (2 ** retry));
         retry += 1;
@@ -87,6 +139,7 @@ function useWs(enabled) {
     return () => {
       disposed = true;
       setConnected(false);
+      setServerError('');
       if (reconnectTimer) {
         window.clearTimeout(reconnectTimer);
       }
@@ -102,7 +155,7 @@ function useWs(enabled) {
     }
   }, []);
 
-  return { state, setState, send, connected };
+  return { state, setState, send, connected, serverError, setServerError };
 }
 
 const Pill = ({ children, className = '' }) => (
@@ -121,14 +174,14 @@ const extractReason = (clue = '') => {
   return match ? match[1] : null;
 };
 
-function GameActions({ onLeave, onProgress, onToggleMusic, musicOn }) {
+function GameActions({ onLeave, onProgress, onToggleMusic, musicLabel }) {
   return (
     <div className="fixed bottom-4 right-4 z-30 flex flex-col gap-2 items-end pointer-events-none">
       <button onClick={onProgress} className="action-btn ghost bg-white/10 border border-white/20 text-white text-xs pointer-events-auto">
         Progreso
       </button>
       <button onClick={onToggleMusic} className="action-btn ghost bg-white/10 border border-white/20 text-white text-xs pointer-events-auto">
-        {musicOn ? 'Música ON' : 'Música OFF'}
+        {musicLabel}
       </button>
       <button onClick={onLeave} className="h-11 px-4 rounded-full bg-white/10 border border-white/30 text-white font-semibold hover:bg-white/20 transition pointer-events-auto">
         Salir
@@ -372,7 +425,12 @@ function Lobby({ state, send, onSolo, onLeave, onShowProgress, toggleMusic, musi
               <div className="grid grid-cols-2 gap-3">
                 <select
                   value={state.mode}
-                  onChange={(e) => send({ type: 'set_mode', mode: e.target.value, drinkLevel: state.drinkLevel })}
+                  onChange={(e) => send({
+                    type: 'set_mode',
+                    mode: e.target.value,
+                    drinkLevel: state.drinkLevel,
+                    partyRules: state.partyRules || { randomEvents: true, safeMessaging: true },
+                  })}
                   className="h-11 px-3 rounded-xl bg-white/10 border border-white/20 text-white text-sm"
                 >
                   <option value="classic">Clásico</option>
@@ -381,7 +439,12 @@ function Lobby({ state, send, onSolo, onLeave, onShowProgress, toggleMusic, musi
                 {state.mode === 'party' && (
                   <select
                     value={state.drinkLevel || 'light'}
-                    onChange={(e) => send({ type: 'set_mode', mode: 'party', drinkLevel: e.target.value })}
+                    onChange={(e) => send({
+                      type: 'set_mode',
+                      mode: 'party',
+                      drinkLevel: e.target.value,
+                      partyRules: state.partyRules || { randomEvents: true, safeMessaging: true },
+                    })}
                     className="h-11 px-3 rounded-xl bg-white/10 border border-white/20 text-white text-sm"
                   >
                     <option value="light">Beber poco</option>
@@ -390,6 +453,42 @@ function Lobby({ state, send, onSolo, onLeave, onShowProgress, toggleMusic, musi
                   </select>
                 )}
               </div>
+              {state.mode === 'party' && (
+                <div className="grid grid-cols-1 gap-2 pt-1">
+                  <label className="text-xs text-white/60 flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={state.partyRules?.randomEvents !== false}
+                      onChange={(e) => send({
+                        type: 'set_mode',
+                        mode: 'party',
+                        drinkLevel: state.drinkLevel,
+                        partyRules: {
+                          ...(state.partyRules || {}),
+                          randomEvents: e.target.checked,
+                        },
+                      })}
+                    />
+                    Eventos aleatorios
+                  </label>
+                  <label className="text-xs text-white/60 flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={state.partyRules?.safeMessaging !== false}
+                      onChange={(e) => send({
+                        type: 'set_mode',
+                        mode: 'party',
+                        drinkLevel: state.drinkLevel,
+                        partyRules: {
+                          ...(state.partyRules || {}),
+                          safeMessaging: e.target.checked,
+                        },
+                      })}
+                    />
+                    Mensajes de consumo responsable
+                  </label>
+                </div>
+              )}
               <p className="text-xs text-white/50">En +18 se genera un reto de bebida ligado a la carta del narrador.</p>
             </div>
           </>
@@ -452,7 +551,13 @@ function Lobby({ state, send, onSolo, onLeave, onShowProgress, toggleMusic, musi
               <button onClick={() => send({ type: 'add_bot', difficulty: botDifficulty })} className="h-12 px-3 rounded-xl border border-white/20 bg-white/10 text-white font-semibold hover:bg-white/20 transition text-sm min-w-[110px]">
                 Añadir bot
               </button>
-              <button onClick={() => send({ type: 'start_with_bots', difficulty: botDifficulty, mode: state.mode, drinkLevel: state.drinkLevel })} className="h-12 px-4 rounded-xl bg-gradient-to-r from-primary to-accent-pink text-white font-semibold shadow-lg shadow-primary/30 hover:brightness-110 transition min-w-[120px]">
+              <button onClick={() => send({
+                type: 'start_with_bots',
+                difficulty: botDifficulty,
+                mode: state.mode,
+                drinkLevel: state.drinkLevel,
+                partyRules: state.partyRules || { randomEvents: true, safeMessaging: true },
+              })} className="h-12 px-4 rounded-xl bg-gradient-to-r from-primary to-accent-pink text-white font-semibold shadow-lg shadow-primary/30 hover:brightness-110 transition min-w-[120px]">
                 Empezar
               </button>
             </div>
@@ -745,60 +850,416 @@ function Score({ state, send }) {
   );
 }
 
+function ActiveRoomsView({
+  activeRooms = [],
+  fetchActiveRooms,
+  onBack,
+  onJoinRoom,
+  onResumeRoom,
+  send,
+}) {
+  const [filter, setFilter] = useState('joinable');
+  const [deleteModalRoom, setDeleteModalRoom] = useState('');
+  const [deletePassword, setDeletePassword] = useState('');
+
+  const filteredRooms = useMemo(() => {
+    return (activeRooms || []).filter((room) => {
+      if (filter === 'all') return true;
+      if (filter === 'joinable') return room.canJoin && room.kind !== 'solo_bots';
+      if (filter === 'mine') return room.isUserInRoom;
+      if (filter === 'lobby') return room.status === 'lobby';
+      if (filter === 'running') return room.status === 'in_progress';
+      if (filter === 'party') return room.mode === 'party';
+      if (filter === 'online') return room.kind === 'online' || room.kind === 'mixed';
+      return true;
+    });
+  }, [activeRooms, filter]);
+
+  const confirmDeleteRoom = () => {
+    if (!deleteModalRoom) return;
+    send({ type: 'end_room', roomCode: deleteModalRoom, password: deletePassword });
+    setDeleteModalRoom('');
+    setDeletePassword('');
+    window.setTimeout(() => {
+      fetchActiveRooms();
+    }, 350);
+  };
+
+  return (
+    <section className="relative z-10 flex-1 flex flex-col overflow-hidden px-4 pb-6">
+      <header className="flex items-center justify-between pt-10 pb-4">
+        <button onClick={onBack} className="h-10 w-10 rounded-full bg-white/10 border border-white/20 text-white">
+          <span className="material-symbols-outlined">arrow_back</span>
+        </button>
+        <h2 className="text-white text-lg font-bold">Salas activas</h2>
+        <button onClick={fetchActiveRooms} className="h-10 px-3 rounded-xl bg-white/10 border border-white/20 text-white text-sm font-semibold">
+          Refrescar
+        </button>
+      </header>
+
+      <div className="mb-3 flex gap-2 overflow-x-auto no-scrollbar">
+        {[
+          ['joinable', 'Unibles'],
+          ['mine', 'Mías'],
+          ['lobby', 'Lobby'],
+          ['running', 'En curso'],
+          ['party', '+18'],
+          ['online', 'Online'],
+          ['all', 'Todas'],
+        ].map(([key, label]) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => setFilter(key)}
+            className={`h-9 px-3 rounded-full text-xs font-semibold border ${filter === key ? 'bg-primary/30 border-primary/50 text-white' : 'bg-white/10 border-white/20 text-white/70'}`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex-1 overflow-y-auto no-scrollbar space-y-3">
+        {filteredRooms.length === 0 && (
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-center text-sm text-white/60">
+            No hay salas para este filtro.
+          </div>
+        )}
+        {filteredRooms.map((room) => {
+          const canJoin = room.canJoin && room.kind !== 'solo_bots';
+          return (
+            <article key={room.code} className="rounded-2xl border border-white/10 bg-white/5 p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs text-white/50">Código</p>
+                  <p className="text-xl font-black text-white tracking-widest font-mono">{room.code}</p>
+                </div>
+                <div className="text-right flex flex-col gap-1">
+                  <Pill className={room.status === 'lobby' ? 'bg-sky-500/20 text-sky-100' : room.status === 'finished' ? 'bg-emerald-500/20 text-emerald-100' : 'bg-amber-500/20 text-amber-100'}>
+                    {room.status === 'lobby' ? 'Lobby' : room.status === 'finished' ? 'Terminada' : 'En curso'}
+                  </Pill>
+                  <Pill className={room.mode === 'party' ? 'bg-accent-pink/30 text-white' : 'bg-primary/20 text-white'}>
+                    {room.mode === 'party' ? '+18' : 'Clásico'}
+                  </Pill>
+                </div>
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-white/70">
+                <p>Jugadores: {room.humanCount} humanos + {room.botCount} bots</p>
+                <p>Narrador: {room.storytellerName || '—'}</p>
+                <p>Límite: {room.pointLimit} pts</p>
+                <p>Tipo: {room.kind === 'solo_bots' ? 'Solo bots' : room.kind === 'mixed' ? 'Mixta' : 'Online'}</p>
+              </div>
+              <div className="mt-3 flex gap-2">
+                {room.isUserInRoom ? (
+                  <button
+                    type="button"
+                    onClick={() => onResumeRoom(room.code)}
+                    className="h-10 px-3 rounded-xl bg-primary text-white text-sm font-semibold"
+                  >
+                    Reanudar
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    disabled={!canJoin}
+                    onClick={() => onJoinRoom(room.code)}
+                    className="h-10 px-3 rounded-xl bg-white/10 border border-white/20 text-white text-sm font-semibold disabled:opacity-50"
+                  >
+                    {canJoin ? 'Entrar' : 'No unible'}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeletePassword('');
+                    setDeleteModalRoom(room.code);
+                  }}
+                  className="h-10 px-3 rounded-xl bg-red-600/85 text-white text-sm font-semibold"
+                >
+                  Eliminar
+                </button>
+              </div>
+            </article>
+          );
+        })}
+      </div>
+
+      {deleteModalRoom && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center px-4">
+          <div className="w-full max-w-sm rounded-2xl border border-white/15 bg-[#241634] p-5 shadow-2xl">
+            <h3 className="text-white text-lg font-bold">Eliminar sala {deleteModalRoom}</h3>
+            <p className="text-white/65 text-sm mt-1">Si no eres host, usa contraseña maestra opcional.</p>
+            <label className="block mt-4 text-xs text-white/60">Contraseña maestra (opcional)</label>
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={deletePassword}
+              onChange={(event) => setDeletePassword(event.target.value)}
+              className="mt-2 w-full rounded-xl border border-white/15 bg-white/10 px-3 py-3 text-white placeholder:text-white/40"
+              placeholder="Escribe la contraseña"
+            />
+            <div className="mt-4 flex gap-2 justify-end">
+              <button
+                type="button"
+                onClick={() => {
+                  setDeleteModalRoom('');
+                  setDeletePassword('');
+                }}
+                className="h-10 px-4 rounded-xl border border-white/20 bg-white/10 text-white text-sm"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={confirmDeleteRoom}
+                className="h-10 px-4 rounded-xl bg-red-600 text-white text-sm font-semibold"
+              >
+                Eliminar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ProfileView({
+  profileData,
+  profileDraft,
+  setProfileDraft,
+  profileSaving,
+  profileError,
+  profileSavedAt,
+  onSave,
+  onBack,
+}) {
+  const stats = profileData?.stats || {};
+  const history = profileData?.history || [];
+  const winRate = Math.round((stats.winRate || 0) * 100);
+  const initial = profileDraft?.nickname?.[0] || profileData?.profile?.nickname?.[0] || '?';
+
+  if (!profileDraft) {
+    return (
+      <section className="relative z-10 flex-1 flex items-center justify-center">
+        <div className="loading-orb" />
+      </section>
+    );
+  }
+
+  return (
+    <section className="relative z-10 flex-1 flex flex-col overflow-hidden px-4 pb-6">
+      <header className="flex items-center justify-between pt-10 pb-4">
+        <button onClick={onBack} className="h-10 w-10 rounded-full bg-white/10 border border-white/20 text-white">
+          <span className="material-symbols-outlined">arrow_back</span>
+        </button>
+        <h2 className="text-white text-lg font-bold">Perfil</h2>
+        <button
+          type="button"
+          disabled={profileSaving}
+          onClick={onSave}
+          className="h-10 px-3 rounded-xl bg-gradient-to-r from-primary to-accent-pink text-white text-sm font-semibold disabled:opacity-60"
+        >
+          {profileSaving ? 'Guardando...' : 'Guardar'}
+        </button>
+      </header>
+
+      <div className="flex-1 overflow-y-auto no-scrollbar space-y-4">
+        <article className="rounded-2xl border border-white/10 bg-white/5 p-4">
+          <div className="flex items-center gap-4">
+            <div className="h-14 w-14 rounded-full bg-white/10 border border-white/20 flex items-center justify-center text-xl font-black">
+              {initial.toUpperCase()}
+            </div>
+            <div>
+              <p className="text-white text-sm">{profileData?.user?.username}</p>
+              <p className="text-white/60 text-xs">ID: {profileData?.user?.id}</p>
+            </div>
+          </div>
+          <div className="mt-3 grid grid-cols-1 gap-3">
+            <label className="text-xs text-white/60">
+              Nickname visible
+              <input
+                value={profileDraft.nickname}
+                onChange={(event) => setProfileDraft((current) => ({ ...current, nickname: event.target.value }))}
+                maxLength={28}
+                className="mt-1 w-full rounded-xl border border-white/15 bg-white/10 px-3 py-2 text-white"
+              />
+            </label>
+            <label className="text-xs text-white/60">
+              Avatar seed
+              <input
+                value={profileDraft.avatarSeed}
+                onChange={(event) => setProfileDraft((current) => ({ ...current, avatarSeed: event.target.value }))}
+                maxLength={24}
+                className="mt-1 w-full rounded-xl border border-white/15 bg-white/10 px-3 py-2 text-white"
+              />
+            </label>
+          </div>
+        </article>
+
+        <article className="rounded-2xl border border-white/10 bg-white/5 p-4">
+          <p className="text-sm text-white/80 font-semibold mb-2">Preferencias</p>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-xs text-white/60">
+              Modo por defecto
+              <select
+                value={profileDraft.preferredMode}
+                onChange={(event) => setProfileDraft((current) => ({ ...current, preferredMode: event.target.value }))}
+                className="mt-1 w-full h-10 rounded-xl border border-white/15 bg-white/10 px-2 text-white"
+              >
+                <option value="classic">Clásico</option>
+                <option value="party">+18</option>
+              </select>
+            </label>
+            <label className="text-xs text-white/60">
+              Bot por defecto
+              <select
+                value={profileDraft.preferredBotDifficulty}
+                onChange={(event) => setProfileDraft((current) => ({ ...current, preferredBotDifficulty: event.target.value }))}
+                className="mt-1 w-full h-10 rounded-xl border border-white/15 bg-white/10 px-2 text-white"
+              >
+                <option value="easy">Fácil</option>
+                <option value="normal">Normal</option>
+                <option value="smart">Difícil</option>
+              </select>
+            </label>
+            <label className="text-xs text-white/60 flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={profileDraft.musicOn}
+                onChange={(event) => setProfileDraft((current) => ({ ...current, musicOn: event.target.checked }))}
+              />
+              Música activada
+            </label>
+            <label className="text-xs text-white/60 flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={profileDraft.sfxOn}
+                onChange={(event) => setProfileDraft((current) => ({ ...current, sfxOn: event.target.checked }))}
+              />
+              Efectos activados
+            </label>
+          </div>
+          <div className="mt-3 grid grid-cols-1 gap-2">
+            <label className="text-xs text-white/60">
+              Volumen música ({Math.round(profileDraft.musicVolume * 100)}%)
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={profileDraft.musicVolume}
+                onChange={(event) => setProfileDraft((current) => ({ ...current, musicVolume: Number(event.target.value) }))}
+                className="w-full accent-primary"
+              />
+            </label>
+            <label className="text-xs text-white/60">
+              Volumen efectos ({Math.round(profileDraft.sfxVolume * 100)}%)
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.01"
+                value={profileDraft.sfxVolume}
+                onChange={(event) => setProfileDraft((current) => ({ ...current, sfxVolume: Number(event.target.value) }))}
+                className="w-full accent-primary"
+              />
+            </label>
+          </div>
+          <label className="mt-3 text-xs text-white/60 flex items-start gap-2">
+            <input
+              type="checkbox"
+              checked={profileDraft.adultModeOptIn}
+              onChange={(event) => setProfileDraft((current) => ({
+                ...current,
+                adultModeOptIn: event.target.checked,
+                preferredMode: event.target.checked ? current.preferredMode : 'classic',
+              }))}
+            />
+            <span>Acepto activar modo +18 (solo adultos, consumo responsable, opcional).</span>
+          </label>
+          {!profileDraft.adultModeOptIn && (
+            <p className="mt-2 text-xs text-amber-200/90">El modo +18 permanece oculto hasta que lo actives aquí.</p>
+          )}
+        </article>
+
+        <article className="rounded-2xl border border-white/10 bg-white/5 p-4 grid grid-cols-2 gap-3">
+          <div>
+            <p className="text-xs text-white/60">Partidas</p>
+            <p className="text-2xl font-black text-white">{stats.gamesPlayed || 0}</p>
+          </div>
+          <div>
+            <p className="text-xs text-white/60">Victorias</p>
+            <p className="text-2xl font-black text-white">{stats.gamesWon || 0}</p>
+          </div>
+          <div>
+            <p className="text-xs text-white/60">Winrate</p>
+            <p className="text-2xl font-black text-white">{winRate}%</p>
+          </div>
+          <div>
+            <p className="text-xs text-white/60">Puntos acumulados</p>
+            <p className="text-2xl font-black text-white">{stats.totalPoints || 0}</p>
+          </div>
+        </article>
+
+        <article className="rounded-2xl border border-white/10 bg-white/5 p-4">
+          <p className="text-sm text-white/80 font-semibold mb-2">Historial reciente</p>
+          <div className="space-y-2">
+            {history.length === 0 && <p className="text-xs text-white/50">Aún no hay partidas terminadas.</p>}
+            {history.map((entry) => (
+              <div key={entry.id} className="rounded-xl bg-white/5 border border-white/10 px-3 py-2 flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-white text-sm font-semibold">{entry.roomCode}</p>
+                  <p className="text-xs text-white/60">
+                    {entry.mode === 'party' ? '+18' : 'Clásico'} · {entry.winner ? 'Victoria' : 'Derrota'}
+                  </p>
+                </div>
+                <div className="text-right">
+                  <p className="text-white text-sm font-bold">{entry.score} pts</p>
+                  <p className="text-xs text-white/50">{new Date(entry.createdAt).toLocaleDateString()}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </article>
+      </div>
+
+      {(profileError || profileSavedAt) && (
+        <div className={`mt-3 rounded-xl border px-3 py-2 text-xs ${profileError ? 'border-rose-300/40 bg-rose-500/20 text-rose-100' : 'border-emerald-300/40 bg-emerald-500/20 text-emerald-100'}`}>
+          {profileError || `Perfil guardado (${new Date(profileSavedAt).toLocaleTimeString()})`}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function Landing({
   onJoin,
   onSolo,
-  onResume,
+  onOpenRooms,
+  onOpenProfile,
   onLogout,
   name,
   setName,
   room,
   setRoom,
   activeRooms,
-  resumePlayerId,
-  setResumePlayerId,
-  fetchActiveRooms,
   toggleMusic,
   musicOn,
-  send,
+  musicStatusLabel,
+  startingSolo,
+  soloConfig,
+  setSoloConfig,
+  adultModeEnabled,
 }) {
-  const [showRooms, setShowRooms] = React.useState(false);
   const [menuOpen, setMenuOpen] = React.useState(false);
-  const [deleteModalRoom, setDeleteModalRoom] = React.useState('');
-  const [deletePassword, setDeletePassword] = React.useState('');
   const handleRoomChange = (value, el) => {
     const formatted = formatRoomCode(value);
     if (el) el.value = formatted;
     setRoom(formatted);
   };
 
-  const openDeleteModal = (roomCode) => {
-    handleRoomChange(roomCode);
-    setDeletePassword('');
-    setDeleteModalRoom(roomCode);
-  };
-
-  const closeDeleteModal = () => {
-    setDeleteModalRoom('');
-    setDeletePassword('');
-  };
-
-  const confirmDeleteRoom = () => {
-    if (!deleteModalRoom) return;
-    send({ type: 'end_room', roomCode: deleteModalRoom, password: deletePassword });
-    closeDeleteModal();
-    window.setTimeout(() => {
-      fetchActiveRooms();
-    }, 350);
-  };
-
-  const handleResumeClick = (code, playerId) => {
-    setResumePlayerId(playerId);
-    handleRoomChange(code);
-    onResume && onResume(code, playerId);
-  };
-
-  const featuredRoom = activeRooms?.[0];
+  const featuredRoom = activeRooms?.find((entry) => entry.status !== 'finished');
+  const soloBlockedByAdult = soloConfig.mode === 'party' && !adultModeEnabled;
 
   return (
     <section className="relative z-10 flex-1 flex flex-col bg-surreal text-white overflow-hidden">
@@ -809,11 +1270,11 @@ function Landing({
         <h1 className="text-xl font-extrabold tracking-widest text-transparent bg-clip-text bg-gradient-to-r from-white via-purple-100 to-white text-glow uppercase">
           DIXIT: ONÍRICO
         </h1>
-        <div className="flex items-center gap-3">
+        <button onClick={onOpenProfile} className="flex items-center gap-3">
           <div className="h-10 w-10 rounded-full border-2 border-primary p-0.5 overflow-hidden">
             <div className="h-full w-full rounded-full bg-white/10 flex items-center justify-center text-sm font-bold">{name?.[0] || 'T'}</div>
           </div>
-        </div>
+        </button>
       </div>
 
       {menuOpen && (
@@ -825,15 +1286,15 @@ function Landing({
             </div>
             <button onClick={() => { toggleMusic(); }} className="w-full h-11 rounded-xl bg-white/10 border border-white/20 text-white font-semibold hover:bg-white/20 transition flex items-center justify-between px-3">
               <span>Música misteriosa</span>
-              <span>{musicOn ? 'ON' : 'OFF'}</span>
+              <span>{musicStatusLabel || (musicOn ? 'ON' : 'OFF')}</span>
             </button>
-            <button onClick={() => { setMenuOpen(false); setShowRooms(true); fetchActiveRooms(); }} className="w-full h-11 rounded-xl bg-white/10 border border-white/20 text-white font-semibold hover:bg-white/20 transition flex items-center justify-between px-3">
-              <span>Ver salas</span>
-              <span className="material-symbols-outlined">visibility</span>
+            <button onClick={() => { setMenuOpen(false); onOpenRooms(); }} className="w-full h-11 rounded-xl bg-white/10 border border-white/20 text-white font-semibold hover:bg-white/20 transition flex items-center justify-between px-3">
+              <span>Salas activas</span>
+              <span className="material-symbols-outlined">groups</span>
             </button>
-            <button onClick={() => { window.dispatchEvent(new Event('dixit:progress')); setMenuOpen(false); }} className="w-full h-11 rounded-xl bg-white/10 border border-white/20 text-white font-semibold hover:bg-white/20 transition flex items-center justify-between px-3">
-              <span>Progreso</span>
-              <span className="material-symbols-outlined">leaderboard</span>
+            <button onClick={() => { setMenuOpen(false); onOpenProfile(); }} className="w-full h-11 rounded-xl bg-white/10 border border-white/20 text-white font-semibold hover:bg-white/20 transition flex items-center justify-between px-3">
+              <span>Perfil</span>
+              <span className="material-symbols-outlined">person</span>
             </button>
             <button onClick={onLogout} className="w-full h-11 rounded-xl bg-white/10 border border-white/20 text-white font-semibold hover:bg-white/20 transition flex items-center justify-between px-3">
               <span>Cerrar sesión</span>
@@ -854,14 +1315,14 @@ function Landing({
                 <div>
                   <div className="flex items-center justify-between mb-1">
                     <h3 className="text-sm font-bold tracking-wide text-gold/90 uppercase">Partida rápida</h3>
-                    <span className="text-[10px] font-medium bg-white/10 px-2 py-0.5 rounded-full text-white/80">{featuredRoom ? `${featuredRoom.players?.length || 1} jugadores` : 'Nueva'}</span>
+                    <span className="text-[10px] font-medium bg-white/10 px-2 py-0.5 rounded-full text-white/80">{featuredRoom ? `${featuredRoom.humanCount + featuredRoom.botCount} jugadores` : 'Nueva'}</span>
                   </div>
-                  <p className="text-xs text-purple-200 line-clamp-2">"La llave de los sueños perdidos..."</p>
+                  <p className="text-xs text-purple-200 line-clamp-2">Estado limpio: Home, Salas y Perfil están separados.</p>
                 </div>
                 <div className="flex items-center justify-between mt-2">
                   <div className="flex items-center gap-1.5 text-sm">
                     <span className="material-symbols-outlined text-primary text-[18px]">hourglass_top</span>
-                    <p className="font-medium text-white">Turno libre</p>
+                    <p className="font-medium text-white">{featuredRoom?.status === 'in_progress' ? 'Partidas en curso' : 'Turno libre'}</p>
                   </div>
                   <button onClick={onJoin} className="group flex items-center gap-1 bg-primary hover:bg-primary-light text-white text-xs font-bold px-4 py-2 rounded-full transition-all btn-glow shadow-lg shadow-primary/20">
                     CONTINUAR
@@ -873,7 +1334,7 @@ function Landing({
           </div>
         </div>
 
-        <div className="w-full max-w-md space-y-4 pt-4">
+        <div className="w-full max-w-md space-y-4 pt-2">
           <div className="grid grid-cols-2 gap-3">
             <div className="col-span-2">
               <label className="text-sm text-white/70">Tu nombre</label>
@@ -910,7 +1371,75 @@ function Landing({
             </div>
           </button>
 
-          <button onClick={onSolo} className="relative group w-full overflow-hidden rounded-2xl bg-gradient-to-r from-surface-dark to-surface-dark p-[1px] border border-white/5 hover:border-primary/50 transition-colors active:scale-95">
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-3 space-y-3">
+            <p className="text-sm text-white/80 font-semibold">Configurar Solo con bots</p>
+            <div className="grid grid-cols-2 gap-3">
+              <label className="text-xs text-white/60">
+                Modo
+                <select
+                  value={soloConfig.mode}
+                  onChange={(event) => setSoloConfig((current) => ({ ...current, mode: event.target.value }))}
+                  className="mt-1 w-full h-10 rounded-xl border border-white/20 bg-white/10 px-2 text-white"
+                >
+                  <option value="classic">Clásico</option>
+                  <option value="party">+18 (adultos)</option>
+                </select>
+              </label>
+              <label className="text-xs text-white/60">
+                Bot
+                <select
+                  value={soloConfig.difficulty}
+                  onChange={(event) => setSoloConfig((current) => ({ ...current, difficulty: event.target.value }))}
+                  className="mt-1 w-full h-10 rounded-xl border border-white/20 bg-white/10 px-2 text-white"
+                >
+                  <option value="easy">Fácil</option>
+                  <option value="normal">Normal</option>
+                  <option value="smart">Difícil</option>
+                </select>
+              </label>
+            </div>
+            {soloConfig.mode === 'party' && (
+              <div className="space-y-2">
+                <label className="text-xs text-white/60">
+                  Intensidad bebida
+                  <select
+                    value={soloConfig.drinkLevel}
+                    onChange={(event) => setSoloConfig((current) => ({ ...current, drinkLevel: event.target.value }))}
+                    className="mt-1 w-full h-10 rounded-xl border border-white/20 bg-white/10 px-2 text-white"
+                  >
+                    <option value="light">Beber poco</option>
+                    <option value="medium">Beber medio</option>
+                    <option value="heavy">Beber mucho</option>
+                  </select>
+                </label>
+                <label className="text-xs text-white/60 flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={soloConfig.partyRules.randomEvents}
+                    onChange={(event) => setSoloConfig((current) => ({ ...current, partyRules: { ...current.partyRules, randomEvents: event.target.checked } }))}
+                  />
+                  Eventos aleatorios de ronda
+                </label>
+                <label className="text-xs text-white/60 flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={soloConfig.partyRules.safeMessaging}
+                    onChange={(event) => setSoloConfig((current) => ({ ...current, partyRules: { ...current.partyRules, safeMessaging: event.target.checked } }))}
+                  />
+                  Mensajes de consumo responsable
+                </label>
+              </div>
+            )}
+            {soloBlockedByAdult && (
+              <p className="text-xs text-amber-200">Activa +18 en tu perfil para iniciar este modo.</p>
+            )}
+          </div>
+
+          <button
+            onClick={onSolo}
+            disabled={startingSolo || soloBlockedByAdult}
+            className="relative group w-full overflow-hidden rounded-2xl bg-gradient-to-r from-surface-dark to-surface-dark p-[1px] border border-white/5 hover:border-primary/50 transition-colors active:scale-95 disabled:opacity-60"
+          >
             <div className="relative flex h-16 w-full items-center justify-between px-6 bg-surface-dark/80 backdrop-blur-md rounded-2xl">
               <div className="flex items-center gap-4">
                 <div className="flex h-10 w-10 items-center justify-center rounded-full bg-white/5 text-purple-200">
@@ -918,136 +1447,44 @@ function Landing({
                 </div>
                 <div className="flex flex-col items-start">
                   <span className="text-lg font-bold text-white tracking-wide">Solo con bots</span>
-                  <span className="text-xs text-white/40 font-medium">Practica contra IA</span>
+                  <span className="text-xs text-white/40 font-medium">
+                    {startingSolo ? 'Iniciando partida...' : 'Modo aislado, robusto y configurable'}
+                  </span>
                 </div>
               </div>
               <span className="material-symbols-outlined text-white/30 group-hover:text-white transition-colors">chevron_right</span>
             </div>
           </button>
-
-          <div className="grid grid-cols-2 gap-4">
-          <button className="flex flex-col items-center justify-center gap-2 h-24 rounded-2xl glass-panel hover:bg-white/5 transition-colors active:scale-95 border-0" onClick={() => { fetchActiveRooms(); setShowRooms((v) => !v); }}>
-            <span className="material-symbols-outlined text-gold/80 text-3xl">visibility</span>
-            <span className="text-sm font-bold text-white/90">{showRooms ? 'Ocultar salas' : 'Ver salas'}</span>
-          </button>
-            <button className="flex flex-col items-center justify-center gap-2 h-24 rounded-2xl glass-panel hover:bg-white/5 transition-colors active:scale-95 border-0" onClick={() => window.dispatchEvent(new Event('dixit:progress'))}>
-              <span className="material-symbols-outlined text-purple-300 text-3xl">leaderboard</span>
-              <span className="text-sm font-bold text-white/90">Progreso</span>
-            </button>
-          </div>
         </div>
-
-        <div className="mt-4 w-full max-w-md">
-          <p className="text-xs text-purple-200 italic text-center">"Una imagen vale más que mil palabras, pero un sueño es infinito."</p>
-        </div>
-
-        {showRooms && (
-        <div className="w-full max-w-md space-y-3 border-t border-white/10 pt-4">
-          <div className="flex items-center justify-between">
-            <p className="text-sm text-white/70 font-semibold">Partidas activas</p>
-            <button onClick={fetchActiveRooms} className="text-xs px-3 py-1 rounded-full bg-white/10 border border-white/20 text-white/80 hover:bg-white/20 transition">Refrescar</button>
-          </div>
-          <div className="space-y-3 max-h-72 overflow-y-auto pr-1">
-            {(activeRooms || []).length === 0 && <p className="text-white/50 text-sm">No hay partidas activas.</p>}
-            {(activeRooms || []).map((r) => (
-              <div key={r.code} className="rounded-2xl border border-white/10 bg-white/5 p-3">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-xs text-white/50">Código</p>
-                    <p className="text-lg font-bold text-white tracking-widest font-mono">{r.code}</p>
-                    <p className="text-xs text-white/60 mt-1">Fase: {r.phase}</p>
-                  </div>
-                  <div className="text-right text-xs text-white/60">
-                    <p>{r.players?.length || 0} jugadores</p>
-                    <p>Modo: {r.mode === 'party' ? '+18' : 'clásico'}</p>
-                  </div>
-                </div>
-                <div className="mt-3 grid grid-cols-2 gap-2">
-                  {(r.players || []).map((p) => (
-                    <button
-                      key={p.id}
-                      onClick={() => handleResumeClick(r.code, p.id)}
-                      className={`flex items-center justify-between px-3 py-2 rounded-xl text-left border ${resumePlayerId === p.id ? 'border-primary bg-primary/20' : 'border-white/10 bg-white/5 hover:bg-white/10'} text-white/80 transition text-sm`}
-                    >
-                      <span className="font-semibold">{p.name}</span>
-                      <span className={`w-2 h-2 rounded-full ${p.connected ? 'bg-green-400' : 'bg-yellow-300'}`} title={p.connected ? 'Conectado' : 'Desconectado'} />
-                    </button>
-                  ))}
-                </div>
-                <button
-                  onClick={() => openDeleteModal(r.code)}
-                  className="mt-2 w-full h-10 rounded-xl bg-red-600/80 text-white text-sm font-semibold hover:bg-red-600 transition"
-                >
-                  Eliminar sala
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
-        )}
       </div>
-
-      {deleteModalRoom && (
-        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center px-4">
-          <div className="w-full max-w-sm rounded-2xl border border-white/15 bg-[#241634] p-5 shadow-2xl">
-            <h3 className="text-white text-lg font-bold">Eliminar sala {deleteModalRoom}</h3>
-            <p className="text-white/65 text-sm mt-1">Si no eres host, puedes usar contraseña maestra opcional.</p>
-            <label className="block mt-4 text-xs text-white/60">Contraseña maestra (opcional)</label>
-            <input
-              type="password"
-              autoComplete="current-password"
-              value={deletePassword}
-              onChange={(event) => setDeletePassword(event.target.value)}
-              className="mt-2 w-full rounded-xl border border-white/15 bg-white/10 px-3 py-3 text-white placeholder:text-white/40"
-              placeholder="Escribe la contraseña"
-            />
-            <div className="mt-4 flex gap-2 justify-end">
-              <button
-                type="button"
-                onClick={closeDeleteModal}
-                className="h-10 px-4 rounded-xl border border-white/20 bg-white/10 text-white text-sm"
-              >
-                Cancelar
-              </button>
-              <button
-                type="button"
-                onClick={confirmDeleteRoom}
-                className="h-10 px-4 rounded-xl bg-red-600 text-white text-sm font-semibold"
-              >
-                Eliminar
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       <div className="fixed bottom-0 left-0 right-0 z-50 px-4 pb-4 pt-2">
         <div className="glass-panel mx-auto flex h-16 w-full max-w-md items-center justify-between rounded-full px-1 shadow-2xl">
-          <div className="flex flex-1 flex-col items-center justify-center gap-0.5">
+          <button className="flex flex-1 flex-col items-center justify-center gap-0.5" type="button">
             <div className="flex h-10 w-16 items-center justify-center rounded-full bg-primary/20 text-primary transition-all">
               <span className="material-symbols-outlined fill-current" style={{ fontVariationSettings: "'FILL' 1, 'wght' 400" }}>home</span>
             </div>
-          </div>
-          <div className="flex flex-1 flex-col items-center justify-center gap-0.5">
+          </button>
+          <button onClick={onOpenRooms} className="flex flex-1 flex-col items-center justify-center gap-0.5" type="button">
             <div className="flex h-10 w-16 items-center justify-center rounded-full text-purple-200/60 hover:text-white transition-all hover:bg-white/5">
               <span className="material-symbols-outlined">group</span>
             </div>
-          </div>
+          </button>
           <div className="relative -top-6">
             <button onClick={onJoin} className="flex h-14 w-14 items-center justify-center rounded-full bg-gradient-to-b from-gold to-yellow-600 text-black shadow-lg shadow-gold/20 transition-transform active:scale-95 border-4 border-background-dark">
               <span className="material-symbols-outlined" style={{ fontSize: 28, fontVariationSettings: "'FILL' 1" }}>play_arrow</span>
             </button>
           </div>
-          <div className="flex flex-1 flex-col items-center justify-center gap-0.5">
-            <div className="flex h-10 w-16 items-center justify-center rounded-full text-purple-200/60 hover:text-white transition-all hover:bg-white/5">
-              <span className="material-symbols-outlined">style</span>
-            </div>
-          </div>
-          <div className="flex flex-1 flex-col items-center justify-center gap-0.5">
+          <button onClick={onOpenProfile} className="flex flex-1 flex-col items-center justify-center gap-0.5" type="button">
             <div className="flex h-10 w-16 items-center justify-center rounded-full text-purple-200/60 hover:text-white transition-all hover:bg-white/5">
               <span className="material-symbols-outlined">person</span>
             </div>
-          </div>
+          </button>
+          <button onClick={onLogout} className="flex flex-1 flex-col items-center justify-center gap-0.5" type="button">
+            <div className="flex h-10 w-16 items-center justify-center rounded-full text-purple-200/60 hover:text-white transition-all hover:bg-white/5">
+              <span className="material-symbols-outlined">logout</span>
+            </div>
+          </button>
         </div>
       </div>
     </section>
@@ -1057,29 +1494,63 @@ function Landing({
 export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [user, setUser] = useState(null);
+  const [landingView, setLandingView] = useState('home');
+  const [entryMode, setEntryMode] = useState(null);
   const [resumeRoomCode, setResumeRoomCode] = useState('');
   const [name, setName] = useState(localStorage.getItem('dixit:name') || '');
   const [room, setRoom] = useState(localStorage.getItem('dixit:room') || '');
   const [selected, setSelected] = useState(null);
   const [clue, setClue] = useState('');
-  const [soloPending, setSoloPending] = useState(false);
-  const [musicOn, setMusicOn] = useState(true);
+  const [startingSolo, setStartingSolo] = useState(false);
+  const [musicOn, setMusicOn] = useState(() => {
+    const saved = localStorage.getItem('dixit:music-on');
+    return saved === null ? true : saved === '1';
+  });
+  const [sfxOn, setSfxOn] = useState(() => {
+    const saved = localStorage.getItem('dixit:sfx-on');
+    return saved === null ? true : saved === '1';
+  });
+  const [musicVolume, setMusicVolume] = useState(() => {
+    const saved = Number(localStorage.getItem('dixit:music-volume'));
+    return Number.isFinite(saved) && saved >= 0 && saved <= 1 ? saved : 0.35;
+  });
+  const [sfxVolume, setSfxVolume] = useState(() => {
+    const saved = Number(localStorage.getItem('dixit:sfx-volume'));
+    return Number.isFinite(saved) && saved >= 0 && saved <= 1 ? saved : 0.7;
+  });
   const [audioNeedsInteraction, setAudioNeedsInteraction] = useState(false);
+  const [audioStatus, setAudioStatus] = useState('idle');
+  const [audioError, setAudioError] = useState('');
   const [showProgress, setShowProgress] = useState(false);
   const [progressData, setProgressData] = useState([]);
   const [activeRooms, setActiveRooms] = useState([]);
-  const [resumePlayerId, setResumePlayerId] = useState('');
-  const [now, setNow] = useState(Date.now());
-  const { state, setState, send, connected } = useWs(Boolean(user));
+  const [profileData, setProfileData] = useState(null);
+  const [profileDraft, setProfileDraft] = useState(null);
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileError, setProfileError] = useState('');
+  const [profileSavedAt, setProfileSavedAt] = useState('');
+  const [soloConfig, setSoloConfig] = useState({
+    mode: 'classic',
+    difficulty: 'normal',
+    drinkLevel: 'light',
+    partyRules: {
+      randomEvents: true,
+      safeMessaging: true,
+    },
+  });
+  const { state, setState, send, connected, serverError, setServerError } = useWs(Boolean(user));
   const audioRef = useRef(null);
   const tickAudioCtxRef = useRef(null);
   const tickIntervalRef = useRef(null);
+  const tickLastSecondRef = useRef(null);
   const resumedRef = useRef(false);
-
-  const currentRemainingMs = state?.timer?.deadlineAt ? Math.max(0, Number(state.timer.deadlineAt) - now) : 0;
+  const lastRoomCodeRef = useRef('');
+  const phaseRef = useRef('');
+  const gameOverPlayedRef = useRef(false);
+  const audioPrefsHydratedRef = useRef(false);
 
   const playTick = useCallback(() => {
-    if (!musicOn) return;
+    if (!sfxOn || audioNeedsInteraction) return;
     try {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (!Ctx) return;
@@ -1094,7 +1565,7 @@ export default function App() {
       const gain = ctx.createGain();
       osc.type = 'square';
       osc.frequency.value = 980;
-      gain.gain.value = 0.03;
+      gain.gain.value = 0.02 + sfxVolume * 0.05;
       osc.connect(gain);
       gain.connect(ctx.destination);
       const t0 = ctx.currentTime;
@@ -1103,7 +1574,47 @@ export default function App() {
     } catch {
       // ignore audio errors
     }
-  }, [musicOn]);
+  }, [sfxOn, audioNeedsInteraction, sfxVolume]);
+
+  const playSfx = useCallback((kind = 'click') => {
+    if (!sfxOn || audioNeedsInteraction) return;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!tickAudioCtxRef.current) {
+        tickAudioCtxRef.current = new Ctx();
+      }
+      const ctx = tickAudioCtxRef.current;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+      const now = ctx.currentTime;
+      const patterns = {
+        click: [[880, 0.03, 0], [660, 0.02, 0.03]],
+        transition: [[420, 0.05, 0], [560, 0.05, 0.05], [720, 0.06, 0.1]],
+        vote: [[520, 0.05, 0], [620, 0.04, 0.05]],
+        reveal: [[420, 0.06, 0], [640, 0.07, 0.06], [840, 0.07, 0.12]],
+        success: [[500, 0.07, 0], [750, 0.08, 0.08], [1000, 0.09, 0.16]],
+        error: [[360, 0.08, 0], [250, 0.1, 0.08]],
+      };
+      const selected = patterns[kind] || patterns.click;
+      selected.forEach(([frequency, duration, offset]) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.value = frequency;
+        gain.gain.setValueAtTime(0.0001, now + offset);
+        gain.gain.exponentialRampToValueAtTime(0.01 + sfxVolume * 0.045, now + offset + 0.01);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + duration);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now + offset);
+        osc.stop(now + offset + duration + 0.01);
+      });
+    } catch {
+      // ignore synthesized sfx failures
+    }
+  }, [sfxOn, audioNeedsInteraction, sfxVolume]);
 
   const stopTicking = useCallback(() => {
     if (tickIntervalRef.current) {
@@ -1111,6 +1622,55 @@ export default function App() {
       tickIntervalRef.current = null;
     }
   }, []);
+
+  const attemptPlayMusic = useCallback(async (source = 'auto') => {
+    const audio = audioRef.current;
+    if (!audio) return false;
+    if (!musicOn) {
+      audio.pause();
+      setAudioStatus('disabled');
+      setAudioNeedsInteraction(false);
+      return false;
+    }
+    try {
+      audio.volume = musicVolume;
+      audio.loop = true;
+      await audio.play();
+      setAudioStatus('playing');
+      setAudioNeedsInteraction(false);
+      setAudioError('');
+      debugLog('audio:playing', { source });
+      return true;
+    } catch (error) {
+      const blocked = error?.name === 'NotAllowedError' || error?.name === 'AbortError';
+      setAudioStatus(blocked ? 'blocked' : 'error');
+      setAudioNeedsInteraction(blocked);
+      setAudioError(error?.message || 'No se pudo reproducir la música.');
+      debugLog('audio:play_failed', {
+        source,
+        name: error?.name,
+        message: error?.message,
+      });
+      return false;
+    }
+  }, [musicOn, musicVolume]);
+
+  const requestAudioUnlock = useCallback(async () => {
+    if (!musicOn) {
+      setMusicOn(true);
+      return;
+    }
+    const ctx = tickAudioCtxRef.current;
+    if (ctx?.state === 'suspended') {
+      try {
+        await ctx.resume();
+      } catch {
+        // ignore resume errors
+      }
+    }
+    await attemptPlayMusic('user_gesture');
+    playSfx('click');
+  }, [attemptPlayMusic, musicOn, playSfx]);
 
   useEffect(() => {
     let active = true;
@@ -1122,6 +1682,14 @@ export default function App() {
           setResumeRoomCode(payload.activeRoom?.code || '');
           if (!name) {
             setName(payload.user.displayName || payload.user.username || '');
+          }
+          if (payload.profile) {
+            hydrateProfilePreferences({
+              user: payload.user,
+              profile: payload.profile,
+              stats: {},
+              history: [],
+            });
           }
         }
       })
@@ -1143,6 +1711,76 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('dixit:room', room);
   }, [room]);
+  useEffect(() => {
+    localStorage.setItem('dixit:music-on', musicOn ? '1' : '0');
+  }, [musicOn]);
+  useEffect(() => {
+    localStorage.setItem('dixit:sfx-on', sfxOn ? '1' : '0');
+  }, [sfxOn]);
+  useEffect(() => {
+    localStorage.setItem('dixit:music-volume', String(musicVolume));
+  }, [musicVolume]);
+  useEffect(() => {
+    localStorage.setItem('dixit:sfx-volume', String(sfxVolume));
+  }, [sfxVolume]);
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.volume = musicVolume;
+    }
+  }, [musicVolume]);
+  useEffect(() => {
+    setProfileDraft((current) => {
+      if (!current) return current;
+      if (
+        current.musicOn === musicOn &&
+        current.sfxOn === sfxOn &&
+        current.musicVolume === musicVolume &&
+        current.sfxVolume === sfxVolume
+      ) {
+        return current;
+      }
+      return {
+        ...current,
+        musicOn,
+        sfxOn,
+        musicVolume,
+        sfxVolume,
+      };
+    });
+  }, [musicOn, musicVolume, sfxOn, sfxVolume]);
+  useEffect(() => {
+    if (!user || !profileDraft) return;
+    if (!audioPrefsHydratedRef.current) {
+      audioPrefsHydratedRef.current = true;
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      api('/api/profile', {
+        method: 'PUT',
+        body: JSON.stringify({
+          musicOn,
+          sfxOn,
+          musicVolume,
+          sfxVolume,
+        }),
+      })
+        .then((payload) => {
+          if (!payload?.ok) return;
+          setProfileData(payload);
+          setProfileDraft((current) => (current ? {
+            ...current,
+            musicOn: payload.profile.musicOn,
+            sfxOn: payload.profile.sfxOn,
+            musicVolume: payload.profile.musicVolume,
+            sfxVolume: payload.profile.sfxVolume,
+          } : current));
+        })
+        .catch(() => {
+          // ignore silent preference sync errors
+        });
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [musicOn, musicVolume, profileDraft, sfxOn, sfxVolume, user]);
 
   const fetchActiveRooms = useCallback(async () => {
     if (!user) return;
@@ -1154,22 +1792,132 @@ export default function App() {
     }
   }, [user]);
 
-  const join = (withBots = false) => {
+  const hydrateProfilePreferences = useCallback((payload) => {
+    if (!payload?.profile) return;
+    setProfileData(payload);
+    setProfileDraft({
+      nickname: payload.profile.nickname || payload.user?.displayName || '',
+      avatarSeed: payload.profile.avatarSeed || '',
+      preferredMode: payload.profile.preferredMode || 'classic',
+      preferredBotDifficulty: payload.profile.preferredBotDifficulty || 'normal',
+      musicOn: payload.profile.musicOn !== false,
+      sfxOn: payload.profile.sfxOn !== false,
+      musicVolume: Number(payload.profile.musicVolume ?? 0.35),
+      sfxVolume: Number(payload.profile.sfxVolume ?? 0.7),
+      adultModeOptIn: Boolean(payload.profile.adultModeOptIn),
+    });
+    setMusicOn(payload.profile.musicOn !== false);
+    setSfxOn(payload.profile.sfxOn !== false);
+    setMusicVolume(Number(payload.profile.musicVolume ?? 0.35));
+    setSfxVolume(Number(payload.profile.sfxVolume ?? 0.7));
+    setSoloConfig((current) => ({
+      ...current,
+      mode: payload.profile.preferredMode || 'classic',
+      difficulty: payload.profile.preferredBotDifficulty || current.difficulty,
+    }));
+  }, []);
+
+  const fetchProfile = useCallback(async () => {
+    if (!user) return;
+    try {
+      const payload = await api('/api/profile');
+      hydrateProfilePreferences(payload);
+      setProfileError('');
+    } catch (error) {
+      setProfileError(error?.message || 'No se pudo cargar el perfil.');
+    }
+  }, [hydrateProfilePreferences, user]);
+
+  const saveProfile = useCallback(async () => {
+    if (!profileDraft) return;
+    setProfileSaving(true);
+    setProfileError('');
+    try {
+      const payload = await api('/api/profile', {
+        method: 'PUT',
+        body: JSON.stringify(profileDraft),
+      });
+      hydrateProfilePreferences(payload);
+      setUser((current) => (current ? { ...current, displayName: payload?.user?.displayName || profileDraft.nickname } : current));
+      setName(payload?.profile?.nickname || name);
+      setProfileSavedAt(payload?.savedAt || new Date().toISOString());
+    } catch (error) {
+      setProfileError(error?.message || 'No se pudo guardar el perfil.');
+    } finally {
+      setProfileSaving(false);
+    }
+  }, [hydrateProfilePreferences, name, profileDraft]);
+
+  const join = () => {
+    playSfx('click');
+    setEntryMode('online');
+    setStartingSolo(false);
+    setServerError('');
+    resumedRef.current = true;
     const payload = { type: 'join', name: name || user?.displayName || 'Jugador' };
     if (room) payload.roomCode = room;
     send(payload);
-    if (withBots) setSoloPending(true);
   };
 
-  const handleResume = (roomCode, playerId) => {
+  const startSolo = useCallback(() => {
+    if (!user) return;
+    if (soloConfig.mode === 'party' && !(profileDraft?.adultModeOptIn || profileData?.profile?.adultModeOptIn)) {
+      setServerError('Activa y confirma el modo +18 en tu perfil para iniciar esta variante.');
+      return;
+    }
+    playSfx('transition');
+    setEntryMode('solo');
+    setStartingSolo(true);
+    setServerError('');
+    setResumeRoomCode('');
+    setRoom('');
+    setShowProgress(false);
+    setProgressData([]);
+    resumedRef.current = true;
+    debugLog('solo:start_requested');
+    send({
+      type: 'start_solo',
+      name: name || user.displayName || user.username || 'Jugador',
+      mode: soloConfig.mode,
+      difficulty: soloConfig.difficulty,
+      drinkLevel: soloConfig.drinkLevel,
+      partyRules: soloConfig.partyRules,
+    });
+  }, [name, playSfx, profileData?.profile?.adultModeOptIn, profileDraft?.adultModeOptIn, send, setServerError, soloConfig, user]);
+
+  const handleResume = (roomCode) => {
+    playSfx('click');
+    setEntryMode('online');
+    setStartingSolo(false);
+    setServerError('');
+    resumedRef.current = true;
     const formatted = formatRoomCode(roomCode || room);
     if (formatted) {
       setRoom(formatted);
       setResumeRoomCode(formatted);
     }
-    if (playerId) setResumePlayerId(playerId);
     send({ type: 'join', name: name || user?.displayName || 'Jugador', roomCode: formatted });
   };
+
+  const openRoomsView = useCallback(() => {
+    playSfx('click');
+    setLandingView('rooms');
+    fetchActiveRooms();
+  }, [fetchActiveRooms, playSfx]);
+
+  const openProfileView = useCallback(() => {
+    playSfx('click');
+    setLandingView('profile');
+    fetchProfile();
+  }, [fetchProfile, playSfx]);
+
+  const joinFromActiveRoom = useCallback((roomCode) => {
+    const formatted = formatRoomCode(roomCode);
+    if (!formatted) return;
+    setRoom(formatted);
+    setLandingView('home');
+    handleResume(formatted);
+  }, [handleResume]);
 
   const handleLogout = async () => {
     try {
@@ -1179,54 +1927,65 @@ export default function App() {
     } finally {
       setState(null);
       setUser(null);
+      setLandingView('home');
+      setEntryMode(null);
+      setStartingSolo(false);
       setResumeRoomCode('');
+      setServerError('');
+      setProfileData(null);
+      setProfileDraft(null);
+      setProfileError('');
+      setProfileSavedAt('');
+      audioPrefsHydratedRef.current = false;
       resumedRef.current = false;
     }
   };
 
   const leave = () => {
+    playSfx('click');
+    debugLog('room:leave', { roomCode: state?.roomCode, entryMode });
     send({ type: 'leave' });
     setState(null);
+    setShowProgress(false);
+    setProgressData([]);
+    setStartingSolo(false);
+    setLandingView('home');
+    if (entryMode === 'solo') {
+      setRoom('');
+      setResumeRoomCode('');
+    }
+    setEntryMode(null);
+    setServerError('');
   };
 
   const toggleMusic = useCallback(() => {
-    const audio = audioRef.current;
-    setMusicOn((prev) => {
-      const next = !prev;
-      if (audio) {
-        if (next) {
-          audio.volume = 0.35;
-          audio.loop = true;
-          audio.play().then(() => setAudioNeedsInteraction(false)).catch(() => setAudioNeedsInteraction(true));
-        } else {
-          audio.pause();
-        }
-      }
-      return next;
-    });
-  }, []);
+    playSfx('click');
+    setMusicOn((prev) => !prev);
+  }, [playSfx]);
+
+  useEffect(() => {
+    if (!connected) {
+      resumedRef.current = false;
+    }
+  }, [connected]);
 
   useEffect(() => {
     if (!connected || !user) return;
     if (state?.roomCode) return;
     if (resumedRef.current) return;
-    const targetCode = resumeRoomCode || room;
+    if (startingSolo) return;
+    const targetCode = resumeRoomCode;
     if (!targetCode) return;
     resumedRef.current = true;
+    debugLog('resume:auto_join', { targetCode });
     send({ type: 'join', name: name || user.displayName || user.username, roomCode: targetCode });
-  }, [connected, user, state?.roomCode, resumeRoomCode, room, name, send]);
-
-  useEffect(() => {
-    if (soloPending && state?.roomCode) {
-      send({ type: 'start_with_bots' });
-      setSoloPending(false);
-    }
-  }, [soloPending, state?.roomCode, send]);
+  }, [connected, user, state?.roomCode, resumeRoomCode, name, send, startingSolo]);
 
   useEffect(() => {
     if (!user) return;
     fetchActiveRooms();
-  }, [fetchActiveRooms, user]);
+    fetchProfile();
+  }, [fetchActiveRooms, fetchProfile, user]);
 
   useEffect(() => {
     const handler = () => setShowProgress(true);
@@ -1235,14 +1994,39 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 500);
-    return () => window.clearInterval(id);
-  }, []);
+    if (!user || landingView !== 'rooms' || state?.phase) return;
+    const timer = window.setInterval(() => {
+      fetchActiveRooms();
+    }, 7000);
+    return () => window.clearInterval(timer);
+  }, [fetchActiveRooms, landingView, state?.phase, user]);
 
   useEffect(() => {
     if (!state?.players) return;
     setProgressData(state.players);
   }, [state?.players]);
+
+  useEffect(() => {
+    const nextPhase = state?.phase || '';
+    const prevPhase = phaseRef.current;
+    if (nextPhase && prevPhase && nextPhase !== prevPhase) {
+      if (nextPhase === 'vote') playSfx('vote');
+      else if (nextPhase === 'reveal') playSfx('reveal');
+      else playSfx('transition');
+    }
+    phaseRef.current = nextPhase;
+  }, [playSfx, state?.phase]);
+
+  useEffect(() => {
+    const gameOver = Boolean(state?.summary?.gameOver || state?.finished);
+    if (!gameOver) {
+      gameOverPlayedRef.current = false;
+      return;
+    }
+    if (gameOverPlayedRef.current) return;
+    gameOverPlayedRef.current = true;
+    playSfx('success');
+  }, [playSfx, state?.finished, state?.summary?.gameOver]);
 
   useEffect(() => {
     if (state?.phase !== phases.CLUE) {
@@ -1252,43 +2036,153 @@ export default function App() {
   }, [state?.phase]);
 
   useEffect(() => {
+    if (!serverError || !startingSolo) return;
+    setStartingSolo(false);
+  }, [serverError, startingSolo]);
+
+  useEffect(() => {
+    if (!serverError) return;
+    playSfx('error');
+  }, [playSfx, serverError]);
+
+  useEffect(() => {
+    if (startingSolo && state?.phase && state.phase !== phases.LOBBY) {
+      setStartingSolo(false);
+    }
+  }, [startingSolo, state?.phase]);
+
+  useEffect(() => {
+    const nextRoomCode = state?.roomCode || '';
+    if (nextRoomCode === lastRoomCodeRef.current) return;
+    const previousRoomCode = lastRoomCodeRef.current;
+    lastRoomCodeRef.current = nextRoomCode;
+    debugLog('room:changed', {
+      from: previousRoomCode || null,
+      to: nextRoomCode || null,
+      mode: entryMode,
+    });
+    setSelected(null);
+    setClue('');
+    setShowProgress(false);
+    if (nextRoomCode) {
+      setResumeRoomCode(nextRoomCode);
+      if (entryMode !== 'solo') {
+        setRoom(nextRoomCode);
+      }
+    } else if (entryMode === 'solo') {
+      setRoom('');
+    }
+  }, [state?.roomCode, entryMode]);
+
+  useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
     if (!musicOn) {
       audio.pause();
+      setAudioStatus('disabled');
+      setAudioNeedsInteraction(false);
       return;
     }
-    audio.volume = 0.35;
-    audio.loop = true;
-    audio.play().then(() => setAudioNeedsInteraction(false)).catch(() => setAudioNeedsInteraction(true));
-  }, [musicOn, user]);
+    void attemptPlayMusic('music_enabled');
+  }, [musicOn, user, attemptPlayMusic]);
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return undefined;
+    const onPlaying = () => {
+      setAudioStatus('playing');
+      setAudioNeedsInteraction(false);
+    };
+    const onPause = () => {
+      if (!musicOn) {
+        setAudioStatus('disabled');
+        return;
+      }
+      setAudioStatus((current) => (current === 'blocked' || current === 'error' ? current : 'idle'));
+    };
+    const onError = () => {
+      setAudioStatus('error');
+      setAudioNeedsInteraction(false);
+      setAudioError('No se pudo cargar la música.');
+    };
+    audio.addEventListener('playing', onPlaying);
+    audio.addEventListener('pause', onPause);
+    audio.addEventListener('error', onError);
+    return () => {
+      audio.removeEventListener('playing', onPlaying);
+      audio.removeEventListener('pause', onPause);
+      audio.removeEventListener('error', onError);
+    };
+  }, [musicOn]);
 
   useEffect(() => {
     if (!audioNeedsInteraction || !musicOn) return;
     const unlock = () => {
-      const audio = audioRef.current;
-      if (!audio) return;
-      audio.play().then(() => setAudioNeedsInteraction(false)).catch(() => {});
+      void requestAudioUnlock();
     };
-    window.addEventListener('pointerdown', unlock, { once: true });
+    window.addEventListener('pointerdown', unlock);
     return () => window.removeEventListener('pointerdown', unlock);
-  }, [audioNeedsInteraction, musicOn]);
+  }, [audioNeedsInteraction, musicOn, requestAudioUnlock]);
 
   useEffect(() => {
     const shouldTick =
-      musicOn &&
+      sfxOn &&
+      !audioNeedsInteraction &&
       state?.timer?.active &&
       ['clue', 'submit', 'vote'].includes(state?.phase) &&
-      currentRemainingMs > 0 &&
-      currentRemainingMs <= 12000;
+      Number(state?.timer?.deadlineAt) > 0;
     if (!shouldTick) {
       stopTicking();
+      tickLastSecondRef.current = null;
       return;
     }
-    playTick();
-    tickIntervalRef.current = window.setInterval(() => playTick(), 1000);
-    return () => stopTicking();
-  }, [musicOn, state?.phase, state?.timer?.active, state?.timer?.deadlineAt, currentRemainingMs, playTick, stopTicking]);
+    const deadlineAt = Number(state?.timer?.deadlineAt);
+    const maybeTick = () => {
+      const remainingMs = Math.max(0, deadlineAt - Date.now());
+      const remainingSeconds = Math.ceil(remainingMs / 1000);
+      if (remainingSeconds <= 0) return;
+      if (remainingSeconds > 10) {
+        tickLastSecondRef.current = null;
+        return;
+      }
+      if (tickLastSecondRef.current === remainingSeconds) return;
+      tickLastSecondRef.current = remainingSeconds;
+      playTick();
+    };
+    maybeTick();
+    tickIntervalRef.current = window.setInterval(maybeTick, 200);
+    return () => {
+      stopTicking();
+      tickLastSecondRef.current = null;
+    };
+  }, [sfxOn, audioNeedsInteraction, state?.phase, state?.timer?.active, state?.timer?.deadlineAt, playTick, stopTicking]);
+
+  useEffect(() => () => {
+    stopTicking();
+    if (tickAudioCtxRef.current) {
+      tickAudioCtxRef.current.close().catch(() => {});
+      tickAudioCtxRef.current = null;
+    }
+  }, [stopTicking]);
+
+  const musicStatusLabel = !musicOn
+    ? 'OFF'
+    : audioStatus === 'playing'
+      ? 'ON'
+      : audioStatus === 'blocked'
+        ? 'BLOQ'
+        : audioStatus === 'error'
+          ? 'ERR'
+          : '...';
+  const musicActionLabel = !musicOn
+    ? 'Música OFF'
+    : audioStatus === 'playing'
+      ? 'Música ON'
+      : audioStatus === 'blocked'
+        ? 'Música bloqueada'
+        : audioStatus === 'error'
+          ? 'Música con error'
+          : 'Música iniciando';
 
   const renderPhase = (extra = {}) => {
     if (!state || !state.phase) return null;
@@ -1337,10 +2231,25 @@ export default function App() {
     return (
       <div className="relative flex min-h-screen flex-col bg-surreal overflow-hidden">
         <AuthGate onAuthenticated={(me) => {
+          playSfx('success');
           setUser(me);
+          setLandingView('home');
+          setEntryMode(null);
+          setServerError('');
+          resumedRef.current = false;
           setName((current) => current || me.displayName || me.username || '');
           api('/api/auth/me')
-            .then((payload) => setResumeRoomCode(payload?.activeRoom?.code || ''))
+            .then((payload) => {
+              setResumeRoomCode(payload?.activeRoom?.code || '');
+              if (payload?.profile) {
+                hydrateProfilePreferences({
+                  user: payload.user || me,
+                  profile: payload.profile,
+                  stats: {},
+                  history: [],
+                });
+              }
+            })
             .catch(() => {});
         }} />
       </div>
@@ -1348,20 +2257,35 @@ export default function App() {
   }
 
   const isLanding = !state || !state.phase;
+  const adultModeEnabled = Boolean(profileDraft?.adultModeOptIn || profileData?.profile?.adultModeOptIn);
 
   return (
     <div className="relative flex min-h-screen flex-col bg-surreal overflow-hidden">
       <div className="fixed top-[-100px] right-[-100px] w-96 h-96 bg-primary/20 rounded-full blur-[100px] pointer-events-none z-0" />
       <div className="fixed bottom-[-50px] left-[-50px] w-64 h-64 bg-accent-pink/10 rounded-full blur-[80px] pointer-events-none z-0" />
-      <audio ref={audioRef} preload="auto" crossOrigin="anonymous" src="https://cdn.pixabay.com/download/audio/2022/10/13/audio_1c2d5c93e9.mp3?filename=creepy-ambient-124267.mp3" />
-      {audioNeedsInteraction && (
+      <audio ref={audioRef} preload="auto" src="/audio/ambient-loop.wav" />
+      {audioNeedsInteraction && musicOn && (
         <button
           type="button"
-          onClick={toggleMusic}
+          onClick={requestAudioUnlock}
           className="fixed left-1/2 top-4 z-40 -translate-x-1/2 rounded-full border border-white/20 bg-black/50 px-4 py-2 text-xs text-white"
         >
           Toca para activar audio
         </button>
+      )}
+      {serverError && (
+        <button
+          type="button"
+          onClick={() => setServerError('')}
+          className="fixed left-1/2 top-16 z-40 -translate-x-1/2 rounded-xl border border-rose-300/40 bg-rose-500/20 px-4 py-2 text-xs text-rose-50"
+        >
+          {serverError}
+        </button>
+      )}
+      {audioStatus === 'error' && audioError && (
+        <div className="fixed left-1/2 top-28 z-40 -translate-x-1/2 rounded-xl border border-amber-300/40 bg-amber-500/20 px-3 py-2 text-xs text-amber-50">
+          Audio: {audioError}
+        </div>
       )}
       {!connected && !isLanding && (
         <div className="fixed right-4 top-4 z-40 rounded-full border border-amber-300/40 bg-amber-500/20 px-3 py-1 text-xs text-amber-50">
@@ -1369,23 +2293,47 @@ export default function App() {
         </div>
       )}
       {isLanding ? (
-        <Landing
-          onJoin={() => join(false)}
-          onSolo={() => join(true)}
-          onResume={handleResume}
-          onLogout={handleLogout}
-          name={name}
-          setName={setName}
-          room={room}
-          setRoom={setRoom}
-          activeRooms={activeRooms}
-          resumePlayerId={resumePlayerId}
-          setResumePlayerId={setResumePlayerId}
-          fetchActiveRooms={fetchActiveRooms}
-          toggleMusic={toggleMusic}
-          musicOn={musicOn}
-          send={send}
-        />
+        landingView === 'rooms' ? (
+          <ActiveRoomsView
+            activeRooms={activeRooms}
+            fetchActiveRooms={fetchActiveRooms}
+            onBack={() => setLandingView('home')}
+            onJoinRoom={joinFromActiveRoom}
+            onResumeRoom={joinFromActiveRoom}
+            send={send}
+          />
+        ) : landingView === 'profile' ? (
+          <ProfileView
+            profileData={profileData}
+            profileDraft={profileDraft}
+            setProfileDraft={setProfileDraft}
+            profileSaving={profileSaving}
+            profileError={profileError}
+            profileSavedAt={profileSavedAt}
+            onSave={saveProfile}
+            onBack={() => setLandingView('home')}
+          />
+        ) : (
+          <Landing
+            onJoin={join}
+            onSolo={startSolo}
+            onOpenRooms={openRoomsView}
+            onOpenProfile={openProfileView}
+            onLogout={handleLogout}
+            name={name}
+            setName={setName}
+            room={room}
+            setRoom={setRoom}
+            activeRooms={activeRooms}
+            toggleMusic={toggleMusic}
+            musicOn={musicOn}
+            musicStatusLabel={musicStatusLabel}
+            startingSolo={startingSolo}
+            soloConfig={soloConfig}
+            setSoloConfig={setSoloConfig}
+            adultModeEnabled={adultModeEnabled}
+          />
+        )
       ) : (
         renderPhase({ onLeave: leave, onShowProgress: () => setShowProgress(true), toggleMusic, musicOn })
       )}
@@ -1394,7 +2342,7 @@ export default function App() {
           onLeave={leave}
           onProgress={() => setShowProgress(true)}
           onToggleMusic={toggleMusic}
-          musicOn={musicOn}
+          musicLabel={musicActionLabel}
         />
       )}
       {showProgress && (

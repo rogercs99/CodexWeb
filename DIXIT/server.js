@@ -20,6 +20,8 @@ const MAX_POINT_LIMIT = 80;
 const REVEAL_AUTO_ADVANCE_SECONDS = 12;
 const ROOM_TICK_MS = 1000;
 const MASTER_DELETE_PASSWORD = String(process.env.ROOM_DELETE_PASSWORD || '').trim();
+const DEFAULT_MUSIC_VOLUME = 0.35;
+const DEFAULT_SFX_VOLUME = 0.7;
 
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
@@ -57,6 +59,7 @@ CREATE TABLE IF NOT EXISTS rooms (
   active INTEGER NOT NULL DEFAULT 1,
   mode TEXT NOT NULL DEFAULT 'classic',
   drink_level TEXT NOT NULL DEFAULT 'light',
+  party_rules_json TEXT NOT NULL DEFAULT '{}',
   point_limit INTEGER NOT NULL DEFAULT ${DEFAULT_POINT_LIMIT},
   finished INTEGER NOT NULL DEFAULT 0,
   winner_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -120,7 +123,53 @@ CREATE TABLE IF NOT EXISTS room_history (
   created_at TEXT NOT NULL,
   FOREIGN KEY(room_code) REFERENCES rooms(code) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS user_profiles (
+  user_id TEXT PRIMARY KEY,
+  nickname TEXT NOT NULL,
+  avatar_seed TEXT NOT NULL DEFAULT '',
+  preferred_mode TEXT NOT NULL DEFAULT 'classic',
+  preferred_bot_difficulty TEXT NOT NULL DEFAULT 'normal',
+  music_on INTEGER NOT NULL DEFAULT 1,
+  sfx_on INTEGER NOT NULL DEFAULT 1,
+  music_volume REAL NOT NULL DEFAULT 0.35,
+  sfx_volume REAL NOT NULL DEFAULT 0.7,
+  adult_mode_opt_in INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS user_stats (
+  user_id TEXT PRIMARY KEY,
+  games_played INTEGER NOT NULL DEFAULT 0,
+  games_won INTEGER NOT NULL DEFAULT 0,
+  total_points INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS user_game_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  room_code TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'classic',
+  result TEXT NOT NULL,
+  score INTEGER NOT NULL DEFAULT 0,
+  winner INTEGER NOT NULL DEFAULT 0,
+  point_limit INTEGER NOT NULL DEFAULT ${DEFAULT_POINT_LIMIT},
+  created_at TEXT NOT NULL,
+  UNIQUE(user_id, room_code),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
 `);
+
+function ensureColumnExists(tableName, columnName, columnDef) {
+  const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
+  if (columns.some((column) => column.name === columnName)) return;
+  db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnDef}`);
+}
+
+ensureColumnExists('rooms', 'party_rules_json', `TEXT NOT NULL DEFAULT '{}'`);
 
 const getSessionUserStmt = db.prepare(`
   SELECT u.id, u.username, u.display_name, s.expires_at
@@ -146,6 +195,71 @@ const getUserByIdStmt = db.prepare(`
 const insertUserStmt = db.prepare(`
   INSERT INTO users (id, username, display_name, password_hash, password_salt, created_at, updated_at)
   VALUES (?, ?, ?, ?, ?, ?, ?)
+`);
+const updateUserDisplayNameStmt = db.prepare(`
+  UPDATE users
+  SET display_name = ?, updated_at = ?
+  WHERE id = ?
+`);
+const upsertUserProfileStmt = db.prepare(`
+  INSERT INTO user_profiles (
+    user_id, nickname, avatar_seed, preferred_mode, preferred_bot_difficulty,
+    music_on, sfx_on, music_volume, sfx_volume, adult_mode_opt_in, updated_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(user_id) DO UPDATE SET
+    nickname = excluded.nickname,
+    avatar_seed = excluded.avatar_seed,
+    preferred_mode = excluded.preferred_mode,
+    preferred_bot_difficulty = excluded.preferred_bot_difficulty,
+    music_on = excluded.music_on,
+    sfx_on = excluded.sfx_on,
+    music_volume = excluded.music_volume,
+    sfx_volume = excluded.sfx_volume,
+    adult_mode_opt_in = excluded.adult_mode_opt_in,
+    updated_at = excluded.updated_at
+`);
+const getUserProfileStmt = db.prepare(`
+  SELECT
+    up.user_id,
+    up.nickname,
+    up.avatar_seed,
+    up.preferred_mode,
+    up.preferred_bot_difficulty,
+    up.music_on,
+    up.sfx_on,
+    up.music_volume,
+    up.sfx_volume,
+    up.adult_mode_opt_in,
+    up.updated_at
+  FROM user_profiles up
+  WHERE up.user_id = ?
+`);
+const getUserStatsStmt = db.prepare(`
+  SELECT user_id, games_played, games_won, total_points, updated_at
+  FROM user_stats
+  WHERE user_id = ?
+`);
+const upsertUserStatsDeltaStmt = db.prepare(`
+  INSERT INTO user_stats (user_id, games_played, games_won, total_points, updated_at)
+  VALUES (?, 1, ?, ?, ?)
+  ON CONFLICT(user_id) DO UPDATE SET
+    games_played = user_stats.games_played + 1,
+    games_won = user_stats.games_won + excluded.games_won,
+    total_points = user_stats.total_points + excluded.total_points,
+    updated_at = excluded.updated_at
+`);
+const insertUserGameHistoryStmt = db.prepare(`
+  INSERT INTO user_game_history (
+    user_id, room_code, mode, result, score, winner, point_limit, created_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(user_id, room_code) DO NOTHING
+`);
+const getRecentUserGamesStmt = db.prepare(`
+  SELECT id, room_code, mode, result, score, winner, point_limit, created_at
+  FROM user_game_history
+  WHERE user_id = ?
+  ORDER BY id DESC
+  LIMIT ?
 `);
 
 function nowIso() {
@@ -197,6 +311,113 @@ function toPublicUser(row) {
     username: row.username,
     displayName: row.display_name,
   };
+}
+
+function clampNumber(value, min, max, fallback) {
+  const numeric = Number(value);
+  if (Number.isNaN(numeric)) return fallback;
+  return Math.max(min, Math.min(max, numeric));
+}
+
+function normalizePreferredMode(value) {
+  return value === 'party' ? 'party' : 'classic';
+}
+
+function normalizeBotDifficulty(value) {
+  return BOT_LEVELS.includes(value) ? value : 'normal';
+}
+
+function normalizeAvatarSeed(value = '') {
+  return String(value || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, '')
+    .slice(0, 24);
+}
+
+function sanitizeNickname(input = '', fallback = 'Jugador') {
+  const clean = String(input || '').trim().slice(0, 28);
+  return clean || fallback;
+}
+
+function toPublicProfileRow(row, user) {
+  const gamesPlayed = Number(row?.games_played || 0);
+  const gamesWon = Number(row?.games_won || 0);
+  return {
+    user: {
+      id: user.id,
+      username: user.username,
+      displayName: user.display_name,
+    },
+    profile: {
+      nickname: row?.nickname || user.display_name,
+      avatarSeed: row?.avatar_seed || '',
+      preferredMode: normalizePreferredMode(row?.preferred_mode || 'classic'),
+      preferredBotDifficulty: normalizeBotDifficulty(row?.preferred_bot_difficulty || 'normal'),
+      musicOn: Number(row?.music_on ?? 1) === 1,
+      sfxOn: Number(row?.sfx_on ?? 1) === 1,
+      musicVolume: clampNumber(row?.music_volume, 0, 1, DEFAULT_MUSIC_VOLUME),
+      sfxVolume: clampNumber(row?.sfx_volume, 0, 1, DEFAULT_SFX_VOLUME),
+      adultModeOptIn: Number(row?.adult_mode_opt_in ?? 0) === 1,
+      updatedAt: row?.updated_at || nowIso(),
+    },
+    stats: {
+      gamesPlayed,
+      gamesWon,
+      winRate: gamesPlayed > 0 ? Number((gamesWon / gamesPlayed).toFixed(3)) : 0,
+      totalPoints: Number(row?.total_points || 0),
+      updatedAt: row?.stats_updated_at || row?.updated_at || nowIso(),
+    },
+  };
+}
+
+function ensureUserProfile(userId, fallbackNickname = 'Jugador') {
+  const user = getUserByIdStmt.get(userId);
+  if (!user) return null;
+  const now = nowIso();
+  const existing = getUserProfileStmt.get(userId);
+  if (!existing) {
+    upsertUserProfileStmt.run(
+      userId,
+      sanitizeNickname(fallbackNickname || user.display_name, user.display_name),
+      '',
+      'classic',
+      'normal',
+      1,
+      1,
+      DEFAULT_MUSIC_VOLUME,
+      DEFAULT_SFX_VOLUME,
+      0,
+      now,
+    );
+  }
+  return getUserProfileStmt.get(userId);
+}
+
+function getProfileSnapshot(userId) {
+  const user = getUserByIdStmt.get(userId);
+  if (!user) return null;
+  const profile = ensureUserProfile(userId, user.display_name);
+  const stats = getUserStatsStmt.get(userId) || {
+    games_played: 0,
+    games_won: 0,
+    total_points: 0,
+    updated_at: nowIso(),
+  };
+  return toPublicProfileRow(
+    {
+      ...profile,
+      games_played: stats.games_played,
+      games_won: stats.games_won,
+      total_points: stats.total_points,
+      stats_updated_at: stats.updated_at,
+    },
+    user,
+  );
+}
+
+function isPartyModeAllowedForUser(userId) {
+  const profile = ensureUserProfile(userId);
+  return Number(profile?.adult_mode_opt_in || 0) === 1;
 }
 
 function normalizeUsername(input = '') {
@@ -489,6 +710,7 @@ function createBotBrain() {
     botPersonaById: {},
     recentVotesByOwner: {},
     recentCardsByBot: {},
+    voteOwnerHistoryByBot: {},
   };
 }
 
@@ -504,6 +726,7 @@ function ensureBotBrain(room) {
   if (!room.botBrain.botPersonaById) room.botBrain.botPersonaById = {};
   if (!room.botBrain.recentVotesByOwner) room.botBrain.recentVotesByOwner = {};
   if (!room.botBrain.recentCardsByBot) room.botBrain.recentCardsByBot = {};
+  if (!room.botBrain.voteOwnerHistoryByBot) room.botBrain.voteOwnerHistoryByBot = {};
   return room.botBrain;
 }
 
@@ -705,6 +928,11 @@ function evaluateStoryCandidate(room, storyteller, cardPath, clue, level = 'norm
   const config = getBotDifficulty(level);
   const ownScore = scoreCardForClue(clue, cardPath);
   const opponents = Array.from(room.players.values()).filter((player) => player.id !== storyteller.id);
+  const ranking = Array.from(room.players.values()).sort((a, b) => (b.score || 0) - (a.score || 0));
+  const storytellerRank = Math.max(0, ranking.findIndex((candidate) => candidate.id === storyteller.id));
+  const maxRank = Math.max(ranking.length - 1, 1);
+  const rankRatio = storytellerRank / maxRank;
+  const adaptiveRisk = (0.5 - rankRatio) * 0.3;
 
   let bestOpponentScore = -Infinity;
   let strongOpponents = 0;
@@ -724,14 +952,15 @@ function evaluateStoryCandidate(room, storyteller, cardPath, clue, level = 'norm
   if (bestOpponentScore === -Infinity) bestOpponentScore = 0;
 
   const targetAmbiguity = clamp(
-    Math.round(opponents.length * config.targetAmbiguity),
+    Math.round(opponents.length * clamp(config.targetAmbiguity + adaptiveRisk, 0.15, 0.85)),
     opponents.length > 1 ? 1 : 0,
     Math.max(opponents.length - 1, 0),
   );
   const ambiguityPenalty = Math.abs(strongOpponents - targetAmbiguity) * 1.25;
 
   const lead = ownScore - bestOpponentScore;
-  const leadPenalty = Math.abs(lead - config.desiredLead) * 1.85;
+  const desiredLead = clamp(config.desiredLead + adaptiveRisk * 0.75, -0.4, 0.8);
+  const leadPenalty = Math.abs(lead - desiredLead) * 1.85;
 
   const noveltyPenalty = clueNoveltyPenalty(room, clue);
   const clarityPenalty = ownScore < config.minOwnScore ? (config.minOwnScore - ownScore) * 2.3 : 0;
@@ -786,9 +1015,12 @@ function chooseBotSubmissionCard(room, bot, level = bot?.difficulty || 'normal')
   const scored = bot.hand.map((card) => {
     const similarity = scoreCardForClue(room.clue, card);
     const repeatPenalty = recentCards.includes(card) ? 0.45 : 0;
+    const idealSimilarity = 0.9 + config.targetAmbiguity;
+    const ambiguityPenalty = Math.abs(similarity - idealSimilarity) * 0.25;
+    const ownerMomentum = Number(brain.recentVotesByOwner[bot.id] || 0) * 0.08;
     return {
       card,
-      score: similarity - repeatPenalty + Math.random() * 0.05,
+      score: similarity - ambiguityPenalty - repeatPenalty + ownerMomentum + Math.random() * 0.05,
     };
   });
 
@@ -804,16 +1036,28 @@ function chooseBotVote(room, bot, level = bot?.difficulty || 'normal') {
   const choices = room.shuffledSubmissions.filter((submission) => submission.playerId !== bot.id);
   if (choices.length === 0) return null;
   const config = getBotDifficulty(level);
+  const brain = ensureBotBrain(room);
+  const ownerHistory = brain.voteOwnerHistoryByBot[bot.id] || [];
 
   if (Math.random() < config.randomVoteChance) {
-    return pickRandom(choices) || choices[0];
+    const randomChoice = pickRandom(choices) || choices[0];
+    ownerHistory.push(randomChoice.playerId);
+    brain.voteOwnerHistoryByBot[bot.id] = ownerHistory.slice(-8);
+    return randomChoice;
   }
 
   const scored = choices.map((choice) => ({
     choice,
-    score: scoreCardForClue(room.clue, choice.card) + Math.random() * 0.05,
+    score: (() => {
+      const semanticScore = scoreCardForClue(room.clue, choice.card);
+      const ownerAttractiveness = Number(brain.recentVotesByOwner[choice.playerId] || 0) * 0.12;
+      const repeatedOwnerPenalty = ownerHistory.includes(choice.playerId) ? 0.25 : 0;
+      return semanticScore + ownerAttractiveness - repeatedOwnerPenalty + Math.random() * 0.05;
+    })(),
   }));
   const selected = softmaxPick(scored, (entry) => entry.score, config.voteTemperature) || scored[0];
+  ownerHistory.push(selected.choice.playerId);
+  brain.voteOwnerHistoryByBot[bot.id] = ownerHistory.slice(-8);
   return selected.choice;
 }
 
@@ -885,9 +1129,10 @@ function moveToRevealPhase(room) {
   return true;
 }
 
-function buildDrinkPrompt(tags, level = 'light') {
+function buildDrinkPrompt(tags, level = 'light', partyRules = {}) {
   const sips = level === 'heavy' ? 3 : level === 'medium' ? 2 : 1;
   const shots = level === 'heavy' ? 1 : 0;
+  const rules = normalizePartyRules(partyRules);
   const templates = [
     `Beben ${sips} sorbo(s) quienes hayan visto ${tags.element} hoy.`,
     `Elige a alguien que se parezca al ambiente ${tags.mood}; esa persona bebe ${sips} y reparte ${sips} más.`,
@@ -898,7 +1143,23 @@ function buildDrinkPrompt(tags, level = 'light') {
     `Reto rápido: imita el ${tags.mood} de la escena; si el grupo no lo compra, toma ${sips} extra.`,
     shots ? `Todos beben ${shots} chupito si creen que la carta transmite ${tags.theme}.` : `Quien no votó bebe ${sips}.`,
   ];
-  return templates[hashString(tags.theme + tags.mood) % templates.length];
+  const eventTemplates = [
+    `Evento aleatorio: quien tenga la puntuación más alta brinda y reparte ${sips} sorbo(s).`,
+    `Evento aleatorio: quien haya quedado último decide un mini-reto y todos cumplen.`,
+    `Evento aleatorio: ronda relámpago, todos votan en 10 segundos o beben ${sips}.`,
+  ];
+  const allTemplates = rules.randomEvents ? templates.concat(eventTemplates) : templates;
+  const selected = allTemplates[hashString(tags.theme + tags.mood + level) % allTemplates.length];
+  if (!rules.safeMessaging) return selected;
+  return `${selected} Recuerda beber con responsabilidad y agua entre rondas.`;
+}
+
+function normalizePartyRules(input = {}) {
+  return {
+    randomEvents: input?.randomEvents !== false,
+    revealTwist: Boolean(input?.revealTwist),
+    safeMessaging: input?.safeMessaging !== false,
+  };
 }
 
 function roomToJSON(room) {
@@ -939,6 +1200,7 @@ function roomToJSON(room) {
     active: room.active,
     mode: room.mode,
     drinkLevel: room.drinkLevel,
+    partyRules: normalizePartyRules(room.partyRules || {}),
     pointLimit: room.pointLimit || DEFAULT_POINT_LIMIT,
     finished: Boolean(room.finished),
     winnerIds: room.winnerIds || [],
@@ -959,12 +1221,23 @@ function parseJsonArray(raw, fallback = []) {
   }
 }
 
+function parseJsonObject(raw, fallback = {}) {
+  if (!raw) return { ...fallback };
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ...fallback };
+    return { ...fallback, ...parsed };
+  } catch {
+    return { ...fallback };
+  }
+}
+
 const upsertRoomStmt = db.prepare(`
   INSERT INTO rooms (
     code, host_id, storyteller_id, phase, round, clue, clue_reason, turn_seconds, phase_started_at, deadline_at,
-    active, mode, drink_level, point_limit, finished, winner_ids_json, order_json, deck_json, discard_json,
+    active, mode, drink_level, party_rules_json, point_limit, finished, winner_ids_json, order_json, deck_json, discard_json,
     shuffled_submissions_json, summary_json, bot_brain_json, version, created_at, updated_at
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(code) DO UPDATE SET
     host_id = excluded.host_id,
     storyteller_id = excluded.storyteller_id,
@@ -978,6 +1251,7 @@ const upsertRoomStmt = db.prepare(`
     active = excluded.active,
     mode = excluded.mode,
     drink_level = excluded.drink_level,
+    party_rules_json = excluded.party_rules_json,
     point_limit = excluded.point_limit,
     finished = excluded.finished,
     winner_ids_json = excluded.winner_ids_json,
@@ -1031,6 +1305,7 @@ const persistRoomTx = db.transaction((room) => {
     serialized.active === false ? 0 : 1,
     serialized.mode || 'classic',
     serialized.drinkLevel || 'light',
+    JSON.stringify(normalizePartyRules(serialized.partyRules || {})),
     Number(serialized.pointLimit || DEFAULT_POINT_LIMIT),
     serialized.finished ? 1 : 0,
     JSON.stringify(serialized.winnerIds || []),
@@ -1132,6 +1407,7 @@ function hydrateRoomFromJson(raw) {
     players: new Map(),
     mode: raw.mode || 'classic',
     drinkLevel: raw.drinkLevel || 'light',
+    partyRules: normalizePartyRules(raw.partyRules || {}),
     pointLimit: Number(raw.pointLimit || DEFAULT_POINT_LIMIT),
     deadlineAt: raw.deadlineAt || null,
     finished: Boolean(raw.finished),
@@ -1190,6 +1466,7 @@ function loadRooms() {
       active: Number(row.active) !== 0,
       mode: row.mode || 'classic',
       drinkLevel: row.drink_level || 'light',
+      partyRules: normalizePartyRules(parseJsonObject(row.party_rules_json, {})),
       pointLimit: Number(row.point_limit || DEFAULT_POINT_LIMIT),
       finished: Number(row.finished) === 1,
       winnerIds: parseJsonArray(row.winner_ids_json),
@@ -1374,6 +1651,7 @@ function createRoom(code) {
     active: true,
     mode: 'classic',
     drinkLevel: 'light',
+    partyRules: normalizePartyRules({}),
     pointLimit: DEFAULT_POINT_LIMIT,
     finished: false,
     winnerIds: [],
@@ -1442,6 +1720,50 @@ function startGame(room) {
   room.botBrain = createBotBrain();
   resetRound(room);
   setRoomPhase(room, 'clue', room.turnSeconds);
+}
+
+function applyLobbyGameConfig(room, msg = {}) {
+  if (!room || room.phase !== 'lobby') return false;
+  if (msg.mode) {
+    room.mode = msg.mode === 'party' ? 'party' : 'classic';
+  }
+  if (msg.drinkLevel && DRINK_LEVELS.includes(msg.drinkLevel)) {
+    room.drinkLevel = msg.drinkLevel;
+  }
+  if (msg.partyRules && typeof msg.partyRules === 'object') {
+    room.partyRules = normalizePartyRules(msg.partyRules);
+  }
+  if (msg.pointLimit) {
+    room.pointLimit = Math.max(
+      MIN_POINT_LIMIT,
+      Math.min(MAX_POINT_LIMIT, Number(msg.pointLimit) || room.pointLimit),
+    );
+  }
+  return true;
+}
+
+function ensureMinPlayersWithBots(room, difficulty = 'normal') {
+  const level = BOT_LEVELS.includes(difficulty) ? difficulty : 'normal';
+  while (room.players.size < MIN_PLAYERS) {
+    const botName = BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)];
+    addBot(room, `Bot ${botName}`, level);
+  }
+}
+
+function initializeGameState(room, { forceReady = false } = {}) {
+  for (const participant of room.players.values()) {
+    participant.score = 0;
+    participant.hand = [];
+    participant.submittedCardId = null;
+    participant.votedFor = null;
+    if (forceReady) {
+      participant.ready = true;
+    }
+  }
+  room.deck = shuffle(cardFiles).map((file) => `cards/${file}`);
+  room.discard = [];
+  room.storytellerId = room.order[0] || null;
+  startGame(room);
 }
 
 function canContinueRoom(room) {
@@ -1709,6 +2031,7 @@ function removePlayer(room, playerId, reason = 'left') {
     delete room.botBrain.botPersonaById?.[playerId];
     delete room.botBrain.recentVotesByOwner?.[playerId];
     delete room.botBrain.recentCardsByBot?.[playerId];
+    delete room.botBrain.voteOwnerHistoryByBot?.[playerId];
   }
 
   if (room.players.size === 0) {
@@ -1740,6 +2063,47 @@ function removePlayer(room, playerId, reason = 'left') {
       p.submittedCardId = null;
       p.votedFor = null;
     }
+  }
+}
+
+function commitFinishedGameStats(room) {
+  if (!room?.finished) return;
+  const winners = new Set(room.winnerIds || []);
+  const mode = room.mode === 'party' ? 'party' : 'classic';
+  const pointLimit = Math.max(MIN_POINT_LIMIT, Math.min(MAX_POINT_LIMIT, Number(room.pointLimit || DEFAULT_POINT_LIMIT)));
+  const now = nowIso();
+  const humans = Array.from(room.players.values()).filter((player) => !player.isBot && player.userId);
+  if (humans.length === 0) return;
+
+  const tx = db.transaction(() => {
+    for (const player of humans) {
+      const won = winners.has(player.id) ? 1 : 0;
+      const result = won ? 'win' : 'loss';
+      const history = insertUserGameHistoryStmt.run(
+        player.userId,
+        room.code,
+        mode,
+        result,
+        Number(player.score || 0),
+        won,
+        pointLimit,
+        now,
+      );
+      if (history.changes > 0) {
+        upsertUserStatsDeltaStmt.run(
+          player.userId,
+          won,
+          Number(player.score || 0),
+          now,
+        );
+      }
+    }
+  });
+
+  try {
+    tx();
+  } catch (error) {
+    console.error('Error committing finished game stats', room?.code, error);
   }
 }
 
@@ -1795,8 +2159,9 @@ function computeScores(room) {
   if (room.mode === 'party') {
     const storytellerCard = room.submissions.find(s => s.playerId === storytellerId)?.card;
     const tags = getCardTags(storytellerCard);
-    room.summary.drinkPrompt = buildDrinkPrompt(tags, room.drinkLevel);
+    room.summary.drinkPrompt = buildDrinkPrompt(tags, room.drinkLevel, room.partyRules);
     room.summary.tags = tags;
+    room.summary.partyRules = normalizePartyRules(room.partyRules || {});
   }
 
   const scores = Array.from(room.players.values()).map((player) => ({
@@ -1817,6 +2182,7 @@ function computeScores(room) {
   if (reachedLimit || reachedRoundCap) {
     room.finished = true;
     room.winnerIds = winners;
+    commitFinishedGameStats(room);
   }
 
   rememberClueMemory(room, storytellerId, room.clue);
@@ -1849,12 +2215,16 @@ function toClientState(room, playerId) {
   const sortedByScore = Array.from(room.players.values()).sort((a, b) => (b.score || 0) - (a.score || 0));
   const topScore = sortedByScore.length > 0 ? Number(sortedByScore[0].score || 0) : 0;
   const leaderIds = sortedByScore.filter((entry) => Number(entry.score || 0) === topScore).map((entry) => entry.id);
+  const humanCount = Array.from(room.players.values()).filter((entry) => !entry.isBot).length;
+  const botCount = room.players.size - humanCount;
+  const roomKind = humanCount <= 1 && botCount >= 2 ? 'solo_bots' : botCount > 0 ? 'mixed' : 'online';
 
   const state = {
     type: 'state',
     roomCode: room.code,
     mode: room.mode || 'classic',
     drinkLevel: room.drinkLevel || 'light',
+    partyRules: normalizePartyRules(room.partyRules || {}),
     phase: room.phase,
     round: room.round,
     hostId: room.hostId,
@@ -1862,6 +2232,7 @@ function toClientState(room, playerId) {
     clue: room.clue,
     clueReason: room.clueReason || '',
     pointLimit: room.pointLimit || DEFAULT_POINT_LIMIT,
+    roomKind,
     finished: Boolean(room.finished),
     winnerIds: room.winnerIds || [],
     leaderIds,
@@ -2054,6 +2425,51 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    if (type === 'start_solo') {
+      const requestedName = msg.name?.toString().trim().slice(0, 20);
+      const name = requestedName || authUser.displayName || authUser.username || 'Jugador';
+      const wantsParty = msg.mode === 'party';
+      const canUseParty = isPartyModeAllowedForUser(authUser.id);
+      const soloConfig = {
+        ...msg,
+        mode: wantsParty && canUseParty ? 'party' : 'classic',
+      };
+      if (wantsParty && !canUseParty) {
+        send(ws, {
+          type: 'error',
+          message: 'Para usar modo +18 debes activarlo y confirmar mayoría de edad en tu perfil.',
+        });
+      }
+      const previousRoom = currentRoom || getActiveRoomForPlayer(authUser.id);
+      if (previousRoom) {
+        mutateAndBroadcast(previousRoom, () => {
+          removePlayer(previousRoom, authUser.id, 'moved_room');
+          return true;
+        }, { skipAutomation: true });
+      }
+
+      currentRoom = null;
+      currentPlayerId = authUser.id;
+      const room = createRoom();
+      const started = mutateAndBroadcast(room, () => {
+        applyLobbyGameConfig(room, soloConfig);
+        const player = addPlayer(room, authUser, ws, name, soloConfig.difficulty || 'normal');
+        player.connected = true;
+        player.ws = ws;
+        player.ready = true;
+        player.lastSeenAt = Date.now();
+        ensureMinPlayersWithBots(room, soloConfig.difficulty || 'normal');
+        initializeGameState(room, { forceReady: true });
+        attachToRoom(room, player);
+        return true;
+      }, { skipAutomation: true });
+
+      if (!started) {
+        send(ws, { type: 'error', message: 'No se pudo iniciar la partida en solitario.' });
+      }
+      return;
+    }
+
     if (type === 'end_room') {
       const targetCode = msg.roomCode ? normalizeRoomCode(msg.roomCode) : currentRoom?.code || null;
       const target = targetCode ? rooms.get(targetCode) : null;
@@ -2129,9 +2545,19 @@ wss.on('connection', (ws, req) => {
         mutateAndBroadcast(room, () => {
           if (player.id !== room.hostId || room.phase !== 'lobby') return false;
           const mode = msg.mode === 'party' ? 'party' : 'classic';
+          if (mode === 'party' && !isPartyModeAllowedForUser(authUser.id)) {
+            send(ws, {
+              type: 'error',
+              message: 'Activa y confirma +18 en tu perfil para usar este modo.',
+            });
+            return false;
+          }
           const level = DRINK_LEVELS.includes(msg.drinkLevel) ? msg.drinkLevel : room.drinkLevel;
           room.mode = mode;
           room.drinkLevel = level;
+          if (msg.partyRules && typeof msg.partyRules === 'object') {
+            room.partyRules = normalizePartyRules(msg.partyRules);
+          }
           return true;
         });
         break;
@@ -2139,6 +2565,15 @@ wss.on('connection', (ws, req) => {
       case 'start': {
         mutateAndBroadcast(room, () => {
           if (player.id !== room.hostId || room.phase !== 'lobby') return false;
+          if (room.mode === 'party' && !isPartyModeAllowedForUser(authUser.id)) {
+            room.mode = 'classic';
+            room.drinkLevel = 'light';
+            room.partyRules = normalizePartyRules({});
+            send(ws, {
+              type: 'error',
+              message: 'Modo +18 desactivado: confirma mayoría de edad en tu perfil.',
+            });
+          }
           if (room.players.size < MIN_PLAYERS) {
             send(ws, { type: 'error', message: 'Se requieren al menos 3 jugadores.' });
             return false;
@@ -2149,22 +2584,8 @@ wss.on('connection', (ws, req) => {
             return false;
           }
 
-          if (msg.mode) room.mode = msg.mode === 'party' ? 'party' : 'classic';
-          if (msg.drinkLevel && DRINK_LEVELS.includes(msg.drinkLevel)) room.drinkLevel = msg.drinkLevel;
-          if (msg.pointLimit) {
-            room.pointLimit = Math.max(MIN_POINT_LIMIT, Math.min(MAX_POINT_LIMIT, Number(msg.pointLimit) || room.pointLimit));
-          }
-
-          for (const participant of room.players.values()) {
-            participant.score = 0;
-            participant.hand = [];
-            participant.submittedCardId = null;
-            participant.votedFor = null;
-          }
-          room.deck = shuffle(cardFiles).map((file) => `cards/${file}`);
-          room.discard = [];
-          room.storytellerId = room.order[0] || null;
-          startGame(room);
+          applyLobbyGameConfig(room, msg);
+          initializeGameState(room);
           return true;
         });
         break;
@@ -2182,26 +2603,18 @@ wss.on('connection', (ws, req) => {
       case 'start_with_bots': {
         mutateAndBroadcast(room, () => {
           if (player.id !== room.hostId || room.phase !== 'lobby') return false;
-          if (msg.mode) room.mode = msg.mode === 'party' ? 'party' : 'classic';
-          if (msg.drinkLevel && DRINK_LEVELS.includes(msg.drinkLevel)) room.drinkLevel = msg.drinkLevel;
-          if (msg.pointLimit) {
-            room.pointLimit = Math.max(MIN_POINT_LIMIT, Math.min(MAX_POINT_LIMIT, Number(msg.pointLimit) || room.pointLimit));
+          if ((msg.mode === 'party' || room.mode === 'party') && !isPartyModeAllowedForUser(authUser.id)) {
+            room.mode = 'classic';
+            room.drinkLevel = 'light';
+            room.partyRules = normalizePartyRules({});
+            send(ws, {
+              type: 'error',
+              message: 'Modo +18 desactivado: confirma mayoría de edad en tu perfil.',
+            });
           }
-          while (room.players.size < MIN_PLAYERS) {
-            const botName = BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)];
-            addBot(room, `Bot ${botName}`, msg.difficulty || 'normal');
-          }
-          for (const participant of room.players.values()) {
-            participant.score = 0;
-            participant.hand = [];
-            participant.submittedCardId = null;
-            participant.votedFor = null;
-            participant.ready = true;
-          }
-          room.deck = shuffle(cardFiles).map((file) => `cards/${file}`);
-          room.discard = [];
-          room.storytellerId = room.order[0] || null;
-          startGame(room);
+          applyLobbyGameConfig(room, msg);
+          ensureMinPlayersWithBots(room, msg.difficulty || 'normal');
+          initializeGameState(room, { forceReady: true });
           return true;
         });
         break;
@@ -2324,6 +2737,7 @@ app.post('/api/auth/register', (req, res) => {
       now,
       now,
     );
+    ensureUserProfile(userId, displayName || username);
 
     const session = createSession(userId);
     setSessionCookie(res, session.token, session.expiresAt);
@@ -2353,6 +2767,7 @@ app.post('/api/auth/login', (req, res) => {
       return;
     }
 
+    ensureUserProfile(row.id, row.display_name || row.username);
     const session = createSession(row.id);
     setSessionCookie(res, session.token, session.expiresAt);
     res.json({
@@ -2378,10 +2793,12 @@ app.get('/api/auth/me', (req, res) => {
     return;
   }
   const activeRoom = getActiveRoomForPlayer(req.authUser.id);
+  const profile = getProfileSnapshot(req.authUser.id);
   res.json({
     ok: true,
     authenticated: true,
     user: req.authUser,
+    profile: profile?.profile || null,
     activeRoom: activeRoom
       ? {
           code: activeRoom.code,
@@ -2394,26 +2811,146 @@ app.get('/api/auth/me', (req, res) => {
   });
 });
 
+app.get('/api/profile', requireAuth, (req, res) => {
+  const snapshot = getProfileSnapshot(req.authUser.id);
+  if (!snapshot) {
+    res.status(404).json({ ok: false, error: 'Usuario no encontrado.' });
+    return;
+  }
+  const history = getRecentUserGamesStmt.all(req.authUser.id, 12).map((entry) => ({
+    id: entry.id,
+    roomCode: entry.room_code,
+    mode: entry.mode,
+    result: entry.result,
+    score: Number(entry.score || 0),
+    winner: Number(entry.winner) === 1,
+    pointLimit: Number(entry.point_limit || DEFAULT_POINT_LIMIT),
+    createdAt: entry.created_at,
+  }));
+  res.json({ ok: true, ...snapshot, history });
+});
+
+app.put('/api/profile', requireAuth, (req, res) => {
+  const currentUser = getUserByIdStmt.get(req.authUser.id);
+  if (!currentUser) {
+    res.status(404).json({ ok: false, error: 'Usuario no encontrado.' });
+    return;
+  }
+  const currentProfile = ensureUserProfile(req.authUser.id, currentUser.display_name || currentUser.username);
+  const now = nowIso();
+  const adultModeOptIn = typeof req.body?.adultModeOptIn === 'boolean'
+    ? req.body.adultModeOptIn
+    : Number(currentProfile?.adult_mode_opt_in || 0) === 1;
+  let preferredMode = normalizePreferredMode(req.body?.preferredMode || currentProfile?.preferred_mode || 'classic');
+  if (preferredMode === 'party' && !adultModeOptIn) {
+    preferredMode = 'classic';
+  }
+  const nickname = sanitizeNickname(
+    req.body?.nickname ?? currentProfile?.nickname,
+    currentUser.display_name || currentUser.username,
+  );
+  const avatarSeed = normalizeAvatarSeed(req.body?.avatarSeed ?? currentProfile?.avatar_seed ?? '');
+  const preferredBotDifficulty = normalizeBotDifficulty(
+    req.body?.preferredBotDifficulty ?? currentProfile?.preferred_bot_difficulty ?? 'normal',
+  );
+  const musicOn = typeof req.body?.musicOn === 'boolean'
+    ? req.body.musicOn
+    : Number(currentProfile?.music_on ?? 1) === 1;
+  const sfxOn = typeof req.body?.sfxOn === 'boolean'
+    ? req.body.sfxOn
+    : Number(currentProfile?.sfx_on ?? 1) === 1;
+  const musicVolume = clampNumber(
+    req.body?.musicVolume ?? currentProfile?.music_volume,
+    0,
+    1,
+    DEFAULT_MUSIC_VOLUME,
+  );
+  const sfxVolume = clampNumber(
+    req.body?.sfxVolume ?? currentProfile?.sfx_volume,
+    0,
+    1,
+    DEFAULT_SFX_VOLUME,
+  );
+
+  const tx = db.transaction(() => {
+    updateUserDisplayNameStmt.run(nickname, now, req.authUser.id);
+    upsertUserProfileStmt.run(
+      req.authUser.id,
+      nickname,
+      avatarSeed,
+      preferredMode,
+      preferredBotDifficulty,
+      musicOn ? 1 : 0,
+      sfxOn ? 1 : 0,
+      musicVolume,
+      sfxVolume,
+      adultModeOptIn ? 1 : 0,
+      now,
+    );
+  });
+
+  try {
+    tx();
+  } catch (error) {
+    res.status(400).json({ ok: false, error: error?.message || 'No se pudo guardar el perfil.' });
+    return;
+  }
+
+  const snapshot = getProfileSnapshot(req.authUser.id);
+  const history = getRecentUserGamesStmt.all(req.authUser.id, 12).map((entry) => ({
+    id: entry.id,
+    roomCode: entry.room_code,
+    mode: entry.mode,
+    result: entry.result,
+    score: Number(entry.score || 0),
+    winner: Number(entry.winner) === 1,
+    pointLimit: Number(entry.point_limit || DEFAULT_POINT_LIMIT),
+    createdAt: entry.created_at,
+  }));
+  res.json({ ok: true, ...snapshot, history, savedAt: now });
+});
+
 app.get('/api/rooms', requireAuth, (req, res) => {
   const list = Array.from(rooms.values())
-    .filter((room) => room.active !== false)
-    .map((room) => ({
-      code: room.code,
-      phase: room.phase,
-      turnSeconds: room.turnSeconds,
-      pointLimit: room.pointLimit || DEFAULT_POINT_LIMIT,
-      mode: room.mode || 'classic',
-      drinkLevel: room.drinkLevel || 'light',
-      finished: Boolean(room.finished),
-      winnerIds: room.winnerIds || [],
-      players: Array.from(room.players.values()).map((player) => ({
-        id: player.id,
-        name: player.name,
-        score: player.score,
-        connected: player.connected,
-        isBot: Boolean(player.isBot),
-      })),
-    }));
+    .filter((room) => room.active !== false && room.players.size > 0)
+    .map((room) => {
+      const players = Array.from(room.players.values());
+      const humanPlayers = players.filter((player) => !player.isBot);
+      const botPlayers = players.filter((player) => player.isBot);
+      const storyteller = players.find((player) => player.id === room.storytellerId) || null;
+      const isUserInRoom = players.some((player) => player.id === req.authUser.id);
+      const kind = humanPlayers.length <= 1 && botPlayers.length >= 2
+        ? 'solo_bots'
+        : botPlayers.length > 0
+          ? 'mixed'
+          : 'online';
+      return {
+        code: room.code,
+        phase: room.phase,
+        status: room.finished ? 'finished' : room.phase === 'lobby' ? 'lobby' : 'in_progress',
+        turnSeconds: room.turnSeconds,
+        pointLimit: room.pointLimit || DEFAULT_POINT_LIMIT,
+        mode: room.mode || 'classic',
+        drinkLevel: room.drinkLevel || 'light',
+        partyRules: normalizePartyRules(room.partyRules || {}),
+        finished: Boolean(room.finished),
+        winnerIds: room.winnerIds || [],
+        storytellerId: room.storytellerId || null,
+        storytellerName: storyteller?.name || null,
+        humanCount: humanPlayers.length,
+        botCount: botPlayers.length,
+        kind,
+        isUserInRoom,
+        canJoin: isUserInRoom || (room.phase === 'lobby' && !room.finished),
+        players: players.map((player) => ({
+          id: player.id,
+          name: player.name,
+          score: player.score,
+          connected: player.connected,
+          isBot: Boolean(player.isBot),
+        })),
+      };
+    });
   res.json({ ok: true, rooms: list });
 });
 

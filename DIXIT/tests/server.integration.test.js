@@ -252,6 +252,18 @@ test('solo el host puede cambiar timer/modo y añadir bots', async (t) => {
   host.send({ type: 'set_timer', seconds: 45 });
   await waitForMessage(host, (m) => m.type === 'state' && m.turnSeconds === 45, 'timer updated');
 
+  const profileOptIn = await fetch(`http://127.0.0.1:${port}/api/profile`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: hostAuth.cookie,
+    },
+    body: JSON.stringify({
+      adultModeOptIn: true,
+    }),
+  }).then((response) => response.json());
+  assert.equal(profileOptIn.ok, true);
+
   host.send({ type: 'set_mode', mode: 'party', drinkLevel: 'heavy' });
   await waitForMessage(
     host,
@@ -266,6 +278,60 @@ test('solo el host puede cambiar timer/modo y añadir bots', async (t) => {
     'bot added'
   );
   assert.equal(withBot.players.length, 3);
+});
+
+test('perfil persiste preferencias y habilita modo +18 solo con confirmación adulta', async (t) => {
+  const { port } = await startServer(t);
+  const auth = await createAuthSession(port, makeUsername('prof1'), 'Perfil');
+  const client = await createClient(t, port, auth.cookie);
+  client.send({ type: 'join', name: 'Perfil' });
+  await waitForMessage(client, (m) => m.type === 'joined', 'joined');
+  await waitForMessage(client, (m) => m.type === 'state' && m.phase === 'lobby', 'lobby');
+
+  const profileBefore = await fetch(`http://127.0.0.1:${port}/api/profile`, {
+    headers: { Cookie: auth.cookie },
+  }).then((response) => response.json());
+  assert.equal(profileBefore.ok, true);
+  assert.equal(profileBefore.profile.adultModeOptIn, false);
+  assert.equal(profileBefore.profile.musicOn, true);
+
+  client.send({ type: 'set_mode', mode: 'party', drinkLevel: 'heavy' });
+  await delay(150);
+  const blockedState = client.latestState();
+  assert.equal(blockedState.mode, 'classic');
+  assert.ok(client.messages.some((message) => message.type === 'error'));
+
+  const profileUpdated = await fetch(`http://127.0.0.1:${port}/api/profile`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      Cookie: auth.cookie,
+    },
+    body: JSON.stringify({
+      nickname: 'PerfilX',
+      adultModeOptIn: true,
+      preferredMode: 'party',
+      musicOn: false,
+      sfxOn: true,
+      musicVolume: 0.25,
+      sfxVolume: 0.65,
+      preferredBotDifficulty: 'smart',
+    }),
+  }).then((response) => response.json());
+  assert.equal(profileUpdated.ok, true);
+  assert.equal(profileUpdated.profile.nickname, 'PerfilX');
+  assert.equal(profileUpdated.profile.adultModeOptIn, true);
+  assert.equal(profileUpdated.profile.preferredMode, 'party');
+  assert.equal(profileUpdated.profile.musicOn, false);
+  assert.equal(profileUpdated.profile.preferredBotDifficulty, 'smart');
+
+  client.send({ type: 'set_mode', mode: 'party', drinkLevel: 'heavy', partyRules: { randomEvents: true, safeMessaging: true } });
+  const enabledState = await waitForMessage(
+    client,
+    (m) => m.type === 'state' && m.mode === 'party' && m.drinkLevel === 'heavy',
+    'party mode enabled after adult opt-in',
+  );
+  assert.equal(enabledState.mode, 'party');
 });
 
 test('solo con bots completa una ronda y permite pasar a la siguiente', async (t) => {
@@ -313,6 +379,39 @@ test('solo con bots completa una ronda y permite pasar a la siguiente', async (t
     'next round started'
   );
   assert.ok(['clue', 'submit', 'vote'].includes(nextRound.phase));
+});
+
+test('start_solo crea una partida aislada y no reusa lobby multijugador previo', async (t) => {
+  const { port } = await startServer(t);
+  const hostAuth = await createAuthSession(port, makeUsername('soloiso1'), 'Host');
+  const guestAuth = await createAuthSession(port, makeUsername('soloiso2'), 'Guest');
+  const host = await createClient(t, port, hostAuth.cookie);
+  const guest = await createClient(t, port, guestAuth.cookie);
+
+  host.send({ type: 'join', name: 'Host' });
+  const joined = await waitForMessage(host, (m) => m.type === 'joined', 'host joined base room');
+  guest.send({ type: 'join', name: 'Guest', roomCode: joined.roomCode });
+  await waitForMessage(host, (m) => m.type === 'state' && m.roomCode === joined.roomCode && m.players.length === 2, 'base room with 2 players');
+  await waitForMessage(guest, (m) => m.type === 'state' && m.roomCode === joined.roomCode && m.players.length === 2, 'guest in base room');
+
+  host.send({ type: 'start_solo', name: 'Host' });
+  const soloState = await waitForMessage(
+    host,
+    (m) => m.type === 'state' && m.roomCode !== joined.roomCode && ['clue', 'submit'].includes(m.phase) && m.players.length >= 3,
+    'host moved to isolated solo room',
+    8000
+  );
+  const humansInSolo = soloState.players.filter((player) => !player.isBot);
+  assert.equal(humansInSolo.length, 1);
+  assert.equal(humansInSolo[0].id, hostAuth.user.id);
+
+  const guestAfterMove = await waitForMessage(
+    guest,
+    (m) => m.type === 'state' && m.roomCode === joined.roomCode && !m.players.some((player) => player.id === hostAuth.user.id),
+    'guest sees host removed from previous room'
+  );
+  assert.equal(guestAfterMove.players.length, 1);
+  assert.equal(guestAfterMove.players[0].id, guestAuth.user.id);
 });
 
 test('cuando el narrador es bot genera pista realista con motivo y se identifica como bot', async (t) => {

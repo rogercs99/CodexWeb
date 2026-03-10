@@ -1,4 +1,7 @@
 import type {
+  AiProviderInfo,
+  AiProviderPermissionProfile,
+  AiProviderQuota,
   AiAgentSettingsItem,
   AiAgentSettingsPayload,
   AttachmentItem,
@@ -15,11 +18,20 @@ import type {
   ToolsDeployedAppDescribeJob,
   ToolsDeployedAppDescribeResponse,
   ToolsDeployedAppLogsResponse,
+  ToolsDeployedAppBackupItem,
   ToolsDeployedAppsPayload,
+  ToolsDriveAccount,
+  ToolsDriveFilesPayload,
   ToolsGitPushResult,
+  ToolsGitBranchesPayload,
+  ToolsGitMergePayload,
   ToolsGitRepoSummary,
   ToolsGitResolvePayload,
   ToolsGitReposPayload,
+  ToolsStorageHeavyPayload,
+  ToolsStorageJob,
+  ToolsStorageLocalListPayload,
+  ToolsStorageOverview,
   RestartState,
   TaskRecovery,
   TaskRunDashboardItem,
@@ -52,6 +64,93 @@ export async function api<T = any>(url: string, init?: RequestInit): Promise<T> 
     throw err;
   }
   return data as T;
+}
+
+function normalizeAiProviderQuota(rawValue: any): AiProviderQuota {
+  const unitRaw = String(rawValue?.unit || '').trim().toLowerCase();
+  return {
+    used: Number.isFinite(Number(rawValue?.used)) ? Number(rawValue.used) : null,
+    limit: Number.isFinite(Number(rawValue?.limit)) ? Number(rawValue.limit) : null,
+    remaining: Number.isFinite(Number(rawValue?.remaining)) ? Number(rawValue.remaining) : null,
+    unit:
+      unitRaw === 'requests' || unitRaw === 'tokens' || unitRaw === 'credits' || unitRaw === 'usd'
+        ? (unitRaw as AiProviderQuota['unit'])
+        : null,
+    resetAt: String(rawValue?.resetAt || '').trim() || null,
+    available: Boolean(rawValue?.available)
+  };
+}
+
+function normalizeAiProviderPermissionProfile(rawValue: any): AiProviderPermissionProfile {
+  return {
+    agentId: String(rawValue?.agentId || ''),
+    allowRoot: Boolean(rawValue?.allowRoot),
+    runAsUser: String(rawValue?.runAsUser || ''),
+    allowedPaths: Array.isArray(rawValue?.allowedPaths)
+      ? rawValue.allowedPaths.map((entry: any) => String(entry || '')).filter(Boolean)
+      : ['/'],
+    deniedPaths: Array.isArray(rawValue?.deniedPaths)
+      ? rawValue.deniedPaths.map((entry: any) => String(entry || '')).filter(Boolean)
+      : [],
+    readOnly: Boolean(rawValue?.readOnly),
+    allowShell: Boolean(rawValue?.allowShell),
+    allowSensitiveTools: Boolean(rawValue?.allowSensitiveTools),
+    allowNetwork: Boolean(rawValue?.allowNetwork),
+    allowGit: Boolean(rawValue?.allowGit),
+    allowBackupRestore: Boolean(rawValue?.allowBackupRestore),
+    allowedTools: Array.isArray(rawValue?.allowedTools)
+      ? rawValue.allowedTools.map((entry: any) => String(entry || '').trim().toLowerCase()).filter(Boolean)
+      : ['chat', 'git', 'storage', 'drive', 'backups', 'deployments', 'shell'],
+    updatedAt: String(rawValue?.updatedAt || '')
+  };
+}
+
+function normalizeAiProviderInfo(rawValue: any): AiProviderInfo {
+  return {
+    id: String(rawValue?.id || ''),
+    name: String(rawValue?.name || ''),
+    vendor: String(rawValue?.vendor || ''),
+    description: String(rawValue?.description || ''),
+    pricing:
+      rawValue?.pricing === 'free' || rawValue?.pricing === 'freemium' || rawValue?.pricing === 'paid'
+        ? rawValue.pricing
+        : 'paid',
+    integrationType:
+      rawValue?.integrationType === 'api_key' ||
+      rawValue?.integrationType === 'oauth' ||
+      rawValue?.integrationType === 'local_cli'
+        ? rawValue.integrationType
+        : 'api_key',
+    authModes: Array.isArray(rawValue?.authModes)
+      ? rawValue.authModes.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+      : [],
+    docsUrl: String(rawValue?.docsUrl || ''),
+    integration: {
+      enabled: Boolean(rawValue?.integration?.enabled),
+      configured: Boolean(rawValue?.integration?.configured),
+      hasApiKey: Boolean(rawValue?.integration?.hasApiKey),
+      apiKeyMasked: String(rawValue?.integration?.apiKeyMasked || ''),
+      baseUrl: String(rawValue?.integration?.baseUrl || ''),
+      updatedAt: String(rawValue?.integration?.updatedAt || '')
+    },
+    capabilities: Array.isArray(rawValue?.capabilities)
+      ? rawValue.capabilities.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+      : [],
+    models: Array.isArray(rawValue?.models)
+      ? rawValue.models.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+      : [],
+    defaults: {
+      model: String(rawValue?.defaults?.model || ''),
+      reasoningEffort: String(rawValue?.defaults?.reasoningEffort || '').trim().toLowerCase()
+    },
+    quota: normalizeAiProviderQuota(rawValue?.quota),
+    permissions: normalizeAiProviderPermissionProfile(rawValue?.permissions),
+    availability: {
+      chat: Boolean(rawValue?.availability?.chat),
+      configured: Boolean(rawValue?.availability?.configured),
+      enabled: Boolean(rawValue?.availability?.enabled)
+    }
+  };
 }
 
 export async function getMe(): Promise<{ authenticated: boolean; user: User | null }> {
@@ -203,9 +302,13 @@ export async function updateConversationSettings(
 
 export async function getChatOptions(): Promise<ChatOptions> {
   const data = await api<ChatOptions & {
+    providerId?: string;
     activeAgentId?: string;
     activeAgentName?: string;
     runtimeProvider?: string;
+    capabilities?: string[];
+    quota?: AiProviderQuota | null;
+    permissions?: AiProviderPermissionProfile | null;
   }>('/api/chat/options');
   return {
     models: Array.isArray(data.models) ? data.models.map((item) => String(item || '').trim()).filter(Boolean) : [],
@@ -216,9 +319,15 @@ export async function getChatOptions(): Promise<ChatOptions> {
       model: String(data.defaults?.model || '').trim(),
       reasoningEffort: String(data.defaults?.reasoningEffort || '').trim().toLowerCase()
     },
+    providerId: String(data.providerId || '').trim(),
     activeAgentId: String(data.activeAgentId || '').trim(),
     activeAgentName: String(data.activeAgentName || '').trim(),
-    runtimeProvider: String(data.runtimeProvider || '').trim()
+    runtimeProvider: String(data.runtimeProvider || '').trim(),
+    capabilities: Array.isArray(data.capabilities)
+      ? data.capabilities.map((entry) => String(entry || '').trim()).filter(Boolean)
+      : [],
+    quota: data.quota ? normalizeAiProviderQuota(data.quota) : null,
+    permissions: data.permissions ? normalizeAiProviderPermissionProfile(data.permissions) : null
   };
 }
 
@@ -273,6 +382,41 @@ export async function updateActiveAiAgentSetting(agentId: string): Promise<{ act
   return {
     activeAgentId: String(data.activeAgentId || '')
   };
+}
+
+export async function listAiProviders(): Promise<{ activeProviderId: string; providers: AiProviderInfo[] }> {
+  const data = await api<{ activeProviderId?: string; providers?: any[] }>('/api/ai/providers');
+  return {
+    activeProviderId: String(data?.activeProviderId || ''),
+    providers: Array.isArray(data?.providers) ? data.providers.map((entry) => normalizeAiProviderInfo(entry)) : []
+  };
+}
+
+export async function getAiProviderQuota(providerId: string): Promise<AiProviderQuota> {
+  const data = await api<{ quota: any }>(`/api/ai/providers/${encodeURIComponent(String(providerId || '').trim())}/quota`);
+  return normalizeAiProviderQuota(data?.quota);
+}
+
+export async function getAiProviderPermissions(providerId: string): Promise<AiProviderPermissionProfile> {
+  const data = await api<{ permissions: any }>(
+    `/api/ai/providers/${encodeURIComponent(String(providerId || '').trim())}/permissions`
+  );
+  return normalizeAiProviderPermissionProfile(data?.permissions);
+}
+
+export async function updateAiProviderPermissions(
+  providerId: string,
+  payload: Partial<AiProviderPermissionProfile>
+): Promise<AiProviderPermissionProfile> {
+  const data = await api<{ permissions: any }>(
+    `/api/ai/providers/${encodeURIComponent(String(providerId || '').trim())}/permissions`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }
+  );
+  return normalizeAiProviderPermissionProfile(data?.permissions);
 }
 
 export async function getCodexQuota(): Promise<CodexQuota | null> {
@@ -479,23 +623,500 @@ export async function getToolsDeployedAppDescribeJob(jobId: string): Promise<Too
   return normalizeToolsDeployedAppDescribeJob(data?.job);
 }
 
+function normalizeToolsStorageJob(rawValue: any): ToolsStorageJob {
+  return {
+    id: String(rawValue?.id || ''),
+    type:
+      rawValue?.type === 'drive_upload_files' ||
+      rawValue?.type === 'deployed_backup_create' ||
+      rawValue?.type === 'deployed_backup_restore'
+        ? rawValue.type
+        : 'drive_upload_files',
+    status:
+      rawValue?.status === 'running' ||
+      rawValue?.status === 'completed' ||
+      rawValue?.status === 'error'
+        ? rawValue.status
+        : 'pending',
+    payload: rawValue?.payload && typeof rawValue.payload === 'object' ? rawValue.payload : {},
+    progress: rawValue?.progress && typeof rawValue.progress === 'object' ? rawValue.progress : {},
+    result: rawValue?.result && typeof rawValue.result === 'object' ? rawValue.result : {},
+    error: String(rawValue?.error || ''),
+    log: String(rawValue?.log || ''),
+    createdAt: String(rawValue?.createdAt || ''),
+    updatedAt: String(rawValue?.updatedAt || ''),
+    startedAt: String(rawValue?.startedAt || ''),
+    finishedAt: String(rawValue?.finishedAt || '')
+  };
+}
+
+function normalizeToolsDriveAccount(rawValue: any): ToolsDriveAccount {
+  return {
+    id: String(rawValue?.id || ''),
+    alias: String(rawValue?.alias || ''),
+    authMode: rawValue?.authMode === 'oauth_client' ? 'oauth_client' : 'service_account',
+    rootFolderId: String(rawValue?.rootFolderId || 'root'),
+    status:
+      rawValue?.status === 'active' ||
+      rawValue?.status === 'needs_oauth' ||
+      rawValue?.status === 'error'
+        ? rawValue.status
+        : 'pending',
+    lastError: String(rawValue?.lastError || ''),
+    details: {
+      credentialType: String(rawValue?.details?.credentialType || ''),
+      projectId: String(rawValue?.details?.projectId || ''),
+      clientEmail: String(rawValue?.details?.clientEmail || ''),
+      clientId: String(rawValue?.details?.clientId || ''),
+      redirectUris: Array.isArray(rawValue?.details?.redirectUris)
+        ? rawValue.details.redirectUris.map((entry: any) => String(entry || '')).filter(Boolean)
+        : []
+    },
+    createdAt: String(rawValue?.createdAt || ''),
+    updatedAt: String(rawValue?.updatedAt || '')
+  };
+}
+
+export async function getToolsStorageLocalList(payload: {
+  path: string;
+  sortBy?: 'name' | 'size' | 'mtime';
+  sortOrder?: 'asc' | 'desc';
+  limit?: number;
+  includeDirSize?: boolean;
+}): Promise<ToolsStorageLocalListPayload> {
+  const params = new URLSearchParams();
+  params.set('path', String(payload.path || ''));
+  if (payload.sortBy) params.set('sortBy', payload.sortBy);
+  if (payload.sortOrder) params.set('sortOrder', payload.sortOrder);
+  if (Number.isInteger(Number(payload.limit))) params.set('limit', String(payload.limit));
+  if (payload.includeDirSize === false) params.set('includeDirSize', '0');
+  const data = await api<ToolsStorageLocalListPayload>(`/api/tools/storage/local/list?${params.toString()}`);
+  return {
+    path: String(data?.path || ''),
+    parentPath: String(data?.parentPath || ''),
+    sortBy:
+      data?.sortBy === 'size' || data?.sortBy === 'mtime'
+        ? data.sortBy
+        : 'name',
+    sortOrder: data?.sortOrder === 'asc' ? 'asc' : 'desc',
+    totalEntries: Math.max(0, Number(data?.totalEntries) || 0),
+    entries: Array.isArray(data?.entries)
+      ? data.entries.map((entry: any) => ({
+          name: String(entry?.name || ''),
+          path: String(entry?.path || ''),
+          type:
+            entry?.type === 'directory' ||
+            entry?.type === 'symlink' ||
+            entry?.type === 'other'
+              ? entry.type
+              : 'file',
+          sizeBytes: Number.isFinite(Number(entry?.sizeBytes)) ? Number(entry.sizeBytes) : null,
+          modifiedAt: String(entry?.modifiedAt || '')
+        }))
+      : []
+  };
+}
+
+export async function getToolsStorageHeavy(payload: {
+  path: string;
+  limit?: number;
+  maxDepth?: number;
+}): Promise<ToolsStorageHeavyPayload> {
+  const params = new URLSearchParams();
+  params.set('path', String(payload.path || ''));
+  if (Number.isInteger(Number(payload.limit))) params.set('limit', String(payload.limit));
+  if (Number.isInteger(Number(payload.maxDepth))) params.set('maxDepth', String(payload.maxDepth));
+  const data = await api<ToolsStorageHeavyPayload>(`/api/tools/storage/local/heavy?${params.toString()}`);
+  return {
+    path: String(data?.path || ''),
+    scannedAt: String(data?.scannedAt || ''),
+    maxDepth: Number(data?.maxDepth) || 0,
+    limit: Number(data?.limit) || 0,
+    totalBytes: Number(data?.totalBytes) || 0,
+    entries: Array.isArray(data?.entries)
+      ? data.entries.map((entry: any) => ({
+          path: String(entry?.path || ''),
+          name: String(entry?.name || ''),
+          type: entry?.type === 'directory' ? 'directory' : entry?.type === 'other' ? 'other' : 'file',
+          sizeBytes: Number(entry?.sizeBytes) || 0
+        }))
+      : []
+  };
+}
+
+export async function moveToolsStoragePaths(payload: {
+  paths: string[];
+  destinationDir: string;
+}): Promise<{ destinationDir: string; moved: Array<{ sourcePath: string; targetPath: string }>; failed: Array<{ sourcePath: string; error: string }> }> {
+  return api('/api/tools/storage/local/move', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function compressToolsStoragePaths(payload: {
+  paths: string[];
+  archiveName?: string;
+  destinationDir?: string;
+}): Promise<{ archive: { path: string; name: string; sizeBytes: number; createdAt: string } }> {
+  return api('/api/tools/storage/local/compress', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function getToolsStorageOverview(
+  accountId = '',
+  pathValue = ''
+): Promise<ToolsStorageOverview> {
+  const params = new URLSearchParams();
+  if (accountId) params.set('accountId', accountId);
+  if (pathValue) params.set('path', pathValue);
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const data = await api<ToolsStorageOverview>(`/api/tools/storage/overview${suffix}`);
+  return {
+    localDisk: {
+      path: String(data?.localDisk?.path || ''),
+      totalBytes: Number.isFinite(Number(data?.localDisk?.totalBytes)) ? Number(data.localDisk.totalBytes) : null,
+      usedBytes: Number.isFinite(Number(data?.localDisk?.usedBytes)) ? Number(data.localDisk.usedBytes) : null,
+      availableBytes: Number.isFinite(Number(data?.localDisk?.availableBytes)) ? Number(data.localDisk.availableBytes) : null,
+      usagePercent: String(data?.localDisk?.usagePercent || '')
+    },
+    cloud: {
+      accountId: String(data?.cloud?.accountId || ''),
+      available: Boolean(data?.cloud?.available),
+      error: String((data as any)?.cloud?.error || ''),
+      quota: {
+        limit: Number.isFinite(Number(data?.cloud?.quota?.limit)) ? Number(data.cloud.quota.limit) : null,
+        usage: Number.isFinite(Number(data?.cloud?.quota?.usage)) ? Number(data.cloud.quota.usage) : null,
+        usageInDrive: Number.isFinite(Number(data?.cloud?.quota?.usageInDrive)) ? Number(data.cloud.quota.usageInDrive) : null
+      }
+    },
+    jobs: Array.isArray(data?.jobs) ? data.jobs.map((row: any) => normalizeToolsStorageJob(row)) : []
+  };
+}
+
+export async function getToolsStorageJobs(limit = 40): Promise<ToolsStorageJob[]> {
+  const safeLimit = Number.isInteger(limit) ? Math.min(Math.max(limit, 1), 120) : 40;
+  const data = await api<{ jobs: ToolsStorageJob[] }>(`/api/tools/storage/jobs?limit=${safeLimit}`);
+  return Array.isArray(data?.jobs) ? data.jobs.map((row: any) => normalizeToolsStorageJob(row)) : [];
+}
+
+export async function getToolsStorageJob(jobId: string): Promise<ToolsStorageJob> {
+  const data = await api<{ job: ToolsStorageJob }>(
+    `/api/tools/storage/jobs/${encodeURIComponent(String(jobId || '').trim())}`
+  );
+  return normalizeToolsStorageJob(data?.job);
+}
+
+export async function listToolsDriveAccounts(): Promise<ToolsDriveAccount[]> {
+  const data = await api<{ accounts: ToolsDriveAccount[] }>('/api/tools/storage/drive/accounts');
+  return Array.isArray(data?.accounts) ? data.accounts.map((row: any) => normalizeToolsDriveAccount(row)) : [];
+}
+
+export async function createToolsDriveAccount(payload: {
+  alias: string;
+  rootFolderId?: string;
+  credentialsJson: Record<string, any> | string;
+}): Promise<ToolsDriveAccount> {
+  const data = await api<{ account: ToolsDriveAccount }>('/api/tools/storage/drive/accounts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  return normalizeToolsDriveAccount(data?.account);
+}
+
+export async function validateToolsDriveAccount(accountId: string): Promise<{
+  account: ToolsDriveAccount;
+  about: { email: string; displayName: string; quota: { limit: number | null; usage: number | null; usageInDrive: number | null } };
+}> {
+  const data = await api<{
+    account: ToolsDriveAccount;
+    about: { email: string; displayName: string; quota: { limit: number | null; usage: number | null; usageInDrive: number | null } };
+  }>(
+    `/api/tools/storage/drive/accounts/${encodeURIComponent(String(accountId || '').trim())}/validate`,
+    { method: 'POST' }
+  );
+  return {
+    account: normalizeToolsDriveAccount(data?.account),
+    about: data.about
+  };
+}
+
+export async function startToolsDriveOauth(accountId: string, redirectUri = ''): Promise<{
+  account: ToolsDriveAccount;
+  oauth: { authUrl: string; redirectUri: string; instructions: string };
+}> {
+  const data = await api<{
+    account: ToolsDriveAccount;
+    oauth: { authUrl: string; redirectUri: string; instructions: string };
+  }>(
+    `/api/tools/storage/drive/accounts/${encodeURIComponent(String(accountId || '').trim())}/oauth/start`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ redirectUri })
+    }
+  );
+  return {
+    account: normalizeToolsDriveAccount(data?.account),
+    oauth: {
+      authUrl: String(data?.oauth?.authUrl || ''),
+      redirectUri: String(data?.oauth?.redirectUri || ''),
+      instructions: String(data?.oauth?.instructions || '')
+    }
+  };
+}
+
+export async function completeToolsDriveOauth(payload: {
+  accountId: string;
+  code: string;
+  redirectUri?: string;
+}): Promise<{ account: ToolsDriveAccount }> {
+  const data = await api<{ account: ToolsDriveAccount }>(
+    `/api/tools/storage/drive/accounts/${encodeURIComponent(String(payload.accountId || '').trim())}/oauth/complete`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: payload.code, redirectUri: payload.redirectUri || '' })
+    }
+  );
+  return {
+    account: normalizeToolsDriveAccount(data?.account)
+  };
+}
+
+export async function deleteToolsDriveAccount(accountId: string): Promise<{ deleted: boolean; accountId: string }> {
+  return api(`/api/tools/storage/drive/accounts/${encodeURIComponent(String(accountId || '').trim())}`, {
+    method: 'DELETE'
+  });
+}
+
+export async function listToolsDriveFiles(payload: {
+  accountId: string;
+  folderId?: string;
+  pageToken?: string;
+  query?: string;
+}): Promise<ToolsDriveFilesPayload> {
+  const params = new URLSearchParams();
+  params.set('accountId', String(payload.accountId || ''));
+  if (payload.folderId) params.set('folderId', String(payload.folderId));
+  if (payload.pageToken) params.set('pageToken', String(payload.pageToken));
+  if (payload.query) params.set('query', String(payload.query));
+  const data = await api<ToolsDriveFilesPayload>(`/api/tools/storage/drive/files?${params.toString()}`);
+  return {
+    account: normalizeToolsDriveAccount(data?.account),
+    folderId: String(data?.folderId || ''),
+    nextPageToken: String(data?.nextPageToken || ''),
+    files: Array.isArray(data?.files)
+      ? data.files.map((file: any) => ({
+          id: String(file?.id || ''),
+          name: String(file?.name || ''),
+          mimeType: String(file?.mimeType || ''),
+          sizeBytes: Number.isFinite(Number(file?.sizeBytes)) ? Number(file.sizeBytes) : null,
+          createdAt: String(file?.createdAt || ''),
+          modifiedAt: String(file?.modifiedAt || ''),
+          parents: Array.isArray(file?.parents) ? file.parents.map((entry: any) => String(entry || '')).filter(Boolean) : [],
+          appProperties:
+            file?.appProperties && typeof file.appProperties === 'object'
+              ? file.appProperties
+              : {}
+        }))
+      : []
+  };
+}
+
+export async function uploadToolsDriveFiles(payload: {
+  accountId: string;
+  paths: string[];
+  parentId?: string;
+}): Promise<{ job: ToolsStorageJob }> {
+  const data = await api<{ job: ToolsStorageJob }>('/api/tools/storage/drive/upload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  return {
+    job: normalizeToolsStorageJob(data?.job)
+  };
+}
+
+export async function deleteToolsDriveFile(payload: {
+  accountId: string;
+  fileId: string;
+}): Promise<{ deleted: boolean; fileId: string; account: ToolsDriveAccount }> {
+  const data = await api<{ deleted: boolean; fileId: string; account: ToolsDriveAccount }>(
+    `/api/tools/storage/drive/files/${encodeURIComponent(String(payload.fileId || '').trim())}?accountId=${encodeURIComponent(String(payload.accountId || '').trim())}&confirm=DELETE`,
+    {
+      method: 'DELETE'
+    }
+  );
+  return {
+    deleted: Boolean(data?.deleted),
+    fileId: String(data?.fileId || ''),
+    account: normalizeToolsDriveAccount(data?.account)
+  };
+}
+
+export async function listToolsDeployedAppBackups(
+  appId: string,
+  accountId = ''
+): Promise<{ appId: string; accountId: string; retentionDays: number; backups: ToolsDeployedAppBackupItem[]; warning?: string }> {
+  const params = new URLSearchParams();
+  if (accountId) params.set('accountId', accountId);
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const data = await api<{
+    appId: string;
+    accountId: string;
+    retentionDays: number;
+    backups: ToolsDeployedAppBackupItem[];
+    warning?: string;
+  }>(
+    `/api/tools/deployed-apps/${encodeURIComponent(String(appId || '').trim())}/backups${suffix}`
+  );
+  return {
+    appId: String(data?.appId || appId),
+    accountId: String(data?.accountId || accountId),
+    retentionDays: Number(data?.retentionDays) || 4,
+    backups: Array.isArray(data?.backups)
+      ? data.backups.map((entry: any) => ({
+          id: String(entry?.id || ''),
+          appId: String(entry?.appId || appId),
+          driveFileId: String(entry?.driveFileId || ''),
+          accountId: String(entry?.accountId || ''),
+          accountAlias: String(entry?.accountAlias || ''),
+          name: String(entry?.name || ''),
+          targetPath: String(entry?.targetPath || ''),
+          sizeBytes: Number.isFinite(Number(entry?.sizeBytes)) ? Number(entry.sizeBytes) : null,
+          createdAt: String(entry?.createdAt || ''),
+          modifiedAt: String(entry?.modifiedAt || ''),
+          appProperties:
+            entry?.appProperties && typeof entry.appProperties === 'object'
+              ? entry.appProperties
+              : {}
+        }))
+      : [],
+    warning: String(data?.warning || '')
+  };
+}
+
+export async function createToolsDeployedAppBackup(payload: {
+  appId: string;
+  accountId: string;
+  sourcePath?: string;
+  targetPath?: string;
+}): Promise<{ appId: string; job: ToolsStorageJob }> {
+  const data = await api<{ appId: string; job: ToolsStorageJob }>(
+    `/api/tools/deployed-apps/${encodeURIComponent(String(payload.appId || '').trim())}/backups`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }
+  );
+  return {
+    appId: String(data?.appId || payload.appId),
+    job: normalizeToolsStorageJob(data?.job)
+  };
+}
+
+export async function restoreToolsDeployedAppBackup(payload: {
+  appId: string;
+  accountId: string;
+  fileId: string;
+  targetPath?: string;
+}): Promise<{ appId: string; job: ToolsStorageJob }> {
+  const data = await api<{ appId: string; job: ToolsStorageJob }>(
+    `/api/tools/deployed-apps/${encodeURIComponent(String(payload.appId || '').trim())}/restore`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        appId: payload.appId,
+        accountId: payload.accountId,
+        fileId: payload.fileId,
+        targetPath: payload.targetPath || '',
+        confirm: 'RESTORE'
+      })
+    }
+  );
+  return {
+    appId: String(data?.appId || payload.appId),
+    job: normalizeToolsStorageJob(data?.job)
+  };
+}
+
 export async function getToolsGitRepos(forceRefresh = false): Promise<ToolsGitReposPayload> {
   const suffix = forceRefresh ? '?refresh=1' : '';
   const data = await api<{ scannedAt: string; repos: ToolsGitRepoSummary[] }>(`/api/tools/git/repos${suffix}`);
   return {
     scannedAt: String(data.scannedAt || ''),
-    repos: Array.isArray(data.repos) ? data.repos : []
+    repos: Array.isArray(data.repos)
+      ? data.repos.map((repo: any) => ({
+          ...repo,
+          branches: Array.isArray(repo?.branches)
+            ? repo.branches.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+            : []
+        }))
+      : []
   };
 }
 
 export async function pushToolsGitRepo(
   repoId: string,
-  commitMessage = ''
+  payload?: { commitMessage?: string; branch?: string; createBranch?: boolean; remote?: string }
 ): Promise<{ repo: ToolsGitRepoSummary; push: ToolsGitPushResult }> {
   return api(`/api/tools/git/repos/${encodeURIComponent(String(repoId || ''))}/push`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ commitMessage })
+    body: JSON.stringify({
+      commitMessage: String(payload?.commitMessage || ''),
+      branch: String(payload?.branch || ''),
+      createBranch: Boolean(payload?.createBranch),
+      remote: String(payload?.remote || '')
+    })
+  });
+}
+
+export async function getToolsGitBranches(repoId: string): Promise<ToolsGitBranchesPayload> {
+  const data = await api<ToolsGitBranchesPayload>(
+    `/api/tools/git/repos/${encodeURIComponent(String(repoId || ''))}/branches`
+  );
+  return {
+    repo: {
+      ...data.repo,
+      branches: Array.isArray(data?.repo?.branches)
+        ? data.repo.branches.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+        : []
+    },
+    branches: Array.isArray(data?.branches)
+      ? data.branches.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+      : []
+  };
+}
+
+export async function checkoutToolsGitBranch(
+  repoId: string,
+  payload: { branch: string; create?: boolean }
+): Promise<{ repo: ToolsGitRepoSummary; branch: string; created: boolean; output: string }> {
+  return api(`/api/tools/git/repos/${encodeURIComponent(String(repoId || ''))}/branches/checkout`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function mergeToolsGitBranches(
+  repoId: string,
+  payload: { sourceBranch: string; targetBranch: string }
+): Promise<{ repo: ToolsGitRepoSummary; merge?: ToolsGitMergePayload }> {
+  return api(`/api/tools/git/repos/${encodeURIComponent(String(repoId || ''))}/merge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
   });
 }
 

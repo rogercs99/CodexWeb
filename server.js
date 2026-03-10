@@ -57,6 +57,58 @@ const supportedAiAgents = [
 const supportedAiAgentsById = new Map(
   supportedAiAgents.map((agent) => [agent.id, agent])
 );
+const aiProviderCapabilitiesById = {
+  'codex-cli': [
+    'chat',
+    'streaming',
+    'tool-calling',
+    'shell',
+    'file-ops',
+    'git',
+    'background-tasks',
+    'reasoning-visibility',
+    'model-listing',
+    'quota'
+  ],
+  'gemini-cli': [
+    'chat',
+    'streaming',
+    'shell',
+    'file-ops',
+    'git',
+    'background-tasks',
+    'reasoning-visibility',
+    'model-listing'
+  ]
+};
+const aiProviderAuthModesById = {
+  'codex-cli': ['oauth'],
+  'gemini-cli': ['api_key']
+};
+const aiPermissionToolCatalog = [
+  'chat',
+  'git',
+  'storage',
+  'drive',
+  'backups',
+  'deployments',
+  'shell'
+];
+const aiPermissionDefaultAllowedTools = ['chat', 'git', 'storage', 'drive', 'backups', 'deployments', 'shell'];
+const aiProviderQuotaUnits = new Set(['requests', 'tokens', 'credits', 'usd']);
+const aiProviderPermissionProfileDefaults = Object.freeze({
+  allowRoot: true,
+  runAsUser: '',
+  allowedPaths: ['/'],
+  deniedPaths: [],
+  readOnly: false,
+  allowShell: true,
+  allowSensitiveTools: true,
+  allowNetwork: true,
+  allowGit: true,
+  allowBackupRestore: true,
+  allowedTools: aiPermissionDefaultAllowedTools
+});
 const aiAgentTutorialsById = {
   'codex-cli': {
     title: 'Integracion Codex CLI',
@@ -345,6 +397,8 @@ const storageLocalListMaxItems = 500;
 const storageHeavyScanMaxItems = 120;
 const storageHeavyScanMaxDepth = 7;
 const storageBackupRetentionDays = 4;
+const storageBackupMaxSourceBytes = 8 * 1024 * 1024 * 1024;
+const storageBackupReserveBytes = 512 * 1024 * 1024;
 const storageUploadJobMaxFiles = 40;
 const storageJobLogMaxChars = 12000;
 const driveScopes = ['https://www.googleapis.com/auth/drive'];
@@ -550,7 +604,9 @@ function appendStorageJobLogText(previousLog, message) {
 
 function normalizeAbsoluteStoragePath(rawPath, fallbackPath = repoRootDir) {
   const value = String(rawPath || '').trim();
-  const target = value || String(fallbackPath || repoRootDir);
+  const fallback = typeof fallbackPath === 'string' ? fallbackPath.trim() : '';
+  const target = value || fallback;
+  if (!target) return '';
   if (!target || target.includes('\0')) return '';
   const expanded = target.startsWith('~/') ? path.join(os.homedir(), target.slice(2)) : target;
   try {
@@ -656,6 +712,41 @@ function getDirectorySizeWithDu(absolutePath) {
   if (!firstLine) return null;
   const sizeRaw = Number.parseInt(firstLine.split(/\s+/)[0], 10);
   return Number.isFinite(sizeRaw) && sizeRaw >= 0 ? sizeRaw : null;
+}
+
+function estimateStoragePathBytes(absolutePath) {
+  const target = normalizeAbsoluteStoragePath(absolutePath, '');
+  if (!target || !pathExistsSyncSafe(target)) return null;
+  let stats = null;
+  try {
+    stats = fs.statSync(target);
+  } catch (_error) {
+    stats = null;
+  }
+  if (!stats) return null;
+  if (stats.isFile()) {
+    return Number(stats.size || 0);
+  }
+  return getDirectorySizeWithDu(target);
+}
+
+function getDiskAvailableBytesForPath(absolutePath) {
+  const target = normalizeAbsoluteStoragePath(absolutePath, storageJobsRootDir);
+  if (!target) return null;
+  const result = runSystemCommandSync('df', ['-B1', target], {
+    allowNonZero: true,
+    timeoutMs: 10000,
+    maxBuffer: 1024 * 512
+  });
+  if (!result || !result.ok) return null;
+  const rows = String(result.stdout || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .filter((line) => line.trim());
+  if (rows.length < 2) return null;
+  const cols = rows[1].trim().split(/\s+/);
+  const available = Number.parseInt(String(cols[3] || ''), 10);
+  return Number.isFinite(available) ? Math.max(0, available) : null;
 }
 
 function listStorageLocalDirectory(payload = {}) {
@@ -768,12 +859,16 @@ function scanStorageHeavyPaths(payload = {}) {
       const sizeBytes = Number.parseInt(match[1], 10);
       const absolutePath = normalizeAbsoluteStoragePath(match[2]);
       if (!absolutePath || !Number.isFinite(sizeBytes)) return;
+      let isDirectory = false;
+      try {
+        isDirectory = fs.statSync(absolutePath).isDirectory();
+      } catch (_error) {
+        isDirectory = false;
+      }
       entries.push({
         path: absolutePath,
         sizeBytes,
-        type: pathExistsSyncSafe(absolutePath) && fs.existsSync(absolutePath) && fs.statSync(absolutePath).isDirectory()
-          ? 'directory'
-          : 'file'
+        type: isDirectory ? 'directory' : 'file'
       });
     });
   }
@@ -2441,6 +2536,44 @@ function ensureGitIdentityForRepo(repoPath, gitIdentity) {
   };
 }
 
+function ensureGitBranchForRepo(repoPath, branchName, options = {}) {
+  const safeRepoPath = String(repoPath || '').trim() || repoRootDir;
+  const requestedBranch = normalizeGitBranchName(branchName);
+  if (!requestedBranch) {
+    return {
+      ok: false,
+      error: 'branch_invalid',
+      branch: ''
+    };
+  }
+  const createIfMissing = Boolean(options && options.createIfMissing);
+  const exists = gitBranchExists(safeRepoPath, requestedBranch);
+  if (!exists && !createIfMissing) {
+    return {
+      ok: false,
+      error: `La rama no existe: ${requestedBranch}`,
+      branch: requestedBranch
+    };
+  }
+  const checkoutArgs = exists ? ['checkout', requestedBranch] : ['checkout', '-b', requestedBranch];
+  const checkoutResult = runGitInRepoSync(safeRepoPath, checkoutArgs, {
+    allowNonZero: true
+  });
+  if (!checkoutResult.ok) {
+    return {
+      ok: false,
+      error: truncateForNotify(checkoutResult.stderr || checkoutResult.stdout || 'git_checkout_failed', 220),
+      branch: requestedBranch
+    };
+  }
+  return {
+    ok: true,
+    branch: requestedBranch,
+    created: !exists,
+    output: String(checkoutResult.stdout || checkoutResult.stderr || '')
+  };
+}
+
 function truncateRawText(rawValue, maxChars = 120000) {
   const text = String(rawValue || '');
   if (!text) return '';
@@ -3610,6 +3743,864 @@ function resumePendingDeployedDescriptionJobs() {
   });
 }
 
+function serializeDriveAccountRow(row) {
+  if (!row || typeof row !== 'object') return null;
+  const details = safeParseJsonObject(row.details_json);
+  return {
+    id: String(row.id || '').trim(),
+    alias: String(row.alias || '').trim(),
+    authMode: normalizeDriveAuthMode(row.auth_mode),
+    rootFolderId: String(row.root_folder_id || 'root').trim() || 'root',
+    status: normalizeDriveAccountStatus(row.status),
+    lastError: String(row.last_error || '').trim(),
+    details: {
+      credentialType: String(details.credentialType || '').trim(),
+      projectId: String(details.projectId || '').trim(),
+      clientEmail: String(details.clientEmail || '').trim(),
+      clientId: String(details.clientId || '').trim(),
+      redirectUris: Array.isArray(details.redirectUris)
+        ? details.redirectUris.map((entry) => String(entry || '').trim()).filter(Boolean)
+        : []
+    },
+    createdAt: String(row.created_at || '').trim(),
+    updatedAt: String(row.updated_at || '').trim()
+  };
+}
+
+function parseDriveAccountCredentials(row) {
+  if (!row || typeof row !== 'object') {
+    throw new Error('drive_account_not_found');
+  }
+  const cipher = String(row.credentials_cipher || '').trim();
+  if (!cipher) {
+    throw new Error('drive_credentials_missing');
+  }
+  const decrypted = decryptSecretText(cipher);
+  const parsed = safeParseJsonObject(decrypted);
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('drive_credentials_invalid_json');
+  }
+  return parsed;
+}
+
+function parseDriveAccountTokens(row) {
+  if (!row || typeof row !== 'object') return {};
+  const cipher = String(row.token_cipher || '').trim();
+  if (!cipher) return {};
+  try {
+    const decrypted = decryptSecretText(cipher);
+    return safeParseJsonObject(decrypted);
+  } catch (_error) {
+    return {};
+  }
+}
+
+function upsertDriveAccountTokenCipher(row, tokenPayload) {
+  const safeRow = row && typeof row === 'object' ? row : null;
+  if (!safeRow || !safeRow.id) return;
+  const merged = safeParseJsonObject(tokenPayload);
+  const tokenCipher = Object.keys(merged).length > 0 ? encryptSecretText(JSON.stringify(merged)) : '';
+  updateDriveAccountTokenStmt.run(tokenCipher, 'active', '', nowIso(), String(safeRow.id));
+}
+
+function buildOAuth2ClientFromDriveAccount(row, credentials, preferredRedirectUri = '') {
+  const oauthConfig = extractDriveOauthClientConfig(credentials, preferredRedirectUri);
+  if (!oauthConfig.clientId || !oauthConfig.clientSecret) {
+    throw new Error('oauth_client_credentials_incomplete');
+  }
+  const oauthClient = new google.auth.OAuth2(
+    oauthConfig.clientId,
+    oauthConfig.clientSecret,
+    oauthConfig.redirectUri || driveOauthFallbackRedirectUri
+  );
+  oauthClient.on('tokens', (tokens) => {
+    const current = parseDriveAccountTokens(row);
+    const merged = {
+      ...current,
+      ...(tokens && typeof tokens === 'object' ? tokens : {})
+    };
+    if (!merged.refresh_token && current.refresh_token) {
+      merged.refresh_token = current.refresh_token;
+    }
+    upsertDriveAccountTokenCipher(row, merged);
+  });
+  return {
+    oauthClient,
+    oauthConfig
+  };
+}
+
+async function getDriveContextForUser(userId, accountId, options = {}) {
+  const safeUserId = getSafeUserId(userId);
+  const safeAccountId = String(accountId || '').trim();
+  if (!safeUserId || !safeAccountId) {
+    throw createClientRequestError('Cuenta de Drive inválida', 400);
+  }
+  const row = getDriveAccountByIdForUserStmt.get(safeAccountId, safeUserId);
+  if (!row) {
+    throw createClientRequestError('Cuenta de Drive no encontrada', 404);
+  }
+  const serialized = serializeDriveAccountRow(row);
+  const credentials = parseDriveAccountCredentials(row);
+  const authMode = normalizeDriveAuthMode(row.auth_mode);
+  const allowNeedsOauth = Boolean(options.allowNeedsOauth);
+  const preferredRedirectUri = String(options.redirectUri || '').trim();
+
+  if (authMode === 'service_account') {
+    const clientEmail = String(credentials.client_email || '').trim();
+    const privateKey = String(credentials.private_key || '').trim();
+    if (!clientEmail || !privateKey) {
+      throw createClientRequestError('Credenciales service account incompletas', 400);
+    }
+    const jwt = new google.auth.JWT({
+      email: clientEmail,
+      key: privateKey,
+      scopes: driveScopes
+    });
+    const drive = google.drive({ version: 'v3', auth: jwt });
+    return {
+      row,
+      account: serialized,
+      authMode,
+      credentials,
+      authClient: jwt,
+      drive
+    };
+  }
+
+  const { oauthClient, oauthConfig } = buildOAuth2ClientFromDriveAccount(row, credentials, preferredRedirectUri);
+  const tokens = parseDriveAccountTokens(row);
+  const hasRefreshToken = Boolean(tokens && tokens.refresh_token);
+  if (!hasRefreshToken && !allowNeedsOauth) {
+    throw createClientRequestError('Esta cuenta OAuth aún no está autorizada. Completa el flujo OAuth.', 409);
+  }
+  oauthClient.setCredentials(tokens);
+  const drive = google.drive({ version: 'v3', auth: oauthClient });
+  return {
+    row,
+    account: serialized,
+    authMode,
+    credentials,
+    oauthConfig,
+    authClient: oauthClient,
+    drive
+  };
+}
+
+async function validateDriveAccountByIdForUser(userId, accountId) {
+  const context = await getDriveContextForUser(userId, accountId, { allowNeedsOauth: false });
+  const about = await context.drive.about.get({
+    fields: 'user(displayName,emailAddress),storageQuota(limit,usage,usageInDrive)'
+  });
+  const user = about && about.data && about.data.user ? about.data.user : {};
+  const quota = about && about.data && about.data.storageQuota ? about.data.storageQuota : {};
+  const details = safeParseJsonObject(context.row.details_json);
+  details.validatedAt = nowIso();
+  details.accountEmail = String(user.emailAddress || '').trim();
+  details.accountDisplayName = String(user.displayName || '').trim();
+  details.storageQuota = {
+    limit: String(quota.limit || '').trim(),
+    usage: String(quota.usage || '').trim(),
+    usageInDrive: String(quota.usageInDrive || '').trim()
+  };
+  updateDriveAccountMetaStmt.run(
+    String(context.row.alias || '').trim(),
+    String(context.row.root_folder_id || 'root').trim() || 'root',
+    'active',
+    '',
+    JSON.stringify(details),
+    nowIso(),
+    String(context.row.id || '').trim(),
+    getSafeUserId(userId)
+  );
+  return {
+    account: serializeDriveAccountRow(getDriveAccountByIdForUserStmt.get(String(context.row.id), getSafeUserId(userId))),
+    about: {
+      email: String(user.emailAddress || '').trim(),
+      displayName: String(user.displayName || '').trim(),
+      quota: {
+        limit: Number.isFinite(Number(quota.limit)) ? Number(quota.limit) : null,
+        usage: Number.isFinite(Number(quota.usage)) ? Number(quota.usage) : null,
+        usageInDrive: Number.isFinite(Number(quota.usageInDrive)) ? Number(quota.usageInDrive) : null
+      }
+    }
+  };
+}
+
+async function ensureDriveFolder(drive, parentId, folderName) {
+  const safeParent = String(parentId || 'root').trim() || 'root';
+  const safeName = sanitizeDriveFileName(folderName, 'CodexWeb');
+  const query = [
+    `'${sanitizeDriveQueryLiteral(safeParent)}' in parents`,
+    `name = '${sanitizeDriveQueryLiteral(safeName)}'`,
+    "mimeType = 'application/vnd.google-apps.folder'",
+    'trashed = false'
+  ].join(' and ');
+  const found = await drive.files.list({
+    q: query,
+    pageSize: 1,
+    fields: 'files(id,name)'
+  });
+  const existing = Array.isArray(found.data && found.data.files) ? found.data.files[0] : null;
+  if (existing && existing.id) return String(existing.id);
+
+  const created = await drive.files.create({
+    requestBody: {
+      name: safeName,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: [safeParent]
+    },
+    fields: 'id,name'
+  });
+  return String(created && created.data && created.data.id ? created.data.id : '');
+}
+
+async function ensureDriveBackupFolder(context, appId) {
+  const rootFolderId = String(context.row.root_folder_id || 'root').trim() || 'root';
+  const codexFolderId = await ensureDriveFolder(context.drive, rootFolderId, 'CodexWebBackups');
+  if (!codexFolderId) {
+    throw new Error('drive_backup_root_folder_failed');
+  }
+  const appFolderName = sanitizeDriveFileName(`app_${String(appId || '').slice(0, 80)}`, 'app');
+  const appFolderId = await ensureDriveFolder(context.drive, codexFolderId, appFolderName);
+  if (!appFolderId) {
+    throw new Error('drive_backup_app_folder_failed');
+  }
+  return {
+    codexFolderId,
+    appFolderId
+  };
+}
+
+function serializeToolsBackgroundJobRow(row) {
+  if (!row || typeof row !== 'object') return null;
+  return {
+    id: String(row.id || '').trim(),
+    type: normalizeStorageJobType(row.job_type),
+    status: normalizeStorageJobStatus(row.status),
+    payload: safeParseJsonObject(row.payload_json),
+    progress: safeParseJsonObject(row.progress_json),
+    result: safeParseJsonObject(row.result_json),
+    error: String(row.error_text || '').trim(),
+    log: String(row.log_text || '').trim(),
+    createdAt: String(row.created_at || '').trim(),
+    updatedAt: String(row.updated_at || '').trim(),
+    startedAt: String(row.started_at || '').trim(),
+    finishedAt: String(row.finished_at || '').trim()
+  };
+}
+
+function setStorageJobProgress(jobId, progressPatch, logMessage = '') {
+  const safeJobId = String(jobId || '').trim();
+  if (!safeJobId) return;
+  const row = getToolsBackgroundJobByIdStmt.get(safeJobId);
+  if (!row) return;
+  const progress = {
+    ...safeParseJsonObject(row.progress_json),
+    ...(progressPatch && typeof progressPatch === 'object' ? progressPatch : {}),
+    updatedAt: nowIso()
+  };
+  const nextLog = logMessage
+    ? appendStorageJobLogText(String(row.log_text || ''), logMessage)
+    : String(row.log_text || '').slice(-storageJobLogMaxChars);
+  updateToolsBackgroundJobProgressStmt.run(JSON.stringify(progress), nextLog, nowIso(), safeJobId);
+}
+
+function markStorageJobError(jobId, errorMessage, progressPatch = {}) {
+  const safeJobId = String(jobId || '').trim();
+  if (!safeJobId) return;
+  const row = getToolsBackgroundJobByIdStmt.get(safeJobId);
+  if (!row) return;
+  const progress = {
+    ...safeParseJsonObject(row.progress_json),
+    ...(progressPatch && typeof progressPatch === 'object' ? progressPatch : {}),
+    endedAt: nowIso()
+  };
+  const errorText = truncateForNotify(errorMessage || 'storage_job_failed', 1000);
+  const nextLog = appendStorageJobLogText(String(row.log_text || ''), `ERROR: ${errorText}`);
+  const finishedAt = nowIso();
+  updateToolsBackgroundJobErrorStmt.run(
+    JSON.stringify(progress),
+    errorText,
+    nextLog,
+    finishedAt,
+    finishedAt,
+    safeJobId
+  );
+}
+
+function markStorageJobCompleted(jobId, resultPayload, progressPatch = {}, logMessage = 'Job completado') {
+  const safeJobId = String(jobId || '').trim();
+  if (!safeJobId) return;
+  const row = getToolsBackgroundJobByIdStmt.get(safeJobId);
+  if (!row) return;
+  const progress = {
+    ...safeParseJsonObject(row.progress_json),
+    ...(progressPatch && typeof progressPatch === 'object' ? progressPatch : {}),
+    endedAt: nowIso(),
+    done: true
+  };
+  const result = resultPayload && typeof resultPayload === 'object' ? resultPayload : {};
+  const nextLog = appendStorageJobLogText(String(row.log_text || ''), logMessage);
+  const finishedAt = nowIso();
+  updateToolsBackgroundJobCompletedStmt.run(
+    JSON.stringify(progress),
+    JSON.stringify(result),
+    nextLog,
+    finishedAt,
+    finishedAt,
+    safeJobId
+  );
+}
+
+function createStorageJob(userId, jobType, payload) {
+  const safeUserId = getSafeUserId(userId);
+  const safeType = normalizeStorageJobType(jobType);
+  if (!safeUserId || !safeType) {
+    throw createClientRequestError('No se pudo crear job de almacenamiento', 400);
+  }
+  const jobId = buildStorageJobId(safeType);
+  const createdAt = nowIso();
+  insertToolsBackgroundJobStmt.run(
+    jobId,
+    safeUserId,
+    safeType,
+    'pending',
+    JSON.stringify(payload && typeof payload === 'object' ? payload : {}),
+    createdAt,
+    createdAt
+  );
+  scheduleStorageJob(jobId);
+  return serializeToolsBackgroundJobRow(getToolsBackgroundJobForUserStmt.get(jobId, safeUserId));
+}
+
+async function listDriveFilesForAccount(userId, accountId, options = {}) {
+  const context = await getDriveContextForUser(userId, accountId, { allowNeedsOauth: false });
+  const folderId = String(options.folderId || context.row.root_folder_id || 'root').trim() || 'root';
+  const pageSizeRaw = Number.parseInt(String(options.pageSize || ''), 10);
+  const pageSize = Number.isInteger(pageSizeRaw) ? Math.min(Math.max(pageSizeRaw, 1), 200) : 80;
+  const pageToken = String(options.pageToken || '').trim();
+  const queryText = String(options.query || '').trim();
+  const qParts = [`'${sanitizeDriveQueryLiteral(folderId)}' in parents`, 'trashed = false'];
+  if (queryText) {
+    qParts.push(`name contains '${sanitizeDriveQueryLiteral(queryText)}'`);
+  }
+  const result = await context.drive.files.list({
+    q: qParts.join(' and '),
+    pageSize,
+    pageToken: pageToken || undefined,
+    fields: 'nextPageToken, files(id,name,mimeType,size,createdTime,modifiedTime,parents,appProperties)'
+  });
+  const files = Array.isArray(result.data && result.data.files)
+    ? result.data.files.map((file) => ({
+        id: String(file && file.id ? file.id : '').trim(),
+        name: String(file && file.name ? file.name : '').trim(),
+        mimeType: String(file && file.mimeType ? file.mimeType : '').trim(),
+        sizeBytes: Number.isFinite(Number(file && file.size)) ? Number(file.size) : null,
+        createdAt: String(file && file.createdTime ? file.createdTime : '').trim(),
+        modifiedAt: String(file && file.modifiedTime ? file.modifiedTime : '').trim(),
+        parents: Array.isArray(file && file.parents)
+          ? file.parents.map((entry) => String(entry || '').trim()).filter(Boolean)
+          : [],
+        appProperties: file && file.appProperties && typeof file.appProperties === 'object'
+          ? file.appProperties
+          : {}
+      }))
+    : [];
+  return {
+    account: context.account,
+    folderId,
+    nextPageToken: String(result.data && result.data.nextPageToken ? result.data.nextPageToken : '').trim(),
+    files
+  };
+}
+
+async function deleteDriveFileForAccount(userId, accountId, fileId) {
+  const context = await getDriveContextForUser(userId, accountId, { allowNeedsOauth: false });
+  const safeFileId = String(fileId || '').trim();
+  if (!safeFileId) {
+    throw createClientRequestError('fileId inválido', 400);
+  }
+  await context.drive.files.delete({ fileId: safeFileId });
+  markDeployedCloudBackupDeletedByDriveFileStmt.run(nowIso(), getSafeUserId(userId), String(accountId), safeFileId);
+  return {
+    deleted: true,
+    fileId: safeFileId,
+    account: context.account
+  };
+}
+
+function buildAppBackupQuery(appId) {
+  return [
+    "trashed = false",
+    "appProperties has { key='codexwebType' and value='app-backup' }",
+    `appProperties has { key='appId' and value='${sanitizeDriveQueryLiteral(appId)}' }`
+  ].join(' and ');
+}
+
+async function listAppBackupsInDriveForAccount(userId, appId, accountId) {
+  const safeAppId = String(appId || '').trim();
+  if (!safeAppId) {
+    throw createClientRequestError('appId inválido', 400);
+  }
+  const context = await getDriveContextForUser(userId, accountId, { allowNeedsOauth: false });
+  const result = await context.drive.files.list({
+    q: buildAppBackupQuery(safeAppId),
+    pageSize: 120,
+    fields: 'files(id,name,size,createdTime,modifiedTime,appProperties,parents)'
+  });
+  const files = Array.isArray(result.data && result.data.files) ? result.data.files : [];
+  return files.map((file) => {
+    const appProperties = file && file.appProperties && typeof file.appProperties === 'object' ? file.appProperties : {};
+    return {
+      id: `drvbackup_${String(context.account.id)}_${String(file && file.id ? file.id : '')}`,
+      appId: safeAppId,
+      driveFileId: String(file && file.id ? file.id : '').trim(),
+      accountId: String(context.account.id),
+      accountAlias: String(context.account.alias || context.account.id),
+      name: String(file && file.name ? file.name : '').trim(),
+      targetPath: String(appProperties.targetPath || '').trim(),
+      sizeBytes: Number.isFinite(Number(file && file.size)) ? Number(file.size) : null,
+      createdAt: String(file && file.createdTime ? file.createdTime : '').trim(),
+      modifiedAt: String(file && file.modifiedTime ? file.modifiedTime : '').trim(),
+      appProperties
+    };
+  });
+}
+
+async function listAppBackupsFromDrive(userId, appId, accountId = '') {
+  const safeUserId = getSafeUserId(userId);
+  const safeAppId = String(appId || '').trim();
+  if (!safeUserId || !safeAppId) {
+    throw createClientRequestError('Parámetros inválidos para listar backups', 400);
+  }
+
+  const accountIds = [];
+  const singleAccount = String(accountId || '').trim();
+  if (singleAccount) {
+    accountIds.push(singleAccount);
+  } else {
+    const rows = listDriveAccountsForUserStmt.all(safeUserId);
+    rows.forEach((row) => {
+      const id = String(row && row.id ? row.id : '').trim();
+      if (!id) return;
+      accountIds.push(id);
+    });
+  }
+
+  const all = [];
+  for (const currentAccountId of accountIds) {
+    try {
+      const items = await listAppBackupsInDriveForAccount(safeUserId, safeAppId, currentAccountId);
+      items.forEach((item) => all.push(item));
+    } catch (_error) {
+      // Keep listing across other accounts.
+    }
+  }
+  all.sort((a, b) => Date.parse(String(b.createdAt || '')) - Date.parse(String(a.createdAt || '')));
+  return all;
+}
+
+async function pruneDriveBackupsForRetention(userId, accountId, appId) {
+  const cutoffMs = Date.now() - storageBackupRetentionDays * 24 * 60 * 60 * 1000;
+  const items = await listAppBackupsInDriveForAccount(userId, appId, accountId);
+  let removed = 0;
+  for (const item of items) {
+    const createdMs = Date.parse(String(item.createdAt || ''));
+    if (!Number.isFinite(createdMs) || createdMs >= cutoffMs) continue;
+    try {
+      await deleteDriveFileForAccount(userId, accountId, item.driveFileId);
+      removed += 1;
+    } catch (_error) {
+      // Keep cleanup best effort.
+    }
+  }
+  return {
+    retentionDays: storageBackupRetentionDays,
+    removed
+  };
+}
+
+function resolveBackupTargetFromApp(app) {
+  const rawLocation = String(app && app.location ? app.location : '').trim();
+  if (!rawLocation) return '';
+  const location = normalizeAbsoluteStoragePath(rawLocation, '');
+  if (!location || !pathExistsSyncSafe(location)) return '';
+  return location;
+}
+
+function createTarGzArchive(sourcePath, archivePath) {
+  const absoluteSource = normalizeAbsoluteStoragePath(sourcePath);
+  const absoluteArchive = normalizeAbsoluteStoragePath(archivePath, storageJobsRootDir);
+  if (!absoluteSource || !absoluteArchive) {
+    throw new Error('archive_path_invalid');
+  }
+  let sourceStats = null;
+  try {
+    sourceStats = fs.statSync(absoluteSource);
+  } catch (_error) {
+    sourceStats = null;
+  }
+  if (!sourceStats) {
+    throw new Error('source_path_not_found');
+  }
+  ensureParentDirForFile(absoluteArchive);
+  const parent = path.dirname(absoluteSource);
+  const base = path.basename(absoluteSource);
+  const result = runSystemCommandSync('tar', ['-czf', absoluteArchive, '-C', parent, base], {
+    timeoutMs: 1000 * 60 * 10,
+    maxBuffer: 1024 * 1024 * 4
+  });
+  if (!result.ok) {
+    throw new Error(truncateForNotify(result.stderr || result.stdout || 'tar_create_failed', 220));
+  }
+  return absoluteArchive;
+}
+
+function extractTarGzArchive(archivePath, targetPath) {
+  const absoluteArchive = normalizeAbsoluteStoragePath(archivePath, storageJobsRootDir);
+  const absoluteTarget = normalizeAbsoluteStoragePath(targetPath);
+  if (!absoluteArchive || !absoluteTarget) {
+    throw new Error('restore_target_invalid');
+  }
+  assertStorageMutationPathAllowed(absoluteTarget);
+  let stats = null;
+  try {
+    stats = fs.statSync(absoluteTarget);
+  } catch (_error) {
+    stats = null;
+  }
+  const extractParent =
+    stats && stats.isFile() ? path.dirname(absoluteTarget) : path.dirname(absoluteTarget);
+  const result = runSystemCommandSync('tar', ['-xzf', absoluteArchive, '-C', extractParent], {
+    timeoutMs: 1000 * 60 * 10,
+    maxBuffer: 1024 * 1024 * 4
+  });
+  if (!result.ok) {
+    throw new Error(truncateForNotify(result.stderr || result.stdout || 'tar_extract_failed', 220));
+  }
+  return {
+    targetPath: absoluteTarget,
+    extractParent
+  };
+}
+
+async function uploadFileToDrive(context, payload) {
+  const localPath = normalizeAbsoluteStoragePath(payload.localPath);
+  if (!localPath) {
+    throw createClientRequestError('Ruta local inválida para subir a Drive', 400);
+  }
+  let stats = null;
+  try {
+    stats = fs.statSync(localPath);
+  } catch (_error) {
+    stats = null;
+  }
+  if (!stats || !stats.isFile()) {
+    throw createClientRequestError('Solo se pueden subir archivos existentes', 400);
+  }
+  const parentId = String(payload.parentId || context.row.root_folder_id || 'root').trim() || 'root';
+  const driveName = sanitizeDriveFileName(payload.fileName || path.basename(localPath), path.basename(localPath));
+  const mediaType = inferMimeTypeFromFilename(driveName);
+  const requestBody = {
+    name: driveName,
+    parents: [parentId]
+  };
+  if (payload.appProperties && typeof payload.appProperties === 'object') {
+    requestBody.appProperties = payload.appProperties;
+  }
+  const response = await context.drive.files.create({
+    requestBody,
+    media: {
+      mimeType: mediaType,
+      body: fs.createReadStream(localPath)
+    },
+    fields: 'id,name,size,mimeType,createdTime,parents,appProperties'
+  });
+  const file = response && response.data ? response.data : {};
+  return {
+    id: String(file.id || '').trim(),
+    name: String(file.name || driveName).trim(),
+    sizeBytes: Number.isFinite(Number(file.size)) ? Number(file.size) : Number(stats.size || 0),
+    mimeType: String(file.mimeType || mediaType).trim(),
+    createdAt: String(file.createdTime || nowIso()).trim(),
+    parents: Array.isArray(file.parents) ? file.parents.map((entry) => String(entry || '').trim()).filter(Boolean) : [],
+    appProperties: file && file.appProperties && typeof file.appProperties === 'object' ? file.appProperties : {},
+    localPath
+  };
+}
+
+async function handleDriveUploadFilesJob(row) {
+  const payload = safeParseJsonObject(row.payload_json);
+  const safeUserId = getSafeUserId(row.user_id);
+  const accountId = String(payload.accountId || '').trim();
+  const localPaths = parseStoragePathList(payload.paths, storageUploadJobMaxFiles);
+  const parentId = String(payload.parentId || '').trim();
+  if (!accountId || localPaths.length === 0) {
+    throw createClientRequestError('Job de subida inválido: cuenta/archivos faltantes', 400);
+  }
+  const context = await getDriveContextForUser(safeUserId, accountId, { allowNeedsOauth: false });
+  const uploaded = [];
+  const failed = [];
+  setStorageJobProgress(row.id, { total: localPaths.length, done: 0, failed: 0, stage: 'uploading' }, 'Subida a Drive iniciada');
+  for (let index = 0; index < localPaths.length; index += 1) {
+    const localPath = localPaths[index];
+    try {
+      const item = await uploadFileToDrive(context, {
+        localPath,
+        parentId,
+        fileName: path.basename(localPath)
+      });
+      uploaded.push(item);
+      setStorageJobProgress(
+        row.id,
+        {
+          total: localPaths.length,
+          done: uploaded.length,
+          failed: failed.length,
+          stage: 'uploading'
+        },
+        `Subido: ${item.name}`
+      );
+    } catch (error) {
+      failed.push({
+        localPath,
+        error: truncateForNotify(error && error.message ? error.message : 'upload_failed', 260)
+      });
+      setStorageJobProgress(
+        row.id,
+        {
+          total: localPaths.length,
+          done: uploaded.length,
+          failed: failed.length,
+          stage: 'uploading'
+        },
+        `Error subiendo ${path.basename(localPath)}`
+      );
+    }
+  }
+  if (uploaded.length === 0 && failed.length > 0) {
+    throw new Error(
+      `No se pudo subir ningun archivo. Primer error: ${truncateForNotify(failed[0] && failed[0].error ? failed[0].error : 'upload_failed', 220)}`
+    );
+  }
+  return {
+    accountId,
+    accountAlias: context.account.alias || context.account.id,
+    uploaded,
+    failed
+  };
+}
+
+async function handleDeployedBackupCreateJob(row) {
+  const payload = safeParseJsonObject(row.payload_json);
+  const safeUserId = getSafeUserId(row.user_id);
+  const accountId = String(payload.accountId || '').trim();
+  const appId = String(payload.appId || '').trim();
+  const appName = String(payload.appName || appId).trim() || appId;
+  const sourcePath = normalizeAbsoluteStoragePath(payload.sourcePath);
+  const targetPath = normalizeAbsoluteStoragePath(payload.targetPath || sourcePath);
+  if (!safeUserId || !accountId || !appId || !sourcePath) {
+    throw createClientRequestError('Backup inválido: faltan parámetros requeridos', 400);
+  }
+  const estimatedSourceBytes = estimateStoragePathBytes(sourcePath);
+  if (Number.isFinite(Number(estimatedSourceBytes)) && Number(estimatedSourceBytes) > storageBackupMaxSourceBytes) {
+    throw createClientRequestError(
+      `La ruta a respaldar supera el límite de ${Math.round(storageBackupMaxSourceBytes / (1024 * 1024 * 1024))}GB.`,
+      413
+    );
+  }
+  const availableBytes = getDiskAvailableBytesForPath(storageJobsRootDir);
+  if (
+    Number.isFinite(Number(estimatedSourceBytes)) &&
+    Number.isFinite(Number(availableBytes)) &&
+    Number(estimatedSourceBytes) + storageBackupReserveBytes >= Number(availableBytes)
+  ) {
+    throw createClientRequestError(
+      'No hay espacio temporal suficiente para generar el backup local antes de subirlo a Drive.',
+      507
+    );
+  }
+
+  const context = await getDriveContextForUser(safeUserId, accountId, { allowNeedsOauth: false });
+  setStorageJobProgress(row.id, { stage: 'archiving' }, `Empaquetando ${sourcePath}`);
+  const tmpArchivePath = path.join(
+    storageJobsRootDir,
+    `${buildStorageJobId('backup')}.tar.gz`
+  );
+  let uploadedItem = null;
+  try {
+    createTarGzArchive(sourcePath, tmpArchivePath);
+    const folders = await ensureDriveBackupFolder(context, appId);
+    setStorageJobProgress(row.id, { stage: 'uploading' }, 'Subiendo backup a Drive');
+    const uploaded = await uploadFileToDrive(context, {
+      localPath: tmpArchivePath,
+      parentId: folders.appFolderId,
+      fileName: buildBackupFileName(appName, appId, nowIso()),
+      appProperties: {
+        codexwebType: 'app-backup',
+        appId,
+        targetPath: targetPath || '',
+        createdAt: nowIso()
+      }
+    });
+    uploadedItem = uploaded;
+
+    const backupId = buildStorageJobId('cloudbackup');
+    upsertDeployedCloudBackupStmt.run(
+      backupId,
+      safeUserId,
+      appId,
+      accountId,
+      uploaded.id,
+      uploaded.name,
+      targetPath || '',
+      Number(uploaded.sizeBytes || 0),
+      uploaded.createdAt || nowIso(),
+      JSON.stringify({
+        appName,
+        sourcePath,
+        targetPath: targetPath || '',
+        parentId: folders.appFolderId
+      })
+    );
+    const retention = await pruneDriveBackupsForRetention(safeUserId, accountId, appId);
+    return {
+      backup: {
+        id: backupId,
+        appId,
+        accountId,
+        accountAlias: context.account.alias || context.account.id,
+        driveFileId: uploaded.id,
+        name: uploaded.name,
+        sizeBytes: uploaded.sizeBytes,
+        createdAt: uploaded.createdAt,
+        targetPath: targetPath || ''
+      },
+      retention
+    };
+  } finally {
+    try {
+      if (tmpArchivePath && fs.existsSync(tmpArchivePath)) {
+        fs.unlinkSync(tmpArchivePath);
+      }
+    } catch (_error) {
+      // ignore temp cleanup failure
+    }
+  }
+}
+
+async function downloadDriveFileToPath(context, fileId, outputPath) {
+  ensureParentDirForFile(outputPath);
+  const response = await context.drive.files.get(
+    { fileId: String(fileId || '').trim(), alt: 'media' },
+    { responseType: 'stream' }
+  );
+  await pipelineAsync(response.data, fs.createWriteStream(outputPath));
+}
+
+async function handleDeployedBackupRestoreJob(row) {
+  const payload = safeParseJsonObject(row.payload_json);
+  const safeUserId = getSafeUserId(row.user_id);
+  const accountId = String(payload.accountId || '').trim();
+  const appId = String(payload.appId || '').trim();
+  const fileId = String(payload.fileId || '').trim();
+  const requestedTargetPath = normalizeAbsoluteStoragePath(payload.targetPath);
+  if (!safeUserId || !accountId || !appId || !fileId) {
+    throw createClientRequestError('Restauración inválida: faltan datos requeridos', 400);
+  }
+  const context = await getDriveContextForUser(safeUserId, accountId, { allowNeedsOauth: false });
+  const metadataRes = await context.drive.files.get({
+    fileId,
+    fields: 'id,name,size,createdTime,appProperties'
+  });
+  const metadata = metadataRes && metadataRes.data ? metadataRes.data : {};
+  const appProperties = metadata && metadata.appProperties && typeof metadata.appProperties === 'object'
+    ? metadata.appProperties
+    : {};
+  const targetPath = requestedTargetPath || normalizeAbsoluteStoragePath(appProperties.targetPath || '');
+  if (!targetPath) {
+    throw createClientRequestError('Este backup no tiene targetPath. Indica ruta de restauración manualmente.', 400);
+  }
+  assertStorageMutationPathAllowed(targetPath);
+  setStorageJobProgress(row.id, { stage: 'downloading' }, `Descargando backup ${String(metadata.name || fileId)}`);
+  const tmpArchivePath = path.join(storageJobsRootDir, `${buildStorageJobId('restore')}.tar.gz`);
+  try {
+    await downloadDriveFileToPath(context, fileId, tmpArchivePath);
+    setStorageJobProgress(row.id, { stage: 'extracting' }, `Restaurando en ${targetPath}`);
+    const extraction = extractTarGzArchive(tmpArchivePath, targetPath);
+    return {
+      appId,
+      accountId,
+      accountAlias: context.account.alias || context.account.id,
+      fileId,
+      backupName: String(metadata.name || '').trim(),
+      targetPath,
+      extractParent: extraction.extractParent,
+      restoredAt: nowIso()
+    };
+  } finally {
+    try {
+      if (tmpArchivePath && fs.existsSync(tmpArchivePath)) {
+        fs.unlinkSync(tmpArchivePath);
+      }
+    } catch (_error) {
+      // ignore temp cleanup failures.
+    }
+  }
+}
+
+async function runStorageJobById(jobId) {
+  const safeJobId = String(jobId || '').trim();
+  if (!safeJobId) return;
+  const row = getToolsBackgroundJobByIdStmt.get(safeJobId);
+  if (!row) return;
+  const status = normalizeStorageJobStatus(row.status);
+  if (status === 'completed' || status === 'error') return;
+  const runningAt = nowIso();
+  updateToolsBackgroundJobRunningStmt.run(runningAt, runningAt, safeJobId);
+  const freshRow = getToolsBackgroundJobByIdStmt.get(safeJobId);
+  if (!freshRow) return;
+  const type = normalizeStorageJobType(freshRow.job_type);
+  try {
+    let result = {};
+    if (type === 'drive_upload_files') {
+      result = await handleDriveUploadFilesJob(freshRow);
+    } else if (type === 'deployed_backup_create') {
+      result = await handleDeployedBackupCreateJob(freshRow);
+    } else if (type === 'deployed_backup_restore') {
+      result = await handleDeployedBackupRestoreJob(freshRow);
+    } else {
+      throw new Error('storage_job_type_not_supported');
+    }
+    markStorageJobCompleted(safeJobId, result, { stage: 'completed' }, 'Job completado');
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'storage_job_failed', 900);
+    markStorageJobError(safeJobId, reason, { stage: 'error' });
+  }
+}
+
+function scheduleStorageJob(jobId) {
+  const safeJobId = String(jobId || '').trim();
+  if (!safeJobId || activeStorageJobWorkers.has(safeJobId)) return;
+  activeStorageJobWorkers.add(safeJobId);
+  setTimeout(() => {
+    void runStorageJobById(safeJobId).finally(() => {
+      activeStorageJobWorkers.delete(safeJobId);
+    });
+  }, 15);
+}
+
+function resumePendingStorageJobs() {
+  const rows = listPendingToolsBackgroundJobsStmt.all(storageJobPollMaxItems);
+  rows.forEach((row) => {
+    const jobId = String(row && row.id ? row.id : '').trim();
+    if (!jobId) return;
+    scheduleStorageJob(jobId);
+  });
+}
+
+
 function parseGitPorcelainPath(line) {
   const raw = String(line || '');
   if (raw.length < 4) return '';
@@ -3719,6 +4710,51 @@ function parseGitStatusPorcelain(rawOutput) {
   };
 }
 
+function normalizeGitBranchName(rawValue, fallback = '') {
+  const value = String(rawValue || '').trim();
+  if (!value) return String(fallback || '').trim();
+  if (value.length > 180) return String(fallback || '').trim();
+  if (/\s/.test(value)) return String(fallback || '').trim();
+  if (!/^[A-Za-z0-9._/\-]+$/.test(value)) return String(fallback || '').trim();
+  if (value.startsWith('-') || value.endsWith('.') || value.endsWith('/')) {
+    return String(fallback || '').trim();
+  }
+  if (value.includes('..') || value.includes('@{') || value.includes('\\')) {
+    return String(fallback || '').trim();
+  }
+  return value;
+}
+
+function normalizeGitRemoteName(rawValue, fallback = '') {
+  const value = String(rawValue || '').trim();
+  if (!value) return String(fallback || '').trim();
+  if (value.length > 120) return String(fallback || '').trim();
+  if (!/^[A-Za-z0-9._-]+$/.test(value)) return String(fallback || '').trim();
+  return value;
+}
+
+function listGitBranchesForRepo(repoPath) {
+  const result = runGitInRepoSync(repoPath, ['branch', '--list', '--format', '%(refname:short)'], {
+    allowNonZero: true
+  });
+  if (!result.ok) return [];
+  const branches = String(result.stdout || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((entry) => normalizeGitBranchName(entry))
+    .filter(Boolean);
+  return Array.from(new Set(branches)).sort((a, b) => a.localeCompare(b));
+}
+
+function gitBranchExists(repoPath, branchName) {
+  const safeName = normalizeGitBranchName(branchName);
+  if (!safeName) return false;
+  const result = runGitInRepoSync(repoPath, ['show-ref', '--verify', `refs/heads/${safeName}`], {
+    allowNonZero: true
+  });
+  return Number(result.code) === 0;
+}
+
 function listGitRepositoriesUnderRoots(baseDirs) {
   const requestedRoots = Array.isArray(baseDirs) ? baseDirs : [baseDirs];
   const normalizedRoots = [];
@@ -3810,6 +4846,7 @@ function collectGitRepoSummary(repoDir, scannedAtIso, scanRoot = repoRootDir) {
     relativePath === '.'
       ? path.basename(safeRepoDir) || path.basename(safeScanRoot) || safeRepoDir
       : relativePath.split('/').filter(Boolean).slice(-1)[0] || relativePath;
+  const branches = listGitBranchesForRepo(safeRepoDir);
 
   return {
     id: buildGitRepoId(relativePath, safeRepoDir),
@@ -3828,6 +4865,7 @@ function collectGitRepoSummary(repoDir, scannedAtIso, scanRoot = repoRootDir) {
     status: parsedStatus.counts,
     changedFiles: parsedStatus.files.slice(0, 120),
     conflictFiles: parsedStatus.conflictedFiles.slice(0, 120),
+    branches: branches.slice(0, 120),
     scanRoot: safeScanRoot,
     scannedAt: scannedAtIso
   };
@@ -5494,6 +6532,28 @@ CREATE TABLE IF NOT EXISTS user_agent_integrations (
 CREATE INDEX IF NOT EXISTS idx_user_agent_integrations_user
 ON user_agent_integrations(user_id, agent_id ASC);
 
+CREATE TABLE IF NOT EXISTS user_agent_permissions (
+  user_id INTEGER NOT NULL,
+  agent_id TEXT NOT NULL,
+  allow_root INTEGER NOT NULL DEFAULT 1,
+  run_as_user TEXT NOT NULL DEFAULT '',
+  allowed_paths_json TEXT NOT NULL DEFAULT '["/"]',
+  denied_paths_json TEXT NOT NULL DEFAULT '[]',
+  read_only INTEGER NOT NULL DEFAULT 0,
+  allow_shell INTEGER NOT NULL DEFAULT 1,
+  allow_sensitive_tools INTEGER NOT NULL DEFAULT 1,
+  allow_network INTEGER NOT NULL DEFAULT 1,
+  allow_git INTEGER NOT NULL DEFAULT 1,
+  allow_backup_restore INTEGER NOT NULL DEFAULT 1,
+  allowed_tools_json TEXT NOT NULL DEFAULT '["chat","git","storage","drive","backups","deployments","shell"]',
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, agent_id),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_agent_permissions_user
+ON user_agent_permissions(user_id, agent_id ASC);
+
 CREATE TABLE IF NOT EXISTS conversations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
@@ -5650,6 +6710,70 @@ CREATE TABLE IF NOT EXISTS deployed_app_descriptions (
 
 CREATE INDEX IF NOT EXISTS idx_deployed_app_descriptions_user_generated
 ON deployed_app_descriptions(user_id, generated_at DESC, app_id ASC);
+
+CREATE TABLE IF NOT EXISTS drive_accounts (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  alias TEXT NOT NULL DEFAULT '',
+  auth_mode TEXT NOT NULL DEFAULT 'service_account',
+  credentials_cipher TEXT NOT NULL DEFAULT '',
+  token_cipher TEXT NOT NULL DEFAULT '',
+  root_folder_id TEXT NOT NULL DEFAULT 'root',
+  status TEXT NOT NULL DEFAULT 'pending',
+  last_error TEXT NOT NULL DEFAULT '',
+  details_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_drive_accounts_user_updated
+ON drive_accounts(user_id, updated_at DESC, id ASC);
+
+CREATE TABLE IF NOT EXISTS tools_background_jobs (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  job_type TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  progress_json TEXT NOT NULL DEFAULT '{}',
+  result_json TEXT NOT NULL DEFAULT '{}',
+  error_text TEXT NOT NULL DEFAULT '',
+  log_text TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  started_at TEXT NOT NULL DEFAULT '',
+  finished_at TEXT NOT NULL DEFAULT '',
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_tools_background_jobs_user_created
+ON tools_background_jobs(user_id, created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_tools_background_jobs_status
+ON tools_background_jobs(status, updated_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS deployed_app_cloud_backups (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  app_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  drive_file_id TEXT NOT NULL,
+  backup_name TEXT NOT NULL DEFAULT '',
+  target_path TEXT NOT NULL DEFAULT '',
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  deleted_at TEXT NOT NULL DEFAULT '',
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (account_id) REFERENCES drive_accounts(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployed_app_cloud_backups_user_app_created
+ON deployed_app_cloud_backups(user_id, app_id, created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_deployed_app_cloud_backups_account_created
+ON deployed_app_cloud_backups(account_id, created_at DESC, id DESC);
 `);
 
 function hasConversationColumn(columnName) {
@@ -5833,6 +6957,79 @@ const deleteUserAgentIntegrationStmt = db.prepare(`
   DELETE FROM user_agent_integrations
   WHERE user_id = ? AND agent_id = ?
 `);
+const getUserAgentPermissionStmt = db.prepare(`
+  SELECT
+    user_id,
+    agent_id,
+    allow_root,
+    run_as_user,
+    allowed_paths_json,
+    denied_paths_json,
+    read_only,
+    allow_shell,
+    allow_sensitive_tools,
+    allow_network,
+    allow_git,
+    allow_backup_restore,
+    allowed_tools_json,
+    updated_at
+  FROM user_agent_permissions
+  WHERE user_id = ?
+    AND agent_id = ?
+  LIMIT 1
+`);
+const listUserAgentPermissionsStmt = db.prepare(`
+  SELECT
+    user_id,
+    agent_id,
+    allow_root,
+    run_as_user,
+    allowed_paths_json,
+    denied_paths_json,
+    read_only,
+    allow_shell,
+    allow_sensitive_tools,
+    allow_network,
+    allow_git,
+    allow_backup_restore,
+    allowed_tools_json,
+    updated_at
+  FROM user_agent_permissions
+  WHERE user_id = ?
+  ORDER BY agent_id ASC
+`);
+const upsertUserAgentPermissionStmt = db.prepare(`
+  INSERT INTO user_agent_permissions (
+    user_id,
+    agent_id,
+    allow_root,
+    run_as_user,
+    allowed_paths_json,
+    denied_paths_json,
+    read_only,
+    allow_shell,
+    allow_sensitive_tools,
+    allow_network,
+    allow_git,
+    allow_backup_restore,
+    allowed_tools_json,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(user_id, agent_id) DO UPDATE SET
+    allow_root = excluded.allow_root,
+    run_as_user = excluded.run_as_user,
+    allowed_paths_json = excluded.allowed_paths_json,
+    denied_paths_json = excluded.denied_paths_json,
+    read_only = excluded.read_only,
+    allow_shell = excluded.allow_shell,
+    allow_sensitive_tools = excluded.allow_sensitive_tools,
+    allow_network = excluded.allow_network,
+    allow_git = excluded.allow_git,
+    allow_backup_restore = excluded.allow_backup_restore,
+    allowed_tools_json = excluded.allowed_tools_json,
+    updated_at = excluded.updated_at
+`);
 const insertDeployedAppDescriptionJobStmt = db.prepare(`
   INSERT INTO deployed_app_description_jobs (
     id,
@@ -5981,6 +7178,302 @@ const listDeployedAppDescriptionsForUserStmt = db.prepare(`
     job_id
   FROM deployed_app_descriptions
   WHERE user_id = ?
+`);
+const listDriveAccountsForUserStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    alias,
+    auth_mode,
+    root_folder_id,
+    status,
+    last_error,
+    details_json,
+    created_at,
+    updated_at
+  FROM drive_accounts
+  WHERE user_id = ?
+  ORDER BY updated_at DESC, id DESC
+`);
+const getDriveAccountByIdForUserStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    alias,
+    auth_mode,
+    credentials_cipher,
+    token_cipher,
+    root_folder_id,
+    status,
+    last_error,
+    details_json,
+    created_at,
+    updated_at
+  FROM drive_accounts
+  WHERE id = ?
+    AND user_id = ?
+  LIMIT 1
+`);
+const getDriveAccountByIdStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    alias,
+    auth_mode,
+    credentials_cipher,
+    token_cipher,
+    root_folder_id,
+    status,
+    last_error,
+    details_json,
+    created_at,
+    updated_at
+  FROM drive_accounts
+  WHERE id = ?
+  LIMIT 1
+`);
+const insertDriveAccountStmt = db.prepare(`
+  INSERT INTO drive_accounts (
+    id,
+    user_id,
+    alias,
+    auth_mode,
+    credentials_cipher,
+    token_cipher,
+    root_folder_id,
+    status,
+    last_error,
+    details_json,
+    created_at,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)
+`);
+const updateDriveAccountMetaStmt = db.prepare(`
+  UPDATE drive_accounts
+  SET
+    alias = ?,
+    root_folder_id = ?,
+    status = ?,
+    last_error = ?,
+    details_json = ?,
+    updated_at = ?
+  WHERE id = ?
+    AND user_id = ?
+`);
+const updateDriveAccountTokenStmt = db.prepare(`
+  UPDATE drive_accounts
+  SET
+    token_cipher = ?,
+    status = ?,
+    last_error = ?,
+    updated_at = ?
+  WHERE id = ?
+`);
+const updateDriveAccountStatusStmt = db.prepare(`
+  UPDATE drive_accounts
+  SET
+    status = ?,
+    last_error = ?,
+    updated_at = ?
+  WHERE id = ?
+`);
+const deleteDriveAccountForUserStmt = db.prepare(`
+  DELETE FROM drive_accounts
+  WHERE id = ?
+    AND user_id = ?
+`);
+const insertToolsBackgroundJobStmt = db.prepare(`
+  INSERT INTO tools_background_jobs (
+    id,
+    user_id,
+    job_type,
+    status,
+    payload_json,
+    progress_json,
+    result_json,
+    error_text,
+    log_text,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  )
+  VALUES (?, ?, ?, ?, ?, '{}', '{}', '', '', ?, ?, '', '')
+`);
+const updateToolsBackgroundJobRunningStmt = db.prepare(`
+  UPDATE tools_background_jobs
+  SET
+    status = 'running',
+    started_at = CASE
+      WHEN LENGTH(started_at) > 0 THEN started_at
+      ELSE ?
+    END,
+    updated_at = ?,
+    error_text = ''
+  WHERE id = ?
+`);
+const updateToolsBackgroundJobProgressStmt = db.prepare(`
+  UPDATE tools_background_jobs
+  SET
+    progress_json = ?,
+    log_text = ?,
+    updated_at = ?
+  WHERE id = ?
+`);
+const updateToolsBackgroundJobCompletedStmt = db.prepare(`
+  UPDATE tools_background_jobs
+  SET
+    status = 'completed',
+    progress_json = ?,
+    result_json = ?,
+    error_text = '',
+    log_text = ?,
+    finished_at = ?,
+    updated_at = ?
+  WHERE id = ?
+`);
+const updateToolsBackgroundJobErrorStmt = db.prepare(`
+  UPDATE tools_background_jobs
+  SET
+    status = 'error',
+    progress_json = ?,
+    error_text = ?,
+    log_text = ?,
+    finished_at = ?,
+    updated_at = ?
+  WHERE id = ?
+`);
+const getToolsBackgroundJobByIdStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    job_type,
+    status,
+    payload_json,
+    progress_json,
+    result_json,
+    error_text,
+    log_text,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  FROM tools_background_jobs
+  WHERE id = ?
+  LIMIT 1
+`);
+const getToolsBackgroundJobForUserStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    job_type,
+    status,
+    payload_json,
+    progress_json,
+    result_json,
+    error_text,
+    log_text,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  FROM tools_background_jobs
+  WHERE id = ?
+    AND user_id = ?
+  LIMIT 1
+`);
+const listPendingToolsBackgroundJobsStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    job_type,
+    status,
+    payload_json,
+    progress_json,
+    result_json,
+    error_text,
+    log_text,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  FROM tools_background_jobs
+  WHERE status IN ('pending', 'running')
+  ORDER BY created_at ASC, id ASC
+  LIMIT ?
+`);
+const listRecentToolsBackgroundJobsForUserStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    job_type,
+    status,
+    payload_json,
+    progress_json,
+    result_json,
+    error_text,
+    log_text,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  FROM tools_background_jobs
+  WHERE user_id = ?
+  ORDER BY created_at DESC, id DESC
+  LIMIT ?
+`);
+const upsertDeployedCloudBackupStmt = db.prepare(`
+  INSERT INTO deployed_app_cloud_backups (
+    id,
+    user_id,
+    app_id,
+    account_id,
+    drive_file_id,
+    backup_name,
+    target_path,
+    size_bytes,
+    created_at,
+    deleted_at,
+    metadata_json
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?)
+  ON CONFLICT(id) DO UPDATE SET
+    account_id = excluded.account_id,
+    drive_file_id = excluded.drive_file_id,
+    backup_name = excluded.backup_name,
+    target_path = excluded.target_path,
+    size_bytes = excluded.size_bytes,
+    created_at = excluded.created_at,
+    deleted_at = '',
+    metadata_json = excluded.metadata_json
+`);
+const markDeployedCloudBackupDeletedByDriveFileStmt = db.prepare(`
+  UPDATE deployed_app_cloud_backups
+  SET deleted_at = ?
+  WHERE user_id = ?
+    AND account_id = ?
+    AND drive_file_id = ?
+`);
+const listDeployedCloudBackupsForUserAndAppStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    app_id,
+    account_id,
+    drive_file_id,
+    backup_name,
+    target_path,
+    size_bytes,
+    created_at,
+    deleted_at,
+    metadata_json
+  FROM deployed_app_cloud_backups
+  WHERE user_id = ?
+    AND app_id = ?
+    AND deleted_at = ''
+  ORDER BY created_at DESC, id DESC
+  LIMIT ?
 `);
 const listMessagesStmt = db.prepare(`
   SELECT id, role, content, created_at
@@ -6645,6 +8138,338 @@ function normalizeSupportedAiAgentId(rawValue) {
   return safeAgentId;
 }
 
+function normalizeAiPermissionPathList(rawValue, fallback = []) {
+  const source = Array.isArray(rawValue) ? rawValue : [];
+  const resolved = [];
+  const seen = new Set();
+  source.forEach((entry) => {
+    const normalized = normalizeAbsoluteStoragePath(entry);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    resolved.push(normalized);
+  });
+  if (resolved.length > 0) {
+    return resolved.slice(0, 40);
+  }
+  const fallbackValues = Array.isArray(fallback) ? fallback : [];
+  const safeFallback = fallbackValues
+    .map((entry) => normalizeAbsoluteStoragePath(entry))
+    .filter(Boolean);
+  if (safeFallback.length > 0) {
+    return safeFallback.slice(0, 40);
+  }
+  return ['/', repoRootDir]
+    .map((entry) => normalizeAbsoluteStoragePath(entry))
+    .filter(Boolean)
+    .slice(0, 2);
+}
+
+function normalizeAiPermissionAllowedTools(rawValue) {
+  const source = Array.isArray(rawValue) ? rawValue : [];
+  const seen = new Set();
+  const normalized = [];
+  source.forEach((entry) => {
+    const value = String(entry || '').trim().toLowerCase();
+    if (!value || !aiPermissionToolCatalog.includes(value) || seen.has(value)) return;
+    seen.add(value);
+    normalized.push(value);
+  });
+  if (normalized.length > 0) {
+    return normalized;
+  }
+  return [...aiPermissionDefaultAllowedTools];
+}
+
+function normalizeAiAgentPermissionProfile(rawValue) {
+  const source = rawValue && typeof rawValue === 'object' ? rawValue : {};
+  return {
+    allowRoot: parseBooleanSetting(source.allowRoot, aiProviderPermissionProfileDefaults.allowRoot),
+    runAsUser: String(source.runAsUser || '').trim().slice(0, 60),
+    allowedPaths: normalizeAiPermissionPathList(
+      source.allowedPaths,
+      aiProviderPermissionProfileDefaults.allowedPaths
+    ),
+    deniedPaths: normalizeAiPermissionPathList(source.deniedPaths, []),
+    readOnly: parseBooleanSetting(source.readOnly, aiProviderPermissionProfileDefaults.readOnly),
+    allowShell: parseBooleanSetting(source.allowShell, aiProviderPermissionProfileDefaults.allowShell),
+    allowSensitiveTools: parseBooleanSetting(
+      source.allowSensitiveTools,
+      aiProviderPermissionProfileDefaults.allowSensitiveTools
+    ),
+    allowNetwork: parseBooleanSetting(source.allowNetwork, aiProviderPermissionProfileDefaults.allowNetwork),
+    allowGit: parseBooleanSetting(source.allowGit, aiProviderPermissionProfileDefaults.allowGit),
+    allowBackupRestore: parseBooleanSetting(
+      source.allowBackupRestore,
+      aiProviderPermissionProfileDefaults.allowBackupRestore
+    ),
+    allowedTools: normalizeAiPermissionAllowedTools(source.allowedTools)
+  };
+}
+
+function normalizeAiAgentPermissionRow(rawValue) {
+  const row = rawValue && typeof rawValue === 'object' ? rawValue : {};
+  const safeAgentId = normalizeSupportedAiAgentId(row.agent_id ?? row.agentId ?? '');
+  const parsedAllowedPaths = safeParseJsonArray(row.allowed_paths_json ?? row.allowedPathsJson);
+  const parsedDeniedPaths = safeParseJsonArray(row.denied_paths_json ?? row.deniedPathsJson);
+  const parsedAllowedTools = safeParseJsonArray(row.allowed_tools_json ?? row.allowedToolsJson);
+  const normalized = normalizeAiAgentPermissionProfile({
+    allowRoot: Number(row.allow_root) === 1,
+    runAsUser: row.run_as_user,
+    allowedPaths: parsedAllowedPaths,
+    deniedPaths: parsedDeniedPaths,
+    readOnly: Number(row.read_only) === 1,
+    allowShell: Number(row.allow_shell) === 1,
+    allowSensitiveTools: Number(row.allow_sensitive_tools) === 1,
+    allowNetwork: Number(row.allow_network) === 1,
+    allowGit: Number(row.allow_git) === 1,
+    allowBackupRestore: Number(row.allow_backup_restore) === 1,
+    allowedTools: parsedAllowedTools
+  });
+  return {
+    agentId: safeAgentId,
+    ...normalized,
+    updatedAt: String(row.updated_at ?? row.updatedAt ?? '').trim()
+  };
+}
+
+function getAiAgentPermissionProfileForUser(userId, agentId) {
+  const safeUserId = getSafeUserId(userId);
+  const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  if (!safeUserId || !safeAgentId) {
+    return {
+      agentId: safeAgentId,
+      ...normalizeAiAgentPermissionProfile(aiProviderPermissionProfileDefaults),
+      updatedAt: ''
+    };
+  }
+  const row = getUserAgentPermissionStmt.get(safeUserId, safeAgentId);
+  if (!row) {
+    return {
+      agentId: safeAgentId,
+      ...normalizeAiAgentPermissionProfile(aiProviderPermissionProfileDefaults),
+      updatedAt: ''
+    };
+  }
+  return normalizeAiAgentPermissionRow(row);
+}
+
+function upsertAiAgentPermissionProfileForUser(userId, agentId, profilePatch = {}) {
+  const safeUserId = getSafeUserId(userId);
+  const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  if (!safeUserId || !safeAgentId) {
+    throw createClientRequestError('Agente inválido', 400);
+  }
+  const current = getAiAgentPermissionProfileForUser(safeUserId, safeAgentId);
+  const next = normalizeAiAgentPermissionProfile({
+    ...current,
+    ...(profilePatch && typeof profilePatch === 'object' ? profilePatch : {})
+  });
+  const updatedAt = nowIso();
+  upsertUserAgentPermissionStmt.run(
+    safeUserId,
+    safeAgentId,
+    next.allowRoot ? 1 : 0,
+    next.runAsUser,
+    JSON.stringify(next.allowedPaths),
+    JSON.stringify(next.deniedPaths),
+    next.readOnly ? 1 : 0,
+    next.allowShell ? 1 : 0,
+    next.allowSensitiveTools ? 1 : 0,
+    next.allowNetwork ? 1 : 0,
+    next.allowGit ? 1 : 0,
+    next.allowBackupRestore ? 1 : 0,
+    JSON.stringify(next.allowedTools),
+    updatedAt
+  );
+  return {
+    agentId: safeAgentId,
+    ...next,
+    updatedAt
+  };
+}
+
+function isPathAllowedByPermissionProfile(profile, absolutePath) {
+  const safeProfile =
+    profile && typeof profile === 'object'
+      ? profile
+      : normalizeAiAgentPermissionProfile(aiProviderPermissionProfileDefaults);
+  const target = normalizeAbsoluteStoragePath(absolutePath);
+  if (!target) return false;
+  const deniedPaths = normalizeAiPermissionPathList(safeProfile.deniedPaths || [], []);
+  if (deniedPaths.some((entry) => isPathWithin(entry, target) || normalizeAbsoluteStoragePath(entry) === target)) {
+    return false;
+  }
+  const allowedPaths = normalizeAiPermissionPathList(
+    safeProfile.allowedPaths || [],
+    aiProviderPermissionProfileDefaults.allowedPaths
+  );
+  return allowedPaths.some((entry) => isPathWithin(entry, target) || normalizeAbsoluteStoragePath(entry) === target);
+}
+
+function assertAiPermissionForAction(profile, action, options = {}) {
+  const safeAction = String(action || '').trim().toLowerCase();
+  const safeProfile =
+    profile && typeof profile === 'object'
+      ? profile
+      : normalizeAiAgentPermissionProfile(aiProviderPermissionProfileDefaults);
+  const readOnlyWriteIntent = Boolean(options && options.writeIntent);
+  const targetPath = options && options.targetPath ? String(options.targetPath) : '';
+  const requiresSensitive = Boolean(options && options.requiresSensitiveTool);
+  const requiresGit = Boolean(options && options.requiresGit);
+  const requiresBackupRestore = Boolean(options && options.requiresBackupRestore);
+  const requiresShell = Boolean(options && options.requiresShell);
+
+  if (safeProfile.allowedTools && Array.isArray(safeProfile.allowedTools)) {
+    if (safeAction && !safeProfile.allowedTools.includes(safeAction)) {
+      throw createClientRequestError(`Acción bloqueada por permisos (${safeAction})`, 403);
+    }
+  }
+  if (requiresShell && !safeProfile.allowShell) {
+    throw createClientRequestError('El perfil actual no permite acceso a shell', 403);
+  }
+  if (requiresSensitive && !safeProfile.allowSensitiveTools) {
+    throw createClientRequestError('El perfil actual bloquea herramientas sensibles', 403);
+  }
+  if (requiresGit && !safeProfile.allowGit) {
+    throw createClientRequestError('El perfil actual no permite operaciones Git', 403);
+  }
+  if (requiresBackupRestore && !safeProfile.allowBackupRestore) {
+    throw createClientRequestError('El perfil actual no permite backup/restauración', 403);
+  }
+  if (readOnlyWriteIntent && safeProfile.readOnly) {
+    throw createClientRequestError('El perfil actual es de solo lectura', 403);
+  }
+  if (targetPath) {
+    const normalizedTarget = normalizeAbsoluteStoragePath(targetPath);
+    if (!isPathAllowedByPermissionProfile(safeProfile, normalizedTarget)) {
+      throw createClientRequestError('La ruta solicitada está fuera de los permisos del perfil activo', 403);
+    }
+  }
+}
+
+function getActiveAiAgentPermissionProfileForUser(userId) {
+  const runtime = resolveChatAgentRuntimeForUser(userId);
+  const activeAgentId = normalizeSupportedAiAgentId(runtime.activeAgentId);
+  const profile = getAiAgentPermissionProfileForUser(userId, activeAgentId);
+  return {
+    activeAgentId,
+    profile
+  };
+}
+
+function assertRequestPermissionByActiveAgent(req, action, options = {}) {
+  const safeUserId = getSafeUserId(req && req.session ? req.session.userId : 0);
+  if (!safeUserId) {
+    throw createClientRequestError('user_id inválido', 400);
+  }
+  const { activeAgentId, profile } = getActiveAiAgentPermissionProfileForUser(safeUserId);
+  assertAiPermissionForAction(profile, action, options);
+  return {
+    activeAgentId,
+    profile
+  };
+}
+
+function guardRequestPermissionOrRespond(req, res, action, options = {}) {
+  try {
+    return assertRequestPermissionByActiveAgent(req, action, options);
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 403;
+    res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `Operación bloqueada por permisos: ${truncateForNotify(error && error.message ? error.message : 'permission_denied', 200)}`
+    });
+    return null;
+  }
+}
+
+function buildUnifiedQuotaPayload(rawQuota) {
+  const source = rawQuota && typeof rawQuota === 'object' ? rawQuota : {};
+  const used = Number(source.used);
+  const limit = Number(source.limit);
+  const remaining = Number(source.remaining);
+  const unitRaw = String(source.unit || '').trim().toLowerCase();
+  const resetAt = String(source.resetAt || '').trim();
+  return {
+    used: Number.isFinite(used) ? used : null,
+    limit: Number.isFinite(limit) ? limit : null,
+    remaining: Number.isFinite(remaining) ? remaining : null,
+    unit: aiProviderQuotaUnits.has(unitRaw) ? unitRaw : null,
+    resetAt: resetAt || null,
+    available: Boolean(source.available)
+  };
+}
+
+function getAiProviderQuotaForUser(userId, agentId) {
+  const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  if (safeAgentId === 'codex-cli') {
+    const snapshot = getCodexQuotaSnapshotForUser(userId);
+    if (snapshot && snapshot.primary) {
+      return buildUnifiedQuotaPayload({
+        used: snapshot.primary.used,
+        limit: snapshot.primary.limit,
+        remaining: snapshot.primary.remaining,
+        unit: 'requests',
+        resetAt: snapshot.primary.resetAt,
+        available: true
+      });
+    }
+    return buildUnifiedQuotaPayload({ available: false });
+  }
+  return buildUnifiedQuotaPayload({ available: false });
+}
+
+function getAiProviderCapabilities(agentId) {
+  const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  const list = aiProviderCapabilitiesById[safeAgentId];
+  return Array.isArray(list) ? list.slice() : [];
+}
+
+function serializeAiProviderInfoForUser(userId, agentId, options = null) {
+  const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  if (!safeAgentId) return null;
+  const agent = supportedAiAgentsById.get(safeAgentId);
+  if (!agent) return null;
+  const serializationOptions = options || getAiAgentSerializationOptionsForUser(userId);
+  const integrationRow = getUserAgentIntegrationStmt.get(userId, safeAgentId);
+  const setting = serializeAiAgentSetting(agent, integrationRow, serializationOptions);
+  const models = getChatAgentModelOptions(safeAgentId);
+  const profile = getAiAgentPermissionProfileForUser(userId, safeAgentId);
+  return {
+    id: safeAgentId,
+    name: setting.name,
+    vendor: setting.vendor,
+    description: setting.description,
+    pricing: setting.pricing,
+    integrationType: setting.integrationType,
+    authModes: aiProviderAuthModesById[safeAgentId] || [setting.integrationType],
+    docsUrl: setting.docsUrl,
+    integration: setting.integration,
+    capabilities: getAiProviderCapabilities(safeAgentId),
+    models,
+    defaults: {
+      model: getChatAgentDefaultModel(safeAgentId),
+      reasoningEffort: DEFAULT_REASONING_EFFORT
+    },
+    quota: getAiProviderQuotaForUser(userId, safeAgentId),
+    permissions: profile,
+    availability: {
+      chat: supportedChatRuntimeAgentIds.has(safeAgentId),
+      configured: Boolean(setting.integration && setting.integration.configured),
+      enabled: Boolean(setting.integration && setting.integration.enabled)
+    }
+  };
+}
+
+function listAiProvidersForUser(userId) {
+  const serializationOptions = getAiAgentSerializationOptionsForUser(userId);
+  return supportedAiAgents
+    .map((agent) => serializeAiProviderInfoForUser(userId, agent.id, serializationOptions))
+    .filter(Boolean);
+}
+
 function buildAiAgentTutorial(agent) {
   const safeAgentId = normalizeSupportedAiAgentId(agent && agent.id);
   const byType = String(agent && agent.integrationType ? agent.integrationType : '').toLowerCase();
@@ -6789,8 +8614,10 @@ function serializeAiAgentSetting(agent, integrationRow, options = {}) {
     pricing: agent.pricing,
     isFree: agent.pricing === 'free',
     integrationType: agent.integrationType,
+    authModes: aiProviderAuthModesById[agent.id] || [agent.integrationType],
     docsUrl: agent.docsUrl,
     supportsBaseUrl: Boolean(agent.supportsBaseUrl),
+    capabilities: getAiProviderCapabilities(agent.id),
     integration: serializeAiAgentIntegration(agent, integrationRow, { forceEnabled, codexLinked }),
     tutorial: buildAiAgentTutorial(agent)
   };
@@ -6910,13 +8737,19 @@ function resolveChatAgentRuntimeForUser(userId) {
   const effectiveAgent = supportedAiAgentsById.get(effectiveAgentId);
   const models = getChatAgentModelOptions(effectiveAgentId);
   const defaultModel = getChatAgentDefaultModel(effectiveAgentId);
+  const permissionProfile = getAiAgentPermissionProfileForUser(userId, effectiveAgentId);
+  const capabilities = getAiProviderCapabilities(effectiveAgentId);
   return {
     requestedAgentId,
     activeAgentId: effectiveAgentId,
     activeAgentName:
       String((effectiveAgent && effectiveAgent.name) || '').trim() || effectiveAgentId || 'Codex CLI',
+    providerId: effectiveAgentId,
     runtimeProvider: effectiveAgentId === 'gemini-cli' ? 'gemini' : 'codex',
     models,
+    capabilities,
+    permissionProfile,
+    quota: getAiProviderQuotaForUser(userId, effectiveAgentId),
     reasoningEfforts: [...chatReasoningEffortOptions],
     defaults: {
       model: defaultModel,
@@ -6945,6 +8778,87 @@ function buildGeminiPromptWithReasoning(prompt, reasoningEffort) {
   ]
     .filter(Boolean)
     .join('\n');
+}
+
+const unixUserIdentityCache = new Map();
+
+function resolveUnixUserIdentity(username) {
+  const safeName = String(username || '').trim();
+  if (!safeName) return null;
+  if (unixUserIdentityCache.has(safeName)) {
+    return unixUserIdentityCache.get(safeName);
+  }
+  try {
+    const uidRaw = execFileSync('id', ['-u', safeName], { encoding: 'utf8', timeout: 4000 }).trim();
+    const gidRaw = execFileSync('id', ['-g', safeName], { encoding: 'utf8', timeout: 4000 }).trim();
+    const uid = Number(uidRaw);
+    const gid = Number(gidRaw);
+    if (!Number.isInteger(uid) || uid < 0 || !Number.isInteger(gid) || gid < 0) {
+      return null;
+    }
+    const identity = { user: safeName, uid, gid };
+    unixUserIdentityCache.set(safeName, identity);
+    return identity;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function resolveChatRuntimeExecutionPolicy(userId, chatRuntime) {
+  const providerId = normalizeSupportedAiAgentId(chatRuntime && chatRuntime.activeAgentId);
+  const profile = getAiAgentPermissionProfileForUser(userId, providerId);
+  const allowedPaths = normalizeAiPermissionPathList(
+    profile.allowedPaths,
+    aiProviderPermissionProfileDefaults.allowedPaths
+  ).filter((entry) => pathExistsSyncSafe(entry));
+  const deniedPaths = normalizeAiPermissionPathList(profile.deniedPaths, []);
+  const safeAllowedPaths = allowedPaths.length > 0 ? allowedPaths : [repoRootDir];
+
+  const firstAllowed = safeAllowedPaths.find((entry) => {
+    const normalized = normalizeAbsoluteStoragePath(entry);
+    if (!normalized || !pathExistsSyncSafe(normalized)) return false;
+    if (deniedPaths.some((blocked) => isPathWithin(blocked, normalized) || blocked === normalized)) return false;
+    try {
+      const stats = fs.statSync(normalized);
+      return stats.isDirectory();
+    } catch (_error) {
+      return false;
+    }
+  });
+  const cwd = firstAllowed || repoRootDir;
+
+  let runAsIdentity = null;
+  const canSwitchUser = typeof process.getuid === 'function' && process.getuid() === 0;
+  if (canSwitchUser) {
+    if (profile.runAsUser) {
+      runAsIdentity = resolveUnixUserIdentity(profile.runAsUser);
+      if (!runAsIdentity) {
+        throw createClientRequestError(
+          `El usuario del sistema configurado no existe: ${profile.runAsUser}`,
+          400
+        );
+      }
+    } else if (!profile.allowRoot) {
+      runAsIdentity = resolveUnixUserIdentity('nobody') || { user: 'nobody', uid: 65534, gid: 65534 };
+    }
+  }
+
+  const hasRootScope = safeAllowedPaths.some((entry) => normalizeAbsoluteStoragePath(entry) === '/');
+  const codexSandbox = profile.readOnly
+    ? 'read-only'
+    : profile.allowRoot && hasRootScope && deniedPaths.length === 0
+      ? 'danger-full-access'
+      : 'workspace-write';
+
+  return {
+    providerId,
+    profile,
+    cwd,
+    allowedPaths: safeAllowedPaths,
+    deniedPaths,
+    runAsIdentity,
+    codexSandbox
+  };
 }
 
 function getOwnedConversationOrNull(conversationId, userId) {
@@ -7477,6 +9391,93 @@ app.patch('/api/settings/ai-agents/:agentId', requireAuth, (req, res) => {
   });
 });
 
+app.get('/api/ai/providers', requireAuth, (req, res) => {
+  const providers = listAiProvidersForUser(req.session.userId);
+  const runtime = resolveChatAgentRuntimeForUser(req.session.userId);
+  return res.json({
+    ok: true,
+    fetchedAt: nowIso(),
+    activeProviderId: runtime.providerId,
+    providers
+  });
+});
+
+app.get('/api/ai/providers/:providerId/models', requireAuth, (req, res) => {
+  const providerId = normalizeSupportedAiAgentId(req.params && req.params.providerId);
+  if (!providerId) {
+    return res.status(404).json({ error: 'Provider no soportado' });
+  }
+  return res.json({
+    ok: true,
+    providerId,
+    models: getChatAgentModelOptions(providerId),
+    defaultModel: getChatAgentDefaultModel(providerId)
+  });
+});
+
+app.get('/api/ai/providers/:providerId/capabilities', requireAuth, (req, res) => {
+  const providerId = normalizeSupportedAiAgentId(req.params && req.params.providerId);
+  if (!providerId) {
+    return res.status(404).json({ error: 'Provider no soportado' });
+  }
+  return res.json({
+    ok: true,
+    providerId,
+    capabilities: getAiProviderCapabilities(providerId)
+  });
+});
+
+app.get('/api/ai/providers/:providerId/quota', requireAuth, (req, res) => {
+  const providerId = normalizeSupportedAiAgentId(req.params && req.params.providerId);
+  if (!providerId) {
+    return res.status(404).json({ error: 'Provider no soportado' });
+  }
+  return res.json({
+    ok: true,
+    providerId,
+    quota: getAiProviderQuotaForUser(req.session.userId, providerId)
+  });
+});
+
+app.get('/api/ai/providers/:providerId/permissions', requireAuth, (req, res) => {
+  const providerId = normalizeSupportedAiAgentId(req.params && req.params.providerId);
+  if (!providerId) {
+    return res.status(404).json({ error: 'Provider no soportado' });
+  }
+  const permissions = getAiAgentPermissionProfileForUser(req.session.userId, providerId);
+  return res.json({
+    ok: true,
+    providerId,
+    permissions
+  });
+});
+
+app.put('/api/ai/providers/:providerId/permissions', requireAuth, (req, res) => {
+  const providerId = normalizeSupportedAiAgentId(req.params && req.params.providerId);
+  if (!providerId) {
+    return res.status(404).json({ error: 'Provider no soportado' });
+  }
+  const body = req.body && typeof req.body === 'object' ? req.body : null;
+  if (!body) {
+    return res.status(400).json({ error: 'Payload inválido' });
+  }
+  try {
+    const permissions = upsertAiAgentPermissionProfileForUser(req.session.userId, providerId, body);
+    return res.json({
+      ok: true,
+      providerId,
+      permissions
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error: error && error.exposeToClient
+        ? error.message
+        : `No se pudieron guardar permisos: ${truncateForNotify(error && error.message ? error.message : 'permissions_update_failed', 220)}`
+    });
+  }
+});
+
 app.post('/api/restart', requireAuth, (req, res) => {
   if (restartScheduled) {
     return res.status(409).json({ error: 'Ya hay un reinicio en progreso' });
@@ -7892,10 +9893,14 @@ app.get('/api/chat/options', requireAuth, (req, res) => {
   const runtime = resolveChatAgentRuntimeForUser(req.session.userId);
   return res.json({
     ok: true,
+    providerId: runtime.providerId,
     activeAgentId: runtime.activeAgentId,
     activeAgentName: runtime.activeAgentName,
     runtimeProvider: runtime.runtimeProvider,
     models: runtime.models,
+    capabilities: runtime.capabilities,
+    quota: runtime.quota,
+    permissions: runtime.permissionProfile,
     reasoningEfforts: runtime.reasoningEfforts,
     defaults: runtime.defaults
   });
@@ -8264,6 +10269,11 @@ app.post('/api/tools/deployed-apps/:appId/action', requireAuth, (req, res) => {
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
+  const permission = guardRequestPermissionOrRespond(req, res, 'deployments', {
+    requiresSensitiveTool: true,
+    writeIntent: true
+  });
+  if (!permission) return;
   const appId = String(req.params.appId || '').trim();
   const action = normalizeDeployedAppAction(req.body && req.body.action);
   if (!action) {
@@ -8335,7 +10345,899 @@ app.get('/api/tools/deployed-apps/:appId/logs', requireAuth, (req, res) => {
   });
 });
 
+app.get('/api/tools/storage/local/list', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const requestedPath = normalizeAbsoluteStoragePath(req.query.path, repoRootDir);
+  const permission = guardRequestPermissionOrRespond(req, res, 'storage', {
+    requiresSensitiveTool: false,
+    targetPath: requestedPath
+  });
+  if (!permission) return;
+  try {
+    const payload = listStorageLocalDirectory({
+      path: req.query.path,
+      sortBy: req.query.sortBy,
+      sortOrder: req.query.sortOrder,
+      limit: req.query.limit,
+      includeDirSize: String(req.query.includeDirSize || '1') !== '0'
+    });
+    return res.json({
+      ok: true,
+      ...payload
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    const message =
+      error && error.exposeToClient
+        ? error.message
+        : `No se pudo listar ruta local: ${truncateForNotify(error && error.message ? error.message : 'storage_local_list_failed', 220)}`;
+    return res.status(statusCode).json({ error: message });
+  }
+});
+
+app.get('/api/tools/storage/local/heavy', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const requestedPath = normalizeAbsoluteStoragePath(req.query.path, repoRootDir);
+  const permission = guardRequestPermissionOrRespond(req, res, 'storage', {
+    requiresSensitiveTool: false,
+    targetPath: requestedPath
+  });
+  if (!permission) return;
+  try {
+    const payload = scanStorageHeavyPaths({
+      path: req.query.path,
+      limit: req.query.limit,
+      maxDepth: req.query.maxDepth
+    });
+    return res.json({
+      ok: true,
+      ...payload
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    const message =
+      error && error.exposeToClient
+        ? error.message
+        : `No se pudo escanear uso de disco: ${truncateForNotify(error && error.message ? error.message : 'storage_heavy_scan_failed', 220)}`;
+    return res.status(statusCode).json({ error: message });
+  }
+});
+
+app.post('/api/tools/storage/local/move', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const sourcePaths = parseStoragePathList(req.body && req.body.paths, 80);
+  const destinationDir = normalizeAbsoluteStoragePath(req.body && req.body.destinationDir);
+  const permission = guardRequestPermissionOrRespond(req, res, 'storage', {
+    requiresSensitiveTool: true,
+    writeIntent: true,
+    targetPath: destinationDir
+  });
+  if (!permission) return;
+  if (sourcePaths.length === 0 || !destinationDir) {
+    return res.status(400).json({ error: 'Selecciona archivos/rutas y destino para mover.' });
+  }
+  try {
+    assertStorageMutationPathAllowed(destinationDir);
+    if (!fs.existsSync(destinationDir)) {
+      fs.mkdirSync(destinationDir, { recursive: true });
+    }
+    const destinationStats = fs.statSync(destinationDir);
+    if (!destinationStats.isDirectory()) {
+      return res.status(400).json({ error: 'El destino debe ser un directorio.' });
+    }
+    const moved = [];
+    const failed = [];
+    sourcePaths.forEach((sourcePath) => {
+      try {
+        assertAiPermissionForAction(permission.profile, 'storage', {
+          requiresSensitiveTool: true,
+          writeIntent: true,
+          targetPath: sourcePath
+        });
+        assertStorageMutationPathAllowed(sourcePath);
+        const targetPath = path.join(destinationDir, path.basename(sourcePath));
+        const result = runSystemCommandSync('mv', ['--', sourcePath, targetPath], {
+          allowNonZero: true,
+          timeoutMs: 60000
+        });
+        if (!result.ok) {
+          throw new Error(result.stderr || result.stdout || 'move_failed');
+        }
+        moved.push({
+          sourcePath,
+          targetPath
+        });
+      } catch (error) {
+        failed.push({
+          sourcePath,
+          error: truncateForNotify(error && error.message ? error.message : 'move_failed', 220)
+        });
+      }
+    });
+    return res.json({
+      ok: true,
+      destinationDir,
+      moved,
+      failed
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    const message =
+      error && error.exposeToClient
+        ? error.message
+        : `No se pudieron mover rutas: ${truncateForNotify(error && error.message ? error.message : 'storage_move_failed', 220)}`;
+    return res.status(statusCode).json({ error: message });
+  }
+});
+
+app.post('/api/tools/storage/local/compress', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const sourcePaths = parseStoragePathList(req.body && req.body.paths, 80);
+  if (sourcePaths.length === 0) {
+    return res.status(400).json({ error: 'Selecciona al menos una ruta para comprimir.' });
+  }
+  const archiveName = sanitizeDriveFileName(
+    req.body && req.body.archiveName ? req.body.archiveName : `cleanup_${Date.now()}`,
+    `cleanup_${Date.now()}`
+  );
+  const destinationDir = normalizeAbsoluteStoragePath(
+    req.body && req.body.destinationDir ? req.body.destinationDir : path.join(storageJobsRootDir, 'archives'),
+    path.join(storageJobsRootDir, 'archives')
+  );
+  const permission = guardRequestPermissionOrRespond(req, res, 'storage', {
+    requiresSensitiveTool: true,
+    writeIntent: true,
+    targetPath: destinationDir
+  });
+  if (!permission) return;
+  if (!destinationDir) {
+    return res.status(400).json({ error: 'Destino de compresión inválido.' });
+  }
+
+  try {
+    assertStorageMutationPathAllowed(destinationDir);
+    fs.mkdirSync(destinationDir, { recursive: true });
+    sourcePaths.forEach((sourcePath) => {
+      assertAiPermissionForAction(permission.profile, 'storage', {
+        requiresSensitiveTool: true,
+        targetPath: sourcePath
+      });
+      if (!pathExistsSyncSafe(sourcePath)) {
+        throw createClientRequestError(`Ruta no encontrada: ${sourcePath}`, 404);
+      }
+    });
+    const archivePath = path.join(destinationDir, `${archiveName}.tar.gz`);
+    const tarArgs = ['-czf', archivePath];
+    sourcePaths.forEach((item) => {
+      tarArgs.push(item);
+    });
+    const result = runSystemCommandSync('tar', tarArgs, {
+      allowNonZero: true,
+      timeoutMs: 1000 * 60 * 10,
+      maxBuffer: 1024 * 1024 * 8
+    });
+    if (!result.ok) {
+      throw new Error(result.stderr || result.stdout || 'compress_failed');
+    }
+    const archiveStats = fs.statSync(archivePath);
+    return res.json({
+      ok: true,
+      archive: {
+        path: archivePath,
+        name: path.basename(archivePath),
+        sizeBytes: Number(archiveStats.size || 0),
+        createdAt: nowIso()
+      }
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    const message =
+      error && error.exposeToClient
+        ? error.message
+        : `No se pudo comprimir selección: ${truncateForNotify(error && error.message ? error.message : 'storage_compress_failed', 220)}`;
+    return res.status(statusCode).json({ error: message });
+  }
+});
+
+app.get('/api/tools/storage/overview', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const accountId = String(req.query.accountId || '').trim();
+  const localPath = normalizeAbsoluteStoragePath(req.query.path, repoRootDir);
+  const permission = guardRequestPermissionOrRespond(req, res, 'storage', {
+    requiresSensitiveTool: false,
+    targetPath: localPath
+  });
+  if (!permission) return;
+  const diskResult = localPath
+    ? runSystemCommandSync('df', ['-B1', localPath], {
+        allowNonZero: true,
+        timeoutMs: 12000,
+        maxBuffer: 1024 * 1024
+      })
+    : null;
+  const diskRows = String((diskResult && diskResult.stdout) || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .filter((line) => line.trim());
+  const diskValues =
+    diskRows.length >= 2
+      ? diskRows[1].trim().split(/\s+/)
+      : [];
+  const localDisk = {
+    path: localPath,
+    totalBytes: Number.isFinite(Number(diskValues[1])) ? Number(diskValues[1]) : null,
+    usedBytes: Number.isFinite(Number(diskValues[2])) ? Number(diskValues[2]) : null,
+    availableBytes: Number.isFinite(Number(diskValues[3])) ? Number(diskValues[3]) : null,
+    usagePercent: diskValues[4] ? String(diskValues[4]) : ''
+  };
+
+  let cloud = {
+    accountId: accountId || '',
+    available: false,
+    quota: {
+      limit: null,
+      usage: null,
+      usageInDrive: null
+    }
+  };
+  if (accountId) {
+    try {
+      const validation = await validateDriveAccountByIdForUser(safeUserId, accountId);
+      cloud = {
+        accountId,
+        available: true,
+        quota: validation.about.quota
+      };
+    } catch (error) {
+      cloud = {
+        accountId,
+        available: false,
+        error: truncateForNotify(error && error.message ? error.message : 'drive_quota_unavailable', 220),
+        quota: {
+          limit: null,
+          usage: null,
+          usageInDrive: null
+        }
+      };
+    }
+  }
+  const recentJobs = listRecentToolsBackgroundJobsForUserStmt
+    .all(safeUserId, 20)
+    .map((row) => serializeToolsBackgroundJobRow(row))
+    .filter(Boolean);
+  return res.json({
+    ok: true,
+    localDisk,
+    cloud,
+    jobs: recentJobs
+  });
+});
+
+app.get('/api/tools/storage/jobs', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'storage', {
+    requiresSensitiveTool: false
+  });
+  if (!permission) return;
+  const rawLimit = Number.parseInt(String(req.query.limit || ''), 10);
+  const limit = Number.isInteger(rawLimit) ? Math.min(Math.max(rawLimit, 1), 120) : 40;
+  const rows = listRecentToolsBackgroundJobsForUserStmt.all(safeUserId, limit);
+  return res.json({
+    ok: true,
+    jobs: rows.map((row) => serializeToolsBackgroundJobRow(row)).filter(Boolean)
+  });
+});
+
+app.get('/api/tools/storage/jobs/:jobId', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'storage', {
+    requiresSensitiveTool: false
+  });
+  if (!permission) return;
+  const jobId = String(req.params.jobId || '').trim();
+  if (!jobId) {
+    return res.status(400).json({ error: 'job_id inválido' });
+  }
+  const row = getToolsBackgroundJobForUserStmt.get(jobId, safeUserId);
+  if (!row) {
+    return res.status(404).json({ error: 'Job no encontrado.' });
+  }
+  return res.json({
+    ok: true,
+    job: serializeToolsBackgroundJobRow(row)
+  });
+});
+
+app.get('/api/tools/storage/drive/accounts', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+    requiresSensitiveTool: false
+  });
+  if (!permission) return;
+  const rows = listDriveAccountsForUserStmt.all(safeUserId);
+  return res.json({
+    ok: true,
+    accounts: rows.map((row) => serializeDriveAccountRow(row)).filter(Boolean)
+  });
+});
+
+app.post('/api/tools/storage/drive/accounts', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+    requiresSensitiveTool: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  const alias = sanitizeDriveAccountAlias(req.body && req.body.alias);
+  const rootFolderId = String((req.body && req.body.rootFolderId) || 'root').trim() || 'root';
+  try {
+    const normalizedCredential = normalizeDriveCredentialPayload(req.body && req.body.credentialsJson);
+    const accountId = buildDriveAccountId();
+    const now = nowIso();
+    const status = normalizedCredential.authMode === 'oauth_client' ? 'needs_oauth' : 'pending';
+    insertDriveAccountStmt.run(
+      accountId,
+      safeUserId,
+      alias || `Drive ${accountId.slice(-6)}`,
+      normalizedCredential.authMode,
+      encryptSecretText(JSON.stringify(normalizedCredential.normalized)),
+      '',
+      rootFolderId,
+      status,
+      JSON.stringify(normalizedCredential.details),
+      now,
+      now
+    );
+    if (normalizedCredential.authMode === 'service_account') {
+      try {
+        await validateDriveAccountByIdForUser(safeUserId, accountId);
+      } catch (error) {
+        updateDriveAccountStatusStmt.run(
+          'error',
+          truncateForNotify(error && error.message ? error.message : 'drive_validation_failed', 220),
+          nowIso(),
+          accountId
+        );
+      }
+    }
+    const row = getDriveAccountByIdForUserStmt.get(accountId, safeUserId);
+    return res.json({
+      ok: true,
+      account: serializeDriveAccountRow(row)
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    const message =
+      error && error.exposeToClient
+        ? error.message
+        : `No se pudo guardar cuenta de Drive: ${truncateForNotify(error && error.message ? error.message : 'drive_account_create_failed', 220)}`;
+    return res.status(statusCode).json({ error: message });
+  }
+});
+
+app.post('/api/tools/storage/drive/accounts/:accountId/validate', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+    requiresSensitiveTool: false
+  });
+  if (!permission) return;
+  const accountId = String(req.params.accountId || '').trim();
+  if (!accountId) {
+    return res.status(400).json({ error: 'account_id inválido' });
+  }
+  try {
+    const payload = await validateDriveAccountByIdForUser(safeUserId, accountId);
+    return res.json({
+      ok: true,
+      ...payload
+    });
+  } catch (error) {
+    updateDriveAccountStatusStmt.run(
+      'error',
+      truncateForNotify(error && error.message ? error.message : 'drive_validation_failed', 220),
+      nowIso(),
+      accountId
+    );
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo validar cuenta de Drive: ${truncateForNotify(error && error.message ? error.message : 'drive_validation_failed', 220)}`
+    });
+  }
+});
+
+app.post('/api/tools/storage/drive/accounts/:accountId/oauth/start', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+    requiresSensitiveTool: true
+  });
+  if (!permission) return;
+  const accountId = String(req.params.accountId || '').trim();
+  if (!accountId) {
+    return res.status(400).json({ error: 'account_id inválido' });
+  }
+  try {
+    const row = getDriveAccountByIdForUserStmt.get(accountId, safeUserId);
+    if (!row) {
+      return res.status(404).json({ error: 'Cuenta de Drive no encontrada.' });
+    }
+    if (normalizeDriveAuthMode(row.auth_mode) !== 'oauth_client') {
+      return res.status(409).json({ error: 'La cuenta indicada no usa modo OAuth client.' });
+    }
+    const credentials = parseDriveAccountCredentials(row);
+    const { oauthClient, oauthConfig } = buildOAuth2ClientFromDriveAccount(
+      row,
+      credentials,
+      String(req.body && req.body.redirectUri ? req.body.redirectUri : '').trim()
+    );
+    const authUrl = oauthClient.generateAuthUrl({
+      access_type: 'offline',
+      prompt: 'consent',
+      include_granted_scopes: true,
+      scope: driveScopes
+    });
+    return res.json({
+      ok: true,
+      account: serializeDriveAccountRow(row),
+      oauth: {
+        authUrl,
+        redirectUri: oauthConfig.redirectUri || driveOauthFallbackRedirectUri,
+        instructions:
+          'Abre la URL, autoriza con Google Drive, copia el code y pégalo en "Completar OAuth" en CodexWeb.'
+      }
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo iniciar OAuth: ${truncateForNotify(error && error.message ? error.message : 'drive_oauth_start_failed', 220)}`
+    });
+  }
+});
+
+app.post('/api/tools/storage/drive/accounts/:accountId/oauth/complete', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+    requiresSensitiveTool: true
+  });
+  if (!permission) return;
+  const accountId = String(req.params.accountId || '').trim();
+  const code = String(req.body && req.body.code ? req.body.code : '').trim();
+  const redirectUri = String(req.body && req.body.redirectUri ? req.body.redirectUri : '').trim();
+  if (!accountId || !code) {
+    return res.status(400).json({ error: 'Faltan accountId o code OAuth.' });
+  }
+  try {
+    const row = getDriveAccountByIdForUserStmt.get(accountId, safeUserId);
+    if (!row) {
+      return res.status(404).json({ error: 'Cuenta de Drive no encontrada.' });
+    }
+    if (normalizeDriveAuthMode(row.auth_mode) !== 'oauth_client') {
+      return res.status(409).json({ error: 'La cuenta indicada no es OAuth client.' });
+    }
+    const credentials = parseDriveAccountCredentials(row);
+    const { oauthClient } = buildOAuth2ClientFromDriveAccount(row, credentials, redirectUri);
+    const tokenResponse = await oauthClient.getToken(code);
+    const tokens = tokenResponse && tokenResponse.tokens ? tokenResponse.tokens : {};
+    const currentTokens = parseDriveAccountTokens(row);
+    const mergedTokens = {
+      ...currentTokens,
+      ...(tokens && typeof tokens === 'object' ? tokens : {})
+    };
+    if (!mergedTokens.refresh_token && currentTokens.refresh_token) {
+      mergedTokens.refresh_token = currentTokens.refresh_token;
+    }
+    if (!mergedTokens.refresh_token) {
+      return res.status(400).json({
+        error:
+          'Google no devolvió refresh_token. Repite autorización con prompt=consent o elimina y recrea la cuenta OAuth.'
+      });
+    }
+    updateDriveAccountTokenStmt.run(
+      encryptSecretText(JSON.stringify(mergedTokens)),
+      'active',
+      '',
+      nowIso(),
+      accountId
+    );
+    let validation = null;
+    try {
+      validation = await validateDriveAccountByIdForUser(safeUserId, accountId);
+    } catch (_error) {
+      // keep account linked even if immediate validation fails.
+    }
+    const refreshed = getDriveAccountByIdForUserStmt.get(accountId, safeUserId);
+    return res.json({
+      ok: true,
+      account: serializeDriveAccountRow(refreshed),
+      validation
+    });
+  } catch (error) {
+    updateDriveAccountStatusStmt.run(
+      'error',
+      truncateForNotify(error && error.message ? error.message : 'drive_oauth_complete_failed', 220),
+      nowIso(),
+      accountId
+    );
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo completar OAuth: ${truncateForNotify(error && error.message ? error.message : 'drive_oauth_complete_failed', 220)}`
+    });
+  }
+});
+
+app.delete('/api/tools/storage/drive/accounts/:accountId', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+    requiresSensitiveTool: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  const accountId = String(req.params.accountId || '').trim();
+  if (!accountId) {
+    return res.status(400).json({ error: 'account_id inválido' });
+  }
+  const row = getDriveAccountByIdForUserStmt.get(accountId, safeUserId);
+  if (!row) {
+    return res.status(404).json({ error: 'Cuenta de Drive no encontrada.' });
+  }
+  deleteDriveAccountForUserStmt.run(accountId, safeUserId);
+  return res.json({
+    ok: true,
+    deleted: true,
+    accountId
+  });
+});
+
+app.get('/api/tools/storage/drive/files', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+    requiresSensitiveTool: false
+  });
+  if (!permission) return;
+  const accountId = String(req.query.accountId || '').trim();
+  if (!accountId) {
+    return res.status(400).json({ error: 'Selecciona una cuenta de Drive.' });
+  }
+  try {
+    const payload = await listDriveFilesForAccount(safeUserId, accountId, {
+      folderId: req.query.folderId,
+      pageToken: req.query.pageToken,
+      pageSize: req.query.pageSize,
+      query: req.query.query
+    });
+    return res.json({
+      ok: true,
+      ...payload
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudieron listar archivos de Drive: ${truncateForNotify(error && error.message ? error.message : 'drive_files_list_failed', 220)}`
+    });
+  }
+});
+
+app.post('/api/tools/storage/drive/upload', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+    requiresSensitiveTool: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  const accountId = String(req.body && req.body.accountId ? req.body.accountId : '').trim();
+  const paths = parseStoragePathList(req.body && req.body.paths, storageUploadJobMaxFiles);
+  const parentId = String(req.body && req.body.parentId ? req.body.parentId : '').trim();
+  if (!accountId || paths.length === 0) {
+    return res.status(400).json({ error: 'Selecciona cuenta de Drive y archivos locales para subir.' });
+  }
+  try {
+    paths.forEach((sourcePath) => {
+      assertAiPermissionForAction(permission.profile, 'drive', {
+        requiresSensitiveTool: true,
+        writeIntent: true,
+        targetPath: sourcePath
+      });
+    });
+    const job = createStorageJob(safeUserId, 'drive_upload_files', {
+      accountId,
+      paths,
+      parentId
+    });
+    return res.json({
+      ok: true,
+      job
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo crear job de subida: ${truncateForNotify(error && error.message ? error.message : 'drive_upload_job_create_failed', 220)}`
+    });
+  }
+});
+
+app.delete('/api/tools/storage/drive/files/:fileId', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+    requiresSensitiveTool: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  const accountId = String(req.query.accountId || req.body && req.body.accountId || '').trim();
+  const fileId = String(req.params.fileId || '').trim();
+  const confirmDelete = String(req.query.confirm || req.body && req.body.confirm || '').trim().toUpperCase() === 'DELETE';
+  if (!accountId || !fileId) {
+    return res.status(400).json({ error: 'Indica accountId y fileId para borrar en Drive.' });
+  }
+  if (!confirmDelete) {
+    return res.status(400).json({ error: 'Confirmación requerida. Envía confirm=DELETE.' });
+  }
+  try {
+    const payload = await deleteDriveFileForAccount(safeUserId, accountId, fileId);
+    return res.json({
+      ok: true,
+      ...payload
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo borrar archivo de Drive: ${truncateForNotify(error && error.message ? error.message : 'drive_delete_failed', 220)}`
+    });
+  }
+});
+
+app.get('/api/tools/deployed-apps/:appId/backups', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'backups', {
+    requiresSensitiveTool: false,
+    requiresBackupRestore: true
+  });
+  if (!permission) return;
+  const appId = String(req.params.appId || '').trim();
+  const accountId = String(req.query.accountId || '').trim();
+  if (!appId) {
+    return res.status(400).json({ error: 'app_id inválido' });
+  }
+  try {
+    const backups = await listAppBackupsFromDrive(safeUserId, appId, accountId);
+    return res.json({
+      ok: true,
+      appId,
+      accountId,
+      retentionDays: storageBackupRetentionDays,
+      backups
+    });
+  } catch (error) {
+    const cached = listDeployedCloudBackupsForUserAndAppStmt
+      .all(safeUserId, appId, 120)
+      .map((row) => ({
+        id: String(row.id || ''),
+        appId: String(row.app_id || ''),
+        accountId: String(row.account_id || ''),
+        driveFileId: String(row.drive_file_id || ''),
+        name: String(row.backup_name || ''),
+        targetPath: String(row.target_path || ''),
+        sizeBytes: Number.isFinite(Number(row.size_bytes)) ? Number(row.size_bytes) : null,
+        createdAt: String(row.created_at || ''),
+        source: 'cache'
+      }));
+    if (cached.length > 0) {
+      return res.json({
+        ok: true,
+        appId,
+        accountId,
+        retentionDays: storageBackupRetentionDays,
+        backups: cached,
+        warning: 'Se devolvió caché local porque Drive no respondió correctamente.'
+      });
+    }
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudieron listar backups en nube: ${truncateForNotify(error && error.message ? error.message : 'app_backups_list_failed', 220)}`
+    });
+  }
+});
+
+app.post('/api/tools/deployed-apps/:appId/backups', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'backups', {
+    requiresSensitiveTool: true,
+    requiresBackupRestore: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  const appId = String(req.params.appId || '').trim();
+  const accountId = String(req.body && req.body.accountId ? req.body.accountId : '').trim();
+  if (!appId || !accountId) {
+    return res.status(400).json({ error: 'appId y accountId son obligatorios para backup.' });
+  }
+  const deployedApp = findDeployedAppById(appId, { forceRefresh: true });
+  if (!deployedApp) {
+    return res.status(404).json({ error: 'App desplegada no encontrada.' });
+  }
+  const requestedPath = normalizeAbsoluteStoragePath(req.body && req.body.sourcePath);
+  const inferredPath = resolveBackupTargetFromApp(deployedApp);
+  const sourcePath = requestedPath || inferredPath;
+  if (!sourcePath || !pathExistsSyncSafe(sourcePath)) {
+    return res.status(400).json({
+      error:
+        'No se pudo inferir ruta de backup de la app. Indica sourcePath manualmente desde la UI.'
+    });
+  }
+  try {
+    assertAiPermissionForAction(permission.profile, 'backups', {
+      requiresBackupRestore: true,
+      requiresSensitiveTool: true,
+      writeIntent: true,
+      targetPath: sourcePath
+    });
+    const job = createStorageJob(safeUserId, 'deployed_backup_create', {
+      appId,
+      appName: String(deployedApp.name || appId),
+      accountId,
+      sourcePath,
+      targetPath: normalizeAbsoluteStoragePath(req.body && req.body.targetPath) || sourcePath
+    });
+    return res.json({
+      ok: true,
+      appId,
+      job
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo crear backup en nube: ${truncateForNotify(error && error.message ? error.message : 'app_backup_create_failed', 220)}`
+    });
+  }
+});
+
+app.post('/api/tools/deployed-apps/:appId/restore', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'backups', {
+    requiresSensitiveTool: true,
+    requiresBackupRestore: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  const appId = String(req.params.appId || '').trim();
+  const accountId = String(req.body && req.body.accountId ? req.body.accountId : '').trim();
+  const fileId = String(
+    (req.body && (req.body.fileId || req.body.driveFileId || req.body.backupFileId)) || ''
+  ).trim();
+  const confirmRestore = String(req.body && req.body.confirm ? req.body.confirm : '')
+    .trim()
+    .toUpperCase() === 'RESTORE';
+  if (!appId || !accountId || !fileId) {
+    return res.status(400).json({ error: 'appId, accountId y fileId son obligatorios para restaurar.' });
+  }
+  if (!confirmRestore) {
+    return res.status(400).json({ error: 'Confirmación requerida. Envía confirm=RESTORE.' });
+  }
+  const deployedApp = findDeployedAppById(appId, { forceRefresh: true });
+  if (!deployedApp) {
+    return res.status(404).json({ error: 'App desplegada no encontrada.' });
+  }
+  const targetPath =
+    normalizeAbsoluteStoragePath(req.body && req.body.targetPath) ||
+    resolveBackupTargetFromApp(deployedApp);
+  if (!targetPath) {
+    return res.status(400).json({ error: 'No se pudo inferir targetPath. Envíalo manualmente.' });
+  }
+  try {
+    assertAiPermissionForAction(permission.profile, 'backups', {
+      requiresBackupRestore: true,
+      requiresSensitiveTool: true,
+      writeIntent: true,
+      targetPath
+    });
+    assertStorageMutationPathAllowed(targetPath);
+    const job = createStorageJob(safeUserId, 'deployed_backup_restore', {
+      appId,
+      appName: String(deployedApp.name || appId),
+      accountId,
+      fileId,
+      targetPath
+    });
+    return res.json({
+      ok: true,
+      appId,
+      job
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo crear job de restauración: ${truncateForNotify(error && error.message ? error.message : 'app_restore_job_create_failed', 220)}`
+    });
+  }
+});
+
 app.get('/api/tools/git/repos', requireAuth, (req, res) => {
+  const permission = guardRequestPermissionOrRespond(req, res, 'git', {
+    requiresGit: true
+  });
+  if (!permission) return;
   const forceRefresh = String(req.query.refresh || '').trim() === '1';
   const snapshot = collectGitToolsReposSnapshot(forceRefresh);
   return res.json({
@@ -8346,11 +11248,157 @@ app.get('/api/tools/git/repos', requireAuth, (req, res) => {
   });
 });
 
+app.get('/api/tools/git/repos/:repoId/branches', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'git', {
+    requiresGit: true
+  });
+  if (!permission) return;
+  const repo = findGitRepoById(req.params.repoId, { forceRefresh: true });
+  if (!repo) {
+    return res.status(404).json({ error: 'Repositorio no encontrado' });
+  }
+  const branches = listGitBranchesForRepo(repo.absolutePath);
+  const refreshed = collectGitRepoSummary(repo.absolutePath, nowIso(), repo.scanRoot);
+  return res.json({
+    ok: true,
+    repo: refreshed || repo,
+    branches
+  });
+});
+
+app.post('/api/tools/git/repos/:repoId/branches/checkout', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'git', {
+    requiresGit: true,
+    requiresSensitiveTool: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  const repo = findGitRepoById(req.params.repoId, { forceRefresh: true });
+  if (!repo) {
+    return res.status(404).json({ error: 'Repositorio no encontrado' });
+  }
+  const branch = normalizeGitBranchName(req.body && req.body.branch);
+  const create = parseBooleanSetting(req.body && req.body.create, false);
+  if (!branch) {
+    return res.status(400).json({ error: 'Indica una rama válida para checkout.' });
+  }
+  const result = ensureGitBranchForRepo(repo.absolutePath, branch, { createIfMissing: create });
+  if (!result.ok) {
+    return res.status(400).json({ error: result.error || 'No se pudo cambiar de rama.' });
+  }
+  const refreshed = collectGitRepoSummary(repo.absolutePath, nowIso(), repo.scanRoot);
+  return res.json({
+    ok: true,
+    branch: result.branch,
+    created: Boolean(result.created),
+    output: truncateForNotify(result.output || '', 1200),
+    repo: refreshed || repo
+  });
+});
+
+app.post('/api/tools/git/repos/:repoId/merge', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'git', {
+    requiresGit: true,
+    requiresSensitiveTool: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  const repo = findGitRepoById(req.params.repoId, { forceRefresh: true });
+  if (!repo) {
+    return res.status(404).json({ error: 'Repositorio no encontrado' });
+  }
+  const sourceBranch = normalizeGitBranchName(req.body && req.body.sourceBranch);
+  const targetBranch = normalizeGitBranchName(req.body && req.body.targetBranch);
+  if (!sourceBranch || !targetBranch) {
+    return res.status(400).json({ error: 'Indica sourceBranch y targetBranch válidas.' });
+  }
+  if (sourceBranch === targetBranch) {
+    return res.status(400).json({ error: 'sourceBranch y targetBranch deben ser diferentes.' });
+  }
+  if (!gitBranchExists(repo.absolutePath, sourceBranch)) {
+    return res.status(404).json({ error: `La rama origen no existe: ${sourceBranch}` });
+  }
+  if (!gitBranchExists(repo.absolutePath, targetBranch)) {
+    return res.status(404).json({ error: `La rama destino no existe: ${targetBranch}` });
+  }
+
+  const gitIdentity = buildGitIdentityFromRequest(req);
+  const ensuredIdentity = ensureGitIdentityForRepo(repo.absolutePath, gitIdentity);
+  if (!ensuredIdentity.ok) {
+    return res.status(500).json({
+      error: `No se pudo preparar identidad Git del repo: ${ensuredIdentity.error || 'git_identity_failed'}`
+    });
+  }
+  const gitIdentityEnv = buildGitIdentityEnv(ensuredIdentity.identity);
+
+  const checkoutTarget = ensureGitBranchForRepo(repo.absolutePath, targetBranch, { createIfMissing: false });
+  if (!checkoutTarget.ok) {
+    return res.status(400).json({ error: `No se pudo cambiar a rama destino: ${checkoutTarget.error}` });
+  }
+
+  const mergeArgs = ['merge', '--no-ff', sourceBranch];
+  const mergeResult = await runGitInRepoAsync(repo.absolutePath, mergeArgs, {
+    allowNonZero: true,
+    env: gitIdentityEnv,
+    timeoutMs: gitToolsCommandTimeoutMs
+  });
+  const refreshed = collectGitRepoSummary(repo.absolutePath, nowIso(), repo.scanRoot);
+  const output = truncateForNotify(
+    [checkoutTarget.output, mergeResult.stdout, mergeResult.stderr].filter(Boolean).join('\n'),
+    2200
+  );
+
+  if (!mergeResult.ok || Number(mergeResult.code) !== 0) {
+    const hasConflicts = refreshed ? refreshed.hasConflicts : false;
+    return res.status(hasConflicts ? 409 : 500).json({
+      error: hasConflicts
+        ? 'Merge con conflictos. Resuélvelos antes de continuar.'
+        : `Merge fallido: ${truncateForNotify(mergeResult.stderr || mergeResult.stdout || 'git_merge_failed', 260)}`,
+      merge: {
+        sourceBranch,
+        targetBranch,
+        hasConflicts: Boolean(hasConflicts),
+        output,
+        conflictFiles: refreshed && Array.isArray(refreshed.conflictFiles) ? refreshed.conflictFiles : []
+      },
+      repo: refreshed || repo
+    });
+  }
+
+  return res.json({
+    ok: true,
+    merge: {
+      sourceBranch,
+      targetBranch,
+      output
+    },
+    repo: refreshed || repo
+  });
+});
+
 app.post('/api/tools/git/repos/:repoId/push', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
+  const permission = guardRequestPermissionOrRespond(req, res, 'git', {
+    requiresGit: true,
+    requiresSensitiveTool: true,
+    writeIntent: true
+  });
+  if (!permission) return;
 
   const repo = findGitRepoById(req.params.repoId, { forceRefresh: true });
   if (!repo) {
@@ -8361,6 +11409,9 @@ app.post('/api/tools/git/repos/:repoId/push', requireAuth, async (req, res) => {
   }
 
   const commitMessage = normalizeGitCommitMessage(req.body && req.body.commitMessage, repo.name);
+  const requestedBranch = normalizeGitBranchName(req.body && req.body.branch);
+  const createBranch = parseBooleanSetting(req.body && req.body.createBranch, false);
+  const requestedRemote = normalizeGitRemoteName(req.body && req.body.remote);
   const gitIdentity = buildGitIdentityFromRequest(req);
   const ensuredIdentity = ensureGitIdentityForRepo(repo.absolutePath, gitIdentity);
   if (!ensuredIdentity.ok) {
@@ -8369,6 +11420,42 @@ app.post('/api/tools/git/repos/:repoId/push', requireAuth, async (req, res) => {
     });
   }
   const gitIdentityEnv = buildGitIdentityEnv(ensuredIdentity.identity);
+
+  let branchSwitched = false;
+  let branchCreated = false;
+  let branchSwitchOutput = '';
+  let repoState = collectGitRepoSummary(repo.absolutePath, nowIso());
+  if (!repoState) {
+    return res.status(500).json({ error: 'No se pudo leer estado actual del repositorio.' });
+  }
+  if (repoState.detached && !requestedBranch) {
+    return res.status(409).json({
+      error:
+        'Repositorio en HEAD detached. Selecciona una rama destino o crea una rama nueva antes de hacer push.'
+    });
+  }
+  if (requestedBranch && requestedBranch !== repoState.branch) {
+    const branchResult = ensureGitBranchForRepo(repo.absolutePath, requestedBranch, {
+      createIfMissing: createBranch
+    });
+    if (!branchResult.ok) {
+      return res.status(400).json({
+        error: `No se pudo cambiar/crear rama: ${branchResult.error || 'git_branch_checkout_failed'}`
+      });
+    }
+    branchSwitched = true;
+    branchCreated = Boolean(branchResult.created);
+    branchSwitchOutput = String(branchResult.output || '');
+    repoState = collectGitRepoSummary(repo.absolutePath, nowIso());
+    if (!repoState) {
+      return res.status(500).json({ error: 'No se pudo refrescar estado del repositorio tras checkout.' });
+    }
+  }
+  if (!repoState.branch || repoState.branch === 'HEAD') {
+    return res.status(409).json({
+      error: 'No se puede hacer push desde HEAD detached. Selecciona una rama válida.'
+    });
+  }
 
   const addResult = await runGitInRepoAsync(repo.absolutePath, ['add', '-A'], { env: gitIdentityEnv });
   if (!addResult.ok) {
@@ -8422,7 +11509,7 @@ app.post('/api/tools/git/repos/:repoId/push', requireAuth, async (req, res) => {
   if (refreshedBeforePush.hasConflicts) {
     return res.status(409).json({ error: 'El repositorio volvió a quedar con conflictos.' });
   }
-  if (refreshedBeforePush.detached) {
+  if (refreshedBeforePush.detached || !refreshedBeforePush.branch || refreshedBeforePush.branch === 'HEAD') {
     return res.status(409).json({ error: 'No se puede subir desde HEAD detached.' });
   }
   if (!refreshedBeforePush.hasRemote || refreshedBeforePush.remotes.length === 0) {
@@ -8434,14 +11521,23 @@ app.post('/api/tools/git/repos/:repoId/push', requireAuth, async (req, res) => {
   }
 
   const pushArgs = ['push'];
-  if (!refreshedBeforePush.upstream) {
-    const defaultRemote = refreshedBeforePush.remotes.includes('origin')
-      ? 'origin'
-      : refreshedBeforePush.remotes[0];
-    if (!defaultRemote) {
-      return res.status(409).json({ error: 'No se encontró remoto para hacer push.' });
-    }
-    pushArgs.push('-u', defaultRemote, refreshedBeforePush.branch);
+  const defaultRemote = refreshedBeforePush.remotes.includes('origin')
+    ? 'origin'
+    : refreshedBeforePush.remotes[0];
+  const upstreamRemote =
+    refreshedBeforePush.upstream && refreshedBeforePush.upstream.includes('/')
+      ? refreshedBeforePush.upstream.split('/')[0]
+      : '';
+  const remoteToUse = normalizeGitRemoteName(
+    requestedRemote || upstreamRemote || defaultRemote
+  );
+  if (!remoteToUse) {
+    return res.status(409).json({ error: 'No se encontró remoto para hacer push.' });
+  }
+  const needsSetUpstream =
+    Boolean(requestedBranch) || Boolean(requestedRemote) || !refreshedBeforePush.upstream;
+  if (needsSetUpstream) {
+    pushArgs.push('-u', remoteToUse, refreshedBeforePush.branch);
   }
 
   const pushResult = await runGitInRepoAsync(repo.absolutePath, pushArgs, {
@@ -8458,7 +11554,7 @@ app.post('/api/tools/git/repos/:repoId/push', requireAuth, async (req, res) => {
   const refreshedRepo =
     refreshedSnapshot.repos.find((entry) => entry.id === repo.id) || refreshedBeforePush;
   const output = truncateForNotify(
-    [commitOutput, pushResult.stdout, pushResult.stderr].filter(Boolean).join('\n').trim(),
+    [branchSwitchOutput, commitOutput, pushResult.stdout, pushResult.stderr].filter(Boolean).join('\n').trim(),
     1800
   );
 
@@ -8469,6 +11565,10 @@ app.post('/api/tools/git/repos/:repoId/push', requireAuth, async (req, res) => {
       commitCreated,
       commitMessage,
       commitHash,
+      targetBranch: refreshedBeforePush.branch,
+      remote: remoteToUse,
+      branchSwitched,
+      branchCreated,
       output
     }
   });
@@ -8479,6 +11579,11 @@ app.post('/api/tools/git/repos/:repoId/resolve-conflicts', requireAuth, (req, re
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
+  const permission = guardRequestPermissionOrRespond(req, res, 'git', {
+    requiresGit: true,
+    requiresSensitiveTool: true
+  });
+  if (!permission) return;
 
   const repo = findGitRepoById(req.params.repoId, { forceRefresh: true });
   if (!repo) {
@@ -8901,6 +12006,22 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Nivel de razonamiento inválido' });
   }
   const chatRuntime = resolveChatAgentRuntimeForUser(req.session.userId);
+  let runtimePolicy = null;
+  try {
+    runtimePolicy = resolveChatRuntimeExecutionPolicy(req.session.userId, chatRuntime);
+    assertAiPermissionForAction(runtimePolicy.profile, 'chat', {
+      requiresShell: true,
+      requiresSensitiveTool: true
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 403;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `Permisos insuficientes para ejecutar el chat: ${truncateForNotify(error && error.message ? error.message : 'permission_denied', 180)}`
+    });
+  }
   let selectedModel = normalizeChatAgentModel(
     chatRuntime.activeAgentId,
     requestedModel || chatRuntime.defaults.model
@@ -9174,18 +12295,56 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         itemId: 'agent_runtime',
         text: `Agente activo: ${chatRuntime.activeAgentName} (modo agente)`
       });
+      sendSse(res, 'reasoning_step', {
+        itemId: 'permission_profile',
+        text: `Permisos: root=${runtimePolicy.profile.allowRoot ? 'si' : 'no'}, shell=${
+          runtimePolicy.profile.allowShell ? 'si' : 'no'
+        }, red=${runtimePolicy.profile.allowNetwork ? 'si' : 'no'}, git=${
+          runtimePolicy.profile.allowGit ? 'si' : 'no'
+        }, modo=${runtimePolicy.profile.readOnly ? 'solo-lectura' : 'lectura/escritura'}`
+      });
 
-      const geminiArgs = ['-p', buildGeminiPromptWithReasoning(executionPrompt, selectedReasoningEffort)];
+      const permissionHints = [];
+      if (runtimePolicy.profile.readOnly) {
+        permissionHints.push('Perfil activo: solo lectura. No modifiques archivos.');
+      }
+      if (!runtimePolicy.profile.allowNetwork) {
+        permissionHints.push('Perfil activo: red bloqueada. No hagas llamadas de red.');
+      }
+      if (!runtimePolicy.profile.allowGit) {
+        permissionHints.push('Perfil activo: operaciones Git bloqueadas.');
+      }
+      const geminiPrompt = [
+        buildGeminiPromptWithReasoning(executionPrompt, selectedReasoningEffort),
+        permissionHints.length > 0 ? `\n[POLITICA]\n${permissionHints.join('\n')}` : ''
+      ]
+        .filter(Boolean)
+        .join('\n');
+      const geminiArgs = ['-p', geminiPrompt];
       if (selectedModel) {
         geminiArgs.push('-m', selectedModel);
       }
-      geminiArgs.push('--approval-mode', 'yolo', '--sandbox', 'false');
-      geminiIncludeDirectories.forEach((directory) => {
+      geminiArgs.push(
+        '--approval-mode',
+        'yolo',
+        '--sandbox',
+        runtimePolicy.profile.readOnly ? 'true' : 'false'
+      );
+      runtimePolicy.allowedPaths.forEach((directory) => {
         geminiArgs.push('--include-directories', directory);
       });
       const geminiEnv = {
         ...process.env,
-        GEMINI_API_KEY: String(geminiIntegration.apiKey || '').trim()
+        GEMINI_API_KEY: String(geminiIntegration.apiKey || '').trim(),
+        CODEXWEB_ACTIVE_PROVIDER: chatRuntime.providerId,
+        CODEXWEB_PERMISSION_PROFILE: JSON.stringify({
+          agentId: chatRuntime.providerId,
+          allowRoot: runtimePolicy.profile.allowRoot,
+          readOnly: runtimePolicy.profile.readOnly,
+          allowNetwork: runtimePolicy.profile.allowNetwork,
+          allowGit: runtimePolicy.profile.allowGit,
+          allowedPaths: runtimePolicy.allowedPaths
+        })
       };
 
       let geminiProcess = null;
@@ -9362,10 +12521,17 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       };
 
       try {
-        geminiProcess = spawn(geminiPath, geminiArgs, {
-          cwd: process.cwd(),
+        const spawnOptions = {
+          cwd: runtimePolicy.cwd,
           env: geminiEnv,
           stdio: ['ignore', 'pipe', 'pipe']
+        };
+        if (runtimePolicy.runAsIdentity) {
+          spawnOptions.uid = runtimePolicy.runAsIdentity.uid;
+          spawnOptions.gid = runtimePolicy.runAsIdentity.gid;
+        }
+        geminiProcess = spawn(geminiPath, geminiArgs, {
+          ...spawnOptions
         });
       } catch (error) {
         const reason = truncateForNotify(error && error.message ? error.message : 'gemini_spawn_error', 200);
@@ -9380,11 +12546,34 @@ app.post('/api/chat', requireAuth, async (req, res) => {
 
       activeRun = registerActiveChatRun(req.session.userId, conversationId, geminiProcess);
 
+      const emitGeminiReasoningChunk = (chunk, source = 'stderr') => {
+        const raw = stripAnsi(String(chunk || ''));
+        if (!raw) return;
+        const lines = raw
+          .replace(/\r/g, '\n')
+          .split('\n')
+          .map((entry) => String(entry || '').trim())
+          .filter(Boolean);
+        if (lines.length === 0) return;
+        lines.forEach((line) => {
+          const looksLikeReasoning = /thinking|pensando|analysis|analizando|plan|step|paso|reason/i.test(line);
+          const looksLikeNoise = /^(\d+%|warning:|error:)/i.test(line);
+          if (source === 'stderr' || looksLikeReasoning || looksLikeNoise) {
+            sendSse(res, 'reasoning_delta', {
+              itemId: source === 'stderr' ? 'gemini_stderr' : 'gemini_thinking',
+              text: `${line}\n`
+            });
+          }
+        });
+      };
+
       geminiProcess.stdout.on('data', (chunk) => {
         stdoutText += String(chunk || '');
+        emitGeminiReasoningChunk(chunk, 'stdout');
       });
       geminiProcess.stderr.on('data', (chunk) => {
         stderrText += String(chunk || '');
+        emitGeminiReasoningChunk(chunk, 'stderr');
       });
       geminiProcess.on('error', (error) => {
         const codeNotFound =
@@ -9450,7 +12639,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       'exec',
       '--skip-git-repo-check',
       '--sandbox',
-      'danger-full-access',
+      runtimePolicy.codexSandbox,
       '--json',
       '--color',
       'never'
@@ -9461,7 +12650,27 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     if (selectedReasoningEffort) {
       args.push('-c', `model_reasoning_effort="${selectedReasoningEffort}"`);
     }
-    args.push(executionPrompt);
+    const codexPermissionHints = [];
+    if (runtimePolicy.profile.readOnly) {
+      codexPermissionHints.push('Perfil activo: solo lectura. No escribas archivos.');
+    }
+    if (!runtimePolicy.profile.allowNetwork) {
+      codexPermissionHints.push('Perfil activo: red bloqueada. No ejecutes llamadas de red.');
+    }
+    if (!runtimePolicy.profile.allowGit) {
+      codexPermissionHints.push('Perfil activo: operaciones Git bloqueadas.');
+    }
+    if (runtimePolicy.allowedPaths.length > 0) {
+      codexPermissionHints.push(`Rutas permitidas: ${runtimePolicy.allowedPaths.join(', ')}`);
+    }
+    if (runtimePolicy.deniedPaths.length > 0) {
+      codexPermissionHints.push(`Rutas bloqueadas: ${runtimePolicy.deniedPaths.join(', ')}`);
+    }
+    const codexPrompt =
+      codexPermissionHints.length > 0
+        ? `${executionPrompt}\n\n[POLITICA]\n${codexPermissionHints.join('\n')}`
+        : executionPrompt;
+    args.push(codexPrompt);
 
     const assistantMessage = insertMessageStmt.run(conversationId, 'assistant', '');
     assistantMessageId = Number(assistantMessage.lastInsertRowid);
@@ -9613,6 +12822,14 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       id: chatRuntime.activeAgentId,
       name: chatRuntime.activeAgentName,
       provider: chatRuntime.runtimeProvider
+    });
+    sendSseSafe('reasoning_step', {
+      itemId: 'permission_profile',
+      text: `Permisos: root=${runtimePolicy.profile.allowRoot ? 'si' : 'no'}, shell=${
+        runtimePolicy.profile.allowShell ? 'si' : 'no'
+      }, red=${runtimePolicy.profile.allowNetwork ? 'si' : 'no'}, git=${
+        runtimePolicy.profile.allowGit ? 'si' : 'no'
+      }, modo=${runtimePolicy.profile.readOnly ? 'solo-lectura' : 'lectura/escritura'}`
     });
     let heartbeatTimer = null;
     const stopHeartbeat = () => {
@@ -10218,12 +13435,28 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       handleStdoutLine(tail);
     };
 
-    codexProcess = execFile(codexPath, args, {
-      env: getCodexEnvForUser(req.session.userId, {
-        username: req.session && typeof req.session.username === 'string' ? req.session.username : ''
-      }),
-      cwd: process.cwd()
-    });
+    const codexExecOptions = {
+      env: {
+        ...getCodexEnvForUser(req.session.userId, {
+          username: req.session && typeof req.session.username === 'string' ? req.session.username : ''
+        }),
+        CODEXWEB_ACTIVE_PROVIDER: chatRuntime.providerId,
+        CODEXWEB_PERMISSION_PROFILE: JSON.stringify({
+          agentId: chatRuntime.providerId,
+          allowRoot: runtimePolicy.profile.allowRoot,
+          readOnly: runtimePolicy.profile.readOnly,
+          allowNetwork: runtimePolicy.profile.allowNetwork,
+          allowGit: runtimePolicy.profile.allowGit,
+          allowedPaths: runtimePolicy.allowedPaths
+        })
+      },
+      cwd: runtimePolicy.cwd
+    };
+    if (runtimePolicy.runAsIdentity) {
+      codexExecOptions.uid = runtimePolicy.runAsIdentity.uid;
+      codexExecOptions.gid = runtimePolicy.runAsIdentity.gid;
+    }
+    codexProcess = execFile(codexPath, args, codexExecOptions);
     activeRun = registerActiveChatRun(req.session.userId, conversationId, codexProcess);
     notifyMilestone('execfile_stdio_fixed', 'FIX aplicado: execFile invocado sin opción stdio');
 
@@ -10590,6 +13823,7 @@ process.on('uncaughtException', (error) => {
 markStaleTaskRunsOnStartup();
 markRestartRecoveredOnStartup();
 resumePendingDeployedDescriptionJobs();
+resumePendingStorageJobs();
 
 const server = app.listen(port, host, () => {
   console.log(`CodexWeb escuchando en http://${host}:${port}`);

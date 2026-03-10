@@ -3,6 +3,7 @@ import { ChevronDown, ChevronLeft, ChevronRight, ExternalLink, RefreshCw } from 
 import BottomNav from './BottomNav';
 import {
   getAiAgentSettings,
+  listAiProviders,
   cancelCodexDeviceLogin,
   getCodexAuthStatus,
   getNotificationSettings,
@@ -11,10 +12,13 @@ import {
   startCodexDeviceLogin,
   updateActiveAiAgentSetting,
   updateAiAgentSetting,
+  updateAiProviderPermissions,
   updateNotificationSettings
 } from '../lib/api';
 import type {
   AiAgentSettingsItem,
+  AiProviderInfo,
+  AiProviderPermissionProfile,
   Capabilities,
   ChatOptions,
   CodexAuthStatus,
@@ -63,6 +67,7 @@ type SettingsView =
   | 'aiIntegrations'
   | 'activeAgent'
   | 'agentQuotas'
+  | 'agentPermissions'
   | 'webhook';
 
 export default function SettingsScreen({
@@ -115,6 +120,11 @@ export default function SettingsScreen({
   const [activeAgentSaving, setActiveAgentSaving] = useState(false);
   const [activeAgentSavedMessage, setActiveAgentSavedMessage] = useState('');
   const [expandedAgentIds, setExpandedAgentIds] = useState<Record<string, boolean>>({});
+  const [providers, setProviders] = useState<AiProviderInfo[]>([]);
+  const [providersLoading, setProvidersLoading] = useState(true);
+  const [providersError, setProvidersError] = useState('');
+  const [permissionDrafts, setPermissionDrafts] = useState<Record<string, AiProviderPermissionProfile>>({});
+  const [savingPermissionProviderId, setSavingPermissionProviderId] = useState('');
 
   const loadQuota = useCallback(async () => {
     setQuotaLoading(true);
@@ -202,12 +212,37 @@ export default function SettingsScreen({
     }
   }, []);
 
+  const loadProviders = useCallback(async () => {
+    setProvidersLoading(true);
+    setProvidersError('');
+    try {
+      const payload = await listAiProviders();
+      const nextProviders = Array.isArray(payload.providers) ? payload.providers : [];
+      setProviders(nextProviders);
+      setPermissionDrafts((prev) => {
+        const next: Record<string, AiProviderPermissionProfile> = { ...prev };
+        nextProviders.forEach((provider) => {
+          if (!provider?.id) return;
+          if (!next[provider.id]) {
+            next[provider.id] = provider.permissions;
+          }
+        });
+        return next;
+      });
+    } catch (error) {
+      setProvidersError(error instanceof Error ? error.message : 'No se pudo cargar catálogo de providers');
+    } finally {
+      setProvidersLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     loadQuota();
     loadAuth();
     loadNotifications();
     loadAiAgents();
-  }, [loadAiAgents, loadAuth, loadNotifications, loadQuota]);
+    loadProviders();
+  }, [loadAiAgents, loadAuth, loadNotifications, loadProviders, loadQuota]);
 
   useEffect(() => {
     if (!auth?.loginInProgress) return undefined;
@@ -274,6 +309,7 @@ export default function SettingsScreen({
         const nextActiveAgentId = String(response.activeAgentId || '');
         setActiveAgentId(nextActiveAgentId);
         setActiveAgentDraft(nextActiveAgentId);
+        void loadProviders();
         setAgentsSavedId(agentId);
         window.setTimeout(() => {
           setAgentsSavedId((current) => (current === agentId ? '' : current));
@@ -284,7 +320,7 @@ export default function SettingsScreen({
         setAgentsSavingId('');
       }
     },
-    [agents, agentsDrafts]
+    [agents, agentsDrafts, loadProviders]
   );
 
   const saveActiveAiAgent = useCallback(async () => {
@@ -296,6 +332,7 @@ export default function SettingsScreen({
       const nextActive = String(response.activeAgentId || '');
       setActiveAgentId(nextActive);
       setActiveAgentDraft(nextActive);
+      void loadProviders();
       setActiveAgentSavedMessage('Guardado');
       window.setTimeout(() => {
         setActiveAgentSavedMessage((current) => (current === 'Guardado' ? '' : current));
@@ -305,7 +342,30 @@ export default function SettingsScreen({
     } finally {
       setActiveAgentSaving(false);
     }
-  }, [activeAgentDraft]);
+  }, [activeAgentDraft, loadProviders]);
+
+  const saveProviderPermissions = useCallback(async (providerId: string) => {
+    const draft = permissionDrafts[providerId];
+    if (!draft) return;
+    setSavingPermissionProviderId(providerId);
+    setProvidersError('');
+    try {
+      const saved = await updateAiProviderPermissions(providerId, draft);
+      setPermissionDrafts((prev) => ({
+        ...prev,
+        [providerId]: saved
+      }));
+      setProviders((prev) =>
+        prev.map((provider) =>
+          provider.id === providerId ? { ...provider, permissions: saved } : provider
+        )
+      );
+    } catch (error) {
+      setProvidersError(error instanceof Error ? error.message : 'No se pudieron guardar permisos del provider');
+    } finally {
+      setSavingPermissionProviderId('');
+    }
+  }, [permissionDrafts]);
 
   const formatPercent = (value: number) => `${Math.max(0, Math.round(Number(value || 0)))}%`;
 
@@ -370,6 +430,7 @@ export default function SettingsScreen({
       }));
       await loadAuth(true);
       await loadAiAgents();
+      await loadProviders();
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : 'No se pudo iniciar login de Codex');
     } finally {
@@ -398,6 +459,7 @@ export default function SettingsScreen({
       await loadAuth(true);
       await loadAiAgents();
       await loadQuota();
+      await loadProviders();
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : 'No se pudo cerrar sesión de Codex');
     } finally {
@@ -479,12 +541,15 @@ export default function SettingsScreen({
   );
 
   const quotaAgents = useMemo(
-    () => selectableIntegratedAgents.filter((agent) => agent.id === 'codex-cli'),
-    [selectableIntegratedAgents]
+    () =>
+      providers.filter(
+        (provider) => provider.integration.enabled && provider.integration.configured
+      ),
+    [providers]
   );
   const connectedWithoutQuotaAgents = useMemo(
-    () => selectableIntegratedAgents.filter((agent) => agent.id !== 'codex-cli'),
-    [selectableIntegratedAgents]
+    () => quotaAgents.filter((provider) => !provider.quota.available),
+    [quotaAgents]
   );
 
   const getRemainingColorClass = (remainingPercent: number) => {
@@ -504,6 +569,8 @@ export default function SettingsScreen({
             ? 'Settings · Agente en uso'
             : activeView === 'agentQuotas'
               ? 'Settings · Cuotas de agentes'
+              : activeView === 'agentPermissions'
+                ? 'Settings · Permisos por IA'
               : 'Settings · Webhook';
 
   const handleBack = () => {
@@ -521,15 +588,21 @@ export default function SettingsScreen({
     if (activeView === 'aiIntegrations') {
       void loadAiAgents();
       void loadAuth();
+      void loadProviders();
       return;
     }
     if (activeView === 'activeAgent') {
       void loadAiAgents();
+      void loadProviders();
       return;
     }
     if (activeView === 'agentQuotas') {
-      void loadAiAgents();
+      void loadProviders();
       void loadQuota();
+      return;
+    }
+    if (activeView === 'agentPermissions') {
+      void loadProviders();
       return;
     }
     if (activeView === 'webhook') {
@@ -537,6 +610,7 @@ export default function SettingsScreen({
       return;
     }
     void loadAiAgents();
+    void loadProviders();
     void loadAuth();
     void loadQuota();
     void loadNotifications();
@@ -620,7 +694,23 @@ export default function SettingsScreen({
                   <div className="min-w-0">
                     <p className="text-sm text-zinc-100">Cuotas por agente</p>
                     <p className="text-xs text-zinc-500 truncate">
-                      {selectableIntegratedAgents.length} agente(s) conectado(s) listos
+                      {quotaAgents.length} provider(s) conectado(s)
+                    </p>
+                  </div>
+                  <ChevronRight size={16} className="text-zinc-600" />
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveView('agentPermissions')}
+                className="w-full text-left rounded-xl border border-zinc-800 bg-black/40 p-3 hover:border-zinc-700 transition-colors"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-sm text-zinc-100">Permisos por IA</p>
+                    <p className="text-xs text-zinc-500 truncate">
+                      Control granular de root, rutas, shell, red, git y backups.
                     </p>
                   </div>
                   <ChevronRight size={16} className="text-zinc-600" />
@@ -1179,19 +1269,24 @@ export default function SettingsScreen({
               <button
                 type="button"
                 onClick={() => {
-                  void loadAiAgents();
+                  void loadProviders();
                   void loadQuota();
                 }}
-                disabled={quotaLoading || agentsLoading}
+                disabled={quotaLoading || providersLoading}
                 className="text-xs px-2.5 py-1 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-50"
               >
-                {quotaLoading ? 'Cargando...' : 'Recargar'}
+                {quotaLoading || providersLoading ? 'Cargando...' : 'Recargar'}
               </button>
             </div>
 
-            {agentsError ? <p className="text-xs text-red-300">{agentsError}</p> : null}
+            {providersError ? <p className="text-xs text-red-300">{providersError}</p> : null}
+            {quotaError ? <p className="text-xs text-red-300">{quotaError}</p> : null}
 
-            {selectableIntegratedAgents.length === 0 ? (
+            {providersLoading ? (
+              <p className="text-sm text-zinc-400">Cargando providers...</p>
+            ) : null}
+
+            {!providersLoading && quotaAgents.length === 0 ? (
               <p className="text-sm text-zinc-400">
                 No hay agentes conectados y configurados. Activa integraciones para ver cuotas.
               </p>
@@ -1199,45 +1294,53 @@ export default function SettingsScreen({
 
             {quotaAgents.length > 0 ? (
               <div className="space-y-3">
-                {quotaAgents.map((agent) => (
-                  <div key={agent.id} className="rounded-xl border border-zinc-800 bg-zinc-950/80 overflow-hidden">
+                {quotaAgents.map((provider) => {
+                  const quotaInfo = provider.quota;
+                  const hasNumericQuota =
+                    Number.isFinite(Number(quotaInfo?.limit)) &&
+                    Number.isFinite(Number(quotaInfo?.remaining));
+                  const remainingPercent = hasNumericQuota
+                    ? Math.max(
+                        0,
+                        Math.min(
+                          100,
+                          (Number(quotaInfo?.remaining || 0) / Math.max(1, Number(quotaInfo?.limit || 1))) * 100
+                        )
+                      )
+                    : null;
+                  return (
+                  <div key={provider.id} className="rounded-xl border border-zinc-800 bg-zinc-950/80 overflow-hidden">
                     <div className="px-3 py-2 border-b border-zinc-800 flex items-center justify-between gap-2">
-                      <p className="text-sm text-zinc-200">{agent.name}</p>
-                      {codexAgentEnabled ? (
+                      <p className="text-sm text-zinc-200">{provider.name}</p>
+                      {provider.integration.configured ? (
                         <span className="text-[11px] text-emerald-300">Conectado</span>
                       ) : (
                         <span className="text-[11px] text-zinc-500">Sin conectar</span>
                       )}
                     </div>
 
-                    {quotaError ? <p className="px-3 py-3 text-sm text-red-300">{quotaError}</p> : null}
-
-                    {!quotaLoading && !quotaError && quotaRows.length === 0 ? (
+                    {!quotaInfo?.available ? (
                       <p className="px-3 py-3 text-sm text-zinc-400">
-                        Sin datos de quota todavia. Envia un mensaje para generar `token_count`.
+                        Cuota no disponible para este provider.
                       </p>
-                    ) : null}
-
-                    {quotaRows.map((row, index) => (
-                      <div
-                        key={row.id}
-                        className={`px-3 py-2 flex items-center justify-between gap-3 ${
-                          index < quotaRows.length - 1 ? 'border-b border-zinc-800' : ''
-                        }`}
-                      >
-                        <span className="text-sm text-zinc-200">{row.label}</span>
-                        <div className="flex items-center gap-3">
-                          <span className={`text-sm font-medium ${getRemainingColorClass(row.remainingPercent)}`}>
-                            {formatPercent(row.remainingPercent)}
-                          </span>
-                          <span className="text-sm text-zinc-400 min-w-[4.5rem] text-right">
-                            {formatResetCompact(row.resetAt, row.windowData)}
-                          </span>
-                        </div>
+                    ) : (
+                      <div className="px-3 py-3 space-y-1">
+                        <p className="text-xs text-zinc-300">
+                          usado {quotaInfo.used ?? 'n/a'} · límite {quotaInfo.limit ?? 'n/a'} · restante{' '}
+                          {quotaInfo.remaining ?? 'n/a'} {quotaInfo.unit || ''}
+                        </p>
+                        {remainingPercent !== null ? (
+                          <p className={`text-xs ${getRemainingColorClass(remainingPercent)}`}>
+                            restante {formatPercent(remainingPercent)}
+                          </p>
+                        ) : null}
+                        {quotaInfo.resetAt ? (
+                          <p className="text-xs text-zinc-500">reset: {formatDate(quotaInfo.resetAt)}</p>
+                        ) : null}
                       </div>
-                    ))}
+                    )}
 
-                    {quota ? (
+                    {provider.id === 'codex-cli' && quota ? (
                       <div className="px-3 py-2 border-t border-zinc-800 space-y-1">
                         <p className="text-xs text-zinc-500">Fuente: {quota.source || '-'}</p>
                         <p className="text-xs text-zinc-500">Actualizado: {formatDate(quota.fetchedAt)}</p>
@@ -1245,7 +1348,7 @@ export default function SettingsScreen({
                       </div>
                     ) : null}
                   </div>
-                ))}
+                )})}
               </div>
             ) : null}
 
@@ -1254,6 +1357,188 @@ export default function SettingsScreen({
                 Sin datos de cuota para: {connectedWithoutQuotaAgents.map((agent) => agent.name).join(', ')}.
               </p>
             ) : null}
+          </section>
+        ) : null}
+
+        {activeView === 'agentPermissions' ? (
+          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <h2 className="text-sm font-semibold text-zinc-100">Permisos granulares por provider</h2>
+                <p className="text-xs text-zinc-500">
+                  Enforcement real en backend para shell, git, backups, rutas y modo solo lectura.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  void loadProviders();
+                }}
+                disabled={providersLoading}
+                className="text-xs px-2.5 py-1 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-50"
+              >
+                {providersLoading ? 'Cargando...' : 'Refrescar'}
+              </button>
+            </div>
+
+            {providersError ? <p className="text-xs text-red-300">{providersError}</p> : null}
+
+            {providersLoading ? <p className="text-sm text-zinc-400">Cargando providers...</p> : null}
+
+            {!providersLoading && providers.length === 0 ? (
+              <p className="text-sm text-zinc-400">No hay providers disponibles.</p>
+            ) : null}
+
+            <div className="space-y-3">
+              {providers.map((provider) => {
+                const draft = permissionDrafts[provider.id] || provider.permissions;
+                const saving = savingPermissionProviderId === provider.id;
+                return (
+                  <article key={provider.id} className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-3 space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-sm text-zinc-100">{provider.name}</p>
+                      <span className="text-[11px] text-zinc-500">{provider.id}</span>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2 text-xs">
+                      <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 px-2 py-1.5">
+                        root
+                        <ToggleSwitch
+                          checked={Boolean(draft.allowRoot)}
+                          onChange={(nextValue) => {
+                            setPermissionDrafts((prev) => ({
+                              ...prev,
+                              [provider.id]: { ...draft, allowRoot: nextValue }
+                            }));
+                          }}
+                        />
+                      </label>
+                      <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 px-2 py-1.5">
+                        solo lectura
+                        <ToggleSwitch
+                          checked={Boolean(draft.readOnly)}
+                          onChange={(nextValue) => {
+                            setPermissionDrafts((prev) => ({
+                              ...prev,
+                              [provider.id]: { ...draft, readOnly: nextValue }
+                            }));
+                          }}
+                        />
+                      </label>
+                      <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 px-2 py-1.5">
+                        shell
+                        <ToggleSwitch
+                          checked={Boolean(draft.allowShell)}
+                          onChange={(nextValue) => {
+                            setPermissionDrafts((prev) => ({
+                              ...prev,
+                              [provider.id]: { ...draft, allowShell: nextValue }
+                            }));
+                          }}
+                        />
+                      </label>
+                      <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 px-2 py-1.5">
+                        red
+                        <ToggleSwitch
+                          checked={Boolean(draft.allowNetwork)}
+                          onChange={(nextValue) => {
+                            setPermissionDrafts((prev) => ({
+                              ...prev,
+                              [provider.id]: { ...draft, allowNetwork: nextValue }
+                            }));
+                          }}
+                        />
+                      </label>
+                      <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 px-2 py-1.5">
+                        git
+                        <ToggleSwitch
+                          checked={Boolean(draft.allowGit)}
+                          onChange={(nextValue) => {
+                            setPermissionDrafts((prev) => ({
+                              ...prev,
+                              [provider.id]: { ...draft, allowGit: nextValue }
+                            }));
+                          }}
+                        />
+                      </label>
+                      <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 px-2 py-1.5">
+                        backup/restore
+                        <ToggleSwitch
+                          checked={Boolean(draft.allowBackupRestore)}
+                          onChange={(nextValue) => {
+                            setPermissionDrafts((prev) => ({
+                              ...prev,
+                              [provider.id]: { ...draft, allowBackupRestore: nextValue }
+                            }));
+                          }}
+                        />
+                      </label>
+                    </div>
+
+                    <div className="space-y-2">
+                      <input
+                        value={draft.runAsUser || ''}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setPermissionDrafts((prev) => ({
+                            ...prev,
+                            [provider.id]: { ...draft, runAsUser: value }
+                          }));
+                        }}
+                        placeholder="usuario sistema (vacío = por defecto)"
+                        className="w-full rounded-lg border border-zinc-800 bg-black/60 px-2 py-1.5 text-xs text-zinc-200"
+                      />
+                      <input
+                        value={(draft.allowedPaths || []).join(', ')}
+                        onChange={(event) => {
+                          const values = event.target.value
+                            .split(',')
+                            .map((entry) => entry.trim())
+                            .filter(Boolean);
+                          setPermissionDrafts((prev) => ({
+                            ...prev,
+                            [provider.id]: { ...draft, allowedPaths: values.length > 0 ? values : ['/'] }
+                          }));
+                        }}
+                        placeholder="/root/CodexWeb,/home,/opt"
+                        className="w-full rounded-lg border border-zinc-800 bg-black/60 px-2 py-1.5 text-xs text-zinc-200"
+                      />
+                      <input
+                        value={(draft.deniedPaths || []).join(', ')}
+                        onChange={(event) => {
+                          const values = event.target.value
+                            .split(',')
+                            .map((entry) => entry.trim())
+                            .filter(Boolean);
+                          setPermissionDrafts((prev) => ({
+                            ...prev,
+                            [provider.id]: { ...draft, deniedPaths: values }
+                          }));
+                        }}
+                        placeholder="rutas bloqueadas separadas por coma"
+                        className="w-full rounded-lg border border-zinc-800 bg-black/60 px-2 py-1.5 text-xs text-zinc-200"
+                      />
+                    </div>
+
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-[11px] text-zinc-500">
+                        actualizado: {draft.updatedAt ? formatDate(draft.updatedAt) : '-'}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void saveProviderPermissions(provider.id);
+                        }}
+                        disabled={saving}
+                        className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-50"
+                      >
+                        {saving ? 'Guardando...' : 'Guardar permisos'}
+                      </button>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
           </section>
         ) : null}
 
