@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const { execFile, execFileSync, spawn } = require('child_process');
-const { Transform, pipeline } = require('stream');
+const { Transform, pipeline, Readable } = require('stream');
 const util = require('util');
 const express = require('express');
 const helmet = require('helmet');
@@ -32,7 +32,42 @@ const DISCORD_WEBHOOK_PREFIXES = [
 ];
 const DISCORD_RESULT_SNIPPET_MAX_LEN = 1400;
 const DISCORD_MESSAGE_MAX_LEN = 1900;
-const supportedAiAgents = [
+const OPENROUTER_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
+const OLLAMA_DEFAULT_BASE_URL = 'http://127.0.0.1:11434';
+const GROQ_DEFAULT_BASE_URL = 'https://api.groq.com/openai/v1';
+const LMSTUDIO_DEFAULT_BASE_URL = 'http://127.0.0.1:1234/v1';
+const DROPBOX_API_BASE_URL = 'https://api.dropboxapi.com/2';
+const DROPBOX_CONTENT_BASE_URL = 'https://content.dropboxapi.com/2';
+const DROPBOX_OAUTH_AUTHORIZE_URL = 'https://www.dropbox.com/oauth2/authorize';
+const DROPBOX_OAUTH_TOKEN_URL = 'https://api.dropboxapi.com/oauth2/token';
+const chatGptModelOptions = [
+  DEFAULT_CHAT_MODEL,
+  'gpt-5',
+  'gpt-5-mini',
+  'gpt-5-nano',
+  'gpt-4.1',
+  'gpt-4.1-mini',
+  'gpt-4.1-nano',
+  'gpt-4o',
+  'gpt-4o-mini',
+  'o3',
+  'o4-mini'
+];
+const geminiModelOptions = [
+  'gemini-2.5-flash',
+  'gemini-2.5-pro',
+  'gemini-2.0-flash'
+];
+const DEFAULT_GEMINI_CHAT_MODEL = geminiModelOptions[0];
+const openRouterFallbackModels = ['openrouter/auto', 'google/gemini-2.0-flash-exp:free'];
+const DEFAULT_OPENROUTER_MODEL = openRouterFallbackModels[0];
+const ollamaFallbackModels = ['llama3.2', 'qwen2.5-coder:7b'];
+const DEFAULT_OLLAMA_MODEL = ollamaFallbackModels[0];
+const groqFallbackModels = ['llama-3.3-70b-versatile', 'deepseek-r1-distill-llama-70b', 'qwen/qwen3-32b'];
+const DEFAULT_GROQ_MODEL = groqFallbackModels[0];
+const lmStudioFallbackModels = ['local-model'];
+const DEFAULT_LMSTUDIO_MODEL = lmStudioFallbackModels[0];
+const aiProviderDefinitions = [
   {
     id: 'codex-cli',
     name: 'Codex CLI',
@@ -40,8 +75,23 @@ const supportedAiAgents = [
     description: 'Agente de terminal para tareas de codigo y repositorios.',
     pricing: 'paid',
     integrationType: 'oauth',
+    authModes: ['oauth'],
     docsUrl: 'https://developers.openai.com/codex/cli',
-    supportsBaseUrl: false
+    supportsBaseUrl: false,
+    runtimeProvider: 'codex',
+    capabilities: [
+      'chat',
+      'streaming',
+      'tool-calling',
+      'shell',
+      'file-ops',
+      'git',
+      'background-tasks',
+      'reasoning-visibility',
+      'model-listing',
+      'quota'
+    ],
+    defaultModel: DEFAULT_CHAT_MODEL
   },
   {
     id: 'gemini-cli',
@@ -50,51 +100,110 @@ const supportedAiAgents = [
     description: 'Agente de terminal de Gemini con ejecucion de comandos y cambios en archivos.',
     pricing: 'freemium',
     integrationType: 'api_key',
+    authModes: ['api_key'],
     docsUrl: 'https://github.com/google-gemini/gemini-cli',
-    supportsBaseUrl: false
+    supportsBaseUrl: false,
+    runtimeProvider: 'gemini',
+    capabilities: [
+      'chat',
+      'streaming',
+      'shell',
+      'file-ops',
+      'git',
+      'background-tasks',
+      'reasoning-visibility',
+      'model-listing'
+    ],
+    defaultModel: DEFAULT_GEMINI_CHAT_MODEL
+  },
+  {
+    id: 'openrouter',
+    name: 'OpenRouter',
+    vendor: 'OpenRouter',
+    description: 'Gateway API multimodelo con free tier y streaming estilo chat completions.',
+    pricing: 'freemium',
+    integrationType: 'api_key',
+    authModes: ['api_key'],
+    docsUrl: 'https://openrouter.ai/docs',
+    supportsBaseUrl: true,
+    runtimeProvider: 'openrouter',
+    capabilities: ['chat', 'streaming', 'reasoning-visibility', 'model-listing', 'quota'],
+    defaultModel: DEFAULT_OPENROUTER_MODEL
+  },
+  {
+    id: 'ollama',
+    name: 'Ollama',
+    vendor: 'Ollama',
+    description: 'Modelos locales en Ubuntu con API HTTP y streaming sin coste por token.',
+    pricing: 'free',
+    integrationType: 'local_cli',
+    authModes: ['none'],
+    docsUrl: 'https://github.com/ollama/ollama/blob/main/docs/api.md',
+    supportsBaseUrl: true,
+    runtimeProvider: 'ollama',
+    capabilities: ['chat', 'streaming', 'reasoning-visibility', 'model-listing'],
+    defaultModel: DEFAULT_OLLAMA_MODEL
+  },
+  {
+    id: 'groq',
+    name: 'Groq',
+    vendor: 'Groq',
+    description: 'API de inferencia ultrarrápida con free tier real y streaming OpenAI-compatible.',
+    pricing: 'freemium',
+    integrationType: 'api_key',
+    authModes: ['api_key'],
+    docsUrl: 'https://console.groq.com/docs/overview',
+    supportsBaseUrl: true,
+    runtimeProvider: 'groq',
+    capabilities: ['chat', 'streaming', 'reasoning-visibility', 'model-listing'],
+    defaultModel: DEFAULT_GROQ_MODEL
+  },
+  {
+    id: 'lmstudio',
+    name: 'LM Studio',
+    vendor: 'LM Studio',
+    description: 'Servidor local OpenAI-compatible, gratuito y útil para flujos offline en Ubuntu.',
+    pricing: 'free',
+    integrationType: 'local_cli',
+    authModes: ['none'],
+    docsUrl: 'https://lmstudio.ai/docs/app/api/endpoints/openai',
+    supportsBaseUrl: true,
+    runtimeProvider: 'lmstudio',
+    capabilities: ['chat', 'streaming', 'reasoning-visibility', 'model-listing'],
+    defaultModel: DEFAULT_LMSTUDIO_MODEL
   }
 ];
-const supportedAiAgentsById = new Map(
-  supportedAiAgents.map((agent) => [agent.id, agent])
-);
-const aiProviderCapabilitiesById = {
-  'codex-cli': [
-    'chat',
-    'streaming',
-    'tool-calling',
-    'shell',
-    'file-ops',
-    'git',
-    'background-tasks',
-    'reasoning-visibility',
-    'model-listing',
-    'quota'
-  ],
-  'gemini-cli': [
-    'chat',
-    'streaming',
-    'shell',
-    'file-ops',
-    'git',
-    'background-tasks',
-    'reasoning-visibility',
-    'model-listing'
-  ]
-};
-const aiProviderAuthModesById = {
-  'codex-cli': ['oauth'],
-  'gemini-cli': ['api_key']
-};
+const supportedAiAgents = aiProviderDefinitions.map((provider) => ({
+  id: provider.id,
+  name: provider.name,
+  vendor: provider.vendor,
+  description: provider.description,
+  pricing: provider.pricing,
+  integrationType: provider.integrationType,
+  docsUrl: provider.docsUrl,
+  supportsBaseUrl: provider.supportsBaseUrl
+}));
+const supportedAiAgentsById = new Map(supportedAiAgents.map((agent) => [agent.id, agent]));
+const aiProviderDefinitionById = new Map(aiProviderDefinitions.map((provider) => [provider.id, provider]));
+const aiProviderCapabilitiesById = aiProviderDefinitions.reduce((acc, provider) => {
+  acc[provider.id] = Array.isArray(provider.capabilities) ? provider.capabilities.slice() : [];
+  return acc;
+}, {});
+const aiProviderAuthModesById = aiProviderDefinitions.reduce((acc, provider) => {
+  acc[provider.id] = Array.isArray(provider.authModes) ? provider.authModes.slice() : [provider.integrationType];
+  return acc;
+}, {});
 const aiPermissionToolCatalog = [
   'chat',
   'git',
   'storage',
+  'dropbox',
   'drive',
   'backups',
   'deployments',
   'shell'
 ];
-const aiPermissionDefaultAllowedTools = ['chat', 'git', 'storage', 'drive', 'backups', 'deployments', 'shell'];
+const aiPermissionDefaultAllowedTools = ['chat', 'git', 'storage', 'dropbox', 'backups', 'deployments', 'shell'];
 const aiProviderQuotaUnits = new Set(['requests', 'tokens', 'credits', 'usd']);
 const aiProviderPermissionProfileDefaults = Object.freeze({
   allowRoot: true,
@@ -138,30 +247,63 @@ const aiAgentTutorialsById = {
       'Gemini se ejecuta en modo agente con acceso a archivos y comandos de terminal.',
       'Para acceso total del sistema define GEMINI_INCLUDE_DIRECTORIES=/ (modo root del host).'
     ]
+  },
+  openrouter: {
+    title: 'Integracion OpenRouter',
+    steps: [
+      'Crea una API key en OpenRouter.',
+      'En CodexWeb > Settings > Integraciones IA > OpenRouter, activa la integracion.',
+      'Pega la API key y guarda.',
+      'Opcional: configura base URL si usas un gateway compatible.',
+      'Selecciona OpenRouter como agente activo y prueba el chat.'
+    ],
+    notes: [
+      'Se soporta streaming SSE y listado dinámico de modelos cuando la API key es válida.',
+      'La cuota se consulta en endpoint de créditos de OpenRouter cuando está disponible.'
+    ]
+  },
+  ollama: {
+    title: 'Integracion Ollama local',
+    steps: [
+      'Instala Ollama en Ubuntu y arranca el servicio.',
+      'Pulsa \"ollama pull <modelo>\" para descargar al menos un modelo.',
+      'En CodexWeb activa Ollama y, si hace falta, define base URL.',
+      'Selecciona Ollama como agente activo y prueba el chat.'
+    ],
+    notes: [
+      `Base URL por defecto: ${OLLAMA_DEFAULT_BASE_URL}.`,
+      'No requiere API key para instancia local.'
+    ]
+  },
+  groq: {
+    title: 'Integracion Groq',
+    steps: [
+      'Crea una API key en Groq Console.',
+      'En CodexWeb > Settings > Integraciones IA > Groq, activa la integración.',
+      'Pega la API key y guarda.',
+      'Opcional: configura base URL compatible OpenAI si usas gateway propio.',
+      'Selecciona Groq como agente activo y prueba chat con streaming.'
+    ],
+    notes: ['Incluye free tier. El listado de modelos se obtiene dinámicamente vía /models.']
+  },
+  lmstudio: {
+    title: 'Integracion LM Studio local',
+    steps: [
+      'Instala LM Studio en la máquina y habilita el servidor OpenAI-compatible.',
+      `Verifica endpoint local (por defecto ${LMSTUDIO_DEFAULT_BASE_URL}).`,
+      'En CodexWeb, activa LM Studio y define base URL si usas otro puerto.',
+      'Selecciona LM Studio como agente activo y prueba el chat.'
+    ],
+    notes: ['No requiere API key en entorno local por defecto.']
   }
 };
-const chatGptModelOptions = [
-  DEFAULT_CHAT_MODEL,
-  'gpt-5',
-  'gpt-5-mini',
-  'gpt-5-nano',
-  'gpt-4.1',
-  'gpt-4.1-mini',
-  'gpt-4.1-nano',
-  'gpt-4o',
-  'gpt-4o-mini',
-  'o3',
-  'o4-mini'
-];
-const geminiModelOptions = [
-  'gemini-2.5-flash',
-  'gemini-2.5-pro',
-  'gemini-2.0-flash'
-];
-const DEFAULT_GEMINI_CHAT_MODEL = geminiModelOptions[0];
 const chatReasoningEffortOptions = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 const allowedReasoningEfforts = new Set(chatReasoningEffortOptions);
-const supportedChatRuntimeAgentIds = new Set(['codex-cli', 'gemini-cli']);
+const supportedChatRuntimeAgentIds = new Set(
+  aiProviderDefinitions
+    .filter((provider) => Array.isArray(provider.capabilities) && provider.capabilities.includes('chat'))
+    .map((provider) => provider.id)
+);
 const geminiReasoningInstructionsByEffort = {
   minimal:
     'Responde de forma muy breve y directa. Evita exploraciones largas y ve al punto.',
@@ -222,6 +364,8 @@ const geminiIncludeDirectories = (() => {
   return parsed.filter((value, index, list) => list.indexOf(value) === index);
 })();
 const codexQuotaCacheTtlMs = 15000;
+const aiProviderModelCacheTtlMs = 1000 * 60;
+const aiProviderQuotaCacheTtlMs = 1000 * 60;
 const adminUsers = new Set(
   String(process.env.ADMIN_USERS || '')
     .split(',')
@@ -234,6 +378,8 @@ const pendingUploads = new Map();
 let restartScheduled = false;
 let restartState = null;
 const codexQuotaStateByUser = new Map();
+const aiProviderModelsCache = new Map();
+const aiProviderQuotaCache = new Map();
 const activeChatRuns = new Map();
 const activeCodexLoginFlows = new Map();
 let activeChatRunClientSeq = 0;
@@ -401,8 +547,7 @@ const storageBackupMaxSourceBytes = 8 * 1024 * 1024 * 1024;
 const storageBackupReserveBytes = 512 * 1024 * 1024;
 const storageUploadJobMaxFiles = 40;
 const storageJobLogMaxChars = 12000;
-const driveScopes = ['https://www.googleapis.com/auth/drive'];
-const driveOauthFallbackRedirectUri = 'urn:ietf:wg:oauth:2.0:oob';
+const dropboxOauthFallbackRedirectUri = 'http://localhost';
 const storageProtectedMutationRoots = new Set([
   '/',
   '/bin',
@@ -539,8 +684,8 @@ function normalizeDriveAuthMode(rawMode) {
   const value = String(rawMode || '')
     .trim()
     .toLowerCase();
-  if (value === 'oauth_client' || value === 'oauth') return 'oauth_client';
-  return 'service_account';
+  if (value === 'oauth_app' || value === 'oauth_client' || value === 'oauth') return 'oauth_app';
+  return 'token';
 }
 
 function normalizeDriveAccountStatus(rawStatus) {
@@ -567,7 +712,12 @@ function normalizeStorageJobType(rawType) {
   const value = String(rawType || '')
     .trim()
     .toLowerCase();
-  if (value === 'drive_upload_files' || value === 'deployed_backup_create' || value === 'deployed_backup_restore') {
+  if (
+    value === 'drive_upload_files' ||
+    value === 'dropbox_upload_files' ||
+    value === 'deployed_backup_create' ||
+    value === 'deployed_backup_restore'
+  ) {
     return value;
   }
   return '';
@@ -583,7 +733,7 @@ function sanitizeDriveAccountAlias(rawAlias) {
 }
 
 function buildDriveAccountId() {
-  return `drv_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;
+  return `dbx_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;
 }
 
 function buildStorageJobId(prefix = 'job') {
@@ -979,18 +1129,32 @@ function buildBackupFileName(appName, appId, createdAtIso) {
   return `${safeName}_${stamp}.tar.gz`;
 }
 
-function detectGoogleCredentialType(rawCredentials) {
-  const credentials = rawCredentials && typeof rawCredentials === 'object' ? rawCredentials : {};
-  if (String(credentials.type || '').trim() === 'service_account') {
-    return 'service_account';
+function parseIsoDateOrEmpty(rawValue) {
+  if (rawValue === null || rawValue === undefined) return '';
+  const numeric = Number(rawValue);
+  if (Number.isFinite(numeric)) {
+    const asMs = numeric > 9999999999 ? numeric : numeric * 1000;
+    const dt = new Date(asMs);
+    return Number.isFinite(dt.getTime()) ? dt.toISOString() : '';
   }
-  if (credentials.installed || credentials.web) {
-    return 'oauth_client';
+  const text = String(rawValue || '').trim();
+  if (!text) return '';
+  const parsed = Date.parse(text);
+  if (!Number.isFinite(parsed)) return '';
+  return new Date(parsed).toISOString();
+}
+
+function normalizeDropboxPath(rawValue, fallback = '') {
+  const input = String(rawValue || '').trim();
+  const value = input || String(fallback || '').trim();
+  if (!value) return '';
+  if (value === '/') return '';
+  let normalized = value.replace(/\\/g, '/').replace(/\/+/g, '/');
+  if (!normalized.startsWith('/')) normalized = `/${normalized}`;
+  if (normalized.length > 1 && normalized.endsWith('/')) {
+    normalized = normalized.slice(0, -1);
   }
-  if (credentials.client_id && credentials.client_secret) {
-    return 'oauth_client';
-  }
-  return '';
+  return normalized;
 }
 
 function normalizeDriveCredentialPayload(rawValue) {
@@ -1004,75 +1168,78 @@ function normalizeDriveCredentialPayload(rawValue) {
             return {};
           }
         })();
-  const credentialType = detectGoogleCredentialType(parsed);
-  if (!credentialType) {
+  const payload = parsed && typeof parsed === 'object' ? parsed : {};
+  const nested = payload.dropbox && typeof payload.dropbox === 'object' ? payload.dropbox : payload;
+
+  const accessToken = String(
+    nested.access_token || nested.accessToken || nested.token || nested.access || ''
+  ).trim();
+  const refreshToken = String(nested.refresh_token || nested.refreshToken || '').trim();
+  const appKey = String(nested.app_key || nested.appKey || nested.client_id || nested.clientId || '').trim();
+  const appSecret = String(
+    nested.app_secret || nested.appSecret || nested.client_secret || nested.clientSecret || ''
+  ).trim();
+  const expiresAt = parseIsoDateOrEmpty(nested.expires_at || nested.expiresAt || nested.expires);
+  const redirectUrisSource = Array.isArray(nested.redirect_uris)
+    ? nested.redirect_uris
+    : Array.isArray(nested.redirectUris)
+      ? nested.redirectUris
+      : [];
+  const redirectUris = redirectUrisSource
+    .map((entry) => String(entry || '').trim())
+    .filter(Boolean)
+    .slice(0, 8);
+
+  if (!accessToken && !(refreshToken && appKey && appSecret) && !(appKey && appSecret)) {
     throw createClientRequestError(
-      'JSON de credenciales no reconocido. Usa service account o OAuth client de Google.',
+      'Credenciales Dropbox inválidas. Usa access token o refresh_token + app_key + app_secret.',
       400
     );
   }
 
-  if (credentialType === 'service_account') {
-    const clientEmail = String(parsed.client_email || '').trim();
-    const privateKey = String(parsed.private_key || '').trim();
-    if (!clientEmail || !privateKey) {
-      throw createClientRequestError('Credenciales service account incompletas (client_email/private_key).', 400);
-    }
-    return {
-      credentialType,
-      authMode: 'service_account',
-      normalized: parsed,
-      details: {
-        credentialType,
-        projectId: String(parsed.project_id || '').trim(),
-        clientEmail
-      }
-    };
-  }
+  const authMode = accessToken || (refreshToken && appKey && appSecret) ? 'token' : 'oauth_app';
+  const normalized = {
+    provider: 'dropbox',
+    access_token: accessToken,
+    refresh_token: refreshToken,
+    app_key: appKey,
+    app_secret: appSecret,
+    expires_at: expiresAt,
+    redirect_uris: redirectUris.length > 0 ? redirectUris : [dropboxOauthFallbackRedirectUri],
+    root_path: normalizeDropboxPath(nested.root_path || nested.rootPath || '')
+  };
+  const tokenSeed = {};
+  if (accessToken) tokenSeed.access_token = accessToken;
+  if (refreshToken) tokenSeed.refresh_token = refreshToken;
+  if (expiresAt) tokenSeed.expires_at = expiresAt;
 
-  const oauthConfig = parsed.installed || parsed.web || parsed;
-  const clientId = String(oauthConfig.client_id || '').trim();
-  const clientSecret = String(oauthConfig.client_secret || '').trim();
-  const redirectUris = Array.isArray(oauthConfig.redirect_uris)
-    ? oauthConfig.redirect_uris.map((entry) => String(entry || '').trim()).filter(Boolean)
-    : [];
-  if (!clientId || !clientSecret) {
-    throw createClientRequestError('Credenciales OAuth incompletas (client_id/client_secret).', 400);
-  }
   return {
-    credentialType: 'oauth_client',
-    authMode: 'oauth_client',
-    normalized:
-      parsed.installed || parsed.web
-        ? parsed
-        : {
-            installed: {
-              client_id: clientId,
-              client_secret: clientSecret,
-              redirect_uris: redirectUris.length > 0 ? redirectUris : [driveOauthFallbackRedirectUri]
-            }
-          },
+    credentialType: authMode === 'oauth_app' ? 'dropbox_oauth_app' : 'dropbox_token',
+    authMode,
+    normalized,
+    tokenSeed,
     details: {
-      credentialType: 'oauth_client',
-      clientId,
-      redirectUris: redirectUris.length > 0 ? redirectUris : [driveOauthFallbackRedirectUri]
+      credentialType: authMode === 'oauth_app' ? 'dropbox_oauth_app' : 'dropbox_token',
+      clientId: appKey,
+      redirectUris: normalized.redirect_uris,
+      clientEmail: '',
+      projectId: ''
     }
   };
 }
 
 function extractDriveOauthClientConfig(credentialsObject, preferredRedirectUri = '') {
   const payload = credentialsObject && typeof credentialsObject === 'object' ? credentialsObject : {};
-  const oauthConfig = payload.installed || payload.web || payload;
-  const redirectUris = Array.isArray(oauthConfig.redirect_uris)
-    ? oauthConfig.redirect_uris.map((entry) => String(entry || '').trim()).filter(Boolean)
+  const redirectUris = Array.isArray(payload.redirect_uris)
+    ? payload.redirect_uris.map((entry) => String(entry || '').trim()).filter(Boolean)
     : [];
-  const fallbackRedirectUri = preferredRedirectUri && redirectUris.includes(preferredRedirectUri)
+  const redirectUri = preferredRedirectUri && redirectUris.includes(preferredRedirectUri)
     ? preferredRedirectUri
-    : redirectUris[0] || driveOauthFallbackRedirectUri;
+    : redirectUris[0] || dropboxOauthFallbackRedirectUri;
   return {
-    clientId: String(oauthConfig.client_id || '').trim(),
-    clientSecret: String(oauthConfig.client_secret || '').trim(),
-    redirectUri: fallbackRedirectUri,
+    clientId: String(payload.app_key || '').trim(),
+    clientSecret: String(payload.app_secret || '').trim(),
+    redirectUri,
     redirectUris
   };
 }
@@ -3746,11 +3913,13 @@ function resumePendingDeployedDescriptionJobs() {
 function serializeDriveAccountRow(row) {
   if (!row || typeof row !== 'object') return null;
   const details = safeParseJsonObject(row.details_json);
+  const rootFolderRaw = String(row.root_folder_id || '').trim();
+  const normalizedRoot = normalizeDropboxPath(rootFolderRaw === 'root' ? '' : rootFolderRaw);
   return {
     id: String(row.id || '').trim(),
     alias: String(row.alias || '').trim(),
     authMode: normalizeDriveAuthMode(row.auth_mode),
-    rootFolderId: String(row.root_folder_id || 'root').trim() || 'root',
+    rootFolderId: normalizedRoot || '/',
     status: normalizeDriveAccountStatus(row.status),
     lastError: String(row.last_error || '').trim(),
     details: {
@@ -3808,104 +3977,248 @@ function buildOAuth2ClientFromDriveAccount(row, credentials, preferredRedirectUr
   if (!oauthConfig.clientId || !oauthConfig.clientSecret) {
     throw new Error('oauth_client_credentials_incomplete');
   }
-  const oauthClient = new google.auth.OAuth2(
-    oauthConfig.clientId,
-    oauthConfig.clientSecret,
-    oauthConfig.redirectUri || driveOauthFallbackRedirectUri
-  );
-  oauthClient.on('tokens', (tokens) => {
-    const current = parseDriveAccountTokens(row);
-    const merged = {
-      ...current,
-      ...(tokens && typeof tokens === 'object' ? tokens : {})
-    };
-    if (!merged.refresh_token && current.refresh_token) {
-      merged.refresh_token = current.refresh_token;
+  const oauthClient = {
+    generateAuthUrl() {
+      const params = new URLSearchParams();
+      params.set('client_id', oauthConfig.clientId);
+      params.set('response_type', 'code');
+      params.set('token_access_type', 'offline');
+      params.set('redirect_uri', oauthConfig.redirectUri || dropboxOauthFallbackRedirectUri);
+      return `${DROPBOX_OAUTH_AUTHORIZE_URL}?${params.toString()}`;
+    },
+    async getToken(code) {
+      const params = new URLSearchParams();
+      params.set('grant_type', 'authorization_code');
+      params.set('code', String(code || '').trim());
+      params.set('client_id', oauthConfig.clientId);
+      params.set('client_secret', oauthConfig.clientSecret);
+      params.set('redirect_uri', oauthConfig.redirectUri || dropboxOauthFallbackRedirectUri);
+      const response = await fetch(DROPBOX_OAUTH_TOKEN_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: params.toString()
+      });
+      const bodyText = String(await response.text()).trim();
+      let parsed = {};
+      try {
+        parsed = bodyText ? JSON.parse(bodyText) : {};
+      } catch (_error) {
+        parsed = {};
+      }
+      if (!response.ok) {
+        const reason = truncateForNotify(
+          (parsed && (parsed.error_description || parsed.error_summary || parsed.error)) || bodyText || 'dropbox_oauth_exchange_failed',
+          220
+        );
+        throw createClientRequestError(`Dropbox OAuth failed: ${reason}`, 400);
+      }
+      return { tokens: parsed };
     }
-    upsertDriveAccountTokenCipher(row, merged);
-  });
+  };
   return {
     oauthClient,
     oauthConfig
   };
 }
 
+function resolveDropboxEffectiveFolderPath(rootFolderId, requestedFolderId = '') {
+  const normalizedRoot = normalizeDropboxPath(String(rootFolderId || '').trim() === 'root' ? '' : rootFolderId);
+  const normalizedRequested = normalizeDropboxPath(String(requestedFolderId || '').trim());
+  if (!normalizedRequested) return normalizedRoot;
+  if (!normalizedRoot) return normalizedRequested;
+  return normalizeDropboxPath(`${normalizedRoot}/${normalizedRequested}`);
+}
+
+function buildDropboxPathFromParentAndName(parentPath, fileName) {
+  const safeParent = normalizeDropboxPath(parentPath);
+  const safeName = sanitizeDriveFileName(fileName || '', 'archivo');
+  if (!safeParent) return `/${safeName}`;
+  return `${safeParent}/${safeName}`;
+}
+
+function isDropboxTokenFresh(tokenPayload) {
+  const tokens = tokenPayload && typeof tokenPayload === 'object' ? tokenPayload : {};
+  const accessToken = String(tokens.access_token || '').trim();
+  if (!accessToken) return false;
+  const expiresAtRaw = String(tokens.expires_at || '').trim();
+  if (!expiresAtRaw) return true;
+  const expiresMs = Date.parse(expiresAtRaw);
+  if (!Number.isFinite(expiresMs)) return true;
+  return expiresMs - Date.now() > 60 * 1000;
+}
+
+async function refreshDropboxAccessTokenIfNeeded(row, credentials, currentTokens = {}) {
+  const tokens = currentTokens && typeof currentTokens === 'object' ? { ...currentTokens } : {};
+  if (isDropboxTokenFresh(tokens)) {
+    return tokens;
+  }
+  const refreshToken =
+    String(tokens.refresh_token || '').trim() || String(credentials.refresh_token || '').trim();
+  const appKey = String(credentials.app_key || '').trim();
+  const appSecret = String(credentials.app_secret || '').trim();
+  if (!refreshToken || !appKey || !appSecret) {
+    return tokens;
+  }
+  const params = new URLSearchParams();
+  params.set('grant_type', 'refresh_token');
+  params.set('refresh_token', refreshToken);
+  params.set('client_id', appKey);
+  params.set('client_secret', appSecret);
+  const response = await fetch(DROPBOX_OAUTH_TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: params.toString()
+  });
+  const bodyText = String(await response.text()).trim();
+  let parsed = {};
+  try {
+    parsed = bodyText ? JSON.parse(bodyText) : {};
+  } catch (_error) {
+    parsed = {};
+  }
+  if (!response.ok) {
+    const reason = truncateForNotify(
+      (parsed && (parsed.error_description || parsed.error_summary || parsed.error)) || bodyText || 'dropbox_refresh_failed',
+      220
+    );
+    throw createClientRequestError(`No se pudo refrescar token de Dropbox: ${reason}`, 401);
+  }
+  const expiresIn = Number(parsed && (parsed.expires_in || parsed.expiresIn));
+  const expiresAt = Number.isFinite(expiresIn) ? new Date(Date.now() + expiresIn * 1000).toISOString() : '';
+  const merged = {
+    ...tokens,
+    ...(parsed && typeof parsed === 'object' ? parsed : {})
+  };
+  merged.refresh_token = refreshToken;
+  if (expiresAt) {
+    merged.expires_at = expiresAt;
+  }
+  upsertDriveAccountTokenCipher(row, merged);
+  return merged;
+}
+
+async function dropboxApiRequest(accessToken, endpoint, body = {}, options = {}) {
+  const safeToken = String(accessToken || '').trim();
+  if (!safeToken) {
+    throw createClientRequestError('Cuenta de Dropbox sin access token válido.', 401);
+  }
+  const response = await fetch(`${DROPBOX_API_BASE_URL}${endpoint}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${safeToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body && typeof body === 'object' ? body : {})
+  });
+  const bodyText = String(await response.text()).trim();
+  let parsed = {};
+  try {
+    parsed = bodyText ? JSON.parse(bodyText) : {};
+  } catch (_error) {
+    parsed = {};
+  }
+  if (!response.ok) {
+    const reason = truncateForNotify(
+      (parsed && (parsed.error_summary || parsed.error_description || parsed.error)) || bodyText || options.fallbackError || 'dropbox_api_failed',
+      260
+    );
+    throw createClientRequestError(`Dropbox API error: ${reason}`, response.status >= 400 ? response.status : 500);
+  }
+  return parsed;
+}
+
 async function getDriveContextForUser(userId, accountId, options = {}) {
   const safeUserId = getSafeUserId(userId);
   const safeAccountId = String(accountId || '').trim();
   if (!safeUserId || !safeAccountId) {
-    throw createClientRequestError('Cuenta de Drive inválida', 400);
+    throw createClientRequestError('Cuenta de Dropbox inválida', 400);
   }
   const row = getDriveAccountByIdForUserStmt.get(safeAccountId, safeUserId);
   if (!row) {
-    throw createClientRequestError('Cuenta de Drive no encontrada', 404);
+    throw createClientRequestError('Cuenta de Dropbox no encontrada', 404);
   }
   const serialized = serializeDriveAccountRow(row);
   const credentials = parseDriveAccountCredentials(row);
   const authMode = normalizeDriveAuthMode(row.auth_mode);
   const allowNeedsOauth = Boolean(options.allowNeedsOauth);
   const preferredRedirectUri = String(options.redirectUri || '').trim();
+  const oauthConfig = extractDriveOauthClientConfig(credentials, preferredRedirectUri);
 
-  if (authMode === 'service_account') {
-    const clientEmail = String(credentials.client_email || '').trim();
-    const privateKey = String(credentials.private_key || '').trim();
-    if (!clientEmail || !privateKey) {
-      throw createClientRequestError('Credenciales service account incompletas', 400);
-    }
-    const jwt = new google.auth.JWT({
-      email: clientEmail,
-      key: privateKey,
-      scopes: driveScopes
-    });
-    const drive = google.drive({ version: 'v3', auth: jwt });
-    return {
-      row,
-      account: serialized,
-      authMode,
-      credentials,
-      authClient: jwt,
-      drive
-    };
+  const tokens = {
+    ...parseDriveAccountTokens(row)
+  };
+  if (!tokens.access_token && credentials.access_token) {
+    tokens.access_token = String(credentials.access_token || '').trim();
   }
-
-  const { oauthClient, oauthConfig } = buildOAuth2ClientFromDriveAccount(row, credentials, preferredRedirectUri);
-  const tokens = parseDriveAccountTokens(row);
-  const hasRefreshToken = Boolean(tokens && tokens.refresh_token);
-  if (!hasRefreshToken && !allowNeedsOauth) {
-    throw createClientRequestError('Esta cuenta OAuth aún no está autorizada. Completa el flujo OAuth.', 409);
+  if (!tokens.refresh_token && credentials.refresh_token) {
+    tokens.refresh_token = String(credentials.refresh_token || '').trim();
   }
-  oauthClient.setCredentials(tokens);
-  const drive = google.drive({ version: 'v3', auth: oauthClient });
+  if (!tokens.expires_at && credentials.expires_at) {
+    tokens.expires_at = String(credentials.expires_at || '').trim();
+  }
+  let resolvedTokens = tokens;
+  try {
+    resolvedTokens = await refreshDropboxAccessTokenIfNeeded(row, credentials, tokens);
+  } catch (error) {
+    if (!allowNeedsOauth) throw error;
+  }
+  const accessToken = String(resolvedTokens && resolvedTokens.access_token ? resolvedTokens.access_token : '').trim();
+  if (!accessToken && !allowNeedsOauth) {
+    throw createClientRequestError('Esta cuenta de Dropbox aún no está autorizada. Completa OAuth o agrega token.', 409);
+  }
   return {
     row,
     account: serialized,
     authMode,
     credentials,
     oauthConfig,
-    authClient: oauthClient,
-    drive
+    tokens: resolvedTokens,
+    accessToken
   };
 }
 
 async function validateDriveAccountByIdForUser(userId, accountId) {
   const context = await getDriveContextForUser(userId, accountId, { allowNeedsOauth: false });
-  const about = await context.drive.about.get({
-    fields: 'user(displayName,emailAddress),storageQuota(limit,usage,usageInDrive)'
-  });
-  const user = about && about.data && about.data.user ? about.data.user : {};
-  const quota = about && about.data && about.data.storageQuota ? about.data.storageQuota : {};
+  const accountInfo = await dropboxApiRequest(
+    context.accessToken,
+    '/users/get_current_account',
+    {},
+    { fallbackError: 'dropbox_account_fetch_failed' }
+  );
+  const spaceInfo = await dropboxApiRequest(
+    context.accessToken,
+    '/users/get_space_usage',
+    {},
+    { fallbackError: 'dropbox_space_usage_failed' }
+  );
+  const quotaAlloc = spaceInfo && spaceInfo.allocation && typeof spaceInfo.allocation === 'object'
+    ? spaceInfo.allocation
+    : {};
+  const allocatedRaw =
+    quotaAlloc &&
+    quotaAlloc.allocated &&
+    Number.isFinite(Number(quotaAlloc.allocated))
+      ? Number(quotaAlloc.allocated)
+      : null;
+  const usedRaw = Number.isFinite(Number(spaceInfo && spaceInfo.used)) ? Number(spaceInfo.used) : null;
   const details = safeParseJsonObject(context.row.details_json);
   details.validatedAt = nowIso();
-  details.accountEmail = String(user.emailAddress || '').trim();
-  details.accountDisplayName = String(user.displayName || '').trim();
+  details.accountEmail = String(accountInfo.email || '').trim();
+  details.accountDisplayName = String(
+    (accountInfo.name && (accountInfo.name.display_name || accountInfo.name.familiar_name)) || ''
+  ).trim();
   details.storageQuota = {
-    limit: String(quota.limit || '').trim(),
-    usage: String(quota.usage || '').trim(),
-    usageInDrive: String(quota.usageInDrive || '').trim()
+    limit: allocatedRaw !== null ? String(allocatedRaw) : '',
+    usage: usedRaw !== null ? String(usedRaw) : '',
+    usageInDrive: usedRaw !== null ? String(usedRaw) : ''
   };
   updateDriveAccountMetaStmt.run(
     String(context.row.alias || '').trim(),
-    String(context.row.root_folder_id || 'root').trim() || 'root',
+    normalizeDropboxPath(String(context.row.root_folder_id || '').trim() === 'root' ? '' : context.row.root_folder_id),
     'active',
     '',
     JSON.stringify(details),
@@ -3916,59 +4229,50 @@ async function validateDriveAccountByIdForUser(userId, accountId) {
   return {
     account: serializeDriveAccountRow(getDriveAccountByIdForUserStmt.get(String(context.row.id), getSafeUserId(userId))),
     about: {
-      email: String(user.emailAddress || '').trim(),
-      displayName: String(user.displayName || '').trim(),
+      email: String(accountInfo.email || '').trim(),
+      displayName: String(
+        (accountInfo.name && (accountInfo.name.display_name || accountInfo.name.familiar_name)) || ''
+      ).trim(),
       quota: {
-        limit: Number.isFinite(Number(quota.limit)) ? Number(quota.limit) : null,
-        usage: Number.isFinite(Number(quota.usage)) ? Number(quota.usage) : null,
-        usageInDrive: Number.isFinite(Number(quota.usageInDrive)) ? Number(quota.usageInDrive) : null
+        limit: allocatedRaw,
+        usage: usedRaw,
+        usageInDrive: usedRaw
       }
     }
   };
 }
 
-async function ensureDriveFolder(drive, parentId, folderName) {
-  const safeParent = String(parentId || 'root').trim() || 'root';
+async function ensureDriveFolder(context, parentId, folderName) {
   const safeName = sanitizeDriveFileName(folderName, 'CodexWeb');
-  const query = [
-    `'${sanitizeDriveQueryLiteral(safeParent)}' in parents`,
-    `name = '${sanitizeDriveQueryLiteral(safeName)}'`,
-    "mimeType = 'application/vnd.google-apps.folder'",
-    'trashed = false'
-  ].join(' and ');
-  const found = await drive.files.list({
-    q: query,
-    pageSize: 1,
-    fields: 'files(id,name)'
-  });
-  const existing = Array.isArray(found.data && found.data.files) ? found.data.files[0] : null;
-  if (existing && existing.id) return String(existing.id);
-
-  const created = await drive.files.create({
-    requestBody: {
-      name: safeName,
-      mimeType: 'application/vnd.google-apps.folder',
-      parents: [safeParent]
+  const parentPath = normalizeDropboxPath(parentId);
+  const childPath = buildDropboxPathFromParentAndName(parentPath, safeName);
+  await dropboxApiRequest(
+    context.accessToken,
+    '/files/create_folder_v2',
+    {
+      path: childPath,
+      autorename: false
     },
-    fields: 'id,name'
+    { fallbackError: 'dropbox_create_folder_failed' }
+  ).catch((error) => {
+    const msg = String(error && error.message ? error.message : '');
+    if (!/path\/conflict|already exists/i.test(msg)) {
+      throw error;
+    }
   });
-  return String(created && created.data && created.data.id ? created.data.id : '');
+  return childPath;
 }
 
 async function ensureDriveBackupFolder(context, appId) {
-  const rootFolderId = String(context.row.root_folder_id || 'root').trim() || 'root';
-  const codexFolderId = await ensureDriveFolder(context.drive, rootFolderId, 'CodexWebBackups');
-  if (!codexFolderId) {
-    throw new Error('drive_backup_root_folder_failed');
-  }
+  const rootPath = normalizeDropboxPath(
+    String(context.row.root_folder_id || '').trim() === 'root' ? '' : context.row.root_folder_id
+  );
+  const codexFolderPath = await ensureDriveFolder(context, rootPath, 'CodexWebBackups');
   const appFolderName = sanitizeDriveFileName(`app_${String(appId || '').slice(0, 80)}`, 'app');
-  const appFolderId = await ensureDriveFolder(context.drive, codexFolderId, appFolderName);
-  if (!appFolderId) {
-    throw new Error('drive_backup_app_folder_failed');
-  }
+  const appFolderPath = await ensureDriveFolder(context, codexFolderPath, appFolderName);
   return {
-    codexFolderId,
-    appFolderId
+    codexFolderId: codexFolderPath,
+    appFolderId: appFolderPath
   };
 }
 
@@ -4076,43 +4380,112 @@ function createStorageJob(userId, jobType, payload) {
 
 async function listDriveFilesForAccount(userId, accountId, options = {}) {
   const context = await getDriveContextForUser(userId, accountId, { allowNeedsOauth: false });
-  const folderId = String(options.folderId || context.row.root_folder_id || 'root').trim() || 'root';
+  const folderId = resolveDropboxEffectiveFolderPath(
+    String(context.row.root_folder_id || '').trim(),
+    String(options.folderId || '').trim()
+  );
   const pageSizeRaw = Number.parseInt(String(options.pageSize || ''), 10);
   const pageSize = Number.isInteger(pageSizeRaw) ? Math.min(Math.max(pageSizeRaw, 1), 200) : 80;
   const pageToken = String(options.pageToken || '').trim();
   const queryText = String(options.query || '').trim();
-  const qParts = [`'${sanitizeDriveQueryLiteral(folderId)}' in parents`, 'trashed = false'];
-  if (queryText) {
-    qParts.push(`name contains '${sanitizeDriveQueryLiteral(queryText)}'`);
+  let payload = null;
+  try {
+    if (pageToken) {
+      payload = await dropboxApiRequest(
+        context.accessToken,
+        '/files/list_folder/continue',
+        { cursor: pageToken },
+        { fallbackError: 'dropbox_list_folder_continue_failed' }
+      );
+    } else {
+      payload = await dropboxApiRequest(
+        context.accessToken,
+        '/files/list_folder',
+        {
+          path: folderId || '',
+          recursive: false,
+          include_deleted: false,
+          include_media_info: false,
+          include_non_downloadable_files: true,
+          limit: pageSize
+        },
+        { fallbackError: 'dropbox_list_folder_failed' }
+      );
+    }
+  } catch (error) {
+    const msg = String(error && error.message ? error.message : '');
+    if (/path\/not_found/i.test(msg)) {
+      return {
+        account: context.account,
+        folderId: folderId || '/',
+        nextPageToken: '',
+        files: []
+      };
+    }
+    throw error;
   }
-  const result = await context.drive.files.list({
-    q: qParts.join(' and '),
-    pageSize,
-    pageToken: pageToken || undefined,
-    fields: 'nextPageToken, files(id,name,mimeType,size,createdTime,modifiedTime,parents,appProperties)'
-  });
-  const files = Array.isArray(result.data && result.data.files)
-    ? result.data.files.map((file) => ({
-        id: String(file && file.id ? file.id : '').trim(),
-        name: String(file && file.name ? file.name : '').trim(),
-        mimeType: String(file && file.mimeType ? file.mimeType : '').trim(),
-        sizeBytes: Number.isFinite(Number(file && file.size)) ? Number(file.size) : null,
-        createdAt: String(file && file.createdTime ? file.createdTime : '').trim(),
-        modifiedAt: String(file && file.modifiedTime ? file.modifiedTime : '').trim(),
-        parents: Array.isArray(file && file.parents)
-          ? file.parents.map((entry) => String(entry || '').trim()).filter(Boolean)
-          : [],
-        appProperties: file && file.appProperties && typeof file.appProperties === 'object'
-          ? file.appProperties
-          : {}
-      }))
-    : [];
+  const entries = Array.isArray(payload && payload.entries) ? payload.entries : [];
+  const files = entries
+    .filter((entry) => entry && typeof entry === 'object')
+    .filter((entry) => {
+      if (!queryText) return true;
+      return String(entry.name || '').toLowerCase().includes(queryText.toLowerCase());
+    })
+    .map((entry) => {
+      const tag = String(entry['.tag'] || '').trim().toLowerCase();
+      const pathDisplay = String(entry.path_display || '').trim();
+      const pathLower = String(entry.path_lower || '').trim();
+      const id = pathLower || String(entry.id || '').trim();
+      const parentPath = pathDisplay ? normalizeDropboxPath(path.posix.dirname(pathDisplay)) : folderId;
+      return {
+        id,
+        name: String(entry.name || '').trim(),
+        mimeType:
+          tag === 'folder'
+            ? 'application/vnd.dropbox.folder'
+            : inferMimeTypeFromFilename(String(entry.name || '').trim()),
+        sizeBytes: Number.isFinite(Number(entry.size)) ? Number(entry.size) : null,
+        createdAt: String(entry.client_modified || entry.server_modified || '').trim(),
+        modifiedAt: String(entry.server_modified || entry.client_modified || '').trim(),
+        parents: parentPath ? [parentPath] : [],
+        appProperties: {
+          dropboxTag: tag,
+          dropboxId: String(entry.id || '').trim(),
+          pathDisplay,
+          pathLower
+        }
+      };
+    });
   return {
     account: context.account,
-    folderId,
-    nextPageToken: String(result.data && result.data.nextPageToken ? result.data.nextPageToken : '').trim(),
+    folderId: folderId || '/',
+    nextPageToken:
+      payload && payload.has_more && payload.cursor ? String(payload.cursor).trim() : '',
     files
   };
+}
+
+async function resolveDropboxPathFromIdentifier(context, fileId) {
+  const identifier = String(fileId || '').trim();
+  if (!identifier) {
+    throw createClientRequestError('fileId inválido', 400);
+  }
+  if (identifier.startsWith('/')) {
+    return normalizeDropboxPath(identifier);
+  }
+  if (identifier.startsWith('id:')) {
+    const metadata = await dropboxApiRequest(
+      context.accessToken,
+      '/files/get_metadata',
+      {
+        path: identifier,
+        include_deleted: false
+      },
+      { fallbackError: 'dropbox_metadata_failed' }
+    );
+    return normalizeDropboxPath(metadata.path_lower || metadata.path_display || identifier);
+  }
+  return normalizeDropboxPath(identifier);
 }
 
 async function deleteDriveFileForAccount(userId, accountId, fileId) {
@@ -4121,21 +4494,32 @@ async function deleteDriveFileForAccount(userId, accountId, fileId) {
   if (!safeFileId) {
     throw createClientRequestError('fileId inválido', 400);
   }
-  await context.drive.files.delete({ fileId: safeFileId });
+  const dropboxPath = await resolveDropboxPathFromIdentifier(context, safeFileId);
+  await dropboxApiRequest(
+    context.accessToken,
+    '/files/delete_v2',
+    { path: dropboxPath },
+    { fallbackError: 'dropbox_delete_failed' }
+  );
   markDeployedCloudBackupDeletedByDriveFileStmt.run(nowIso(), getSafeUserId(userId), String(accountId), safeFileId);
+  if (dropboxPath !== safeFileId) {
+    markDeployedCloudBackupDeletedByDriveFileStmt.run(
+      nowIso(),
+      getSafeUserId(userId),
+      String(accountId),
+      dropboxPath
+    );
+  }
   return {
     deleted: true,
-    fileId: safeFileId,
+    fileId: dropboxPath,
     account: context.account
   };
 }
 
 function buildAppBackupQuery(appId) {
-  return [
-    "trashed = false",
-    "appProperties has { key='codexwebType' and value='app-backup' }",
-    `appProperties has { key='appId' and value='${sanitizeDriveQueryLiteral(appId)}' }`
-  ].join(' and ');
+  const safeAppId = String(appId || '').trim().slice(0, 80);
+  return sanitizeDriveFileName(`app_${safeAppId}`, 'app');
 }
 
 async function listAppBackupsInDriveForAccount(userId, appId, accountId) {
@@ -4144,28 +4528,81 @@ async function listAppBackupsInDriveForAccount(userId, appId, accountId) {
     throw createClientRequestError('appId inválido', 400);
   }
   const context = await getDriveContextForUser(userId, accountId, { allowNeedsOauth: false });
-  const result = await context.drive.files.list({
-    q: buildAppBackupQuery(safeAppId),
-    pageSize: 120,
-    fields: 'files(id,name,size,createdTime,modifiedTime,appProperties,parents)'
-  });
-  const files = Array.isArray(result.data && result.data.files) ? result.data.files : [];
-  return files.map((file) => {
-    const appProperties = file && file.appProperties && typeof file.appProperties === 'object' ? file.appProperties : {};
-    return {
-      id: `drvbackup_${String(context.account.id)}_${String(file && file.id ? file.id : '')}`,
-      appId: safeAppId,
-      driveFileId: String(file && file.id ? file.id : '').trim(),
-      accountId: String(context.account.id),
-      accountAlias: String(context.account.alias || context.account.id),
-      name: String(file && file.name ? file.name : '').trim(),
-      targetPath: String(appProperties.targetPath || '').trim(),
-      sizeBytes: Number.isFinite(Number(file && file.size)) ? Number(file.size) : null,
-      createdAt: String(file && file.createdTime ? file.createdTime : '').trim(),
-      modifiedAt: String(file && file.modifiedTime ? file.modifiedTime : '').trim(),
-      appProperties
-    };
-  });
+  const rootPath = normalizeDropboxPath(
+    String(context.row.root_folder_id || '').trim() === 'root' ? '' : context.row.root_folder_id
+  );
+  const backupFolder = normalizeDropboxPath(`${rootPath || ''}/CodexWebBackups/${buildAppBackupQuery(safeAppId)}`);
+  const cachedRows = listDeployedCloudBackupsForUserAndAppStmt.all(getSafeUserId(userId), safeAppId, 200);
+  const cacheByFileId = new Map(
+    cachedRows.map((entry) => [String(entry && entry.drive_file_id ? entry.drive_file_id : '').trim(), entry])
+  );
+  const entries = [];
+  let cursor = '';
+  let keepFetching = true;
+  while (keepFetching && entries.length < 240) {
+    let payload = null;
+    try {
+      payload = cursor
+        ? await dropboxApiRequest(
+            context.accessToken,
+            '/files/list_folder/continue',
+            { cursor },
+            { fallbackError: 'dropbox_backups_list_continue_failed' }
+          )
+        : await dropboxApiRequest(
+            context.accessToken,
+            '/files/list_folder',
+            {
+              path: backupFolder || '',
+              recursive: false,
+              include_deleted: false,
+              include_media_info: false,
+              limit: 120
+            },
+            { fallbackError: 'dropbox_backups_list_failed' }
+          );
+    } catch (error) {
+      const msg = String(error && error.message ? error.message : '');
+      if (/path\/not_found/i.test(msg)) {
+        break;
+      }
+      throw error;
+    }
+    const pageEntries = Array.isArray(payload && payload.entries) ? payload.entries : [];
+    pageEntries.forEach((entry) => entries.push(entry));
+    cursor = payload && payload.has_more ? String(payload.cursor || '').trim() : '';
+    keepFetching = Boolean(cursor);
+  }
+  return entries
+    .filter((entry) => String(entry && entry['.tag'] ? entry['.tag'] : '').trim().toLowerCase() === 'file')
+    .map((file) => {
+      const fileIdentifier = String(file.path_lower || file.id || '').trim();
+      const cached = cacheByFileId.get(fileIdentifier) || null;
+      const metadata = cached ? safeParseJsonObject(cached.metadata_json) : {};
+      const appProperties = metadata && typeof metadata === 'object' ? metadata : {};
+      const targetPath = cached ? String(cached.target_path || '').trim() : String(appProperties.targetPath || '').trim();
+      const createdAt = String(file.client_modified || file.server_modified || '').trim();
+      const modifiedAt = String(file.server_modified || file.client_modified || '').trim();
+      const sizeBytes = Number.isFinite(Number(file.size))
+        ? Number(file.size)
+        : cached && Number.isFinite(Number(cached.size_bytes))
+          ? Number(cached.size_bytes)
+          : null;
+      const stableId = `drvbackup_${String(context.account.id)}_${Buffer.from(fileIdentifier || String(file.name || ''), 'utf8').toString('hex').slice(0, 48)}`;
+      return {
+        id: stableId,
+        appId: safeAppId,
+        driveFileId: fileIdentifier,
+        accountId: String(context.account.id),
+        accountAlias: String(context.account.alias || context.account.id),
+        name: String(file && file.name ? file.name : '').trim(),
+        targetPath,
+        sizeBytes,
+        createdAt,
+        modifiedAt,
+        appProperties
+      };
+    });
 }
 
 async function listAppBackupsFromDrive(userId, appId, accountId = '') {
@@ -4288,7 +4725,7 @@ function extractTarGzArchive(archivePath, targetPath) {
 async function uploadFileToDrive(context, payload) {
   const localPath = normalizeAbsoluteStoragePath(payload.localPath);
   if (!localPath) {
-    throw createClientRequestError('Ruta local inválida para subir a Drive', 400);
+    throw createClientRequestError('Ruta local inválida para subir a Dropbox', 400);
   }
   let stats = null;
   try {
@@ -4299,33 +4736,56 @@ async function uploadFileToDrive(context, payload) {
   if (!stats || !stats.isFile()) {
     throw createClientRequestError('Solo se pueden subir archivos existentes', 400);
   }
-  const parentId = String(payload.parentId || context.row.root_folder_id || 'root').trim() || 'root';
+  const parentId = resolveDropboxEffectiveFolderPath(
+    String(context.row.root_folder_id || '').trim(),
+    String(payload.parentId || '').trim()
+  );
   const driveName = sanitizeDriveFileName(payload.fileName || path.basename(localPath), path.basename(localPath));
   const mediaType = inferMimeTypeFromFilename(driveName);
+  const dropboxPath = buildDropboxPathFromParentAndName(parentId, driveName);
   const requestBody = {
-    name: driveName,
-    parents: [parentId]
+    path: dropboxPath,
+    mode: 'add',
+    autorename: true,
+    mute: false,
+    strict_conflict: false
   };
-  if (payload.appProperties && typeof payload.appProperties === 'object') {
-    requestBody.appProperties = payload.appProperties;
-  }
-  const response = await context.drive.files.create({
-    requestBody,
-    media: {
-      mimeType: mediaType,
-      body: fs.createReadStream(localPath)
+  const response = await fetch(`${DROPBOX_CONTENT_BASE_URL}/files/upload`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${String(context.accessToken || '').trim()}`,
+      'Content-Type': 'application/octet-stream',
+      'Dropbox-API-Arg': JSON.stringify(requestBody)
     },
-    fields: 'id,name,size,mimeType,createdTime,parents,appProperties'
+    body: fs.createReadStream(localPath),
+    duplex: 'half'
   });
-  const file = response && response.data ? response.data : {};
+  const bodyText = String(await response.text()).trim();
+  let file = {};
+  try {
+    file = bodyText ? JSON.parse(bodyText) : {};
+  } catch (_error) {
+    file = {};
+  }
+  if (!response.ok) {
+    const reason = truncateForNotify(
+      (file && (file.error_summary || file.error_description || file.error)) || bodyText || 'dropbox_upload_failed',
+      220
+    );
+    throw createClientRequestError(`Error subiendo a Dropbox: ${reason}`, response.status >= 400 ? response.status : 500);
+  }
+  const fileIdentifier = String(file.path_lower || file.id || dropboxPath).trim();
   return {
-    id: String(file.id || '').trim(),
+    id: fileIdentifier,
     name: String(file.name || driveName).trim(),
     sizeBytes: Number.isFinite(Number(file.size)) ? Number(file.size) : Number(stats.size || 0),
-    mimeType: String(file.mimeType || mediaType).trim(),
-    createdAt: String(file.createdTime || nowIso()).trim(),
-    parents: Array.isArray(file.parents) ? file.parents.map((entry) => String(entry || '').trim()).filter(Boolean) : [],
-    appProperties: file && file.appProperties && typeof file.appProperties === 'object' ? file.appProperties : {},
+    mimeType: mediaType,
+    createdAt: String(file.client_modified || file.server_modified || nowIso()).trim(),
+    parents: parentId ? [parentId] : [],
+    appProperties:
+      payload && payload.appProperties && typeof payload.appProperties === 'object'
+        ? payload.appProperties
+        : {},
     localPath
   };
 }
@@ -4342,7 +4802,11 @@ async function handleDriveUploadFilesJob(row) {
   const context = await getDriveContextForUser(safeUserId, accountId, { allowNeedsOauth: false });
   const uploaded = [];
   const failed = [];
-  setStorageJobProgress(row.id, { total: localPaths.length, done: 0, failed: 0, stage: 'uploading' }, 'Subida a Drive iniciada');
+  setStorageJobProgress(
+    row.id,
+    { total: localPaths.length, done: 0, failed: 0, stage: 'uploading' },
+    'Subida a Dropbox iniciada'
+  );
   for (let index = 0; index < localPaths.length; index += 1) {
     const localPath = localPaths[index];
     try {
@@ -4417,7 +4881,7 @@ async function handleDeployedBackupCreateJob(row) {
     Number(estimatedSourceBytes) + storageBackupReserveBytes >= Number(availableBytes)
   ) {
     throw createClientRequestError(
-      'No hay espacio temporal suficiente para generar el backup local antes de subirlo a Drive.',
+      'No hay espacio temporal suficiente para generar el backup local antes de subirlo a Dropbox.',
       507
     );
   }
@@ -4432,7 +4896,7 @@ async function handleDeployedBackupCreateJob(row) {
   try {
     createTarGzArchive(sourcePath, tmpArchivePath);
     const folders = await ensureDriveBackupFolder(context, appId);
-    setStorageJobProgress(row.id, { stage: 'uploading' }, 'Subiendo backup a Drive');
+    setStorageJobProgress(row.id, { stage: 'uploading' }, 'Subiendo backup a Dropbox');
     const uploaded = await uploadFileToDrive(context, {
       localPath: tmpArchivePath,
       parentId: folders.appFolderId,
@@ -4492,11 +4956,36 @@ async function handleDeployedBackupCreateJob(row) {
 
 async function downloadDriveFileToPath(context, fileId, outputPath) {
   ensureParentDirForFile(outputPath);
-  const response = await context.drive.files.get(
-    { fileId: String(fileId || '').trim(), alt: 'media' },
-    { responseType: 'stream' }
-  );
-  await pipelineAsync(response.data, fs.createWriteStream(outputPath));
+  const dropboxPath = await resolveDropboxPathFromIdentifier(context, fileId);
+  const response = await fetch(`${DROPBOX_CONTENT_BASE_URL}/files/download`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${String(context.accessToken || '').trim()}`,
+      'Dropbox-API-Arg': JSON.stringify({ path: dropboxPath })
+    }
+  });
+  if (!response.ok) {
+    const bodyText = String(await response.text()).trim();
+    throw createClientRequestError(
+      `No se pudo descargar archivo desde Dropbox: ${truncateForNotify(bodyText || 'dropbox_download_failed', 220)}`,
+      response.status >= 400 ? response.status : 500
+    );
+  }
+  if (!response.body) {
+    throw createClientRequestError('Dropbox no devolvió stream de descarga', 502);
+  }
+  await pipelineAsync(Readable.fromWeb(response.body), fs.createWriteStream(outputPath));
+  const metadataHeader = String(response.headers.get('dropbox-api-result') || '').trim();
+  let metadata = {};
+  try {
+    metadata = metadataHeader ? JSON.parse(metadataHeader) : {};
+  } catch (_error) {
+    metadata = {};
+  }
+  return {
+    metadata,
+    path: dropboxPath
+  };
 }
 
 async function handleDeployedBackupRestoreJob(row) {
@@ -4510,15 +4999,26 @@ async function handleDeployedBackupRestoreJob(row) {
     throw createClientRequestError('Restauración inválida: faltan datos requeridos', 400);
   }
   const context = await getDriveContextForUser(safeUserId, accountId, { allowNeedsOauth: false });
-  const metadataRes = await context.drive.files.get({
-    fileId,
-    fields: 'id,name,size,createdTime,appProperties'
-  });
-  const metadata = metadataRes && metadataRes.data ? metadataRes.data : {};
-  const appProperties = metadata && metadata.appProperties && typeof metadata.appProperties === 'object'
-    ? metadata.appProperties
-    : {};
-  const targetPath = requestedTargetPath || normalizeAbsoluteStoragePath(appProperties.targetPath || '');
+  const metadata = await dropboxApiRequest(
+    context.accessToken,
+    '/files/get_metadata',
+    {
+      path: String(fileId || '').trim(),
+      include_deleted: false
+    },
+    { fallbackError: 'dropbox_metadata_failed' }
+  );
+  const cachedRows = listDeployedCloudBackupsForUserAndAppStmt.all(safeUserId, appId, 200);
+  const cachedByFileId = new Map(
+    cachedRows.map((entry) => [String(entry && entry.drive_file_id ? entry.drive_file_id : '').trim(), entry])
+  );
+  const cached = cachedByFileId.get(String(metadata.path_lower || fileId).trim()) || null;
+  const targetPath =
+    requestedTargetPath ||
+    normalizeAbsoluteStoragePath(
+      (cached && String(cached.target_path || '').trim()) ||
+        ((cached && safeParseJsonObject(cached.metadata_json).targetPath) || '')
+    );
   if (!targetPath) {
     throw createClientRequestError('Este backup no tiene targetPath. Indica ruta de restauración manualmente.', 400);
   }
@@ -4526,7 +5026,10 @@ async function handleDeployedBackupRestoreJob(row) {
   setStorageJobProgress(row.id, { stage: 'downloading' }, `Descargando backup ${String(metadata.name || fileId)}`);
   const tmpArchivePath = path.join(storageJobsRootDir, `${buildStorageJobId('restore')}.tar.gz`);
   try {
-    await downloadDriveFileToPath(context, fileId, tmpArchivePath);
+    const downloaded = await downloadDriveFileToPath(context, fileId, tmpArchivePath);
+    const metadataResolved = downloaded && downloaded.metadata && typeof downloaded.metadata === 'object'
+      ? downloaded.metadata
+      : metadata;
     setStorageJobProgress(row.id, { stage: 'extracting' }, `Restaurando en ${targetPath}`);
     const extraction = extractTarGzArchive(tmpArchivePath, targetPath);
     return {
@@ -4534,7 +5037,7 @@ async function handleDeployedBackupRestoreJob(row) {
       accountId,
       accountAlias: context.account.alias || context.account.id,
       fileId,
-      backupName: String(metadata.name || '').trim(),
+      backupName: String((metadataResolved && metadataResolved.name) || metadata.name || '').trim(),
       targetPath,
       extractParent: extraction.extractParent,
       restoredAt: nowIso()
@@ -4564,7 +5067,7 @@ async function runStorageJobById(jobId) {
   const type = normalizeStorageJobType(freshRow.job_type);
   try {
     let result = {};
-    if (type === 'drive_upload_files') {
+    if (type === 'drive_upload_files' || type === 'dropbox_upload_files') {
       result = await handleDriveUploadFilesJob(freshRow);
     } else if (type === 'deployed_backup_create') {
       result = await handleDeployedBackupCreateJob(freshRow);
@@ -6545,7 +7048,7 @@ CREATE TABLE IF NOT EXISTS user_agent_permissions (
   allow_network INTEGER NOT NULL DEFAULT 1,
   allow_git INTEGER NOT NULL DEFAULT 1,
   allow_backup_restore INTEGER NOT NULL DEFAULT 1,
-  allowed_tools_json TEXT NOT NULL DEFAULT '["chat","git","storage","drive","backups","deployments","shell"]',
+  allowed_tools_json TEXT NOT NULL DEFAULT '["chat","git","storage","dropbox","backups","deployments","shell"]',
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (user_id, agent_id),
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -6715,10 +7218,10 @@ CREATE TABLE IF NOT EXISTS drive_accounts (
   id TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL,
   alias TEXT NOT NULL DEFAULT '',
-  auth_mode TEXT NOT NULL DEFAULT 'service_account',
+  auth_mode TEXT NOT NULL DEFAULT 'token',
   credentials_cipher TEXT NOT NULL DEFAULT '',
   token_cipher TEXT NOT NULL DEFAULT '',
-  root_folder_id TEXT NOT NULL DEFAULT 'root',
+  root_folder_id TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'pending',
   last_error TEXT NOT NULL DEFAULT '',
   details_json TEXT NOT NULL DEFAULT '{}',
@@ -6836,6 +7339,23 @@ SET
     ELSE 0
   END,
   active_ai_agent_id = COALESCE(active_ai_agent_id, '')
+`);
+db.exec(`
+UPDATE user_agent_permissions
+SET allowed_tools_json = REPLACE(allowed_tools_json, '"drive"', '"dropbox"')
+WHERE allowed_tools_json LIKE '%"drive"%'
+`);
+db.exec(`
+UPDATE drive_accounts
+SET
+  auth_mode = CASE
+    WHEN auth_mode IN ('oauth_client', 'oauth_app', 'oauth') THEN 'oauth_app'
+    ELSE 'token'
+  END,
+  root_folder_id = CASE
+    WHEN root_folder_id = 'root' THEN ''
+    ELSE COALESCE(root_folder_id, '')
+  END
 `);
 
 const createConversationStmt = db.prepare(
@@ -8138,7 +8658,446 @@ function normalizeSupportedAiAgentId(rawValue) {
   return safeAgentId;
 }
 
-function normalizeAiPermissionPathList(rawValue, fallback = []) {
+function getAiProviderDefinition(agentId) {
+  const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  if (!safeAgentId) return null;
+  return aiProviderDefinitionById.get(safeAgentId) || null;
+}
+
+function buildAiProviderCacheKey(userId, providerId) {
+  const safeUserId = getSafeUserId(userId);
+  const safeProviderId = normalizeSupportedAiAgentId(providerId);
+  if (!safeUserId || !safeProviderId) return '';
+  return `${safeUserId}:${safeProviderId}`;
+}
+
+function readCachedAiProviderModels(userId, providerId) {
+  const key = buildAiProviderCacheKey(userId, providerId);
+  if (!key) return null;
+  const cached = aiProviderModelsCache.get(key);
+  if (!cached) return null;
+  if (Date.now() - Number(cached.fetchedAtMs || 0) > aiProviderModelCacheTtlMs) {
+    return null;
+  }
+  return Array.isArray(cached.models) ? cached.models.slice() : null;
+}
+
+function cacheAiProviderModels(userId, providerId, models) {
+  const key = buildAiProviderCacheKey(userId, providerId);
+  if (!key) return;
+  const safeModels = Array.isArray(models)
+    ? models
+        .map((entry) => String(entry || '').trim())
+        .filter(Boolean)
+        .filter((entry, index, list) => list.indexOf(entry) === index)
+        .slice(0, 120)
+    : [];
+  aiProviderModelsCache.set(key, {
+    fetchedAtMs: Date.now(),
+    models: safeModels
+  });
+}
+
+function readCachedAiProviderQuota(userId, providerId) {
+  const key = buildAiProviderCacheKey(userId, providerId);
+  if (!key) return null;
+  const cached = aiProviderQuotaCache.get(key);
+  if (!cached) return null;
+  if (Date.now() - Number(cached.fetchedAtMs || 0) > aiProviderQuotaCacheTtlMs) {
+    return null;
+  }
+  return cached.quota || null;
+}
+
+function cacheAiProviderQuota(userId, providerId, quotaPayload) {
+  const key = buildAiProviderCacheKey(userId, providerId);
+  if (!key) return;
+  aiProviderQuotaCache.set(key, {
+    fetchedAtMs: Date.now(),
+    quota: buildUnifiedQuotaPayload(quotaPayload)
+  });
+}
+
+function getUserAiAgentIntegration(userId, agentId) {
+  const safeUserId = getSafeUserId(userId);
+  const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  if (!safeUserId || !safeAgentId) {
+    return normalizeUserAgentIntegrationRow(null);
+  }
+  const row = getUserAgentIntegrationStmt.get(safeUserId, safeAgentId);
+  return normalizeUserAgentIntegrationRow(row);
+}
+
+function extractOpenAiModelIdsFromPayload(payload) {
+  const list = Array.isArray(payload && payload.data)
+    ? payload.data
+    : Array.isArray(payload && payload.models)
+      ? payload.models
+      : [];
+  return list
+    .map((entry) => String((entry && (entry.id || entry.name)) || '').trim())
+    .filter(Boolean)
+    .filter((entry, index, all) => all.indexOf(entry) === index)
+    .slice(0, 120);
+}
+
+function buildOpenAiCompatibleHeaders(apiKey, options = {}) {
+  const headers = {
+    'Content-Type': 'application/json'
+  };
+  const safeApiKey = String(apiKey || '').trim();
+  if (safeApiKey) {
+    headers.Authorization = `Bearer ${safeApiKey}`;
+  }
+  if (options && options.includeOpenRouterHeaders) {
+    headers['HTTP-Referer'] = 'https://codexweb.local';
+    headers['X-Title'] = 'CodexWeb';
+  }
+  return headers;
+}
+
+const aiHttpProviderAdapters = Object.freeze({
+  openrouter: {
+    id: 'openrouter',
+    defaultBaseUrl: OPENROUTER_DEFAULT_BASE_URL,
+    requiresApiKey: true,
+    streamFormat: 'openai_sse',
+    async listModels({ baseUrl, integration }) {
+      const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/models`, {
+        method: 'GET',
+        headers: buildOpenAiCompatibleHeaders(integration.apiKey, {
+          includeOpenRouterHeaders: true
+        })
+      });
+      if (!response.ok) throw new Error(`openrouter_models_http_${response.status}`);
+      const payload = await response.json();
+      return extractOpenAiModelIdsFromPayload(payload);
+    },
+    async getQuota({ baseUrl, integration }) {
+      const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/credits`, {
+        method: 'GET',
+        headers: buildOpenAiCompatibleHeaders(integration.apiKey, {
+          includeOpenRouterHeaders: true
+        })
+      });
+      if (!response.ok) throw new Error(`openrouter_credits_http_${response.status}`);
+      const payload = await response.json();
+      const data = payload && typeof payload.data === 'object' ? payload.data : payload;
+      const used = Number(data && (data.total_usage ?? data.totalUsage ?? data.used));
+      const limit = Number(data && (data.total_credits ?? data.totalCredits ?? data.limit));
+      const remainingRaw = Number(data && (data.remaining_credits ?? data.remainingCredits ?? data.remaining));
+      const remaining =
+        Number.isFinite(remainingRaw) ? remainingRaw : Number.isFinite(limit) && Number.isFinite(used) ? limit - used : NaN;
+      return {
+        used,
+        limit,
+        remaining,
+        unit: 'credits',
+        resetAt: null,
+        available: Number.isFinite(used) || Number.isFinite(limit) || Number.isFinite(remaining)
+      };
+    },
+    buildChatRequest({ model, prompt, integration, baseUrl }) {
+      return {
+        endpoint: `${baseUrl.replace(/\/+$/, '')}/chat/completions`,
+        headers: buildOpenAiCompatibleHeaders(integration.apiKey, {
+          includeOpenRouterHeaders: true
+        }),
+        body: {
+          model,
+          stream: true,
+          messages: [{ role: 'user', content: prompt }]
+        }
+      };
+    }
+  },
+  ollama: {
+    id: 'ollama',
+    defaultBaseUrl: OLLAMA_DEFAULT_BASE_URL,
+    requiresApiKey: false,
+    streamFormat: 'ollama_jsonl',
+    async listModels({ baseUrl }) {
+      const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/tags`, {
+        method: 'GET'
+      });
+      if (!response.ok) throw new Error(`ollama_models_http_${response.status}`);
+      const payload = await response.json();
+      const models = Array.isArray(payload && payload.models) ? payload.models : [];
+      return models
+        .map((entry) => String((entry && entry.name) || '').trim())
+        .filter(Boolean)
+        .filter((entry, index, all) => all.indexOf(entry) === index)
+        .slice(0, 120);
+    },
+    buildChatRequest({ model, prompt, baseUrl }) {
+      return {
+        endpoint: `${baseUrl.replace(/\/+$/, '')}/api/chat`,
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: {
+          model,
+          stream: true,
+          messages: [{ role: 'user', content: prompt }]
+        }
+      };
+    }
+  },
+  groq: {
+    id: 'groq',
+    defaultBaseUrl: GROQ_DEFAULT_BASE_URL,
+    requiresApiKey: true,
+    streamFormat: 'openai_sse',
+    async listModels({ baseUrl, integration }) {
+      const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/models`, {
+        method: 'GET',
+        headers: buildOpenAiCompatibleHeaders(integration.apiKey)
+      });
+      if (!response.ok) throw new Error(`groq_models_http_${response.status}`);
+      const payload = await response.json();
+      return extractOpenAiModelIdsFromPayload(payload);
+    },
+    buildChatRequest({ model, prompt, integration, baseUrl }) {
+      return {
+        endpoint: `${baseUrl.replace(/\/+$/, '')}/chat/completions`,
+        headers: buildOpenAiCompatibleHeaders(integration.apiKey),
+        body: {
+          model,
+          stream: true,
+          messages: [{ role: 'user', content: prompt }]
+        }
+      };
+    }
+  },
+  lmstudio: {
+    id: 'lmstudio',
+    defaultBaseUrl: LMSTUDIO_DEFAULT_BASE_URL,
+    requiresApiKey: false,
+    streamFormat: 'openai_sse',
+    async listModels({ baseUrl, integration }) {
+      const headers = buildOpenAiCompatibleHeaders(integration.apiKey);
+      const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/models`, {
+        method: 'GET',
+        headers
+      });
+      if (!response.ok) throw new Error(`lmstudio_models_http_${response.status}`);
+      const payload = await response.json();
+      return extractOpenAiModelIdsFromPayload(payload);
+    },
+    buildChatRequest({ model, prompt, integration, baseUrl }) {
+      return {
+        endpoint: `${baseUrl.replace(/\/+$/, '')}/chat/completions`,
+        headers: buildOpenAiCompatibleHeaders(integration.apiKey),
+        body: {
+          model,
+          stream: true,
+          messages: [{ role: 'user', content: prompt }]
+        }
+      };
+    }
+  }
+});
+
+function getAiHttpProviderAdapter(agentId) {
+  const safeProviderId = normalizeSupportedAiAgentId(agentId);
+  if (!safeProviderId) return null;
+  return aiHttpProviderAdapters[safeProviderId] || null;
+}
+
+function normalizeAiProviderError(error, fallbackCode = 'provider_error') {
+  const message = truncateForNotify(error && error.message ? error.message : fallbackCode, 260);
+  const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : null;
+  return {
+    code: String((error && error.code) || fallbackCode).trim() || fallbackCode,
+    message,
+    statusCode
+  };
+}
+
+function getAiProviderAdapter(agentId) {
+  const safeProviderId = normalizeSupportedAiAgentId(agentId);
+  if (!safeProviderId) return null;
+  const providerDefinition = getAiProviderDefinition(safeProviderId);
+  if (!providerDefinition) return null;
+  const httpAdapter = getAiHttpProviderAdapter(safeProviderId);
+  const fallbackModel = getChatAgentDefaultModel(safeProviderId);
+  const base = {
+    id: safeProviderId,
+    listModels: async ({ userId, integration, allowRemoteFetch = true }) => {
+      if (allowRemoteFetch && httpAdapter && typeof httpAdapter.listModels === 'function') {
+        const baseUrl = resolveAiProviderBaseUrl(safeProviderId, integration) || httpAdapter.defaultBaseUrl;
+        return httpAdapter.listModels({
+          userId,
+          providerId: safeProviderId,
+          integration: normalizeUserAgentIntegrationRow(integration),
+          baseUrl
+        });
+      }
+      return getAiProviderStaticModelOptions(safeProviderId);
+    },
+    sendMessage: async () => {
+      throw createClientRequestError(`Provider ${safeProviderId} no soporta sendMessage sync`, 501);
+    },
+    streamMessage: async () => {
+      throw createClientRequestError(`Provider ${safeProviderId} no soporta streamMessage`, 501);
+    },
+    checkAvailability: ({ integration, codexLinked = false } = {}) =>
+      isAiAgentConfiguredForUser(safeProviderId, integration, { codexLinked }),
+    getQuota: async ({ userId, integration }) => {
+      if (!httpAdapter || typeof httpAdapter.getQuota !== 'function') {
+        return buildUnifiedQuotaPayload({ available: false });
+      }
+      const normalizedIntegration = normalizeUserAgentIntegrationRow(integration);
+      const baseUrl = resolveAiProviderBaseUrl(safeProviderId, normalizedIntegration) || httpAdapter.defaultBaseUrl;
+      const quota = await httpAdapter.getQuota({
+        userId: getSafeUserId(userId),
+        providerId: safeProviderId,
+        integration: normalizedIntegration,
+        baseUrl
+      });
+      return buildUnifiedQuotaPayload(quota);
+    },
+    listCapabilities: () => getAiProviderCapabilities(safeProviderId),
+    normalizeError: (error) => normalizeAiProviderError(error),
+    normalizeMessage: (message) => String(message || '').trim(),
+    normalizeModel: (model) => normalizeChatAgentModel(safeProviderId, model || fallbackModel),
+    supportsReasoningVisibility: () => getAiProviderCapabilities(safeProviderId).includes('reasoning-visibility'),
+    getPermissionProfile: (userId) => getAiAgentPermissionProfileForUser(userId, safeProviderId),
+    executeToolCall: async () => {
+      throw createClientRequestError(`Provider ${safeProviderId} no soporta executeToolCall`, 501);
+    },
+    checkProviderHealth: async ({ integration }) => {
+      if (!httpAdapter) return { available: true, reason: '' };
+      const normalizedIntegration = normalizeUserAgentIntegrationRow(integration);
+      if (httpAdapter.requiresApiKey && !String(normalizedIntegration.apiKey || '').trim()) {
+        return { available: false, reason: 'missing_api_key' };
+      }
+      return {
+        available: Boolean(resolveAiProviderBaseUrl(safeProviderId, normalizedIntegration)),
+        reason: ''
+      };
+    }
+  };
+  if (!httpAdapter) {
+    return base;
+  }
+  return {
+    ...base,
+    streamMessage: async ({ model, prompt, integration, reasoningEffort }) => {
+      const normalizedIntegration = normalizeUserAgentIntegrationRow(integration);
+      const baseUrl = resolveAiProviderBaseUrl(safeProviderId, normalizedIntegration) || httpAdapter.defaultBaseUrl;
+      return httpAdapter.buildChatRequest({
+        model: base.normalizeModel(model || fallbackModel),
+        prompt: base.normalizeMessage(prompt),
+        integration: normalizedIntegration,
+        baseUrl,
+        reasoningEffort: sanitizeReasoningEffort(reasoningEffort, DEFAULT_REASONING_EFFORT)
+      });
+    }
+  };
+}
+
+function resolveAiProviderBaseUrl(agentId, integrationRow) {
+  const providerId = normalizeSupportedAiAgentId(agentId);
+  const normalized = normalizeUserAgentIntegrationRow(integrationRow);
+  const custom = sanitizeHttpUrl(normalized.baseUrl || '', '');
+  if (custom) return custom;
+  const adapter = getAiHttpProviderAdapter(providerId);
+  if (adapter && adapter.defaultBaseUrl) {
+    return String(adapter.defaultBaseUrl || '').trim();
+  }
+  return '';
+}
+
+function isAiAgentConfiguredForUser(agentId, integrationRow, options = {}) {
+  const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  if (!safeAgentId) return false;
+  const provider = getAiProviderDefinition(safeAgentId);
+  if (!provider) return false;
+  const normalized = normalizeUserAgentIntegrationRow(integrationRow);
+  const codexLinked = Boolean(options && options.codexLinked);
+  if (safeAgentId === 'codex-cli') {
+    return codexLinked;
+  }
+  const httpAdapter = getAiHttpProviderAdapter(safeAgentId);
+  if (httpAdapter) {
+    if (httpAdapter.requiresApiKey && !String(normalized.apiKey || '').trim()) {
+      return false;
+    }
+    return Boolean(resolveAiProviderBaseUrl(safeAgentId, normalized));
+  }
+  if (String(provider.integrationType || '').toLowerCase() === 'api_key') {
+    return Boolean(String(normalized.apiKey || '').trim());
+  }
+  return true;
+}
+
+async function listAiProviderModelsFromRemote(userId, providerId, integrationRow) {
+  const safeProviderId = normalizeSupportedAiAgentId(providerId);
+  const normalizedIntegration = normalizeUserAgentIntegrationRow(integrationRow);
+  if (!safeProviderId) {
+    return [];
+  }
+  const providerAdapter = getAiProviderAdapter(safeProviderId);
+  if (providerAdapter && typeof providerAdapter.listModels === 'function') {
+    return providerAdapter.listModels({
+      userId: getSafeUserId(userId),
+      integration: normalizedIntegration,
+      allowRemoteFetch: true
+    });
+  }
+  return [];
+}
+
+function getAiProviderStaticModelOptions(providerId) {
+  const safeProviderId = normalizeSupportedAiAgentId(providerId);
+  if (safeProviderId === 'codex-cli') {
+    const cachedModels = loadCodexModelsFromCache();
+    return [...chatGptModelOptions, ...cachedModels].filter((slug, index, list) => list.indexOf(slug) === index);
+  }
+  if (safeProviderId === 'gemini-cli') {
+    return [...geminiModelOptions];
+  }
+  if (safeProviderId === 'openrouter') {
+    return [...openRouterFallbackModels];
+  }
+  if (safeProviderId === 'ollama') {
+    return [...ollamaFallbackModels];
+  }
+  if (safeProviderId === 'groq') {
+    return [...groqFallbackModels];
+  }
+  if (safeProviderId === 'lmstudio') {
+    return [...lmStudioFallbackModels];
+  }
+  return [];
+}
+
+async function listAiProviderModelsForUser(userId, providerId, options = {}) {
+  const safeProviderId = normalizeSupportedAiAgentId(providerId);
+  if (!safeProviderId) return [];
+  const allowRemote = options && options.allowRemoteFetch === true;
+  if (allowRemote) {
+    const integrationRow = getUserAiAgentIntegration(userId, safeProviderId);
+    try {
+      const remote = await listAiProviderModelsFromRemote(userId, safeProviderId, integrationRow);
+      if (remote.length > 0) {
+        cacheAiProviderModels(userId, safeProviderId, remote);
+        return remote;
+      }
+    } catch (_error) {
+      // fallback to cached/static model list
+    }
+  }
+  const cached = readCachedAiProviderModels(userId, safeProviderId);
+  if (cached && cached.length > 0) {
+    return cached;
+  }
+  return getAiProviderStaticModelOptions(safeProviderId);
+}
+
+function normalizeAiPermissionPathList(rawValue, fallback = [], options = null) {
+  const allowEmpty = Boolean(options && options.allowEmpty);
   const source = Array.isArray(rawValue) ? rawValue : [];
   const resolved = [];
   const seen = new Set();
@@ -8158,6 +9117,9 @@ function normalizeAiPermissionPathList(rawValue, fallback = []) {
   if (safeFallback.length > 0) {
     return safeFallback.slice(0, 40);
   }
+  if (allowEmpty) {
+    return [];
+  }
   return ['/', repoRootDir]
     .map((entry) => normalizeAbsoluteStoragePath(entry))
     .filter(Boolean)
@@ -8169,8 +9131,10 @@ function normalizeAiPermissionAllowedTools(rawValue) {
   const seen = new Set();
   const normalized = [];
   source.forEach((entry) => {
-    const value = String(entry || '').trim().toLowerCase();
-    if (!value || !aiPermissionToolCatalog.includes(value) || seen.has(value)) return;
+    const rawTool = String(entry || '').trim().toLowerCase();
+    if (!rawTool) return;
+    const value = rawTool === 'drive' ? 'dropbox' : rawTool;
+    if (!aiPermissionToolCatalog.includes(value) || seen.has(value)) return;
     seen.add(value);
     normalized.push(value);
   });
@@ -8189,7 +9153,7 @@ function normalizeAiAgentPermissionProfile(rawValue) {
       source.allowedPaths,
       aiProviderPermissionProfileDefaults.allowedPaths
     ),
-    deniedPaths: normalizeAiPermissionPathList(source.deniedPaths, []),
+    deniedPaths: normalizeAiPermissionPathList(source.deniedPaths, [], { allowEmpty: true }),
     readOnly: parseBooleanSetting(source.readOnly, aiProviderPermissionProfileDefaults.readOnly),
     allowShell: parseBooleanSetting(source.allowShell, aiProviderPermissionProfileDefaults.allowShell),
     allowSensitiveTools: parseBooleanSetting(
@@ -8288,6 +9252,73 @@ function upsertAiAgentPermissionProfileForUser(userId, agentId, profilePatch = {
   };
 }
 
+function buildAiPermissionFullAccessPatch() {
+  return {
+    allowRoot: true,
+    runAsUser: '',
+    allowedPaths: ['/'],
+    deniedPaths: [],
+    readOnly: false,
+    allowShell: true,
+    allowSensitiveTools: true,
+    allowNetwork: true,
+    allowGit: true,
+    allowBackupRestore: true,
+    allowedTools: [...aiPermissionToolCatalog]
+  };
+}
+
+function grantFullAccessToActiveProviderForAdminUsersOnStartup() {
+  const adminUsernames = Array.from(adminUsers)
+    .map((entry) => String(entry || '').trim().toLowerCase())
+    .filter(Boolean);
+  if (adminUsernames.length === 0) {
+    return;
+  }
+  const placeholders = adminUsernames.map(() => '?').join(', ');
+  if (!placeholders) {
+    return;
+  }
+  const rows = db
+    .prepare(
+      `SELECT id, username, active_ai_agent_id
+       FROM users
+       WHERE LOWER(username) IN (${placeholders})`
+    )
+    .all(...adminUsernames);
+  rows.forEach((row) => {
+    const safeUserId = getSafeUserId(row && row.id);
+    if (!safeUserId) return;
+    const runtime = resolveChatAgentRuntimeForUser(safeUserId);
+    const requestedProviderId = normalizeSupportedAiAgentId(row && row.active_ai_agent_id);
+    const providerId =
+      requestedProviderId || normalizeSupportedAiAgentId(runtime && runtime.activeAgentId);
+    if (!providerId) return;
+    try {
+      upsertAiAgentPermissionProfileForUser(
+        safeUserId,
+        providerId,
+        buildAiPermissionFullAccessPatch()
+      );
+      void notify(
+        `PERMISSIONS startup_grant_full user=${truncateForNotify(
+          (row && row.username) || String(safeUserId),
+          80
+        )} provider=${providerId}`
+      );
+    } catch (error) {
+      const reason = truncateForNotify(
+        error && error.message ? error.message : 'startup_grant_full_failed',
+        180
+      );
+      console.warn(`No se pudo aplicar grant-full de arranque para admin user=${safeUserId}: ${reason}`);
+      void notify(
+        `PERMISSIONS startup_grant_full_failed user=${safeUserId} provider=${providerId} reason=${reason}`
+      );
+    }
+  });
+}
+
 function isPathAllowedByPermissionProfile(profile, absolutePath) {
   const safeProfile =
     profile && typeof profile === 'object'
@@ -8295,7 +9326,7 @@ function isPathAllowedByPermissionProfile(profile, absolutePath) {
       : normalizeAiAgentPermissionProfile(aiProviderPermissionProfileDefaults);
   const target = normalizeAbsoluteStoragePath(absolutePath);
   if (!target) return false;
-  const deniedPaths = normalizeAiPermissionPathList(safeProfile.deniedPaths || [], []);
+  const deniedPaths = normalizeAiPermissionPathList(safeProfile.deniedPaths || [], [], { allowEmpty: true });
   if (deniedPaths.some((entry) => isPathWithin(entry, target) || normalizeAbsoluteStoragePath(entry) === target)) {
     return false;
   }
@@ -8318,14 +9349,22 @@ function assertAiPermissionForAction(profile, action, options = {}) {
   const requiresGit = Boolean(options && options.requiresGit);
   const requiresBackupRestore = Boolean(options && options.requiresBackupRestore);
   const requiresShell = Boolean(options && options.requiresShell);
+  const requiresNetwork = Boolean(options && options.requiresNetwork);
 
   if (safeProfile.allowedTools && Array.isArray(safeProfile.allowedTools)) {
-    if (safeAction && !safeProfile.allowedTools.includes(safeAction)) {
+    const actionAliases = new Set([safeAction]);
+    if (safeAction === 'dropbox') actionAliases.add('drive');
+    if (safeAction === 'drive') actionAliases.add('dropbox');
+    const allowed = Array.from(actionAliases.values()).some((item) => safeProfile.allowedTools.includes(item));
+    if (safeAction && !allowed) {
       throw createClientRequestError(`Acción bloqueada por permisos (${safeAction})`, 403);
     }
   }
   if (requiresShell && !safeProfile.allowShell) {
     throw createClientRequestError('El perfil actual no permite acceso a shell', 403);
+  }
+  if (requiresNetwork && !safeProfile.allowNetwork) {
+    throw createClientRequestError('El perfil actual no permite acceso de red', 403);
   }
   if (requiresSensitive && !safeProfile.allowSensitiveTools) {
     throw createClientRequestError('El perfil actual bloquea herramientas sensibles', 403);
@@ -8416,9 +9455,52 @@ function getAiProviderQuotaForUser(userId, agentId) {
         available: true
       });
     }
-    return buildUnifiedQuotaPayload({ available: false });
+    const cachedCodex = buildUnifiedQuotaPayload({ available: false });
+    cacheAiProviderQuota(userId, safeAgentId, cachedCodex);
+    return cachedCodex;
+  }
+  const cached = readCachedAiProviderQuota(userId, safeAgentId);
+  if (cached) {
+    return buildUnifiedQuotaPayload(cached);
   }
   return buildUnifiedQuotaPayload({ available: false });
+}
+
+async function refreshAiProviderQuotaForUser(userId, agentId) {
+  const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  if (!safeAgentId) {
+    return buildUnifiedQuotaPayload({ available: false });
+  }
+  if (safeAgentId === 'codex-cli') {
+    const quota = getAiProviderQuotaForUser(userId, safeAgentId);
+    cacheAiProviderQuota(userId, safeAgentId, quota);
+    return quota;
+  }
+  const integration = getUserAiAgentIntegration(userId, safeAgentId);
+  const providerAdapter = getAiProviderAdapter(safeAgentId);
+  if (!providerAdapter || typeof providerAdapter.getQuota !== 'function') {
+    const unavailable = buildUnifiedQuotaPayload({ available: false });
+    cacheAiProviderQuota(userId, safeAgentId, unavailable);
+    return unavailable;
+  }
+  const httpAdapter = getAiHttpProviderAdapter(safeAgentId);
+  if (httpAdapter && httpAdapter.requiresApiKey && !String(integration.apiKey || '').trim()) {
+    const unavailable = buildUnifiedQuotaPayload({ available: false });
+    cacheAiProviderQuota(userId, safeAgentId, unavailable);
+    return unavailable;
+  }
+  try {
+    const quota = await providerAdapter.getQuota({
+      userId: getSafeUserId(userId),
+      integration
+    });
+    const normalizedQuota = buildUnifiedQuotaPayload(quota);
+    cacheAiProviderQuota(userId, safeAgentId, normalizedQuota);
+    return normalizedQuota;
+  } catch (_error) {
+    const fallback = getAiProviderQuotaForUser(userId, safeAgentId);
+    return buildUnifiedQuotaPayload(fallback);
+  }
 }
 
 function getAiProviderCapabilities(agentId) {
@@ -8435,8 +9517,13 @@ function serializeAiProviderInfoForUser(userId, agentId, options = null) {
   const serializationOptions = options || getAiAgentSerializationOptionsForUser(userId);
   const integrationRow = getUserAgentIntegrationStmt.get(userId, safeAgentId);
   const setting = serializeAiAgentSetting(agent, integrationRow, serializationOptions);
-  const models = getChatAgentModelOptions(safeAgentId);
-  const profile = getAiAgentPermissionProfileForUser(userId, safeAgentId);
+  const models = getChatAgentModelOptions(safeAgentId, userId);
+  const providerAdapter = getAiProviderAdapter(safeAgentId);
+  const profile =
+    providerAdapter && typeof providerAdapter.getPermissionProfile === 'function'
+      ? providerAdapter.getPermissionProfile(userId)
+      : getAiAgentPermissionProfileForUser(userId, safeAgentId);
+  const hasChatCapability = getAiProviderCapabilities(safeAgentId).includes('chat');
   return {
     id: safeAgentId,
     name: setting.name,
@@ -8455,8 +9542,13 @@ function serializeAiProviderInfoForUser(userId, agentId, options = null) {
     },
     quota: getAiProviderQuotaForUser(userId, safeAgentId),
     permissions: profile,
+    supportsReasoningVisibility: Boolean(
+      providerAdapter &&
+        typeof providerAdapter.supportsReasoningVisibility === 'function' &&
+        providerAdapter.supportsReasoningVisibility()
+    ),
     availability: {
-      chat: supportedChatRuntimeAgentIds.has(safeAgentId),
+      chat: supportedChatRuntimeAgentIds.has(safeAgentId) && hasChatCapability,
       configured: Boolean(setting.integration && setting.integration.configured),
       enabled: Boolean(setting.integration && setting.integration.enabled)
     }
@@ -8584,17 +9676,15 @@ function getAiAgentSerializationOptionsForUser(userId) {
 function serializeAiAgentIntegration(agent, integrationRow, options = {}) {
   const normalized = normalizeUserAgentIntegrationRow(integrationRow);
   const forceEnabled = Boolean(options && options.forceEnabled);
-  const codexLinked = Boolean(options && options.codexLinked);
   const hasApiKey = Boolean(normalized.apiKey);
-  const requiresApiKey = String(agent.integrationType || '') === 'api_key';
-  const isCodexCli = String(agent && agent.id ? agent.id : '') === 'codex-cli';
-  const configured = isCodexCli ? codexLinked : requiresApiKey ? hasApiKey : true;
+  const configured = isAiAgentConfiguredForUser(agent && agent.id, normalized, options);
+  const resolvedBaseUrl = resolveAiProviderBaseUrl(agent && agent.id, normalized);
   return {
     enabled: forceEnabled ? true : normalized.enabled,
     configured,
     hasApiKey,
     apiKeyMasked: hasApiKey ? maskSecretValue(normalized.apiKey) : '',
-    baseUrl: normalized.baseUrl,
+    baseUrl: resolvedBaseUrl,
     updatedAt: normalized.updatedAt
   };
 }
@@ -8689,23 +9779,20 @@ function serializeAiAgentSettingsPayloadForUser(userId) {
   };
 }
 
-function getChatAgentModelOptions(agentId) {
-  const safeAgentId = String(agentId || '').trim();
-  if (safeAgentId === 'gemini-cli') {
-    return [...geminiModelOptions];
+function getChatAgentModelOptions(agentId, userId = 0) {
+  const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  if (!safeAgentId) return [];
+  const cached = readCachedAiProviderModels(userId, safeAgentId);
+  if (cached && cached.length > 0) {
+    return cached;
   }
-  const cachedModels = loadCodexModelsFromCache();
-  return [...chatGptModelOptions, ...cachedModels].filter(
-    (slug, index, list) => list.indexOf(slug) === index
-  );
+  return getAiProviderStaticModelOptions(safeAgentId);
 }
 
 function getChatAgentDefaultModel(agentId) {
-  const safeAgentId = String(agentId || '').trim();
-  if (safeAgentId === 'gemini-cli') {
-    return DEFAULT_GEMINI_CHAT_MODEL;
-  }
-  return DEFAULT_CHAT_MODEL;
+  const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  const provider = getAiProviderDefinition(safeAgentId);
+  return String((provider && provider.defaultModel) || DEFAULT_CHAT_MODEL).trim() || DEFAULT_CHAT_MODEL;
 }
 
 function normalizeChatAgentModel(agentId, rawModel) {
@@ -8724,18 +9811,27 @@ function normalizeChatAgentModel(agentId, rawModel) {
 function resolveChatAgentRuntimeForUser(userId) {
   const payload = serializeAiAgentSettingsPayloadForUser(userId);
   const requestedAgentId = normalizeSupportedAiAgentId(payload.activeAgentId);
-  let effectiveAgentId = requestedAgentId;
+  const selectableRuntimeIds = payload.agents
+    .filter((entry) => supportedChatRuntimeAgentIds.has(String(entry && entry.id ? entry.id : '')))
+    .filter((entry) => isSerializedAiAgentSelectable(entry))
+    .map((entry) => String(entry.id || '').trim())
+    .filter(Boolean);
+  const defaultRuntimeId = supportedChatRuntimeAgentIds.has('codex-cli')
+    ? 'codex-cli'
+    : Array.from(supportedChatRuntimeAgentIds.values())[0] || '';
+  const requestedIsSelectable = selectableRuntimeIds.includes(requestedAgentId);
+  let effectiveAgentId = requestedIsSelectable
+    ? requestedAgentId
+    : selectableRuntimeIds[0] || requestedAgentId || defaultRuntimeId;
   if (!effectiveAgentId || !supportedChatRuntimeAgentIds.has(effectiveAgentId)) {
-    effectiveAgentId = 'codex-cli';
+    effectiveAgentId = defaultRuntimeId;
   }
-  const selectedEntry =
-    payload.agents.find((entry) => entry.id === requestedAgentId) || null;
-  const selectedIsSelectable = isSerializedAiAgentSelectable(selectedEntry);
-  if (!selectedIsSelectable && effectiveAgentId !== 'codex-cli') {
+  if (!effectiveAgentId) {
     effectiveAgentId = 'codex-cli';
   }
   const effectiveAgent = supportedAiAgentsById.get(effectiveAgentId);
-  const models = getChatAgentModelOptions(effectiveAgentId);
+  const providerDefinition = getAiProviderDefinition(effectiveAgentId);
+  const models = getChatAgentModelOptions(effectiveAgentId, userId);
   const defaultModel = getChatAgentDefaultModel(effectiveAgentId);
   const permissionProfile = getAiAgentPermissionProfileForUser(userId, effectiveAgentId);
   const capabilities = getAiProviderCapabilities(effectiveAgentId);
@@ -8745,7 +9841,8 @@ function resolveChatAgentRuntimeForUser(userId) {
     activeAgentName:
       String((effectiveAgent && effectiveAgent.name) || '').trim() || effectiveAgentId || 'Codex CLI',
     providerId: effectiveAgentId,
-    runtimeProvider: effectiveAgentId === 'gemini-cli' ? 'gemini' : 'codex',
+    runtimeProvider:
+      String((providerDefinition && providerDefinition.runtimeProvider) || '').trim() || effectiveAgentId,
     models,
     capabilities,
     permissionProfile,
@@ -8811,7 +9908,7 @@ function resolveChatRuntimeExecutionPolicy(userId, chatRuntime) {
     profile.allowedPaths,
     aiProviderPermissionProfileDefaults.allowedPaths
   ).filter((entry) => pathExistsSyncSafe(entry));
-  const deniedPaths = normalizeAiPermissionPathList(profile.deniedPaths, []);
+  const deniedPaths = normalizeAiPermissionPathList(profile.deniedPaths, [], { allowEmpty: true });
   const safeAllowedPaths = allowedPaths.length > 0 ? allowedPaths : [repoRootDir];
 
   const firstAllowed = safeAllowedPaths.find((entry) => {
@@ -9073,6 +10170,50 @@ function loadCodexModelsFromCache() {
   } catch (_error) {
     return [];
   }
+}
+
+function extractTextFromProviderPayload(value) {
+  if (typeof value === 'string') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => {
+        if (typeof entry === 'string') return entry;
+        if (!entry || typeof entry !== 'object') return '';
+        if (typeof entry.text === 'string') return entry.text;
+        if (typeof entry.content === 'string') return entry.content;
+        if (entry.type === 'text' && typeof entry.value === 'string') return entry.value;
+        return '';
+      })
+      .filter(Boolean)
+      .join('');
+  }
+  if (value && typeof value === 'object') {
+    if (typeof value.text === 'string') return value.text;
+    if (typeof value.content === 'string') return value.content;
+  }
+  return '';
+}
+
+function buildAbortableRunHandle(abortController) {
+  const state = {
+    exitCode: null,
+    killed: false,
+    pid: null,
+    kill(signal = 'SIGTERM') {
+      if (state.killed || state.exitCode !== null) return false;
+      state.killed = true;
+      state.exitCode = signal === 'SIGKILL' ? 137 : 143;
+      try {
+        abortController.abort();
+      } catch (_error) {
+        // no-op
+      }
+      return true;
+    }
+  };
+  return state;
 }
 
 app.post('/api/register', async (req, res) => {
@@ -9402,15 +10543,23 @@ app.get('/api/ai/providers', requireAuth, (req, res) => {
   });
 });
 
-app.get('/api/ai/providers/:providerId/models', requireAuth, (req, res) => {
+app.get('/api/ai/providers/:providerId/models', requireAuth, async (req, res) => {
   const providerId = normalizeSupportedAiAgentId(req.params && req.params.providerId);
   if (!providerId) {
     return res.status(404).json({ error: 'Provider no soportado' });
   }
+  let models = [];
+  try {
+    models = await listAiProviderModelsForUser(req.session.userId, providerId, {
+      allowRemoteFetch: true
+    });
+  } catch (_error) {
+    models = getChatAgentModelOptions(providerId, req.session.userId);
+  }
   return res.json({
     ok: true,
     providerId,
-    models: getChatAgentModelOptions(providerId),
+    models,
     defaultModel: getChatAgentDefaultModel(providerId)
   });
 });
@@ -9427,15 +10576,59 @@ app.get('/api/ai/providers/:providerId/capabilities', requireAuth, (req, res) =>
   });
 });
 
-app.get('/api/ai/providers/:providerId/quota', requireAuth, (req, res) => {
+app.get('/api/ai/providers/:providerId/availability', requireAuth, async (req, res) => {
   const providerId = normalizeSupportedAiAgentId(req.params && req.params.providerId);
   if (!providerId) {
     return res.status(404).json({ error: 'Provider no soportado' });
   }
+  const providerAdapter = getAiProviderAdapter(providerId);
+  const integration = getUserAiAgentIntegration(req.session.userId, providerId);
+  const serializationOptions = getAiAgentSerializationOptionsForUser(req.session.userId);
+  const configured = isAiAgentConfiguredForUser(providerId, integration, serializationOptions);
+  let health = {
+    available: configured,
+    reason: configured ? '' : 'not_configured'
+  };
+  if (providerAdapter && typeof providerAdapter.checkProviderHealth === 'function') {
+    try {
+      health = await providerAdapter.checkProviderHealth({
+        userId: req.session.userId,
+        integration
+      });
+    } catch (error) {
+      const normalized = providerAdapter.normalizeError(error);
+      health = {
+        available: false,
+        reason: normalized.code || 'provider_health_failed'
+      };
+    }
+  }
   return res.json({
     ok: true,
     providerId,
-    quota: getAiProviderQuotaForUser(req.session.userId, providerId)
+    availability: {
+      configured,
+      available: Boolean(health.available),
+      reason: String(health.reason || '').trim()
+    }
+  });
+});
+
+app.get('/api/ai/providers/:providerId/quota', requireAuth, async (req, res) => {
+  const providerId = normalizeSupportedAiAgentId(req.params && req.params.providerId);
+  if (!providerId) {
+    return res.status(404).json({ error: 'Provider no soportado' });
+  }
+  let quota = getAiProviderQuotaForUser(req.session.userId, providerId);
+  try {
+    quota = await refreshAiProviderQuotaForUser(req.session.userId, providerId);
+  } catch (_error) {
+    quota = getAiProviderQuotaForUser(req.session.userId, providerId);
+  }
+  return res.json({
+    ok: true,
+    providerId,
+    quota
   });
 });
 
@@ -9474,6 +10667,36 @@ app.put('/api/ai/providers/:providerId/permissions', requireAuth, (req, res) => 
       error: error && error.exposeToClient
         ? error.message
         : `No se pudieron guardar permisos: ${truncateForNotify(error && error.message ? error.message : 'permissions_update_failed', 220)}`
+    });
+  }
+});
+
+app.post('/api/ai/providers/:providerId/permissions/grant-full', requireAuth, (req, res) => {
+  const providerId = normalizeSupportedAiAgentId(req.params && req.params.providerId);
+  if (!providerId) {
+    return res.status(404).json({ error: 'Provider no soportado' });
+  }
+  try {
+    const permissions = upsertAiAgentPermissionProfileForUser(
+      req.session.userId,
+      providerId,
+      buildAiPermissionFullAccessPatch()
+    );
+    return res.json({
+      ok: true,
+      providerId,
+      permissions
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudieron conceder permisos completos: ${truncateForNotify(
+              error && error.message ? error.message : 'permissions_grant_full_failed',
+              220
+            )}`
     });
   }
 });
@@ -9889,20 +11112,43 @@ app.delete('/api/conversations/:id', requireAuth, (req, res) => {
   return res.json({ ok: true, deleted: { conversationId } });
 });
 
-app.get('/api/chat/options', requireAuth, (req, res) => {
+app.get('/api/chat/options', requireAuth, async (req, res) => {
   const runtime = resolveChatAgentRuntimeForUser(req.session.userId);
+  let models = Array.isArray(runtime.models) ? runtime.models.slice() : [];
+  let quota = runtime.quota;
+  try {
+    const remoteModels = await listAiProviderModelsForUser(req.session.userId, runtime.activeAgentId, {
+      allowRemoteFetch: true
+    });
+    if (remoteModels.length > 0) {
+      models = remoteModels;
+    }
+  } catch (_error) {
+    // fallback to cached/static model list
+  }
+  try {
+    quota = await refreshAiProviderQuotaForUser(req.session.userId, runtime.activeAgentId);
+  } catch (_error) {
+    quota = runtime.quota;
+  }
+  const normalizedDefaultModel = models.includes(runtime.defaults.model)
+    ? runtime.defaults.model
+    : models[0] || runtime.defaults.model;
   return res.json({
     ok: true,
     providerId: runtime.providerId,
     activeAgentId: runtime.activeAgentId,
     activeAgentName: runtime.activeAgentName,
     runtimeProvider: runtime.runtimeProvider,
-    models: runtime.models,
+    models,
     capabilities: runtime.capabilities,
-    quota: runtime.quota,
+    quota,
     permissions: runtime.permissionProfile,
     reasoningEfforts: runtime.reasoningEfforts,
-    defaults: runtime.defaults
+    defaults: {
+      ...runtime.defaults,
+      model: normalizedDefaultModel
+    }
   });
 });
 
@@ -10607,7 +11853,7 @@ app.get('/api/tools/storage/overview', requireAuth, async (req, res) => {
       cloud = {
         accountId,
         available: false,
-        error: truncateForNotify(error && error.message ? error.message : 'drive_quota_unavailable', 220),
+        error: truncateForNotify(error && error.message ? error.message : 'dropbox_quota_unavailable', 220),
         quota: {
           limit: null,
           usage: null,
@@ -10669,12 +11915,12 @@ app.get('/api/tools/storage/jobs/:jobId', requireAuth, (req, res) => {
   });
 });
 
-app.get('/api/tools/storage/drive/accounts', requireAuth, (req, res) => {
+app.get('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts', requireAuth, (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
     requiresSensitiveTool: false
   });
   if (!permission) return;
@@ -10685,43 +11931,47 @@ app.get('/api/tools/storage/drive/accounts', requireAuth, (req, res) => {
   });
 });
 
-app.post('/api/tools/storage/drive/accounts', requireAuth, async (req, res) => {
+app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
     requiresSensitiveTool: true,
     writeIntent: true
   });
   if (!permission) return;
   const alias = sanitizeDriveAccountAlias(req.body && req.body.alias);
-  const rootFolderId = String((req.body && req.body.rootFolderId) || 'root').trim() || 'root';
+  const rootFolderId = normalizeDropboxPath(String((req.body && req.body.rootFolderId) || '').trim());
   try {
     const normalizedCredential = normalizeDriveCredentialPayload(req.body && req.body.credentialsJson);
     const accountId = buildDriveAccountId();
     const now = nowIso();
-    const status = normalizedCredential.authMode === 'oauth_client' ? 'needs_oauth' : 'pending';
+    const status = normalizedCredential.authMode === 'oauth_app' ? 'needs_oauth' : 'pending';
+    const tokenCipher =
+      normalizedCredential.tokenSeed && Object.keys(normalizedCredential.tokenSeed).length > 0
+        ? encryptSecretText(JSON.stringify(normalizedCredential.tokenSeed))
+        : '';
     insertDriveAccountStmt.run(
       accountId,
       safeUserId,
-      alias || `Drive ${accountId.slice(-6)}`,
+      alias || `Dropbox ${accountId.slice(-6)}`,
       normalizedCredential.authMode,
       encryptSecretText(JSON.stringify(normalizedCredential.normalized)),
-      '',
+      tokenCipher,
       rootFolderId,
       status,
       JSON.stringify(normalizedCredential.details),
       now,
       now
     );
-    if (normalizedCredential.authMode === 'service_account') {
+    if (normalizedCredential.authMode === 'token') {
       try {
         await validateDriveAccountByIdForUser(safeUserId, accountId);
       } catch (error) {
         updateDriveAccountStatusStmt.run(
           'error',
-          truncateForNotify(error && error.message ? error.message : 'drive_validation_failed', 220),
+          truncateForNotify(error && error.message ? error.message : 'dropbox_validation_failed', 220),
           nowIso(),
           accountId
         );
@@ -10737,17 +11987,17 @@ app.post('/api/tools/storage/drive/accounts', requireAuth, async (req, res) => {
     const message =
       error && error.exposeToClient
         ? error.message
-        : `No se pudo guardar cuenta de Drive: ${truncateForNotify(error && error.message ? error.message : 'drive_account_create_failed', 220)}`;
+        : `No se pudo guardar cuenta de Dropbox: ${truncateForNotify(error && error.message ? error.message : 'dropbox_account_create_failed', 220)}`;
     return res.status(statusCode).json({ error: message });
   }
 });
 
-app.post('/api/tools/storage/drive/accounts/:accountId/validate', requireAuth, async (req, res) => {
+app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts/:accountId/validate', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
     requiresSensitiveTool: false
   });
   if (!permission) return;
@@ -10764,7 +12014,7 @@ app.post('/api/tools/storage/drive/accounts/:accountId/validate', requireAuth, a
   } catch (error) {
     updateDriveAccountStatusStmt.run(
       'error',
-      truncateForNotify(error && error.message ? error.message : 'drive_validation_failed', 220),
+      truncateForNotify(error && error.message ? error.message : 'dropbox_validation_failed', 220),
       nowIso(),
       accountId
     );
@@ -10773,17 +12023,17 @@ app.post('/api/tools/storage/drive/accounts/:accountId/validate', requireAuth, a
       error:
         error && error.exposeToClient
           ? error.message
-          : `No se pudo validar cuenta de Drive: ${truncateForNotify(error && error.message ? error.message : 'drive_validation_failed', 220)}`
+          : `No se pudo validar cuenta de Dropbox: ${truncateForNotify(error && error.message ? error.message : 'dropbox_validation_failed', 220)}`
     });
   }
 });
 
-app.post('/api/tools/storage/drive/accounts/:accountId/oauth/start', requireAuth, (req, res) => {
+app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts/:accountId/oauth/start', requireAuth, (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
     requiresSensitiveTool: true
   });
   if (!permission) return;
@@ -10794,10 +12044,10 @@ app.post('/api/tools/storage/drive/accounts/:accountId/oauth/start', requireAuth
   try {
     const row = getDriveAccountByIdForUserStmt.get(accountId, safeUserId);
     if (!row) {
-      return res.status(404).json({ error: 'Cuenta de Drive no encontrada.' });
+      return res.status(404).json({ error: 'Cuenta de Dropbox no encontrada.' });
     }
-    if (normalizeDriveAuthMode(row.auth_mode) !== 'oauth_client') {
-      return res.status(409).json({ error: 'La cuenta indicada no usa modo OAuth client.' });
+    if (normalizeDriveAuthMode(row.auth_mode) !== 'oauth_app') {
+      return res.status(409).json({ error: 'La cuenta indicada no usa modo OAuth app.' });
     }
     const credentials = parseDriveAccountCredentials(row);
     const { oauthClient, oauthConfig } = buildOAuth2ClientFromDriveAccount(
@@ -10805,20 +12055,15 @@ app.post('/api/tools/storage/drive/accounts/:accountId/oauth/start', requireAuth
       credentials,
       String(req.body && req.body.redirectUri ? req.body.redirectUri : '').trim()
     );
-    const authUrl = oauthClient.generateAuthUrl({
-      access_type: 'offline',
-      prompt: 'consent',
-      include_granted_scopes: true,
-      scope: driveScopes
-    });
+    const authUrl = oauthClient.generateAuthUrl();
     return res.json({
       ok: true,
       account: serializeDriveAccountRow(row),
       oauth: {
         authUrl,
-        redirectUri: oauthConfig.redirectUri || driveOauthFallbackRedirectUri,
+        redirectUri: oauthConfig.redirectUri || dropboxOauthFallbackRedirectUri,
         instructions:
-          'Abre la URL, autoriza con Google Drive, copia el code y pégalo en "Completar OAuth" en CodexWeb.'
+          'Abre la URL, autoriza con Dropbox, copia el code y pégalo en "Completar OAuth" en CodexWeb.'
       }
     });
   } catch (error) {
@@ -10827,17 +12072,17 @@ app.post('/api/tools/storage/drive/accounts/:accountId/oauth/start', requireAuth
       error:
         error && error.exposeToClient
           ? error.message
-          : `No se pudo iniciar OAuth: ${truncateForNotify(error && error.message ? error.message : 'drive_oauth_start_failed', 220)}`
+          : `No se pudo iniciar OAuth de Dropbox: ${truncateForNotify(error && error.message ? error.message : 'dropbox_oauth_start_failed', 220)}`
     });
   }
 });
 
-app.post('/api/tools/storage/drive/accounts/:accountId/oauth/complete', requireAuth, async (req, res) => {
+app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts/:accountId/oauth/complete', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
     requiresSensitiveTool: true
   });
   if (!permission) return;
@@ -10850,10 +12095,10 @@ app.post('/api/tools/storage/drive/accounts/:accountId/oauth/complete', requireA
   try {
     const row = getDriveAccountByIdForUserStmt.get(accountId, safeUserId);
     if (!row) {
-      return res.status(404).json({ error: 'Cuenta de Drive no encontrada.' });
+      return res.status(404).json({ error: 'Cuenta de Dropbox no encontrada.' });
     }
-    if (normalizeDriveAuthMode(row.auth_mode) !== 'oauth_client') {
-      return res.status(409).json({ error: 'La cuenta indicada no es OAuth client.' });
+    if (normalizeDriveAuthMode(row.auth_mode) !== 'oauth_app') {
+      return res.status(409).json({ error: 'La cuenta indicada no es OAuth app.' });
     }
     const credentials = parseDriveAccountCredentials(row);
     const { oauthClient } = buildOAuth2ClientFromDriveAccount(row, credentials, redirectUri);
@@ -10864,13 +12109,16 @@ app.post('/api/tools/storage/drive/accounts/:accountId/oauth/complete', requireA
       ...currentTokens,
       ...(tokens && typeof tokens === 'object' ? tokens : {})
     };
+    const expiresInSec = Number(mergedTokens.expires_in || mergedTokens.expiresIn);
+    if (Number.isFinite(expiresInSec) && expiresInSec > 0) {
+      mergedTokens.expires_at = new Date(Date.now() + expiresInSec * 1000).toISOString();
+    }
     if (!mergedTokens.refresh_token && currentTokens.refresh_token) {
       mergedTokens.refresh_token = currentTokens.refresh_token;
     }
-    if (!mergedTokens.refresh_token) {
+    if (!mergedTokens.access_token) {
       return res.status(400).json({
-        error:
-          'Google no devolvió refresh_token. Repite autorización con prompt=consent o elimina y recrea la cuenta OAuth.'
+        error: 'Dropbox no devolvió access_token válido. Repite autorización o reconfigura la cuenta.'
       });
     }
     updateDriveAccountTokenStmt.run(
@@ -10895,7 +12143,7 @@ app.post('/api/tools/storage/drive/accounts/:accountId/oauth/complete', requireA
   } catch (error) {
     updateDriveAccountStatusStmt.run(
       'error',
-      truncateForNotify(error && error.message ? error.message : 'drive_oauth_complete_failed', 220),
+      truncateForNotify(error && error.message ? error.message : 'dropbox_oauth_complete_failed', 220),
       nowIso(),
       accountId
     );
@@ -10904,17 +12152,17 @@ app.post('/api/tools/storage/drive/accounts/:accountId/oauth/complete', requireA
       error:
         error && error.exposeToClient
           ? error.message
-          : `No se pudo completar OAuth: ${truncateForNotify(error && error.message ? error.message : 'drive_oauth_complete_failed', 220)}`
+          : `No se pudo completar OAuth de Dropbox: ${truncateForNotify(error && error.message ? error.message : 'dropbox_oauth_complete_failed', 220)}`
     });
   }
 });
 
-app.delete('/api/tools/storage/drive/accounts/:accountId', requireAuth, (req, res) => {
+app.delete('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts/:accountId', requireAuth, (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
     requiresSensitiveTool: true,
     writeIntent: true
   });
@@ -10925,7 +12173,7 @@ app.delete('/api/tools/storage/drive/accounts/:accountId', requireAuth, (req, re
   }
   const row = getDriveAccountByIdForUserStmt.get(accountId, safeUserId);
   if (!row) {
-    return res.status(404).json({ error: 'Cuenta de Drive no encontrada.' });
+    return res.status(404).json({ error: 'Cuenta de Dropbox no encontrada.' });
   }
   deleteDriveAccountForUserStmt.run(accountId, safeUserId);
   return res.json({
@@ -10935,18 +12183,18 @@ app.delete('/api/tools/storage/drive/accounts/:accountId', requireAuth, (req, re
   });
 });
 
-app.get('/api/tools/storage/drive/files', requireAuth, async (req, res) => {
+app.get('/api/tools/storage/:cloudProvider(drive|dropbox)/files', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
     requiresSensitiveTool: false
   });
   if (!permission) return;
   const accountId = String(req.query.accountId || '').trim();
   if (!accountId) {
-    return res.status(400).json({ error: 'Selecciona una cuenta de Drive.' });
+    return res.status(400).json({ error: 'Selecciona una cuenta de Dropbox.' });
   }
   try {
     const payload = await listDriveFilesForAccount(safeUserId, accountId, {
@@ -10965,17 +12213,17 @@ app.get('/api/tools/storage/drive/files', requireAuth, async (req, res) => {
       error:
         error && error.exposeToClient
           ? error.message
-          : `No se pudieron listar archivos de Drive: ${truncateForNotify(error && error.message ? error.message : 'drive_files_list_failed', 220)}`
+          : `No se pudieron listar archivos de Dropbox: ${truncateForNotify(error && error.message ? error.message : 'dropbox_files_list_failed', 220)}`
     });
   }
 });
 
-app.post('/api/tools/storage/drive/upload', requireAuth, (req, res) => {
+app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/upload', requireAuth, (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
     requiresSensitiveTool: true,
     writeIntent: true
   });
@@ -10984,17 +12232,17 @@ app.post('/api/tools/storage/drive/upload', requireAuth, (req, res) => {
   const paths = parseStoragePathList(req.body && req.body.paths, storageUploadJobMaxFiles);
   const parentId = String(req.body && req.body.parentId ? req.body.parentId : '').trim();
   if (!accountId || paths.length === 0) {
-    return res.status(400).json({ error: 'Selecciona cuenta de Drive y archivos locales para subir.' });
+    return res.status(400).json({ error: 'Selecciona cuenta de Dropbox y archivos locales para subir.' });
   }
   try {
     paths.forEach((sourcePath) => {
-      assertAiPermissionForAction(permission.profile, 'drive', {
+      assertAiPermissionForAction(permission.profile, 'dropbox', {
         requiresSensitiveTool: true,
         writeIntent: true,
         targetPath: sourcePath
       });
     });
-    const job = createStorageJob(safeUserId, 'drive_upload_files', {
+    const job = createStorageJob(safeUserId, 'dropbox_upload_files', {
       accountId,
       paths,
       parentId
@@ -11009,17 +12257,17 @@ app.post('/api/tools/storage/drive/upload', requireAuth, (req, res) => {
       error:
         error && error.exposeToClient
           ? error.message
-          : `No se pudo crear job de subida: ${truncateForNotify(error && error.message ? error.message : 'drive_upload_job_create_failed', 220)}`
+          : `No se pudo crear job de subida a Dropbox: ${truncateForNotify(error && error.message ? error.message : 'dropbox_upload_job_create_failed', 220)}`
     });
   }
 });
 
-app.delete('/api/tools/storage/drive/files/:fileId', requireAuth, async (req, res) => {
+app.delete('/api/tools/storage/:cloudProvider(drive|dropbox)/files/:fileId', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
     requiresSensitiveTool: true,
     writeIntent: true
   });
@@ -11028,7 +12276,7 @@ app.delete('/api/tools/storage/drive/files/:fileId', requireAuth, async (req, re
   const fileId = String(req.params.fileId || '').trim();
   const confirmDelete = String(req.query.confirm || req.body && req.body.confirm || '').trim().toUpperCase() === 'DELETE';
   if (!accountId || !fileId) {
-    return res.status(400).json({ error: 'Indica accountId y fileId para borrar en Drive.' });
+    return res.status(400).json({ error: 'Indica accountId y fileId para borrar en Dropbox.' });
   }
   if (!confirmDelete) {
     return res.status(400).json({ error: 'Confirmación requerida. Envía confirm=DELETE.' });
@@ -11045,7 +12293,7 @@ app.delete('/api/tools/storage/drive/files/:fileId', requireAuth, async (req, re
       error:
         error && error.exposeToClient
           ? error.message
-          : `No se pudo borrar archivo de Drive: ${truncateForNotify(error && error.message ? error.message : 'drive_delete_failed', 220)}`
+          : `No se pudo borrar archivo de Dropbox: ${truncateForNotify(error && error.message ? error.message : 'dropbox_delete_failed', 220)}`
     });
   }
 });
@@ -11095,7 +12343,7 @@ app.get('/api/tools/deployed-apps/:appId/backups', requireAuth, async (req, res)
         accountId,
         retentionDays: storageBackupRetentionDays,
         backups: cached,
-        warning: 'Se devolvió caché local porque Drive no respondió correctamente.'
+        warning: 'Se devolvió caché local porque Dropbox no respondió correctamente.'
       });
     }
     const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
@@ -12006,12 +13254,18 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Nivel de razonamiento inválido' });
   }
   const chatRuntime = resolveChatAgentRuntimeForUser(req.session.userId);
+  const providerDefinition = getAiProviderDefinition(chatRuntime.activeAgentId);
+  const providerCapabilities = Array.isArray(chatRuntime.capabilities) ? chatRuntime.capabilities : [];
+  const providerNeedsShell = providerCapabilities.includes('shell');
+  const providerNeedsSensitiveTools = providerCapabilities.includes('tool-calling') || providerNeedsShell;
+  const providerNeedsNetwork = !['ollama', 'lmstudio'].includes(chatRuntime.activeAgentId);
   let runtimePolicy = null;
   try {
     runtimePolicy = resolveChatRuntimeExecutionPolicy(req.session.userId, chatRuntime);
     assertAiPermissionForAction(runtimePolicy.profile, 'chat', {
-      requiresShell: true,
-      requiresSensitiveTool: true
+      requiresShell: providerNeedsShell,
+      requiresSensitiveTool: providerNeedsSensitiveTools,
+      requiresNetwork: providerNeedsNetwork
     });
   } catch (error) {
     const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 403;
@@ -12211,7 +13465,490 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     const promptWithHistory = buildPromptWithConversationHistory(prompt, conversationMessages);
     const promptWithRepoContext = buildPromptWithRepoContext(promptWithHistory, prompt);
     const executionPrompt = buildPromptWithAttachments(promptWithRepoContext, persistedAttachments);
-    if (chatRuntime.runtimeProvider === 'gemini') {
+    const httpProviderAdapter = getAiHttpProviderAdapter(chatRuntime.activeAgentId);
+    if (httpProviderAdapter && typeof httpProviderAdapter.buildChatRequest === 'function') {
+      const selectedProviderId = chatRuntime.activeAgentId;
+      const providerIntegration = getUserAiAgentIntegration(req.session.userId, selectedProviderId);
+      const providerLabel =
+        (providerDefinition && providerDefinition.name) ||
+        chatRuntime.activeAgentName ||
+        selectedProviderId;
+      if (httpProviderAdapter.requiresApiKey && !String(providerIntegration.apiKey || '').trim()) {
+        throw createClientRequestError(
+          `${providerLabel} está seleccionado pero falta API key en Integraciones IA.`,
+          400
+        );
+      }
+      const providerBaseUrl =
+        resolveAiProviderBaseUrl(selectedProviderId, providerIntegration) ||
+        httpProviderAdapter.defaultBaseUrl;
+
+      const assistantMessage = insertMessageStmt.run(conversationId, 'assistant', '');
+      assistantMessageId = Number(assistantMessage.lastInsertRowid);
+      const draftCreatedAt = nowIso();
+      closeOpenDraftsByConversationStmt.run(draftCreatedAt, req.session.userId, conversationId);
+      const draftInsert = insertLiveDraftStmt.run(
+        req.session.userId,
+        conversationId,
+        assistantMessageId,
+        liveDraftRequestId,
+        prompt,
+        '',
+        '{}',
+        0,
+        draftCreatedAt,
+        draftCreatedAt
+      );
+      liveDraftId = Number(draftInsert.lastInsertRowid);
+
+      res.status(200);
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.setHeader('X-Conversation-Id', String(conversationId));
+      req.setTimeout(0);
+      res.setTimeout(0);
+      if (req.socket && typeof req.socket.setTimeout === 'function') {
+        req.socket.setTimeout(0);
+      }
+      if (res.socket && typeof res.socket.setTimeout === 'function') {
+        res.socket.setTimeout(0);
+      }
+      if (req.socket && typeof req.socket.setKeepAlive === 'function') {
+        req.socket.setKeepAlive(true);
+      }
+      if (req.socket && typeof req.socket.setNoDelay === 'function') {
+        req.socket.setNoDelay(true);
+      }
+      if (res.socket && typeof res.socket.setKeepAlive === 'function') {
+        res.socket.setKeepAlive(true);
+      }
+      if (res.socket && typeof res.socket.setNoDelay === 'function') {
+        res.socket.setNoDelay(true);
+      }
+      res.flushHeaders();
+
+      let clientDisconnected = false;
+      const handleHttpProviderClientDisconnect = () => {
+        clientDisconnected = true;
+      };
+      req.on('aborted', handleHttpProviderClientDisconnect);
+      req.on('close', handleHttpProviderClientDisconnect);
+      res.on('close', handleHttpProviderClientDisconnect);
+      res.on('error', handleHttpProviderClientDisconnect);
+
+      sendSseComment(res, 'ok');
+      sendSse(res, 'conversation', { conversationId });
+      sendSse(res, 'chat_agent', {
+        id: chatRuntime.activeAgentId,
+        name: chatRuntime.activeAgentName,
+        provider: chatRuntime.runtimeProvider
+      });
+      sendSse(res, 'reasoning_step', {
+        itemId: 'agent_runtime',
+        text: `Agente activo: ${chatRuntime.activeAgentName}`
+      });
+      sendSse(res, 'reasoning_step', {
+        itemId: 'permission_profile',
+        text: `Permisos: root=${runtimePolicy.profile.allowRoot ? 'si' : 'no'}, shell=${
+          runtimePolicy.profile.allowShell ? 'si' : 'no'
+        }, red=${runtimePolicy.profile.allowNetwork ? 'si' : 'no'}, git=${
+          runtimePolicy.profile.allowGit ? 'si' : 'no'
+        }, modo=${runtimePolicy.profile.readOnly ? 'solo-lectura' : 'lectura/escritura'}`
+      });
+
+      const permissionHints = [];
+      if (runtimePolicy.profile.readOnly) {
+        permissionHints.push('Perfil activo: solo lectura. No modifiques archivos.');
+      }
+      if (!runtimePolicy.profile.allowNetwork) {
+        permissionHints.push('Perfil activo: red bloqueada. No hagas llamadas de red.');
+      }
+      if (!runtimePolicy.profile.allowGit) {
+        permissionHints.push('Perfil activo: operaciones Git bloqueadas.');
+      }
+      const selectedReasoning = sanitizeReasoningEffort(selectedReasoningEffort, DEFAULT_REASONING_EFFORT);
+      const reasoningGuidance =
+        geminiReasoningInstructionsByEffort[selectedReasoning] ||
+        geminiReasoningInstructionsByEffort[DEFAULT_REASONING_EFFORT];
+      const providerPrompt = [
+        `Instruccion de razonamiento (${selectedReasoning}): ${reasoningGuidance}`,
+        executionPrompt,
+        permissionHints.length > 0 ? `\n[POLITICA]\n${permissionHints.join('\n')}` : ''
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      const providerAbortController = new AbortController();
+      const abortableHandle = buildAbortableRunHandle(providerAbortController);
+      let activeRun = registerActiveChatRun(req.session.userId, conversationId, abortableHandle);
+      let usageSummary = null;
+      let structuredOutput = true;
+      let finalized = false;
+      let streamedAssistantOutput = false;
+
+      const finalizeHttpProviderRequest = ({ ok, closeReason, output }) => {
+        if (finalized) return;
+        finalized = true;
+        const safeOutput = String(output || '').trim() || `(Sin salida de ${providerLabel})`;
+        const runWasKilled = Boolean(activeRun && activeRun.killRequested);
+        const success = Boolean(ok) && !runWasKilled;
+        const safeExitCode = runWasKilled ? 130 : success ? 0 : 1;
+        const effectiveCloseReason = runWasKilled
+          ? String(activeRun && activeRun.killReason ? activeRun.killReason : 'killed_by_user')
+          : String(closeReason || (success ? 'completed' : 'provider_error'));
+        abortableHandle.exitCode = safeExitCode;
+        if (activeRun) {
+          clearActiveChatRun(activeRun);
+        }
+
+        if (assistantMessageId) {
+          updateMessageContentStmt.run(safeOutput, assistantMessageId);
+        } else {
+          const fallbackMessage = insertMessageStmt.run(conversationId, 'assistant', safeOutput);
+          assistantMessageId = Number(fallbackMessage.lastInsertRowid);
+        }
+        if (liveDraftId) {
+          try {
+            updateLiveDraftSnapshotStmt.run(
+              conversationId,
+              assistantMessageId,
+              safeOutput,
+              '{}',
+              1,
+              nowIso(),
+              liveDraftId,
+              req.session.userId
+            );
+          } catch (_draftError) {
+            // ignore fallback draft update errors
+          }
+        }
+
+        if (!clientDisconnected) {
+          if (!streamedAssistantOutput) {
+            const chunkSize = 1600;
+            for (let index = 0; index < safeOutput.length; index += chunkSize) {
+              const chunk = safeOutput.slice(index, index + chunkSize);
+              if (!chunk) continue;
+              if (!sendSse(res, 'assistant_delta', { text: chunk })) {
+                clientDisconnected = true;
+                break;
+              }
+            }
+          }
+          if (!clientDisconnected) {
+            sendSse(res, 'done', {
+              ok: success,
+              conversationId,
+              exitCode: safeExitCode,
+              closeReason: effectiveCloseReason,
+              usage: usageSummary,
+              structured: structuredOutput
+            });
+            if (!res.writableEnded && !res.destroyed) {
+              res.end();
+            }
+          }
+        }
+
+        const finishedAt = nowIso();
+        const durationMs = Math.max(0, Date.now() - requestStartedAtMs);
+        finalizeTaskRun({
+          status: success ? 'success' : 'failed',
+          closeReason: effectiveCloseReason,
+          resultSummary: safeOutput,
+          planText: '',
+          finishedAt,
+          durationMs,
+          usage: usageSummary,
+          structured: structuredOutput,
+          clientDisconnected
+        });
+        if (userNotificationSettings.notifyOnFinish) {
+          const message = buildChatCompletionDiscordMessage({
+            status: success ? 'ok' : 'error',
+            username,
+            conversationId,
+            finishedAt,
+            durationMs,
+            closeReason: effectiveCloseReason,
+            includeResult: userNotificationSettings.includeResult,
+            result: safeOutput
+          });
+          if (message) {
+            void notify(message, {
+              webhookUrl: userNotificationSettings.discordWebhookUrl
+            });
+          }
+        }
+        if (success) {
+          void notify(
+            `Chat ejecutado OK user=${username} conv=${conversationId} agent=${chatRuntime.activeAgentId} result=${truncateForNotify(
+              safeOutput,
+              1000
+            )}`
+          );
+          return;
+        }
+        void notify(
+          `Error en chat user=${username} conv=${conversationId} agent=${chatRuntime.activeAgentId}: ${truncateForNotify(
+            safeOutput,
+            240
+          )}`
+        );
+      };
+
+      const providerRequest = httpProviderAdapter.buildChatRequest({
+        model: selectedModel || getChatAgentDefaultModel(selectedProviderId),
+        prompt: providerPrompt,
+        integration: providerIntegration,
+        baseUrl: providerBaseUrl,
+        reasoningEffort: selectedReasoningEffort
+      });
+      const providerEndpoint = String(providerRequest && providerRequest.endpoint ? providerRequest.endpoint : '').trim();
+      const providerHeaders =
+        providerRequest && providerRequest.headers && typeof providerRequest.headers === 'object'
+          ? providerRequest.headers
+          : { 'Content-Type': 'application/json' };
+      const providerBody =
+        providerRequest && providerRequest.body && typeof providerRequest.body === 'object'
+          ? providerRequest.body
+          : {
+              model: selectedModel || getChatAgentDefaultModel(selectedProviderId),
+              stream: true,
+              messages: [{ role: 'user', content: providerPrompt }]
+            };
+      const providerStreamFormat =
+        providerRequest && typeof providerRequest.streamFormat === 'string'
+          ? providerRequest.streamFormat
+          : httpProviderAdapter.streamFormat || 'openai_sse';
+      if (!providerEndpoint) {
+        throw createClientRequestError(`Provider ${providerLabel} no tiene endpoint de chat configurado.`, 400);
+      }
+
+      let response = null;
+      try {
+        response = await fetch(providerEndpoint, {
+          method: 'POST',
+          headers: providerHeaders,
+          body: JSON.stringify(providerBody),
+          signal: providerAbortController.signal
+        });
+      } catch (error) {
+        const wasKilled = Boolean(activeRun && activeRun.killRequested);
+        const reason = truncateForNotify(error && error.message ? error.message : 'provider_request_failed', 220);
+        finalizeHttpProviderRequest({
+          ok: false,
+          closeReason: wasKilled ? 'killed_by_user' : 'provider_unreachable',
+          output: wasKilled
+            ? `${providerLabel} detenido por usuario.`
+            : `No se pudo conectar con ${providerLabel}: ${reason}`
+        });
+        return;
+      }
+
+      if (!response.ok) {
+        let errorDetails = '';
+        try {
+          const payload = await response.json();
+          const message =
+            payload && payload.error && typeof payload.error === 'object'
+              ? payload.error.message
+              : payload && payload.error
+                ? payload.error
+                : payload && payload.message;
+          errorDetails = String(message || '').trim();
+        } catch (_error) {
+          try {
+            errorDetails = String(await response.text()).trim();
+          } catch (_fallbackError) {
+            errorDetails = '';
+          }
+        }
+        finalizeHttpProviderRequest({
+          ok: false,
+          closeReason: 'provider_error',
+          output:
+            errorDetails ||
+            `${providerLabel} respondió HTTP ${response.status}. Revisa credenciales, modelo y disponibilidad.`
+        });
+        return;
+      }
+
+      if (!response.body || typeof response.body.getReader !== 'function') {
+        let plainOutput = '';
+        try {
+          plainOutput = String(await response.text()).trim();
+        } catch (_error) {
+          plainOutput = '';
+        }
+        finalizeHttpProviderRequest({
+          ok: Boolean(plainOutput),
+          closeReason: plainOutput ? 'completed' : 'provider_error',
+          output: plainOutput || `${providerLabel} no devolvió stream válido.`
+        });
+        return;
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let pending = '';
+      let assistantOutput = '';
+      let finishReason = '';
+
+      const emitAssistantDelta = (text) => {
+        const delta = String(text || '');
+        if (!delta) return;
+        streamedAssistantOutput = true;
+        assistantOutput += delta;
+        if (!clientDisconnected) {
+          sendSse(res, 'assistant_delta', { text: delta });
+        }
+      };
+
+      const emitReasoningDelta = (text) => {
+        const delta = String(text || '');
+        if (!delta) return;
+        if (!clientDisconnected) {
+          sendSse(res, 'reasoning_delta', {
+            itemId: `${selectedProviderId}_thinking`,
+            text: delta
+          });
+        }
+      };
+
+      const consumeOpenAiSseLine = (line) => {
+        const trimmed = String(line || '').trim();
+        if (!trimmed || !trimmed.startsWith('data:')) return;
+        const payloadText = trimmed.slice(5).trim();
+        if (!payloadText || payloadText === '[DONE]') return;
+        let parsed = null;
+        try {
+          parsed = JSON.parse(payloadText);
+        } catch (_error) {
+          return;
+        }
+        if (parsed && parsed.usage && typeof parsed.usage === 'object') {
+          usageSummary = parsed.usage;
+        }
+        const choice = parsed && Array.isArray(parsed.choices) ? parsed.choices[0] : null;
+        if (!choice || typeof choice !== 'object') return;
+        const deltaObject = choice.delta && typeof choice.delta === 'object' ? choice.delta : {};
+        const messageObject = choice.message && typeof choice.message === 'object' ? choice.message : {};
+        const contentDelta =
+          extractTextFromProviderPayload(deltaObject.content) ||
+          extractTextFromProviderPayload(messageObject.content);
+        const reasoningDelta =
+          extractTextFromProviderPayload(
+            deltaObject.reasoning ||
+              deltaObject.reasoning_content ||
+              deltaObject.thinking ||
+              deltaObject.analysis ||
+              messageObject.reasoning ||
+              messageObject.thinking
+          ) || '';
+        if (reasoningDelta) {
+          emitReasoningDelta(reasoningDelta);
+        }
+        if (contentDelta) {
+          emitAssistantDelta(contentDelta);
+        }
+        if (choice.finish_reason) {
+          finishReason = String(choice.finish_reason || '').trim();
+        }
+      };
+
+      const consumeOllamaLine = (line) => {
+        const trimmed = String(line || '').trim();
+        if (!trimmed) return;
+        let parsed = null;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch (_error) {
+          return;
+        }
+        if (!parsed || typeof parsed !== 'object') return;
+        if (parsed.done && parsed.done_reason) {
+          finishReason = String(parsed.done_reason || '').trim();
+        }
+        if (parsed.done) {
+          const usageCandidate = {};
+          if (Number.isFinite(Number(parsed.prompt_eval_count))) {
+            usageCandidate.promptEvalCount = Number(parsed.prompt_eval_count);
+          }
+          if (Number.isFinite(Number(parsed.eval_count))) {
+            usageCandidate.evalCount = Number(parsed.eval_count);
+          }
+          if (Object.keys(usageCandidate).length > 0) {
+            usageSummary = usageCandidate;
+          }
+        }
+        const messageObject = parsed.message && typeof parsed.message === 'object' ? parsed.message : {};
+        const contentDelta =
+          extractTextFromProviderPayload(messageObject.content) || extractTextFromProviderPayload(parsed.response);
+        const reasoningDelta =
+          extractTextFromProviderPayload(
+            messageObject.thinking || messageObject.reasoning || parsed.thinking || parsed.reasoning
+          ) || '';
+        if (reasoningDelta) {
+          emitReasoningDelta(reasoningDelta);
+        }
+        if (contentDelta) {
+          emitAssistantDelta(contentDelta);
+        }
+      };
+
+      try {
+        let streamDone = false;
+        while (!streamDone) {
+          const { done, value } = await reader.read();
+          if (done) {
+            streamDone = true;
+          } else {
+            pending += decoder.decode(value, { stream: true });
+          }
+          const normalized = pending.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+          const lines = normalized.split('\n');
+          pending = lines.pop() || '';
+          lines.forEach((line) => {
+            if (providerStreamFormat === 'ollama_jsonl') {
+              consumeOllamaLine(line);
+            } else {
+              consumeOpenAiSseLine(line);
+            }
+          });
+        }
+        if (pending && pending.trim()) {
+          if (providerStreamFormat === 'ollama_jsonl') {
+            consumeOllamaLine(pending.trim());
+          } else {
+            consumeOpenAiSseLine(pending.trim());
+          }
+        }
+      } catch (error) {
+        const wasKilled = Boolean(activeRun && activeRun.killRequested);
+        const reason = truncateForNotify(error && error.message ? error.message : 'provider_stream_failed', 220);
+        finalizeHttpProviderRequest({
+          ok: false,
+          closeReason: wasKilled ? 'killed_by_user' : 'stream_error',
+          output: wasKilled
+            ? `${providerLabel} detenido por usuario.`
+            : `Fallo de streaming en ${providerLabel}: ${reason}`
+        });
+        return;
+      }
+
+      finalizeHttpProviderRequest({
+        ok: true,
+        closeReason: finishReason || 'completed',
+        output: assistantOutput
+      });
+      return;
+    }
+
+    if (chatRuntime.activeAgentId === 'gemini-cli') {
       const geminiIntegration = getGeminiUserIntegrationForUser(req.session.userId);
       if (!geminiIntegration.apiKey) {
         throw createClientRequestError(
@@ -13728,9 +15465,11 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       return res.status(clientStatus).json({ error: clientMessage });
     }
 
-    const usingCodexRuntime = chatRuntime.runtimeProvider !== 'gemini';
-    const providerLabel = usingCodexRuntime ? 'Codex' : 'Gemini';
-    const codeNotFound = usingCodexRuntime && Boolean(error && error.message === 'CODEX_NOT_FOUND');
+    const providerLabel =
+      String((providerDefinition && providerDefinition.name) || chatRuntime.activeAgentName || 'Provider IA').trim() ||
+      'Provider IA';
+    const codeNotFound =
+      chatRuntime.activeAgentId === 'codex-cli' && Boolean(error && error.message === 'CODEX_NOT_FOUND');
     const shortError = codeNotFound
       ? 'codex no encontrado'
       : truncateForNotify(error && error.message ? error.message : 'exec_error', 120);
@@ -13824,37 +15563,60 @@ markStaleTaskRunsOnStartup();
 markRestartRecoveredOnStartup();
 resumePendingDeployedDescriptionJobs();
 resumePendingStorageJobs();
+grantFullAccessToActiveProviderForAdminUsersOnStartup();
+if (process.env.CODEXWEB_NO_LISTEN === '1') {
+  module.exports = {
+    app,
+    db,
+    assertAiPermissionForAction,
+    buildAiPermissionFullAccessPatch,
+    buildAbortableRunHandle,
+    getAiAgentPermissionProfileForUser,
+    getAiProviderCapabilities,
+    getAiProviderQuotaForUser,
+    getChatAgentModelOptions,
+    listAiProviderModelsForUser,
+    listAiProvidersForUser,
+    normalizeChatAgentModel,
+    refreshAiProviderQuotaForUser,
+    resolveAiProviderBaseUrl,
+    resolveChatAgentRuntimeForUser,
+    supportedAiAgents,
+    upsertAiAgentPermissionProfileForUser,
+    grantFullAccessToActiveProviderForAdminUsersOnStartup
+  };
+} else {
+  const server = app.listen(port, host, () => {
+    console.log(`CodexWeb escuchando en http://${host}:${port}`);
+    resolveCodexPath()
+      .then((codexPath) => {
+        console.log(`Codex CLI detectado en ${codexPath}`);
+      })
+      .catch((error) => {
+        const reason = truncateForNotify(error && error.message ? error.message : 'CODEX_NOT_FOUND', 120);
+        console.warn(`No se pudo precargar ruta de codex: ${reason}`);
+      });
+    resolveGeminiPath()
+      .then((geminiPath) => {
+        console.log(`Gemini CLI detectado en ${geminiPath}`);
+      })
+      .catch((error) => {
+        const reason = truncateForNotify(error && error.message ? error.message : 'GEMINI_NOT_FOUND', 120);
+        console.warn(`No se pudo precargar ruta de gemini: ${reason}`);
+      });
+    notifyMilestone('history_persistent', 'Historial persistente implementado');
+    notifyMilestone('codex_full_access', 'CodexWeb ejecuta Codex CLI con acceso total');
+    notifyMilestone('streaming_realtime', 'Streaming en tiempo real implementado');
+    notifyMilestone('fix_streaming_infinito', 'Arranco fix: streaming infinito');
+    notifyMilestone('backend_sse_robusto', 'Backend SSE robusto listo');
+    notifyMilestone('persistencia_incremental', 'Persistencia incremental lista');
+    notifyMilestone('frontend_render_todo', 'Frontend renderiza TODO');
+    notifyMilestone('notify_active', 'Notify server-side activo');
+    notifyMilestone('service_restarted', 'Servicio reiniciado');
+    void notify(`SERVER START CodexWeb listening on http://${host}:${port}`);
+  });
 
-const server = app.listen(port, host, () => {
-  console.log(`CodexWeb escuchando en http://${host}:${port}`);
-  resolveCodexPath()
-    .then((codexPath) => {
-      console.log(`Codex CLI detectado en ${codexPath}`);
-    })
-    .catch((error) => {
-      const reason = truncateForNotify(error && error.message ? error.message : 'CODEX_NOT_FOUND', 120);
-      console.warn(`No se pudo precargar ruta de codex: ${reason}`);
-    });
-  resolveGeminiPath()
-    .then((geminiPath) => {
-      console.log(`Gemini CLI detectado en ${geminiPath}`);
-    })
-    .catch((error) => {
-      const reason = truncateForNotify(error && error.message ? error.message : 'GEMINI_NOT_FOUND', 120);
-      console.warn(`No se pudo precargar ruta de gemini: ${reason}`);
-    });
-  notifyMilestone('history_persistent', 'Historial persistente implementado');
-  notifyMilestone('codex_full_access', 'CodexWeb ejecuta Codex CLI con acceso total');
-  notifyMilestone('streaming_realtime', 'Streaming en tiempo real implementado');
-  notifyMilestone('fix_streaming_infinito', 'Arranco fix: streaming infinito');
-  notifyMilestone('backend_sse_robusto', 'Backend SSE robusto listo');
-  notifyMilestone('persistencia_incremental', 'Persistencia incremental lista');
-  notifyMilestone('frontend_render_todo', 'Frontend renderiza TODO');
-  notifyMilestone('notify_active', 'Notify server-side activo');
-  notifyMilestone('service_restarted', 'Servicio reiniciado');
-  void notify(`SERVER START CodexWeb listening on http://${host}:${port}`);
-});
-
-server.keepAliveTimeout = 1000 * 60 * 10;
-server.headersTimeout = 1000 * 60 * 11;
-server.requestTimeout = 0;
+  server.keepAliveTimeout = 1000 * 60 * 10;
+  server.headersTimeout = 1000 * 60 * 11;
+  server.requestTimeout = 0;
+}

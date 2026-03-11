@@ -494,7 +494,7 @@ export interface ToolsStorageHeavyPayload {
 export interface ToolsDriveAccount {
   id: string;
   alias: string;
-  authMode: 'service_account' | 'oauth_client';
+  authMode: 'token' | 'oauth_app';
   rootFolderId: string;
   status: 'pending' | 'active' | 'needs_oauth' | 'error';
   lastError: string;
@@ -529,6 +529,7 @@ export interface ToolsDriveFilesPayload {
 
 export type ToolsStorageJobType =
   | 'drive_upload_files'
+  | 'dropbox_upload_files'
   | 'deployed_backup_create'
   | 'deployed_backup_restore';
 export type ToolsStorageJobStatus = 'pending' | 'running' | 'completed' | 'error';
@@ -552,6 +553,7 @@ export interface ToolsDeployedAppBackupItem {
   id: string;
   appId: string;
   driveFileId: string;
+  remoteFileId?: string;
   accountId: string;
   accountAlias: string;
   name: string;

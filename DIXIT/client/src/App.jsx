@@ -39,6 +39,15 @@ const dedupePlayers = (players = []) => {
   return Array.from(unique.values());
 };
 
+const dedupeBoardEntries = (board = []) => {
+  const unique = new Map();
+  for (const entry of board) {
+    if (!entry || !entry.id || unique.has(entry.id)) continue;
+    unique.set(entry.id, entry);
+  }
+  return Array.from(unique.values());
+};
+
 const sanitizeStatePayload = (payload) => {
   if (!payload || payload.type !== 'state') return payload;
   const players = dedupePlayers(payload.players || []);
@@ -46,7 +55,7 @@ const sanitizeStatePayload = (payload) => {
   const pendingPlayers = (payload.pendingPlayers || []).filter((entry) => entry?.id && playerIds.has(entry.id));
   const pendingPlayerIds = (payload.pendingPlayerIds || []).filter((id) => playerIds.has(id));
   const you = payload.you && playerIds.has(payload.you.id) ? payload.you : null;
-  const board = Array.isArray(payload.board) ? payload.board : [];
+  const board = dedupeBoardEntries(Array.isArray(payload.board) ? payload.board : []);
   return {
     ...payload,
     players,
@@ -79,12 +88,14 @@ function useWs(enabled) {
   const [connected, setConnected] = useState(false);
   const [serverError, setServerError] = useState('');
   const socketRef = useRef(null);
+  const queuedMessagesRef = useRef([]);
 
   useEffect(() => {
     if (!enabled) {
       setConnected(false);
       setState(null);
       setServerError('');
+      queuedMessagesRef.current = [];
       socketRef.current?.close();
       socketRef.current = null;
       return undefined;
@@ -102,6 +113,16 @@ function useWs(enabled) {
       ws.onopen = () => {
         retry = 0;
         setConnected(true);
+        if (queuedMessagesRef.current.length > 0) {
+          const pending = queuedMessagesRef.current.splice(0);
+          for (const payload of pending) {
+            try {
+              ws.send(JSON.stringify(payload));
+            } catch {
+              break;
+            }
+          }
+        }
       };
 
       ws.onmessage = (e) => {
@@ -124,10 +145,15 @@ function useWs(enabled) {
         }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (event) => {
         setConnected(false);
-        setState(null);
         if (disposed) return;
+        if (event?.code === 4401) {
+          setState(null);
+          setServerError('Tu sesión expiró. Inicia sesión de nuevo.');
+          queuedMessagesRef.current = [];
+          return;
+        }
         const waitMs = Math.min(5000, 500 * (2 ** retry));
         retry += 1;
         reconnectTimer = window.setTimeout(connect, waitMs);
@@ -140,6 +166,7 @@ function useWs(enabled) {
       disposed = true;
       setConnected(false);
       setServerError('');
+      queuedMessagesRef.current = [];
       if (reconnectTimer) {
         window.clearTimeout(reconnectTimer);
       }
@@ -152,8 +179,14 @@ function useWs(enabled) {
     const ws = socketRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(payload));
+      return;
     }
-  }, []);
+    if (!enabled) return;
+    queuedMessagesRef.current.push(payload);
+    if (queuedMessagesRef.current.length > 40) {
+      queuedMessagesRef.current = queuedMessagesRef.current.slice(-40);
+    }
+  }, [enabled]);
 
   return { state, setState, send, connected, serverError, setServerError };
 }

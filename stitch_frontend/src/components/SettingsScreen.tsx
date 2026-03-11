@@ -3,8 +3,10 @@ import { ChevronDown, ChevronLeft, ChevronRight, ExternalLink, RefreshCw } from 
 import BottomNav from './BottomNav';
 import {
   getAiAgentSettings,
+  getAiProviderQuota,
   listAiProviders,
   cancelCodexDeviceLogin,
+  grantAiProviderFullPermissions,
   getCodexAuthStatus,
   getNotificationSettings,
   getCodexQuota,
@@ -70,6 +72,16 @@ type SettingsView =
   | 'agentPermissions'
   | 'webhook';
 
+const providerPermissionToolCatalog = [
+  'chat',
+  'git',
+  'storage',
+  'dropbox',
+  'backups',
+  'deployments',
+  'shell'
+];
+
 export default function SettingsScreen({
   options,
   model,
@@ -125,6 +137,7 @@ export default function SettingsScreen({
   const [providersError, setProvidersError] = useState('');
   const [permissionDrafts, setPermissionDrafts] = useState<Record<string, AiProviderPermissionProfile>>({});
   const [savingPermissionProviderId, setSavingPermissionProviderId] = useState('');
+  const [grantingPermissionProviderId, setGrantingPermissionProviderId] = useState('');
 
   const loadQuota = useCallback(async () => {
     setQuotaLoading(true);
@@ -217,7 +230,21 @@ export default function SettingsScreen({
     setProvidersError('');
     try {
       const payload = await listAiProviders();
-      const nextProviders = Array.isArray(payload.providers) ? payload.providers : [];
+      const listedProviders = Array.isArray(payload.providers) ? payload.providers : [];
+      const nextProviders = await Promise.all(
+        listedProviders.map(async (provider) => {
+          if (!provider?.id) return provider;
+          if (!provider.integration?.enabled || !provider.integration?.configured) {
+            return provider;
+          }
+          try {
+            const quota = await getAiProviderQuota(provider.id);
+            return { ...provider, quota };
+          } catch (_error) {
+            return provider;
+          }
+        })
+      );
       setProviders(nextProviders);
       setPermissionDrafts((prev) => {
         const next: Record<string, AiProviderPermissionProfile> = { ...prev };
@@ -366,6 +393,29 @@ export default function SettingsScreen({
       setSavingPermissionProviderId('');
     }
   }, [permissionDrafts]);
+
+  const grantFullPermissions = useCallback(async (providerId: string) => {
+    setGrantingPermissionProviderId(providerId);
+    setProvidersError('');
+    try {
+      const saved = await grantAiProviderFullPermissions(providerId);
+      setPermissionDrafts((prev) => ({
+        ...prev,
+        [providerId]: saved
+      }));
+      setProviders((prev) =>
+        prev.map((provider) =>
+          provider.id === providerId ? { ...provider, permissions: saved } : provider
+        )
+      );
+    } catch (error) {
+      setProvidersError(
+        error instanceof Error ? error.message : 'No se pudieron conceder permisos completos'
+      );
+    } finally {
+      setGrantingPermissionProviderId('');
+    }
+  }, []);
 
   const formatPercent = (value: number) => `${Math.max(0, Math.round(Number(value || 0)))}%`;
 
@@ -1393,6 +1443,12 @@ export default function SettingsScreen({
               {providers.map((provider) => {
                 const draft = permissionDrafts[provider.id] || provider.permissions;
                 const saving = savingPermissionProviderId === provider.id;
+                const granting = grantingPermissionProviderId === provider.id;
+                const allowedTools = new Set(
+                  (draft.allowedTools || [])
+                    .map((entry) => String(entry || '').trim().toLowerCase())
+                    .filter(Boolean)
+                );
                 return (
                   <article key={provider.id} className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-3 space-y-3">
                     <div className="flex items-center justify-between gap-2">
@@ -1520,20 +1576,76 @@ export default function SettingsScreen({
                       />
                     </div>
 
+                    <div className="space-y-1">
+                      <p className="text-[11px] uppercase text-zinc-500">tools permitidas</p>
+                      <div className="flex flex-wrap gap-2">
+                        {providerPermissionToolCatalog.map((toolId) => {
+                          const enabled = allowedTools.has(toolId);
+                          return (
+                            <button
+                              key={`${provider.id}:tool:${toolId}`}
+                              type="button"
+                              onClick={() => {
+                                setPermissionDrafts((prev) => {
+                                  const current = prev[provider.id] || draft;
+                                  const nextAllowedTools = new Set(
+                                    (current.allowedTools || [])
+                                      .map((entry) => String(entry || '').trim().toLowerCase())
+                                      .filter(Boolean)
+                                  );
+                                  if (nextAllowedTools.has(toolId)) {
+                                    nextAllowedTools.delete(toolId);
+                                  } else {
+                                    nextAllowedTools.add(toolId);
+                                  }
+                                  return {
+                                    ...prev,
+                                    [provider.id]: {
+                                      ...current,
+                                      allowedTools: Array.from(nextAllowedTools)
+                                    }
+                                  };
+                                });
+                              }}
+                              className={`rounded-lg border px-2 py-1 text-xs transition ${
+                                enabled
+                                  ? 'border-emerald-700/70 bg-emerald-600/10 text-emerald-300'
+                                  : 'border-zinc-700 text-zinc-400 hover:text-zinc-200'
+                              }`}
+                            >
+                              {toolId}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
                     <div className="flex items-center justify-between gap-2">
                       <p className="text-[11px] text-zinc-500">
                         actualizado: {draft.updatedAt ? formatDate(draft.updatedAt) : '-'}
                       </p>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void saveProviderPermissions(provider.id);
-                        }}
-                        disabled={saving}
-                        className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-50"
-                      >
-                        {saving ? 'Guardando...' : 'Guardar permisos'}
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void grantFullPermissions(provider.id);
+                          }}
+                          disabled={saving || granting}
+                          className="text-xs px-2.5 py-1.5 rounded-lg border border-emerald-700/70 text-emerald-300 hover:text-emerald-200 hover:border-emerald-500 disabled:opacity-50"
+                        >
+                          {granting ? 'Aplicando...' : 'Acceso total'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void saveProviderPermissions(provider.id);
+                          }}
+                          disabled={saving || granting}
+                          className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-50"
+                        >
+                          {saving ? 'Guardando...' : 'Guardar permisos'}
+                        </button>
+                      </div>
                     </div>
                   </article>
                 );

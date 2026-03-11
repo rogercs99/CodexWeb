@@ -1217,7 +1217,7 @@ export default function TerminalLogScreen({
         return accounts[0]?.id || '';
       });
     } catch (error) {
-      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudieron cargar cuentas de Drive');
+      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudieron cargar cuentas de Dropbox');
     } finally {
       if (!silent) {
         setDriveAccountsLoading(false);
@@ -1239,7 +1239,7 @@ export default function TerminalLogScreen({
       });
       setDriveFiles(payload.files);
     } catch (error) {
-      setDriveFilesError(error instanceof Error ? error.message : 'No se pudieron listar archivos de Drive');
+      setDriveFilesError(error instanceof Error ? error.message : 'No se pudieron listar archivos de Dropbox');
     } finally {
       setDriveFilesLoading(false);
     }
@@ -1310,7 +1310,7 @@ export default function TerminalLogScreen({
     try {
       const credentialsJson = JSON.parse(rawText);
       const account = await createToolsDriveAccount({
-        alias: alias || `Drive ${Date.now().toString().slice(-5)}`,
+        alias: alias || `Dropbox ${Date.now().toString().slice(-5)}`,
         credentialsJson
       });
       setDriveNotice(`Cuenta ${account.alias} guardada.`);
@@ -1322,7 +1322,7 @@ export default function TerminalLogScreen({
         setActiveDriveAccountId(account.id);
       }
     } catch (error) {
-      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo guardar cuenta de Drive');
+      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo guardar cuenta de Dropbox');
     } finally {
       setCreatingDriveAccount(false);
     }
@@ -1339,7 +1339,7 @@ export default function TerminalLogScreen({
       await loadDriveAccounts(true);
       await loadDriveFiles();
     } catch (error) {
-      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo validar cuenta de Drive');
+      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo validar cuenta de Dropbox');
     } finally {
       setValidatingDriveAccountId(null);
     }
@@ -1386,7 +1386,7 @@ export default function TerminalLogScreen({
   };
 
   const removeDriveAccount = async (accountId: string) => {
-    if (!window.confirm('Se eliminará la cuenta de Drive de CodexWeb. ¿Continuar?')) {
+    if (!window.confirm('Se eliminará la cuenta de Dropbox de CodexWeb. ¿Continuar?')) {
       return;
     }
     setDeletingDriveAccountId(accountId);
@@ -1398,7 +1398,7 @@ export default function TerminalLogScreen({
       await loadDriveAccounts(true);
       await loadDriveFiles();
     } catch (error) {
-      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo eliminar cuenta de Drive');
+      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo eliminar cuenta de Dropbox');
     } finally {
       setDeletingDriveAccountId(null);
     }
@@ -1408,7 +1408,7 @@ export default function TerminalLogScreen({
     const accountId = String(activeDriveAccountId || '').trim();
     const paths = Object.keys(storageSelectedLocalPaths);
     if (!accountId) {
-      setDriveAccountsError('Selecciona una cuenta de Drive para subir archivos.');
+      setDriveAccountsError('Selecciona una cuenta de Dropbox para subir archivos.');
       return;
     }
     if (paths.length === 0) {
@@ -1429,13 +1429,13 @@ export default function TerminalLogScreen({
       });
       setDriveUploadJob(job);
       if (job.status === 'error') {
-        throw new Error(job.error || 'La subida a Drive terminó con error.');
+        throw new Error(job.error || 'La subida a Dropbox terminó con error.');
       }
       setStorageSelectedLocalPaths({});
       setDriveNotice('Subida completada.');
       await loadDriveFiles();
     } catch (error) {
-      setDriveFilesError(error instanceof Error ? error.message : 'No se pudo completar la subida a Drive');
+      setDriveFilesError(error instanceof Error ? error.message : 'No se pudo completar la subida a Dropbox');
     }
   };
 
@@ -1443,7 +1443,7 @@ export default function TerminalLogScreen({
     const accountId = String(activeDriveAccountId || '').trim();
     const safeFileId = String(fileId || '').trim();
     if (!accountId || !safeFileId) return;
-    const confirmed = window.confirm('Se eliminará el archivo seleccionado de Google Drive. ¿Continuar?');
+    const confirmed = window.confirm('Se eliminará el archivo seleccionado de Dropbox. ¿Continuar?');
     if (!confirmed) return;
     setDriveFilesError('');
     setDriveNotice('');
@@ -1452,10 +1452,10 @@ export default function TerminalLogScreen({
         accountId,
         fileId: safeFileId
       });
-      setDriveNotice('Archivo borrado en Drive.');
+      setDriveNotice('Archivo borrado en Dropbox.');
       await loadDriveFiles();
     } catch (error) {
-      setDriveFilesError(error instanceof Error ? error.message : 'No se pudo borrar archivo de Drive');
+      setDriveFilesError(error instanceof Error ? error.message : 'No se pudo borrar archivo de Dropbox');
     }
   };
 
@@ -1492,7 +1492,7 @@ export default function TerminalLogScreen({
       String(backupAccountByAppId[safeAppId] || '').trim() ||
       String(activeDriveAccountId || '').trim();
     if (!safeAppId || !accountId) {
-      setDeployedAppsError('Selecciona cuenta de Drive para crear backup.');
+      setDeployedAppsError('Selecciona cuenta de Dropbox para crear backup.');
       return;
     }
     setCreatingBackupAppId(safeAppId);
@@ -1950,7 +1950,7 @@ export default function TerminalLogScreen({
                     <div className="min-w-0">
                       <p className="text-sm text-zinc-100">Storage local + nube</p>
                       <p className="text-xs text-zinc-500 truncate">
-                        {storageLocalData?.entries?.length || 0} item(s) locales · {driveAccounts.length} cuenta(s) Drive
+                        {storageLocalData?.entries?.length || 0} item(s) locales · {driveAccounts.length} cuenta(s) Dropbox
                       </p>
                     </div>
                   </div>
@@ -2679,9 +2679,9 @@ export default function TerminalLogScreen({
         {activeView === 'storage' ? (
           <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 space-y-4">
             <div>
-              <h2 className="text-sm font-semibold text-zinc-100">Storage local + Google Drive</h2>
+              <h2 className="text-sm font-semibold text-zinc-100">Storage local + Dropbox</h2>
               <p className="text-xs text-zinc-500">
-                Explora rutas del servidor, detecta peso, sube a nube y gestiona cuentas de Drive.
+                Explora rutas del servidor, detecta peso, sube a nube y gestiona cuentas de Dropbox.
               </p>
             </div>
 
@@ -2847,7 +2847,7 @@ export default function TerminalLogScreen({
                 >
                   <span className="inline-flex items-center gap-1">
                     <Upload size={12} />
-                    Subir seleccion a Drive
+                    Subir seleccion a Dropbox
                   </span>
                 </button>
                 <button
@@ -2890,7 +2890,7 @@ export default function TerminalLogScreen({
 
             <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-3">
               <div className="flex items-center justify-between gap-2">
-                <p className="text-xs text-zinc-300 uppercase">Google Drive</p>
+                <p className="text-xs text-zinc-300 uppercase">Dropbox</p>
                 <button
                   type="button"
                   onClick={() => {
@@ -2905,15 +2905,15 @@ export default function TerminalLogScreen({
               <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-3 space-y-2">
                 <p className="text-[11px] uppercase text-zinc-500">Subir credenciales JSON</p>
                 <p className="text-[11px] text-zinc-500">
-                  Soporta `service_account` y `oauth_client`. Las credenciales se guardan cifradas en servidor y no se exponen al cliente.
+                  Soporta `token` y `oauth_app`. Las credenciales se guardan cifradas en servidor y no se exponen al cliente.
                 </p>
                 <p className="text-[11px] text-zinc-500">
-                  Pasos: crea proyecto en Google Cloud → habilita Drive API → crea credencial (service account u OAuth client) → descarga JSON → súbelo aquí.
+                  Pasos: crea app en Dropbox Developers → genera token o credenciales OAuth app → descarga/arma JSON → súbelo aquí.
                 </p>
                 <input
                   value={driveCredentialAlias}
                   onChange={(event) => setDriveCredentialAlias(event.target.value)}
-                  placeholder="Alias de cuenta (ej. Drive Produccion)"
+                  placeholder="Alias de cuenta (ej. Dropbox Produccion)"
                   className="w-full rounded-lg border border-zinc-800 bg-black/50 px-3 py-2 text-xs text-zinc-100"
                 />
                 <textarea
@@ -2957,7 +2957,7 @@ export default function TerminalLogScreen({
 
               {driveAccountsLoading ? <p className="text-xs text-zinc-500">Cargando cuentas...</p> : null}
               {!driveAccountsLoading && driveAccounts.length === 0 ? (
-                <p className="text-xs text-zinc-500">No hay cuentas de Drive configuradas todavía.</p>
+                <p className="text-xs text-zinc-500">No hay cuentas de Dropbox configuradas todavía.</p>
               ) : null}
 
               <div className="space-y-2">
@@ -2998,7 +2998,7 @@ export default function TerminalLogScreen({
                         >
                           {validatingDriveAccountId === account.id ? 'Validando...' : 'Validar'}
                         </button>
-                        {account.authMode === 'oauth_client' ? (
+                        {account.authMode === 'oauth_app' ? (
                           <>
                             <button
                               type="button"
@@ -3047,7 +3047,7 @@ export default function TerminalLogScreen({
                   <input
                     value={driveOauthCode}
                     onChange={(event) => setDriveOauthCode(event.target.value)}
-                    placeholder="Pega aquí el code de Google"
+                    placeholder="Pega aquí el code de Dropbox"
                     className="w-full rounded-lg border border-zinc-800 bg-black/40 px-3 py-2 text-xs text-zinc-100"
                   />
                 </article>
@@ -3055,7 +3055,7 @@ export default function TerminalLogScreen({
 
               <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5 space-y-2">
                 <p className="text-[11px] uppercase text-zinc-500">
-                  Archivos en Drive {activeDriveAccountId ? `· cuenta ${activeDriveAccountId}` : ''}
+                  Archivos en Dropbox {activeDriveAccountId ? `· cuenta ${activeDriveAccountId}` : ''}
                 </p>
                 {driveFilesLoading ? <p className="text-xs text-zinc-500">Cargando archivos...</p> : null}
                 {!driveFilesLoading && driveFiles.length === 0 ? (
@@ -3445,7 +3445,7 @@ export default function TerminalLogScreen({
                           <p className="text-[11px] uppercase text-zinc-500">backup nube / restauracion</p>
                           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                             <label className="rounded-lg border border-zinc-800 bg-black/30 px-2.5 py-2 text-xs text-zinc-300">
-                              <span className="block text-[10px] uppercase text-zinc-500 mb-1">Cuenta Drive</span>
+                              <span className="block text-[10px] uppercase text-zinc-500 mb-1">Cuenta Dropbox</span>
                               <select
                                 value={backupAccountId}
                                 onChange={(event) =>

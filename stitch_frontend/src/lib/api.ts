@@ -100,7 +100,7 @@ function normalizeAiProviderPermissionProfile(rawValue: any): AiProviderPermissi
     allowBackupRestore: Boolean(rawValue?.allowBackupRestore),
     allowedTools: Array.isArray(rawValue?.allowedTools)
       ? rawValue.allowedTools.map((entry: any) => String(entry || '').trim().toLowerCase()).filter(Boolean)
-      : ['chat', 'git', 'storage', 'drive', 'backups', 'deployments', 'shell'],
+      : ['chat', 'git', 'storage', 'dropbox', 'backups', 'deployments', 'shell'],
     updatedAt: String(rawValue?.updatedAt || '')
   };
 }
@@ -419,6 +419,18 @@ export async function updateAiProviderPermissions(
   return normalizeAiProviderPermissionProfile(data?.permissions);
 }
 
+export async function grantAiProviderFullPermissions(
+  providerId: string
+): Promise<AiProviderPermissionProfile> {
+  const data = await api<{ permissions: any }>(
+    `/api/ai/providers/${encodeURIComponent(String(providerId || '').trim())}/permissions/grant-full`,
+    {
+      method: 'POST'
+    }
+  );
+  return normalizeAiProviderPermissionProfile(data?.permissions);
+}
+
 export async function getCodexQuota(): Promise<CodexQuota | null> {
   const data = await api<{ quota: CodexQuota | null }>('/api/codex/quota');
   return data.quota ?? null;
@@ -628,10 +640,11 @@ function normalizeToolsStorageJob(rawValue: any): ToolsStorageJob {
     id: String(rawValue?.id || ''),
     type:
       rawValue?.type === 'drive_upload_files' ||
+      rawValue?.type === 'dropbox_upload_files' ||
       rawValue?.type === 'deployed_backup_create' ||
       rawValue?.type === 'deployed_backup_restore'
         ? rawValue.type
-        : 'drive_upload_files',
+        : 'dropbox_upload_files',
     status:
       rawValue?.status === 'running' ||
       rawValue?.status === 'completed' ||
@@ -654,7 +667,7 @@ function normalizeToolsDriveAccount(rawValue: any): ToolsDriveAccount {
   return {
     id: String(rawValue?.id || ''),
     alias: String(rawValue?.alias || ''),
-    authMode: rawValue?.authMode === 'oauth_client' ? 'oauth_client' : 'service_account',
+    authMode: rawValue?.authMode === 'oauth_app' ? 'oauth_app' : 'token',
     rootFolderId: String(rawValue?.rootFolderId || 'root'),
     status:
       rawValue?.status === 'active' ||
@@ -812,7 +825,7 @@ export async function getToolsStorageJob(jobId: string): Promise<ToolsStorageJob
 }
 
 export async function listToolsDriveAccounts(): Promise<ToolsDriveAccount[]> {
-  const data = await api<{ accounts: ToolsDriveAccount[] }>('/api/tools/storage/drive/accounts');
+  const data = await api<{ accounts: ToolsDriveAccount[] }>('/api/tools/storage/dropbox/accounts');
   return Array.isArray(data?.accounts) ? data.accounts.map((row: any) => normalizeToolsDriveAccount(row)) : [];
 }
 
@@ -821,7 +834,7 @@ export async function createToolsDriveAccount(payload: {
   rootFolderId?: string;
   credentialsJson: Record<string, any> | string;
 }): Promise<ToolsDriveAccount> {
-  const data = await api<{ account: ToolsDriveAccount }>('/api/tools/storage/drive/accounts', {
+  const data = await api<{ account: ToolsDriveAccount }>('/api/tools/storage/dropbox/accounts', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
@@ -837,7 +850,7 @@ export async function validateToolsDriveAccount(accountId: string): Promise<{
     account: ToolsDriveAccount;
     about: { email: string; displayName: string; quota: { limit: number | null; usage: number | null; usageInDrive: number | null } };
   }>(
-    `/api/tools/storage/drive/accounts/${encodeURIComponent(String(accountId || '').trim())}/validate`,
+    `/api/tools/storage/dropbox/accounts/${encodeURIComponent(String(accountId || '').trim())}/validate`,
     { method: 'POST' }
   );
   return {
@@ -854,7 +867,7 @@ export async function startToolsDriveOauth(accountId: string, redirectUri = ''):
     account: ToolsDriveAccount;
     oauth: { authUrl: string; redirectUri: string; instructions: string };
   }>(
-    `/api/tools/storage/drive/accounts/${encodeURIComponent(String(accountId || '').trim())}/oauth/start`,
+    `/api/tools/storage/dropbox/accounts/${encodeURIComponent(String(accountId || '').trim())}/oauth/start`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -877,7 +890,7 @@ export async function completeToolsDriveOauth(payload: {
   redirectUri?: string;
 }): Promise<{ account: ToolsDriveAccount }> {
   const data = await api<{ account: ToolsDriveAccount }>(
-    `/api/tools/storage/drive/accounts/${encodeURIComponent(String(payload.accountId || '').trim())}/oauth/complete`,
+    `/api/tools/storage/dropbox/accounts/${encodeURIComponent(String(payload.accountId || '').trim())}/oauth/complete`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -890,7 +903,7 @@ export async function completeToolsDriveOauth(payload: {
 }
 
 export async function deleteToolsDriveAccount(accountId: string): Promise<{ deleted: boolean; accountId: string }> {
-  return api(`/api/tools/storage/drive/accounts/${encodeURIComponent(String(accountId || '').trim())}`, {
+  return api(`/api/tools/storage/dropbox/accounts/${encodeURIComponent(String(accountId || '').trim())}`, {
     method: 'DELETE'
   });
 }
@@ -906,7 +919,7 @@ export async function listToolsDriveFiles(payload: {
   if (payload.folderId) params.set('folderId', String(payload.folderId));
   if (payload.pageToken) params.set('pageToken', String(payload.pageToken));
   if (payload.query) params.set('query', String(payload.query));
-  const data = await api<ToolsDriveFilesPayload>(`/api/tools/storage/drive/files?${params.toString()}`);
+  const data = await api<ToolsDriveFilesPayload>(`/api/tools/storage/dropbox/files?${params.toString()}`);
   return {
     account: normalizeToolsDriveAccount(data?.account),
     folderId: String(data?.folderId || ''),
@@ -934,7 +947,7 @@ export async function uploadToolsDriveFiles(payload: {
   paths: string[];
   parentId?: string;
 }): Promise<{ job: ToolsStorageJob }> {
-  const data = await api<{ job: ToolsStorageJob }>('/api/tools/storage/drive/upload', {
+  const data = await api<{ job: ToolsStorageJob }>('/api/tools/storage/dropbox/upload', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
@@ -949,7 +962,7 @@ export async function deleteToolsDriveFile(payload: {
   fileId: string;
 }): Promise<{ deleted: boolean; fileId: string; account: ToolsDriveAccount }> {
   const data = await api<{ deleted: boolean; fileId: string; account: ToolsDriveAccount }>(
-    `/api/tools/storage/drive/files/${encodeURIComponent(String(payload.fileId || '').trim())}?accountId=${encodeURIComponent(String(payload.accountId || '').trim())}&confirm=DELETE`,
+    `/api/tools/storage/dropbox/files/${encodeURIComponent(String(payload.fileId || '').trim())}?accountId=${encodeURIComponent(String(payload.accountId || '').trim())}&confirm=DELETE`,
     {
       method: 'DELETE'
     }
@@ -986,6 +999,7 @@ export async function listToolsDeployedAppBackups(
           id: String(entry?.id || ''),
           appId: String(entry?.appId || appId),
           driveFileId: String(entry?.driveFileId || ''),
+          remoteFileId: String(entry?.remoteFileId || entry?.driveFileId || ''),
           accountId: String(entry?.accountId || ''),
           accountAlias: String(entry?.accountAlias || ''),
           name: String(entry?.name || ''),
