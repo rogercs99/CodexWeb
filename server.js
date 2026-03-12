@@ -559,6 +559,74 @@ const taskSnapshotsRootDir = resolveConfiguredPath(
   process.env.TASK_SNAPSHOTS_DIR,
   path.join(__dirname, 'tmp', 'task-snapshots')
 );
+const configuredTaskSnapshotMaxFiles = Number.parseInt(String(process.env.TASK_SNAPSHOT_MAX_FILES || '1200'), 10);
+const configuredTaskSnapshotMaxFileBytes = Number.parseInt(
+  String(process.env.TASK_SNAPSHOT_MAX_FILE_BYTES || String(12 * 1024 * 1024)),
+  10
+);
+const configuredTaskSnapshotMaxTotalBytes = Number.parseInt(
+  String(process.env.TASK_SNAPSHOT_MAX_TOTAL_BYTES || String(96 * 1024 * 1024)),
+  10
+);
+const configuredTaskSnapshotsRetentionMaxBytes = Number.parseInt(
+  String(process.env.TASK_SNAPSHOTS_RETENTION_MAX_BYTES || String(768 * 1024 * 1024)),
+  10
+);
+const configuredTaskSnapshotsRetentionMaxEntries = Number.parseInt(
+  String(process.env.TASK_SNAPSHOTS_RETENTION_MAX_ENTRIES || '18'),
+  10
+);
+const configuredTaskSnapshotsRetentionMaxAgeHours = Number.parseInt(
+  String(process.env.TASK_SNAPSHOTS_RETENTION_MAX_AGE_HOURS || '36'),
+  10
+);
+const configuredTaskSnapshotsPruneIntervalMinutes = Number.parseInt(
+  String(process.env.TASK_SNAPSHOTS_PRUNE_INTERVAL_MINUTES || '30'),
+  10
+);
+const taskSnapshotMaxFiles =
+  Number.isInteger(configuredTaskSnapshotMaxFiles) && configuredTaskSnapshotMaxFiles >= 80
+    ? Math.min(configuredTaskSnapshotMaxFiles, 15000)
+    : 1200;
+const taskSnapshotMaxFileBytes =
+  Number.isInteger(configuredTaskSnapshotMaxFileBytes) && configuredTaskSnapshotMaxFileBytes > 0
+    ? Math.min(configuredTaskSnapshotMaxFileBytes, 1024 * 1024 * 1024)
+    : 12 * 1024 * 1024;
+const taskSnapshotMaxTotalBytes =
+  Number.isInteger(configuredTaskSnapshotMaxTotalBytes) && configuredTaskSnapshotMaxTotalBytes > 0
+    ? Math.min(configuredTaskSnapshotMaxTotalBytes, 4 * 1024 * 1024 * 1024)
+    : 96 * 1024 * 1024;
+const taskSnapshotsRetentionMaxBytes =
+  Number.isInteger(configuredTaskSnapshotsRetentionMaxBytes) && configuredTaskSnapshotsRetentionMaxBytes > 0
+    ? Math.min(configuredTaskSnapshotsRetentionMaxBytes, 16 * 1024 * 1024 * 1024)
+    : 768 * 1024 * 1024;
+const taskSnapshotsRetentionMaxEntries =
+  Number.isInteger(configuredTaskSnapshotsRetentionMaxEntries) && configuredTaskSnapshotsRetentionMaxEntries > 0
+    ? Math.min(configuredTaskSnapshotsRetentionMaxEntries, 500)
+    : 18;
+const taskSnapshotsRetentionMaxAgeMs =
+  Number.isInteger(configuredTaskSnapshotsRetentionMaxAgeHours) && configuredTaskSnapshotsRetentionMaxAgeHours > 0
+    ? Math.min(configuredTaskSnapshotsRetentionMaxAgeHours, 24 * 30) * 60 * 60 * 1000
+    : 36 * 60 * 60 * 1000;
+const taskSnapshotsPruneIntervalMs =
+  Number.isInteger(configuredTaskSnapshotsPruneIntervalMinutes) && configuredTaskSnapshotsPruneIntervalMinutes >= 5
+    ? Math.min(configuredTaskSnapshotsPruneIntervalMinutes, 24 * 60) * 60 * 1000
+    : 30 * 60 * 1000;
+const taskSnapshotIgnoredRootDirs = new Set([
+  '.git',
+  '.runtime',
+  '.codex_users',
+  'node_modules',
+  'uploads',
+  'tmp',
+  'dist',
+  'build',
+  'coverage',
+  'test-results'
+]);
+let taskSnapshotPruneInFlight = false;
+let taskSnapshotPruneScheduled = false;
+let taskSnapshotPruneLastAtMs = 0;
 const storageJobsRootDir = resolveConfiguredPath(
   process.env.STORAGE_JOBS_DIR,
   path.join(__dirname, 'tmp', 'storage-jobs')
@@ -8026,6 +8094,22 @@ function buildGitConflictResolverPrompt(repoSummary, gitIdentity) {
   ].join('\n');
 }
 
+function shouldIncludeTaskSnapshotPath(relativePath) {
+  const normalized = normalizeRepoRelativePath(relativePath).toLowerCase();
+  if (!normalized) return false;
+  if (normalized === 'tmp/task-snapshots' || normalized.startsWith('tmp/task-snapshots/')) return false;
+  if (normalized === 'tmp/storage-jobs' || normalized.startsWith('tmp/storage-jobs/')) return false;
+  if (normalized.startsWith('.runtime/')) return false;
+  if (normalized.startsWith('public/assets/')) return false;
+  if (normalized.startsWith('deploy/nginx/')) return false;
+  const segments = normalized.split('/').filter(Boolean);
+  if (segments.length === 0) return false;
+  if (taskSnapshotIgnoredRootDirs.has(segments[0])) return false;
+  if (segments.includes('node_modules')) return false;
+  if (segments.includes('.git')) return false;
+  return true;
+}
+
 function listTrackedAndUntrackedRepoFiles() {
   const tracked = parseNullSeparatedList(runGitStdoutSync(['ls-files', '-z']));
   const untracked = parseNullSeparatedList(
@@ -8034,7 +8118,7 @@ function listTrackedAndUntrackedRepoFiles() {
   const merged = [];
   const seen = new Set();
   [...tracked, ...untracked].forEach((entry) => {
-    if (!entry || seen.has(entry)) return;
+    if (!entry || seen.has(entry) || !shouldIncludeTaskSnapshotPath(entry)) return;
     seen.add(entry);
     merged.push(entry);
   });
@@ -8138,7 +8222,13 @@ function createTaskSnapshot(taskRunId) {
   fs.mkdirSync(path.join(snapshotDir, 'files'), { recursive: true });
 
   const manifestFiles = [];
+  let copiedBytesTotal = 0;
+  let skippedCount = 0;
+  let reachedFilesCap = false;
   knownPaths.forEach((relPath) => {
+    if (reachedFilesCap) {
+      return;
+    }
     const absolutePath = resolveRepoPathFromRelative(relPath);
     if (!absolutePath || !pathExistsOrSymlink(absolutePath)) return;
     let stats = null;
@@ -8166,6 +8256,19 @@ function createTaskSnapshot(taskRunId) {
     }
 
     if (!stats.isFile()) return;
+    const fileSize = Number(stats.size) || 0;
+    if (fileSize > taskSnapshotMaxFileBytes) {
+      skippedCount += 1;
+      return;
+    }
+    if (copiedBytesTotal + fileSize > taskSnapshotMaxTotalBytes) {
+      skippedCount += 1;
+      return;
+    }
+    if (manifestFiles.length >= taskSnapshotMaxFiles) {
+      reachedFilesCap = true;
+      return;
+    }
     const backupPosixPath = path.posix.join('files', relPath);
     const backupAbsolutePath = path.join(snapshotDir, ...backupPosixPath.split('/'));
     try {
@@ -8176,9 +8279,10 @@ function createTaskSnapshot(taskRunId) {
         type: 'file',
         backupPath: backupPosixPath,
         sha256: computeFileSha256(absolutePath),
-        size: Number(stats.size) || 0,
+        size: fileSize,
         mode: Number(stats.mode) || 0
       });
+      copiedBytesTotal += fileSize;
     } catch (_error) {
       // best-effort snapshot file copy
     }
@@ -8200,6 +8304,10 @@ function createTaskSnapshot(taskRunId) {
     snapshotDir,
     snapshotReady: manifest.files.length > 0,
     filesTotal: manifest.files.length,
+    bytesTotal: copiedBytesTotal,
+    skippedTotal: skippedCount,
+    partial:
+      skippedCount > 0 || reachedFilesCap || copiedBytesTotal >= taskSnapshotMaxTotalBytes || knownPaths.length > manifest.files.length,
     manifest
   };
 }
@@ -8820,6 +8928,231 @@ function restoreTaskFilesFromSnapshot(snapshotDir, touchedFiles) {
     touchedFiles: targetPaths,
     errors
   };
+}
+
+function normalizeTaskSnapshotDirPath(rawValue) {
+  const value = String(rawValue || '').trim();
+  if (!value) return '';
+  try {
+    return path.isAbsolute(value) ? path.resolve(value) : path.resolve(repoRootDir, value);
+  } catch (_error) {
+    return '';
+  }
+}
+
+function sumTaskSnapshotManifestBytes(manifest) {
+  if (!manifest || !Array.isArray(manifest.files)) return 0;
+  return manifest.files.reduce((acc, entry) => {
+    const size = Number(entry && entry.size);
+    return Number.isFinite(size) && size > 0 ? acc + size : acc;
+  }, 0);
+}
+
+function computeDirectorySizeRecursiveBytes(rootDir) {
+  const stack = [rootDir];
+  let total = 0;
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let entries = [];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch (_error) {
+      continue;
+    }
+    entries.forEach((entry) => {
+      const absolutePath = path.join(current, entry.name);
+      try {
+        if (entry.isDirectory()) {
+          stack.push(absolutePath);
+          return;
+        }
+        const stats = fs.lstatSync(absolutePath);
+        if (stats.isFile()) {
+          total += Math.max(0, Number(stats.size) || 0);
+        }
+      } catch (_error) {
+        // best-effort size scan
+      }
+    });
+  }
+  return total;
+}
+
+function getTaskSnapshotDirectorySizeBytes(snapshotDir) {
+  const manifest = loadTaskSnapshotManifest(snapshotDir);
+  const manifestBytes = sumTaskSnapshotManifestBytes(manifest);
+  if (manifestBytes > 0) return manifestBytes;
+  return computeDirectorySizeRecursiveBytes(snapshotDir);
+}
+
+function listTaskSnapshotDirectoryEntries() {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(taskSnapshotsRootDir, { withFileTypes: true });
+  } catch (_error) {
+    return [];
+  }
+  return entries
+    .filter((entry) => entry && entry.isDirectory && entry.isDirectory())
+    .map((entry) => {
+      const token = String(entry.name || '').trim();
+      if (!token) return null;
+      const absolutePath = path.join(taskSnapshotsRootDir, token);
+      let stats = null;
+      try {
+        stats = fs.statSync(absolutePath);
+      } catch (_error) {
+        stats = null;
+      }
+      const runIdMatch = /^(\d+)_/.exec(token);
+      const runId = runIdMatch && Number.isInteger(Number(runIdMatch[1])) ? Number(runIdMatch[1]) : null;
+      return {
+        token,
+        runId,
+        absolutePath,
+        createdAtMs: stats ? Number(stats.mtimeMs || stats.ctimeMs || Date.now()) : Date.now(),
+        sizeBytes: getTaskSnapshotDirectorySizeBytes(absolutePath)
+      };
+    })
+    .filter(Boolean);
+}
+
+function pruneTaskSnapshots(options = {}) {
+  const force = Boolean(options && options.force);
+  const nowMs = Date.now();
+  if (!force && nowMs - taskSnapshotPruneLastAtMs < taskSnapshotsPruneIntervalMs) {
+    return {
+      skipped: true,
+      reason: 'interval'
+    };
+  }
+  if (taskSnapshotPruneInFlight) {
+    return {
+      skipped: true,
+      reason: 'busy'
+    };
+  }
+
+  taskSnapshotPruneInFlight = true;
+  try {
+    const snapshotRows = listTaskRunsWithSnapshotsStmt.all();
+    const refsByAbsolutePath = new Map();
+    snapshotRows.forEach((row) => {
+      const rawDir = String((row && row.snapshot_dir) || '').trim();
+      if (!rawDir) return;
+      const absolutePath = normalizeTaskSnapshotDirPath(rawDir);
+      if (!absolutePath) return;
+      const refs = refsByAbsolutePath.get(absolutePath) || [];
+      refs.push({
+        taskId: Number.isInteger(Number(row.id)) ? Number(row.id) : 0,
+        status: String((row && row.status) || '').trim().toLowerCase(),
+        rawDir
+      });
+      refsByAbsolutePath.set(absolutePath, refs);
+    });
+
+    const allEntries = listTaskSnapshotDirectoryEntries().sort((a, b) => b.createdAtMs - a.createdAtMs);
+    const existingSnapshotPathSet = new Set(allEntries.map((entry) => entry.absolutePath));
+    let staleDbRefCount = 0;
+    refsByAbsolutePath.forEach((refs, absolutePath) => {
+      if (existingSnapshotPathSet.has(absolutePath)) return;
+      refs.forEach((ref) => {
+        markTaskRunSnapshotUnavailableByDirStmt.run(nowIso(), String(ref.rawDir || ''));
+        staleDbRefCount += 1;
+      });
+    });
+    allEntries.forEach((entry) => {
+      const refs = refsByAbsolutePath.get(entry.absolutePath) || [];
+      entry.refs = refs;
+      entry.protected = refs.some((ref) => ref.status === 'running');
+    });
+
+    const keepEntries = [];
+    const deleteEntries = [];
+    allEntries.forEach((entry) => {
+      if (entry.protected) {
+        keepEntries.push(entry);
+        return;
+      }
+      if (taskSnapshotsRetentionMaxAgeMs > 0 && nowMs - entry.createdAtMs > taskSnapshotsRetentionMaxAgeMs) {
+        deleteEntries.push({ ...entry, reason: 'age' });
+        return;
+      }
+      keepEntries.push(entry);
+    });
+
+    let keepCount = keepEntries.length;
+    let keepBytes = keepEntries.reduce((acc, entry) => acc + Math.max(0, Number(entry.sizeBytes) || 0), 0);
+    for (let index = keepEntries.length - 1; index >= 0; index -= 1) {
+      const entry = keepEntries[index];
+      if (entry.protected) continue;
+      const overCount = keepCount > taskSnapshotsRetentionMaxEntries;
+      const overBytes = keepBytes > taskSnapshotsRetentionMaxBytes;
+      if (!overCount && !overBytes) continue;
+      keepEntries.splice(index, 1);
+      keepCount -= 1;
+      keepBytes = Math.max(0, keepBytes - Math.max(0, Number(entry.sizeBytes) || 0));
+      deleteEntries.push({ ...entry, reason: overCount ? 'count' : 'bytes' });
+    }
+
+    let deletedCount = 0;
+    let deletedBytes = 0;
+    let failedCount = 0;
+    deleteEntries.forEach((entry) => {
+      try {
+        fs.rmSync(entry.absolutePath, { recursive: true, force: true });
+        deletedCount += 1;
+        deletedBytes += Math.max(0, Number(entry.sizeBytes) || 0);
+        (entry.refs || []).forEach((ref) => {
+          markTaskRunSnapshotUnavailableByDirStmt.run(nowIso(), String(ref.rawDir || ''));
+        });
+      } catch (_error) {
+        failedCount += 1;
+      }
+    });
+
+    taskSnapshotPruneLastAtMs = nowMs;
+    if (deletedCount > 0) {
+      void notify(
+        `Task snapshots limpiados: ${deletedCount} eliminados, ${(deletedBytes / (1024 * 1024)).toFixed(1)}MB liberados.`
+      );
+    }
+    return {
+      skipped: false,
+      scanned: allEntries.length,
+      deletedCount,
+      deletedBytes,
+      failedCount,
+      staleDbRefCount,
+      keptCount: keepEntries.length,
+      keptBytes: keepBytes
+    };
+  } finally {
+    taskSnapshotPruneInFlight = false;
+  }
+}
+
+function scheduleTaskSnapshotPrune(options = {}) {
+  const force = Boolean(options && options.force);
+  if (force) {
+    return pruneTaskSnapshots({ force: true });
+  }
+  if (taskSnapshotPruneScheduled) {
+    return null;
+  }
+  taskSnapshotPruneScheduled = true;
+  const timer = setTimeout(() => {
+    taskSnapshotPruneScheduled = false;
+    try {
+      pruneTaskSnapshots();
+    } catch (_error) {
+      // best-effort maintenance
+    }
+  }, 1200);
+  if (timer && typeof timer.unref === 'function') {
+    timer.unref();
+  }
+  return null;
 }
 
 function sanitizeFilename(name) {
@@ -11110,6 +11443,25 @@ const getTaskRunByIdForUserStmt = db.prepare(`
     ON c.id = t.conversation_id
   WHERE t.id = ? AND t.user_id = ?
   LIMIT 1
+`);
+const listTaskRunsWithSnapshotsStmt = db.prepare(`
+  SELECT
+    id,
+    status,
+    snapshot_dir
+  FROM task_runs
+  WHERE snapshot_dir <> ''
+  ORDER BY id DESC
+  LIMIT 5000
+`);
+const markTaskRunSnapshotUnavailableByDirStmt = db.prepare(`
+  UPDATE task_runs
+  SET
+    snapshot_dir = '',
+    snapshot_ready = 0,
+    rollback_available = 0,
+    updated_at = ?
+  WHERE snapshot_dir = ?
 `);
 const listTaskRunsForUserStmt = db.prepare(`
   SELECT
@@ -17538,6 +17890,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           req.session.userId
         );
       }
+      scheduleTaskSnapshotPrune();
     } catch (error) {
       const reason = truncateForNotify(error && error.message ? error.message : 'task_start_failed', 160);
       void notify(`WARN task_start_failed user=${username} conv=${conversationId} reason=${reason}`);
@@ -19719,6 +20072,22 @@ process.on('uncaughtException', (error) => {
 
 markStaleTaskRunsOnStartup();
 markRestartRecoveredOnStartup();
+try {
+  pruneTaskSnapshots({ force: true });
+} catch (error) {
+  const reason = truncateForNotify(error && error.message ? error.message : 'task_snapshot_prune_startup_failed', 180);
+  void notify(`WARN task_snapshot_prune_startup_failed reason=${reason}`);
+}
+const taskSnapshotPruneTimer = setInterval(() => {
+  try {
+    pruneTaskSnapshots({ force: true });
+  } catch (_error) {
+    // best-effort maintenance
+  }
+}, taskSnapshotsPruneIntervalMs);
+if (taskSnapshotPruneTimer && typeof taskSnapshotPruneTimer.unref === 'function') {
+  taskSnapshotPruneTimer.unref();
+}
 resumePendingDeployedDescriptionJobs();
 resumePendingStorageJobs();
 grantFullAccessToActiveProviderForAdminUsersOnStartup();

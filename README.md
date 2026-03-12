@@ -51,6 +51,13 @@ GEMINI_INCLUDE_DIRECTORIES=/
 - `DB_PATH`: ruta de DB SQLite (admite absoluta o relativa al repo).
 - `UPLOADS_DIR`: ruta de adjuntos/subidas.
 - `TASK_SNAPSHOTS_DIR`: ruta de snapshots de tareas.
+- `TASK_SNAPSHOT_MAX_FILES`: máximo de archivos por snapshot.
+- `TASK_SNAPSHOT_MAX_FILE_BYTES`: tamaño máximo por archivo incluido en snapshot.
+- `TASK_SNAPSHOT_MAX_TOTAL_BYTES`: tope total de bytes por snapshot.
+- `TASK_SNAPSHOTS_RETENTION_MAX_BYTES`: tope acumulado de snapshots en disco.
+- `TASK_SNAPSHOTS_RETENTION_MAX_ENTRIES`: máximo de snapshots retenidos.
+- `TASK_SNAPSHOTS_RETENTION_MAX_AGE_HOURS`: antigüedad máxima de snapshots.
+- `TASK_SNAPSHOTS_PRUNE_INTERVAL_MINUTES`: intervalo de poda automática.
 - `STORAGE_JOBS_DIR`: ruta de jobs temporales de almacenamiento.
 - `RESTART_STATE_PATH`: ruta del estado de reinicio.
 - `STATIC_ASSETS_DIR`: ruta de estáticos servidos por Express.
