@@ -246,8 +246,20 @@ export async function logout(): Promise<void> {
   await api('/api/logout', { method: 'POST' });
 }
 
-export async function listConversations(): Promise<Conversation[]> {
-  const data = await api<{ conversations: any[] }>('/api/conversations');
+export async function listConversations(options?: {
+  scope?: 'all' | 'unassigned' | 'project';
+  projectId?: number | null;
+}): Promise<Conversation[]> {
+  const query = new URLSearchParams();
+  const scope = String(options?.scope || '').trim().toLowerCase();
+  if (scope === 'all' || scope === 'unassigned' || scope === 'project') {
+    query.set('scope', scope);
+  }
+  if (Number.isInteger(Number(options?.projectId)) && Number(options?.projectId) > 0) {
+    query.set('projectId', String(Number(options?.projectId)));
+  }
+  const querySuffix = query.toString() ? `?${query.toString()}` : '';
+  const data = await api<{ conversations: any[] }>(`/api/conversations${querySuffix}`);
   return Array.isArray(data.conversations)
     ? data.conversations.map((entry: any) => {
         const project = normalizeChatProjectRef(entry?.project);

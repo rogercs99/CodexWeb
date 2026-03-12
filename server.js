@@ -13809,7 +13809,40 @@ app.patch('/api/conversations/:id/project', requireAuth, (req, res) => {
 });
 
 app.get('/api/conversations', requireAuth, (req, res) => {
-  const conversations = listConversationsStmt.all(req.session.userId);
+  const scope = String(req.query.scope || '').trim().toLowerCase();
+  if (scope && scope !== 'all' && scope !== 'unassigned' && scope !== 'project') {
+    return res.status(400).json({ error: 'scope inválido. Usa all, unassigned o project.' });
+  }
+
+  const hasProjectQuery = Object.prototype.hasOwnProperty.call(req.query || {}, 'projectId');
+  const rawProjectId = hasProjectQuery ? String(req.query.projectId || '').trim() : '';
+  let requestedProjectId = null;
+  if (hasProjectQuery && rawProjectId) {
+    requestedProjectId = parseProjectIdInput(rawProjectId);
+    if (!requestedProjectId) {
+      return res.status(400).json({ error: 'projectId inválido.' });
+    }
+  }
+
+  if (scope === 'project' && !requestedProjectId) {
+    return res.status(400).json({ error: 'scope=project requiere projectId válido.' });
+  }
+  if (requestedProjectId !== null) {
+    const project = getOwnedProjectOrNull(requestedProjectId, req.session.userId);
+    if (!project) {
+      return res.status(404).json({ error: 'Proyecto no encontrado.' });
+    }
+  }
+
+  let conversations = listConversationsStmt.all(req.session.userId);
+  if (scope === 'unassigned') {
+    conversations = conversations.filter((conversation) => {
+      const conversationProjectId = Number(conversation.project_id);
+      return !Number.isInteger(conversationProjectId) || conversationProjectId <= 0;
+    });
+  } else if (requestedProjectId !== null) {
+    conversations = conversations.filter((conversation) => Number(conversation.project_id) === requestedProjectId);
+  }
   return res.json({
     ok: true,
     conversations: conversations.map((conversation) => ({
