@@ -1,11 +1,9 @@
 # Instrucciones de despliegue en Windows
 
-Este `.zip` incluye el codigo fuente de estos proyectos:
+Este repo incluye:
 
-- `CodexWeb` (raiz del zip)
-- `DIXIT/`
-- `frontend_zip/`
-- `stitch_frontend/`
+- `CodexWeb` (backend, en la raiz)
+- `stitch_frontend/` (frontend principal)
 
 ## 1) Requisitos
 
@@ -58,31 +56,7 @@ Abre en el navegador:
 
 `http://127.0.0.1:3050` (o el puerto que configures en `.env`)
 
-## 3) Desplegar DIXIT
-
-```powershell
-cd DIXIT
-npm install
-npm start
-```
-
-Abre:
-
-`http://localhost:3000`
-
-## 4) Ejecutar frontend_zip (Vite)
-
-```powershell
-cd frontend_zip
-npm install
-npm run dev
-```
-
-Abre:
-
-`http://localhost:3000`
-
-## 5) Ejecutar stitch_frontend (Vite)
+## 3) Ejecutar stitch_frontend (Vite)
 
 ```powershell
 cd stitch_frontend
@@ -94,10 +68,10 @@ Abre:
 
 `http://localhost:3000`
 
-## 6) Problemas comunes
+## 4) Problemas comunes
 
 - Error de puerto en uso:
-  - cambia `PORT` en `.env` (CodexWeb/DIXIT) o ejecuta Vite con otro puerto.
+  - cambia `PORT` en `.env` o ejecuta Vite con otro puerto.
 - Error `codex` no encontrado:
   - instala el CLI de Codex o define la ruta completa en `CODEX_CMD`.
 - Error al instalar modulos nativos (`better-sqlite3`):
