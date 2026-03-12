@@ -1,17 +1,24 @@
-import { ChevronLeft, Clipboard, Paperclip, RefreshCw, Send, Settings, Square, X } from 'lucide-react';
+import { Check, ChevronLeft, Clipboard, Copy, Paperclip, RefreshCw, Send, Settings, Square, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import BottomNav from './BottomNav';
-import type { ChatOptions, Message, Screen, TerminalEntry } from '../lib/types';
+import type { ChatOptions, ChatProject, ConversationProjectContext, Message, Screen, TerminalEntry } from '../lib/types';
 
 const TITLE_MAX_LENGTH = 40;
-const COLLAPSED_CODE_LINES = 20;
-
+const TOP_LOAD_THRESHOLD_PX = 72;
+const STICKY_BOTTOM_THRESHOLD_PX = 140;
 function formatDate(value: string) {
   const date = value ? new Date(value) : null;
   if (!date || Number.isNaN(date.getTime())) return '';
   return date.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
+}
+
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function formatElapsed(totalSeconds: number) {
@@ -26,34 +33,177 @@ function normalizeTitle(value: string) {
   return trimmed || 'Nuevo chat';
 }
 
+function stripOptionalFilePositionSuffix(rawPath: string) {
+  const source = String(rawPath || '').trim();
+  if (!source) return '';
+  const noFragment = source.split('#')[0];
+  const match = /^(.*):(\d+)(?::(\d+))?$/.exec(noFragment);
+  if (!match) return noFragment;
+  const basePath = String(match[1] || '').trim();
+  if (!basePath || !basePath.startsWith('/')) return noFragment;
+  return basePath;
+}
+
+function isLikelyLocalFilesystemPath(rawPath: string) {
+  const source = String(rawPath || '').trim();
+  if (!source) return false;
+  if (/^[a-zA-Z]:\//.test(source)) return true;
+  return (
+    source.startsWith('/root/') ||
+    source.startsWith('/home/') ||
+    source.startsWith('/Users/') ||
+    source.startsWith('/mnt/') ||
+    source.startsWith('/var/') ||
+    source.startsWith('/opt/')
+  );
+}
+
+function buildWorkspaceFileHref(rawPath: string) {
+  const normalized = String(rawPath || '').replace(/\\/g, '/').trim();
+  if (!normalized) return '';
+  const cleanPath = stripOptionalFilePositionSuffix(normalized) || normalized;
+  return `/api/workspace/file?path=${encodeURIComponent(cleanPath)}`;
+}
+
+function normalizeMessageLinkHref(href?: string) {
+  const raw = String(href || '').trim();
+  if (!raw) return '';
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) return raw;
+  if (raw.startsWith('#')) return raw;
+
+  const normalizedPath = raw.replace(/\\/g, '/');
+  const uploadsMarker = '/uploads/';
+  const markerIndex = normalizedPath.toLowerCase().indexOf(uploadsMarker);
+  if (markerIndex >= 0) {
+    return normalizedPath.slice(markerIndex);
+  }
+  if (isLikelyLocalFilesystemPath(normalizedPath)) {
+    return buildWorkspaceFileHref(normalizedPath);
+  }
+  return raw;
+}
+
 function truncateTitle(value: string, maxLength = TITLE_MAX_LENGTH) {
   if (value.length <= maxLength) return value;
   return `${value.slice(0, maxLength - 1).trimEnd()}…`;
 }
 
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  const source = String(text || '');
+  if (!source) return false;
+
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(source);
+      return true;
+    }
+  } catch (_error) {
+    // fallback below
+  }
+
+  try {
+    const textarea = document.createElement('textarea');
+    textarea.value = source;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    textarea.style.pointerEvents = 'none';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    const copied = document.execCommand('copy');
+    document.body.removeChild(textarea);
+    return copied;
+  } catch (_error) {
+    return false;
+  }
+}
+
 function CodeBlock({ text, language }: { text: string; language: string }) {
   const [expanded, setExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<number | null>(null);
   const lines = String(text || '').split('\n');
-  const canCollapse = lines.length > COLLAPSED_CODE_LINES;
-  const shown = !canCollapse || expanded ? lines : lines.slice(0, COLLAPSED_CODE_LINES);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleCopy = async () => {
+    const ok = await copyTextToClipboard(text);
+    if (!ok) return;
+    setCopied(true);
+    if (copyTimerRef.current !== null) {
+      window.clearTimeout(copyTimerRef.current);
+    }
+    copyTimerRef.current = window.setTimeout(() => {
+      setCopied(false);
+      copyTimerRef.current = null;
+    }, 1600);
+  };
 
   return (
     <div className="rounded-xl border border-zinc-700 bg-zinc-950/90 overflow-hidden">
-      <div className="flex items-center justify-between px-3 py-2 border-b border-zinc-800 bg-zinc-900/70">
+      <div
+        className="flex items-center justify-between px-3 py-2 border-b border-zinc-800 bg-zinc-900/70 cursor-pointer"
+        role="button"
+        tabIndex={0}
+        onMouseEnter={() => {
+          if (!expanded) setExpanded(true);
+        }}
+        onClick={() => setExpanded((prev) => !prev)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            setExpanded((prev) => !prev);
+          }
+        }}
+      >
         <span className="text-[11px] uppercase tracking-wide text-zinc-400">{language || 'code'}</span>
-        {canCollapse ? (
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-blue-300">{expanded ? 'Ver menos' : `Abrir (${lines.length} lineas)`}</span>
           <button
             type="button"
-            onClick={() => setExpanded((prev) => !prev)}
-            className="text-[11px] text-blue-300 hover:text-blue-200"
+            onClick={(event) => {
+              event.stopPropagation();
+              void handleCopy();
+            }}
+            className={`inline-flex h-7 w-7 items-center justify-center rounded-full border transition-colors ${
+              copied
+                ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300'
+                : 'border-zinc-700 text-zinc-300 hover:border-zinc-500 hover:bg-zinc-800/90 hover:text-zinc-100'
+            }`}
+            aria-label={copied ? 'Codigo copiado' : 'Copiar codigo'}
+            title={copied ? 'Copiado' : 'Copiar codigo'}
           >
-            {expanded ? 'Ver menos' : `Ver mas (${lines.length - COLLAPSED_CODE_LINES} lineas)`}
+            {copied ? <Check size={13} /> : <Copy size={13} />}
           </button>
-        ) : null}
+        </div>
       </div>
-      <pre className="text-xs text-zinc-200 p-3 overflow-x-auto whitespace-pre">
-        <code>{shown.join('\n')}{!expanded && canCollapse ? '\n...' : ''}</code>
-      </pre>
+      {expanded ? (
+        <pre className="text-xs text-zinc-200 p-3 overflow-x-auto whitespace-pre">
+          <code>{lines.join('\n')}</code>
+        </pre>
+      ) : (
+        <div
+          role="button"
+          tabIndex={0}
+          className="px-3 py-2 text-xs text-zinc-500 cursor-pointer select-none"
+          onClick={() => setExpanded(true)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault();
+              setExpanded(true);
+            }
+          }}
+        >
+          Toca para abrir el bloque de codigo
+        </div>
+      )}
     </div>
   );
 }
@@ -68,16 +218,22 @@ function MarkdownMessage({ content }: { content: string }) {
           ul: ({ children }) => <ul className="my-2 list-disc pl-5 space-y-1">{children}</ul>,
           ol: ({ children }) => <ol className="my-2 list-decimal pl-5 space-y-1">{children}</ol>,
           li: ({ children }) => <li className="my-0 leading-relaxed">{children}</li>,
-          a: ({ href, children }) => (
-            <a
-              href={href}
-              target="_blank"
-              rel="noreferrer"
-              className="text-blue-300 underline underline-offset-2 break-all"
-            >
-              {children}
-            </a>
-          ),
+          a: ({ href, children }) => {
+            const normalizedHref = normalizeMessageLinkHref(href);
+            if (!normalizedHref) {
+              return <span className="text-blue-300 break-all">{children}</span>;
+            }
+            return (
+              <a
+                href={normalizedHref}
+                target="_blank"
+                rel="noreferrer"
+                className="text-blue-300 underline underline-offset-2 break-all"
+              >
+                {children}
+              </a>
+            );
+          },
           code: ({ className, children }) => {
             const raw = String(children || '').replace(/\n$/, '');
             const langMatch = /language-([a-zA-Z0-9_-]+)/.exec(String(className || ''));
@@ -102,13 +258,19 @@ function MarkdownMessage({ content }: { content: string }) {
 export default function ChatScreen({
   chatTitle,
   conversationId,
+  projectContext,
+  draftProject,
   messages,
+  hasMoreMessages,
+  loadingMoreMessages,
   liveReasoning,
   terminalEntries,
   sending,
   sendElapsedSeconds,
   isRunning,
   selectedFiles,
+  uploadProgress,
+  attachmentPipeline,
   status,
   onBack,
   onSend,
@@ -117,21 +279,42 @@ export default function ChatScreen({
   onClearFiles,
   onRefresh,
   onNavigate,
+  activeAgentName,
   model,
   reasoningEffort,
   options,
+  onLoadMoreMessages,
   onModelChange,
   onReasoningChange
 }: {
   chatTitle: string;
   conversationId: number | null;
+  projectContext: ConversationProjectContext | null;
+  draftProject: ChatProject | null;
   messages: Message[];
+  hasMoreMessages: boolean;
+  loadingMoreMessages: boolean;
   liveReasoning: string;
   terminalEntries: TerminalEntry[];
   sending: boolean;
   sendElapsedSeconds: number;
   isRunning: boolean;
   selectedFiles: File[];
+  uploadProgress: {
+    percent: number;
+    uploadedBytes: number;
+    totalBytes: number;
+    fileName: string;
+    fileIndex: number;
+    totalFiles: number;
+  } | null;
+  attachmentPipeline: {
+    phase: 'idle' | 'pending' | 'uploading' | 'processing' | 'ready' | 'error';
+    fileIndex: number;
+    totalFiles: number;
+    fileName: string;
+    error: string;
+  };
   model: string;
   reasoningEffort: string;
   options: ChatOptions;
@@ -143,6 +326,8 @@ export default function ChatScreen({
   onClearFiles: () => void;
   onRefresh: () => void;
   onNavigate: (screen: Screen) => void;
+  activeAgentName: string;
+  onLoadMoreMessages: () => void;
   onModelChange: (value: string) => void;
   onReasoningChange: (value: string) => void;
 }) {
@@ -151,14 +336,30 @@ export default function ChatScreen({
   const [showTerminal, setShowTerminal] = useState(false);
   const [hasTerminalActivity, setHasTerminalActivity] = useState(false);
   const [showTitleModal, setShowTitleModal] = useState(false);
+  const [copiedMessageId, setCopiedMessageId] = useState<number | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
+  const headerRef = useRef<HTMLElement | null>(null);
   const messagesRef = useRef<HTMLElement | null>(null);
+  const messageCopyTimerRef = useRef<number | null>(null);
+  const [headerOffset, setHeaderOffset] = useState(136);
 
   const grouped = useMemo(() => messages, [messages]);
   const fullTitle = normalizeTitle(chatTitle);
   const shortTitle = truncateTitle(fullTitle);
   const isLongTitle = fullTitle.length > TITLE_MAX_LENGTH;
+  const pendingAssistantMessageId = useMemo(() => {
+    for (let i = grouped.length - 1; i >= 0; i -= 1) {
+      const item = grouped[i];
+      if (item.role !== 'assistant') continue;
+      return String(item.content || '').trim() ? null : item.id;
+    }
+    return null;
+  }, [grouped]);
 
+  const firstMessageFingerprint =
+    grouped.length > 0
+      ? `${grouped[0].id}:${String(grouped[0].content || '').length}`
+      : 'none';
   const lastMessageFingerprint = grouped.length > 0 ? `${grouped[grouped.length - 1].id}:${String(grouped[grouped.length - 1].content || '').length}` : 'none';
   const lastTerminalEntry = terminalEntries.length > 0 ? terminalEntries[terminalEntries.length - 1] : null;
   const terminalFingerprint =
@@ -170,6 +371,9 @@ export default function ChatScreen({
   const hadReasoningRef = useRef(liveReasoning.trim().length > 0);
   const terminalFingerprintRef = useRef(terminalFingerprint);
   const wasSendingRef = useRef(sending);
+  const stickToBottomRef = useRef(true);
+  const prependScrollHeightRef = useRef<number | null>(null);
+  const loadingOlderRef = useRef(false);
 
   useEffect(() => {
     if (!showTitleModal) return undefined;
@@ -183,10 +387,72 @@ export default function ChatScreen({
   }, [showTitleModal]);
 
   useEffect(() => {
+    const node = headerRef.current;
+    if (!node) return undefined;
+
+    const syncHeaderOffset = () => {
+      const height = Math.ceil(node.getBoundingClientRect().height);
+      setHeaderOffset((prev) => (prev === height ? prev : height));
+    };
+
+    syncHeaderOffset();
+    window.addEventListener('resize', syncHeaderOffset);
+
+    if (typeof ResizeObserver !== 'undefined') {
+      const observer = new ResizeObserver(syncHeaderOffset);
+      observer.observe(node);
+      return () => {
+        observer.disconnect();
+        window.removeEventListener('resize', syncHeaderOffset);
+      };
+    }
+
+    return () => {
+      window.removeEventListener('resize', syncHeaderOffset);
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (messageCopyTimerRef.current !== null) {
+        window.clearTimeout(messageCopyTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!loadingMoreMessages) {
+      loadingOlderRef.current = false;
+    }
+  }, [loadingMoreMessages]);
+
+  useEffect(() => {
     const node = messagesRef.current;
     if (!node) return;
+    stickToBottomRef.current = true;
+    prependScrollHeightRef.current = null;
+    loadingOlderRef.current = false;
     node.scrollTo({ top: node.scrollHeight, behavior: 'auto' });
-  }, [chatTitle, grouped.length, lastMessageFingerprint, liveReasoning.length, terminalFingerprint]);
+  }, [conversationId]);
+
+  useEffect(() => {
+    const previousScrollHeight = prependScrollHeightRef.current;
+    if (previousScrollHeight === null) return;
+    const node = messagesRef.current;
+    if (!node) return;
+    const nextScrollHeight = node.scrollHeight;
+    if (nextScrollHeight > previousScrollHeight) {
+      node.scrollTop += nextScrollHeight - previousScrollHeight;
+    }
+    prependScrollHeightRef.current = null;
+  }, [firstMessageFingerprint, grouped.length]);
+
+  useEffect(() => {
+    const node = messagesRef.current;
+    if (!node) return;
+    if (!stickToBottomRef.current) return;
+    node.scrollTo({ top: node.scrollHeight, behavior: 'auto' });
+  }, [lastMessageFingerprint, liveReasoning.length, terminalFingerprint]);
 
   useEffect(() => {
     setShowReasoning(false);
@@ -225,6 +491,26 @@ export default function ChatScreen({
     }
   }, [terminalFingerprint, terminalEntries.length, sending, isRunning]);
 
+  const handleMessagesScroll = () => {
+    const node = messagesRef.current;
+    if (!node) return;
+
+    const distanceFromBottom = node.scrollHeight - (node.scrollTop + node.clientHeight);
+    stickToBottomRef.current = distanceFromBottom <= STICKY_BOTTOM_THRESHOLD_PX;
+
+    const shouldLoadOlder =
+      conversationId !== null &&
+      hasMoreMessages &&
+      !loadingMoreMessages &&
+      !loadingOlderRef.current &&
+      node.scrollTop <= TOP_LOAD_THRESHOLD_PX;
+    if (!shouldLoadOlder) return;
+
+    loadingOlderRef.current = true;
+    prependScrollHeightRef.current = node.scrollHeight;
+    onLoadMoreMessages();
+  };
+
   const sendCurrent = () => {
     if (sending || isRunning) return;
     if (!input.trim() && selectedFiles.length === 0) return;
@@ -232,92 +518,207 @@ export default function ChatScreen({
     setInput('');
   };
 
-  const canSend = input.trim().length > 0 || selectedFiles.length > 0;
+  const handleCopyMessage = async (messageId: number, text: string) => {
+    const ok = await copyTextToClipboard(text);
+    if (!ok) return;
+    setCopiedMessageId(messageId);
+    if (messageCopyTimerRef.current !== null) {
+      window.clearTimeout(messageCopyTimerRef.current);
+    }
+    messageCopyTimerRef.current = window.setTimeout(() => {
+      setCopiedMessageId(null);
+      messageCopyTimerRef.current = null;
+    }, 1600);
+  };
+
+  const attachmentPhase = attachmentPipeline?.phase || 'idle';
+  const canSend = (input.trim().length > 0 || selectedFiles.length > 0) && attachmentPhase !== 'processing';
   const canStop = sending || isRunning;
-  const headerStatus = sending ? `Generando · ${formatElapsed(sendElapsedSeconds)}` : status || 'Sesion activa';
+  const pendingUploadBytes = selectedFiles.reduce((sum, file) => {
+    return sum + Math.max(0, Number(file?.size) || 0);
+  }, 0);
+  const composerUploadProgress = uploadProgress
+    ? { ...uploadProgress, pending: false, processing: false, ready: false, failed: false }
+    : selectedFiles.length > 0
+    ? {
+        percent: attachmentPhase === 'ready' || attachmentPhase === 'processing' ? 100 : 0,
+        uploadedBytes: 0,
+        totalBytes: Math.max(0, Math.round(pendingUploadBytes)),
+        fileName: String(attachmentPipeline.fileName || selectedFiles[0]?.name || ''),
+        fileIndex: Math.max(0, Number(attachmentPipeline.fileIndex) || 0),
+        totalFiles: selectedFiles.length,
+        pending: attachmentPhase === 'pending' || attachmentPhase === 'idle',
+        processing: attachmentPhase === 'processing',
+        ready: attachmentPhase === 'ready',
+        failed: attachmentPhase === 'error'
+      }
+    : null;
+  const headerStatus = uploadProgress
+    ? `Subiendo adjuntos · ${uploadProgress.percent}%`
+    : attachmentPhase === 'processing' && selectedFiles.length > 0
+    ? 'Procesando adjuntos para contexto...'
+    : attachmentPhase === 'ready'
+    ? 'Adjuntos listos para contexto'
+    : attachmentPhase === 'error' && attachmentPipeline.error
+    ? attachmentPipeline.error
+    : sending
+    ? `Generando · ${formatElapsed(sendElapsedSeconds)}`
+    : status || 'Sesion activa';
+  const projectLabel = projectContext
+    ? `${projectContext.projectName} · ${projectContext.mode}`
+    : draftProject
+    ? `${draftProject.name} · ${draftProject.contextMode}`
+    : '';
+
+  const resolveSelectedFileState = (index: number): { label: string; className: string } => {
+    if (attachmentPhase === 'uploading') {
+      const activeIndex = Math.max(1, Number(attachmentPipeline.fileIndex) || 1);
+      if (index + 1 < activeIndex) {
+        return { label: 'listo', className: 'text-emerald-300 border-emerald-500/30' };
+      }
+      if (index + 1 === activeIndex) {
+        return { label: 'subiendo', className: 'text-blue-300 border-blue-500/30' };
+      }
+      return { label: 'pendiente', className: 'text-zinc-400 border-zinc-700' };
+    }
+    if (attachmentPhase === 'processing') {
+      return { label: 'procesando', className: 'text-cyan-300 border-cyan-500/30' };
+    }
+    if (attachmentPhase === 'ready') {
+      return { label: 'listo', className: 'text-emerald-300 border-emerald-500/30' };
+    }
+    if (attachmentPhase === 'error') {
+      return { label: 'error', className: 'text-red-300 border-red-500/30' };
+    }
+    return { label: 'pendiente', className: 'text-zinc-400 border-zinc-700' };
+  };
 
   return (
     <div className="h-screen bg-black flex flex-col relative overflow-hidden overflow-x-hidden">
-      <header className="fixed top-0 left-0 right-0 z-[70] bg-black/85 backdrop-blur-xl border-b border-zinc-900 px-3 py-3">
-        <div className="flex items-center gap-1">
-          <button onClick={onBack} className="w-9 h-9 shrink-0 flex items-center justify-center rounded-full hover:bg-white/10 transition-colors" type="button" aria-label="Volver al hub">
-            <ChevronLeft size={24} />
-          </button>
-          <div className="min-w-0 flex-1 text-center px-1">
-            <button
-              type="button"
-              onClick={() => {
-                if (!isLongTitle) return;
-                setShowTitleModal(true);
-              }}
-              className={`mx-auto max-w-full text-[16px] font-semibold tracking-tight flex items-center justify-center gap-2 ${
-                isLongTitle ? 'cursor-help' : ''
-              }`}
-              title={isLongTitle ? fullTitle : undefined}
-              aria-label={fullTitle}
-            >
-              {sending || isRunning ? (
-                <span
-                  className="h-3.5 w-3.5 rounded-full border-2 border-blue-400 border-t-transparent animate-spin shrink-0"
-                  aria-label="Chat en ejecucion"
-                />
+      <header ref={headerRef} className="fixed top-0 left-0 right-0 z-[70] bg-black border-b border-zinc-900">
+        <div className="h-[env(safe-area-inset-top)] bg-black" aria-hidden="true" />
+        <div className="px-3 pb-3 pt-2">
+          <div className="flex items-center gap-1">
+            <button onClick={onBack} className="w-9 h-9 shrink-0 flex items-center justify-center rounded-full hover:bg-white/10 transition-colors" type="button" aria-label="Volver al hub">
+              <ChevronLeft size={24} />
+            </button>
+            <div className="min-w-0 flex-1 text-center px-1">
+              <button
+                type="button"
+                onClick={() => {
+                  if (!isLongTitle) return;
+                  setShowTitleModal(true);
+                }}
+                className={`mx-auto max-w-full text-[16px] font-semibold tracking-tight flex items-center justify-center gap-2 ${
+                  isLongTitle ? 'cursor-help' : ''
+                }`}
+                title={isLongTitle ? fullTitle : undefined}
+                aria-label={fullTitle}
+              >
+                {sending || isRunning ? (
+                  <span
+                    className="h-3.5 w-3.5 rounded-full border-2 border-blue-400 border-t-transparent animate-spin shrink-0"
+                    aria-label="Chat en ejecucion"
+                  />
+                ) : null}
+                <span className="truncate">{shortTitle}</span>
+              </button>
+              <p className="text-xs text-zinc-500">{headerStatus}</p>
+              {uploadProgress ? (
+                <div className="mt-1.5">
+                  <div className="flex items-center justify-between gap-2 text-[11px] text-zinc-400">
+                    <span className="truncate">
+                      {uploadProgress.fileIndex}/{uploadProgress.totalFiles} · {uploadProgress.fileName}
+                    </span>
+                    <span className="shrink-0">
+                      {formatBytes(uploadProgress.uploadedBytes)} / {formatBytes(uploadProgress.totalBytes)}
+                    </span>
+                  </div>
+                  <div className="mt-1 h-1.5 w-full rounded-full bg-zinc-800 overflow-hidden">
+                    <div
+                      className="h-full rounded-full bg-blue-500 transition-[width] duration-150 ease-out"
+                      style={{ width: `${uploadProgress.percent}%` }}
+                    />
+                  </div>
+                </div>
               ) : null}
-              <span className="truncate">{shortTitle}</span>
-            </button>
-            <p className="text-xs text-zinc-500">{headerStatus}</p>
+              <p className="text-[11px] text-zinc-400">IA activa: {activeAgentName || 'Codex CLI'}</p>
+              {projectLabel ? (
+                <p className="text-[11px] text-cyan-300/90">
+                  Proyecto: {projectLabel}
+                </p>
+              ) : null}
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                onClick={onRefresh}
+                className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-300 hover:text-white hover:border-zinc-500"
+                type="button"
+                aria-label="Refrescar chat"
+              >
+                <RefreshCw size={15} />
+              </button>
+              <button
+                onClick={() => onNavigate('settings')}
+                className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-300 hover:text-white hover:border-zinc-500"
+                type="button"
+                aria-label="Abrir opciones"
+              >
+                <Settings size={15} />
+              </button>
+            </div>
           </div>
-          <div className="flex items-center gap-1 shrink-0">
-            <button
-              onClick={onRefresh}
-              className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-300 hover:text-white hover:border-zinc-500"
-              type="button"
-              aria-label="Refrescar chat"
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <select
+              value={model}
+              onChange={(event) => onModelChange(event.target.value)}
+              className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-200"
+              aria-label={`Modelo para ${activeAgentName || 'IA activa'}`}
             >
-              <RefreshCw size={15} />
-            </button>
-            <button
-              onClick={() => onNavigate('settings')}
-              className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-300 hover:text-white hover:border-zinc-500"
-              type="button"
-              aria-label="Abrir opciones"
+              <option value="">Automatico ({activeAgentName || 'IA activa'})</option>
+              {options.models.map((item) => (
+                <option key={item} value={item}>{item}</option>
+              ))}
+            </select>
+            <select
+              value={reasoningEffort}
+              onChange={(event) => onReasoningChange(event.target.value)}
+              className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-200"
+              aria-label={`Nivel de razonamiento para ${activeAgentName || 'IA activa'}`}
             >
-              <Settings size={15} />
-            </button>
+              {options.reasoningEfforts.map((item) => (
+                <option key={item} value={item}>{item}</option>
+              ))}
+            </select>
           </div>
-        </div>
-        <div className="mt-2 grid grid-cols-2 gap-2">
-          <select
-            value={model}
-            onChange={(event) => onModelChange(event.target.value)}
-            className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-200"
-            aria-label="Modelo del chat"
-          >
-            <option value="">Automatico (default CLI)</option>
-            {options.models.map((item) => (
-              <option key={item} value={item}>{item}</option>
-            ))}
-          </select>
-          <select
-            value={reasoningEffort}
-            onChange={(event) => onReasoningChange(event.target.value)}
-            className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-200"
-            aria-label="Nivel de razonamiento del chat"
-          >
-            {options.reasoningEfforts.map((item) => (
-              <option key={item} value={item}>{item}</option>
-            ))}
-          </select>
         </div>
       </header>
 
-      <main ref={messagesRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4 pt-32 pb-72 space-y-4">
+      <main
+        ref={messagesRef}
+        onScroll={handleMessagesScroll}
+        className="flex-1 overflow-y-auto overflow-x-hidden p-4 pb-72 space-y-4"
+        style={{ paddingTop: headerOffset }}
+      >
         {grouped.length === 0 ? (
           <div className="text-center text-zinc-500 text-sm py-10">Escribe un mensaje para iniciar la conversacion.</div>
+        ) : null}
+        {loadingMoreMessages ? (
+          <div className="text-center text-xs text-zinc-500">Cargando mensajes anteriores...</div>
+        ) : null}
+        {!loadingMoreMessages && hasMoreMessages ? (
+          <div className="text-center text-[11px] text-zinc-600">Desliza hacia arriba para cargar mas</div>
         ) : null}
         {grouped.map((message) => {
           const rawContent = String(message.content || '');
           const hasVisibleContent = rawContent.trim().length > 0;
-          const showThinking = (sending || isRunning) && message.role === 'assistant' && !hasVisibleContent;
+          const messageAttachments = Array.isArray(message.attachments) ? message.attachments : [];
+          const showThinking =
+            (sending || isRunning) &&
+            message.role === 'assistant' &&
+            !hasVisibleContent &&
+            pendingAssistantMessageId !== null &&
+            message.id === pendingAssistantMessageId;
           const fallbackText =
             message.role === 'assistant'
               ? '(Sin respuesta visible del modelo. Revisa terminal para el detalle del error.)'
@@ -336,6 +737,41 @@ export default function ChatScreen({
                 ) : (
                   <MarkdownMessage content={visibleContent} />
                 )}
+                {!showThinking && hasVisibleContent ? (
+                  <div className="mt-1.5 flex items-center justify-end">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void handleCopyMessage(message.id, rawContent);
+                      }}
+                      className={`inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors ${
+                        copiedMessageId === message.id
+                          ? 'bg-emerald-500/10 text-emerald-300'
+                          : 'text-zinc-500 hover:bg-zinc-800/80 hover:text-zinc-200'
+                      }`}
+                      aria-label={copiedMessageId === message.id ? 'Mensaje copiado' : 'Copiar mensaje'}
+                      title={copiedMessageId === message.id ? 'Copiado' : 'Copiar mensaje'}
+                    >
+                      {copiedMessageId === message.id ? <Check size={12} /> : <Copy size={12} />}
+                    </button>
+                  </div>
+                ) : null}
+                {messageAttachments.length > 0 ? (
+                  <div className="mt-2 space-y-1.5">
+                    <p className="text-[10px] uppercase tracking-wide text-zinc-400">Adjuntos enviados</p>
+                    {messageAttachments.map((file) => (
+                      <div
+                        key={file.id}
+                        className="rounded-lg border border-zinc-700/80 bg-zinc-950/60 px-2.5 py-1.5 text-xs text-zinc-200 flex items-center justify-between gap-2"
+                      >
+                        <span className="truncate">{file.name}</span>
+                        <span className="shrink-0 text-zinc-400">
+                          {formatBytes(file.size)} · {String(file.mimeType || '').split('/')[0] || 'archivo'}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
                 <p className="text-[10px] text-zinc-500 mt-2">{formatDate(message.created_at)}</p>
               </div>
             </div>
@@ -388,14 +824,77 @@ export default function ChatScreen({
       <div className="fixed bottom-[74px] left-0 right-0 p-4 bg-gradient-to-t from-black via-black/90 to-transparent z-[60] pointer-events-none">
         {selectedFiles.length > 0 ? (
           <div className="mb-2 flex flex-wrap gap-2 overflow-x-hidden pointer-events-auto">
-            {selectedFiles.map((file) => (
-              <span key={file.name + file.size} className="max-w-full truncate text-xs bg-zinc-900 border border-zinc-800 px-2 py-1 rounded-lg text-zinc-300">
-                {file.name}
-              </span>
-            ))}
+            {selectedFiles.map((file, index) => {
+              const fileState = resolveSelectedFileState(index);
+              return (
+                <span
+                  key={file.name + file.size}
+                  className={`max-w-full truncate text-xs bg-zinc-900 border px-2 py-1 rounded-lg ${fileState.className}`}
+                >
+                  {file.name} · {formatBytes(Number(file.size) || 0)} · {fileState.label}
+                </span>
+              );
+            })}
             <button onClick={onClearFiles} className="text-xs bg-zinc-900 border border-zinc-700 px-2 py-1 rounded-lg text-zinc-400" type="button">
               <X size={14} className="inline mr-1" /> limpiar
             </button>
+          </div>
+        ) : null}
+        {composerUploadProgress ? (
+          <div className="mb-2 rounded-xl border border-zinc-800 bg-zinc-900/85 px-3 py-2 pointer-events-auto">
+            <div className="flex items-center justify-between gap-2 text-[11px] text-zinc-300">
+              <span className="truncate">
+                {composerUploadProgress.failed
+                  ? `Error al subir · ${attachmentPipeline.error || 'revisa espacio/red y reintenta'}`
+                  : composerUploadProgress.ready
+                  ? `Adjuntos listos · ${composerUploadProgress.totalFiles} archivo${
+                      composerUploadProgress.totalFiles === 1 ? '' : 's'
+                    }`
+                  : composerUploadProgress.processing
+                  ? `Procesando adjuntos · ${composerUploadProgress.totalFiles} archivo${
+                      composerUploadProgress.totalFiles === 1 ? '' : 's'
+                    }`
+                  : composerUploadProgress.pending
+                  ? `Listo para subir · ${composerUploadProgress.totalFiles} archivo${
+                      composerUploadProgress.totalFiles === 1 ? '' : 's'
+                    }`
+                  : `${composerUploadProgress.fileIndex}/${composerUploadProgress.totalFiles} · ${composerUploadProgress.fileName}`}
+              </span>
+              <span className="shrink-0">
+                {composerUploadProgress.failed
+                  ? 'error'
+                  : composerUploadProgress.pending
+                  ? '0%'
+                  : `${Math.max(0, Math.min(100, Math.round(composerUploadProgress.percent)))}%`}
+              </span>
+            </div>
+            <div className="mt-1 h-1.5 w-full rounded-full bg-zinc-800 overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-[width] duration-150 ease-out ${
+                  composerUploadProgress.failed
+                    ? 'bg-red-500'
+                    : composerUploadProgress.pending
+                    ? 'bg-zinc-600'
+                    : composerUploadProgress.ready
+                    ? 'bg-emerald-500'
+                    : composerUploadProgress.processing
+                    ? 'bg-cyan-500'
+                    : 'bg-blue-500'
+                }`}
+                style={{ width: `${Math.max(0, Math.min(100, Math.round(composerUploadProgress.percent)))}%` }}
+              />
+            </div>
+            <p className="mt-1 text-[10px] text-zinc-400">
+              {composerUploadProgress.failed
+                ? attachmentPipeline.error || 'No se pudo completar la subida de adjuntos.'
+                : composerUploadProgress.ready
+                ? 'El chat ya puede usar estos archivos como contexto.'
+                : composerUploadProgress.processing
+                ? 'Validando adjuntos y preparando contexto en backend...'
+                : composerUploadProgress.pending
+                ? `La subida empieza al enviar · ${formatBytes(composerUploadProgress.totalBytes)}`
+                : `${formatBytes(composerUploadProgress.uploadedBytes)} / ${formatBytes(composerUploadProgress.totalBytes)}`}
+            </p>
           </div>
         ) : null}
 

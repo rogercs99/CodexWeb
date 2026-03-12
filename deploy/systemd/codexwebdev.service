@@ -1,0 +1,17 @@
+[Unit]
+Description=CodexWeb DEV (codexwebdev.gamemodai.pro)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/CodexWeb
+EnvironmentFile=/root/CodexWeb/deploy/codexwebdev.env
+ExecStart=/usr/bin/node /root/CodexWeb/server.js
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
