@@ -1,6 +1,0 @@
-[2026-03-11] Fase 1: discovery iniciado
-[2026-03-11] Se detectaron multiples frontends: DIXIT/client, DIXIT/public (legacy), EclipseGame/src, stitch_frontend/src, frontend_zip/src
-[2026-03-11] Evidencia operacional: proceso /opt/dixit/server.js activo; proceso EclipseGame backend activo
-[2026-03-11] Fase 2: auditoria frontend DIXIT/client (App.jsx monolitico)
-[2026-03-11] Validacion calidad: npm run lint (fallo con 15 errores), npm run build (ok)
-[2026-03-11] Validacion runtime local: bloqueada por sandbox EPERM al abrir puertos

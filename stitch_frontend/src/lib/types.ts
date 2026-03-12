@@ -101,6 +101,40 @@ export interface AttachmentItem {
   uploadedAt: string;
 }
 
+export interface StorageHealthSnapshot {
+  path: string;
+  mountPoint: string;
+  totalBytes: number | null;
+  usedBytes: number | null;
+  availableBytes: number | null;
+  usedPercent: number | null;
+  status: 'ok' | 'warning' | 'critical';
+  thresholds: {
+    warningFreeBytes: number;
+    criticalFreeBytes: number;
+  };
+  requiredBytes?: number | null;
+  enoughForRequired?: boolean | null;
+}
+
+export interface AttachmentUploadPreflight {
+  accepted: boolean;
+  files: Array<{
+    name: string;
+    size: number;
+  }>;
+  estimate: {
+    payloadBytes: number;
+    requiredBytes: number;
+  };
+  limits: {
+    maxAttachments: number;
+    maxAttachmentSizeBytes: number;
+    maxAttachmentSizeMb: number;
+  };
+  storage: StorageHealthSnapshot;
+}
+
 export interface TerminalEntry {
   id: string;
   itemId: string;
@@ -649,12 +683,15 @@ export interface ToolsStorageOverview {
 export interface ToolsStorageResidualCandidate {
   id: string;
   path: string;
+  name: string;
   type: 'file' | 'directory' | 'other';
   sizeBytes: number;
   modifiedAt: string;
   reason: string;
   confidence: 'high' | 'medium' | 'low';
   risk: 'high' | 'medium' | 'low';
+  category: 'temporary' | 'logs' | 'cache' | 'backup' | 'artifact' | 'residual' | 'other';
+  analysisSource: 'ai' | 'heuristic';
   score: number;
 }
 
@@ -671,6 +708,13 @@ export interface ToolsStorageResidualAnalysis {
     providerId?: string;
     providerName?: string;
     attemptedProviders?: string[];
+  };
+  summary?: {
+    totalCandidates: number;
+    totalBytes: number;
+    byCategory: Record<string, number>;
+    criteria: string[];
+    pipeline: string;
   };
 }
 

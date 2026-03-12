@@ -270,6 +270,7 @@ export default function ChatScreen({
   isRunning,
   selectedFiles,
   uploadProgress,
+  attachmentPipeline,
   status,
   onBack,
   onSend,
@@ -307,6 +308,13 @@ export default function ChatScreen({
     fileIndex: number;
     totalFiles: number;
   } | null;
+  attachmentPipeline: {
+    phase: 'idle' | 'pending' | 'uploading' | 'processing' | 'ready' | 'error';
+    fileIndex: number;
+    totalFiles: number;
+    fileName: string;
+    error: string;
+  };
   model: string;
   reasoningEffort: string;
   options: ChatOptions;
@@ -523,26 +531,36 @@ export default function ChatScreen({
     }, 1600);
   };
 
-  const canSend = input.trim().length > 0 || selectedFiles.length > 0;
+  const attachmentPhase = attachmentPipeline?.phase || 'idle';
+  const canSend = (input.trim().length > 0 || selectedFiles.length > 0) && attachmentPhase !== 'processing';
   const canStop = sending || isRunning;
   const pendingUploadBytes = selectedFiles.reduce((sum, file) => {
     return sum + Math.max(0, Number(file?.size) || 0);
   }, 0);
   const composerUploadProgress = uploadProgress
-    ? { ...uploadProgress, pending: false }
+    ? { ...uploadProgress, pending: false, processing: false, ready: false, failed: false }
     : selectedFiles.length > 0
     ? {
-        percent: 0,
+        percent: attachmentPhase === 'ready' || attachmentPhase === 'processing' ? 100 : 0,
         uploadedBytes: 0,
         totalBytes: Math.max(0, Math.round(pendingUploadBytes)),
-        fileName: String(selectedFiles[0]?.name || ''),
-        fileIndex: 0,
+        fileName: String(attachmentPipeline.fileName || selectedFiles[0]?.name || ''),
+        fileIndex: Math.max(0, Number(attachmentPipeline.fileIndex) || 0),
         totalFiles: selectedFiles.length,
-        pending: true
+        pending: attachmentPhase === 'pending' || attachmentPhase === 'idle',
+        processing: attachmentPhase === 'processing',
+        ready: attachmentPhase === 'ready',
+        failed: attachmentPhase === 'error'
       }
     : null;
   const headerStatus = uploadProgress
     ? `Subiendo adjuntos · ${uploadProgress.percent}%`
+    : attachmentPhase === 'processing' && selectedFiles.length > 0
+    ? 'Procesando adjuntos para contexto...'
+    : attachmentPhase === 'ready'
+    ? 'Adjuntos listos para contexto'
+    : attachmentPhase === 'error' && attachmentPipeline.error
+    ? attachmentPipeline.error
     : sending
     ? `Generando · ${formatElapsed(sendElapsedSeconds)}`
     : status || 'Sesion activa';
@@ -551,6 +569,29 @@ export default function ChatScreen({
     : draftProject
     ? `${draftProject.name} · ${draftProject.contextMode}`
     : '';
+
+  const resolveSelectedFileState = (index: number): { label: string; className: string } => {
+    if (attachmentPhase === 'uploading') {
+      const activeIndex = Math.max(1, Number(attachmentPipeline.fileIndex) || 1);
+      if (index + 1 < activeIndex) {
+        return { label: 'listo', className: 'text-emerald-300 border-emerald-500/30' };
+      }
+      if (index + 1 === activeIndex) {
+        return { label: 'subiendo', className: 'text-blue-300 border-blue-500/30' };
+      }
+      return { label: 'pendiente', className: 'text-zinc-400 border-zinc-700' };
+    }
+    if (attachmentPhase === 'processing') {
+      return { label: 'procesando', className: 'text-cyan-300 border-cyan-500/30' };
+    }
+    if (attachmentPhase === 'ready') {
+      return { label: 'listo', className: 'text-emerald-300 border-emerald-500/30' };
+    }
+    if (attachmentPhase === 'error') {
+      return { label: 'error', className: 'text-red-300 border-red-500/30' };
+    }
+    return { label: 'pendiente', className: 'text-zinc-400 border-zinc-700' };
+  };
 
   return (
     <div className="h-screen bg-black flex flex-col relative overflow-hidden overflow-x-hidden">
@@ -783,11 +824,17 @@ export default function ChatScreen({
       <div className="fixed bottom-[74px] left-0 right-0 p-4 bg-gradient-to-t from-black via-black/90 to-transparent z-[60] pointer-events-none">
         {selectedFiles.length > 0 ? (
           <div className="mb-2 flex flex-wrap gap-2 overflow-x-hidden pointer-events-auto">
-            {selectedFiles.map((file) => (
-              <span key={file.name + file.size} className="max-w-full truncate text-xs bg-zinc-900 border border-zinc-800 px-2 py-1 rounded-lg text-zinc-300">
-                {file.name}
-              </span>
-            ))}
+            {selectedFiles.map((file, index) => {
+              const fileState = resolveSelectedFileState(index);
+              return (
+                <span
+                  key={file.name + file.size}
+                  className={`max-w-full truncate text-xs bg-zinc-900 border px-2 py-1 rounded-lg ${fileState.className}`}
+                >
+                  {file.name} · {formatBytes(Number(file.size) || 0)} · {fileState.label}
+                </span>
+              );
+            })}
             <button onClick={onClearFiles} className="text-xs bg-zinc-900 border border-zinc-700 px-2 py-1 rounded-lg text-zinc-400" type="button">
               <X size={14} className="inline mr-1" /> limpiar
             </button>
@@ -797,14 +844,26 @@ export default function ChatScreen({
           <div className="mb-2 rounded-xl border border-zinc-800 bg-zinc-900/85 px-3 py-2 pointer-events-auto">
             <div className="flex items-center justify-between gap-2 text-[11px] text-zinc-300">
               <span className="truncate">
-                {composerUploadProgress.pending
+                {composerUploadProgress.failed
+                  ? `Error al subir · ${attachmentPipeline.error || 'revisa espacio/red y reintenta'}`
+                  : composerUploadProgress.ready
+                  ? `Adjuntos listos · ${composerUploadProgress.totalFiles} archivo${
+                      composerUploadProgress.totalFiles === 1 ? '' : 's'
+                    }`
+                  : composerUploadProgress.processing
+                  ? `Procesando adjuntos · ${composerUploadProgress.totalFiles} archivo${
+                      composerUploadProgress.totalFiles === 1 ? '' : 's'
+                    }`
+                  : composerUploadProgress.pending
                   ? `Listo para subir · ${composerUploadProgress.totalFiles} archivo${
                       composerUploadProgress.totalFiles === 1 ? '' : 's'
                     }`
                   : `${composerUploadProgress.fileIndex}/${composerUploadProgress.totalFiles} · ${composerUploadProgress.fileName}`}
               </span>
               <span className="shrink-0">
-                {composerUploadProgress.pending
+                {composerUploadProgress.failed
+                  ? 'error'
+                  : composerUploadProgress.pending
                   ? '0%'
                   : `${Math.max(0, Math.min(100, Math.round(composerUploadProgress.percent)))}%`}
               </span>
@@ -812,13 +871,27 @@ export default function ChatScreen({
             <div className="mt-1 h-1.5 w-full rounded-full bg-zinc-800 overflow-hidden">
               <div
                 className={`h-full rounded-full transition-[width] duration-150 ease-out ${
-                  composerUploadProgress.pending ? 'bg-zinc-600' : 'bg-blue-500'
+                  composerUploadProgress.failed
+                    ? 'bg-red-500'
+                    : composerUploadProgress.pending
+                    ? 'bg-zinc-600'
+                    : composerUploadProgress.ready
+                    ? 'bg-emerald-500'
+                    : composerUploadProgress.processing
+                    ? 'bg-cyan-500'
+                    : 'bg-blue-500'
                 }`}
                 style={{ width: `${Math.max(0, Math.min(100, Math.round(composerUploadProgress.percent)))}%` }}
               />
             </div>
             <p className="mt-1 text-[10px] text-zinc-400">
-              {composerUploadProgress.pending
+              {composerUploadProgress.failed
+                ? attachmentPipeline.error || 'No se pudo completar la subida de adjuntos.'
+                : composerUploadProgress.ready
+                ? 'El chat ya puede usar estos archivos como contexto.'
+                : composerUploadProgress.processing
+                ? 'Validando adjuntos y preparando contexto en backend...'
+                : composerUploadProgress.pending
                 ? `La subida empieza al enviar · ${formatBytes(composerUploadProgress.totalBytes)}`
                 : `${formatBytes(composerUploadProgress.uploadedBytes)} / ${formatBytes(composerUploadProgress.totalBytes)}`}
             </p>

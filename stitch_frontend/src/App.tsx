@@ -17,6 +17,7 @@ import {
   getCodexRuns,
   getMe,
   getRestartStatus,
+  getStorageHealth,
   getToolsStorageJobs,
   killConversationSession,
   listAttachments,
@@ -32,6 +33,7 @@ import {
   updateProject,
   updateConversationSettings,
   updateConversationTitle,
+  preflightAttachmentUpload,
   uploadAttachment
 } from './lib/api';
 import { consumeSse } from './lib/sse';
@@ -49,6 +51,7 @@ import type {
   Screen,
   TaskRecovery,
   ToolsStorageJob,
+  StorageHealthSnapshot,
   TerminalEntry,
   User
 } from './lib/types';
@@ -173,6 +176,15 @@ function truncateHubNoticeText(value: string, maxLen = 260): string {
   const text = String(value || '').trim();
   if (text.length <= maxLen) return text;
   return `${text.slice(0, Math.max(0, maxLen - 1)).trimEnd()}…`;
+}
+
+function formatBytesShort(value: number | null | undefined): string {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 function buildHubJobProgressDetails(job: ToolsStorageJob): string {
@@ -320,6 +332,32 @@ function buildHubNoticeFromStorageJob(job: ToolsStorageJob): HubBackgroundNotice
   };
 }
 
+function buildHubNoticeFromStorageHealth(health: StorageHealthSnapshot | null): HubBackgroundNotice | null {
+  if (!health) return null;
+  if (health.status !== 'warning' && health.status !== 'critical') return null;
+  const available = formatBytesShort(health.availableBytes);
+  const threshold =
+    health.status === 'critical'
+      ? formatBytesShort(health.thresholds?.criticalFreeBytes ?? null)
+      : formatBytesShort(health.thresholds?.warningFreeBytes ?? null);
+  const usedPercent =
+    Number.isFinite(Number(health.usedPercent)) && Number(health.usedPercent) >= 0
+      ? `${Math.round(Number(health.usedPercent))}%`
+      : 'n/d';
+  return {
+    jobId: `storage_health_${health.status}`,
+    text:
+      health.status === 'critical'
+        ? 'Falta espacio en disco para que CodexWeb funcione correctamente'
+        : 'Espacio en disco bajo: conviene liberar almacenamiento',
+    details: `Libre: ${available} · Umbral ${health.status}: ${threshold} · Uso: ${usedPercent} · Revisa Tools > Observabilidad / Storage.`,
+    tone: health.status === 'critical' ? 'error' : 'info',
+    loading: false,
+    canDismiss: false,
+    updatedAtMs: Date.now()
+  };
+}
+
 interface LiveChatDraft {
   username: string;
   conversationId: number | null;
@@ -345,6 +383,14 @@ interface UploadProgressState {
   fileName: string;
   fileIndex: number;
   totalFiles: number;
+}
+
+interface AttachmentPipelineState {
+  phase: 'idle' | 'pending' | 'uploading' | 'processing' | 'ready' | 'error';
+  fileIndex: number;
+  totalFiles: number;
+  fileName: string;
+  error: string;
 }
 
 function getSafeLocalStorage(): Storage | null {
@@ -556,6 +602,13 @@ export default function App() {
   const [sendStartedAtMs, setSendStartedAtMs] = useState<number | null>(null);
   const [sendElapsedSeconds, setSendElapsedSeconds] = useState(0);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [attachmentPipeline, setAttachmentPipeline] = useState<AttachmentPipelineState>({
+    phase: 'idle',
+    fileIndex: 0,
+    totalFiles: 0,
+    fileName: '',
+    error: ''
+  });
   const [uploadProgress, setUploadProgress] = useState<UploadProgressState | null>(null);
   const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
   const [options, setOptions] = useState<ChatOptions>({
@@ -637,7 +690,10 @@ export default function App() {
     let cancelled = false;
     const pollBackgroundJobs = async () => {
       try {
-        const jobs = await getToolsStorageJobs(90);
+        const [jobs, storageHealth] = await Promise.all([
+          getToolsStorageJobs(90),
+          getStorageHealth().catch(() => null)
+        ]);
         if (cancelled) return;
         const allowedTypes = new Set([
           'cleanup_residual_analyze',
@@ -664,7 +720,8 @@ export default function App() {
             return entry.updatedAtMs >= nowMs - HUB_NOTICE_LOOKBACK_MS;
           })
           .slice(0, HUB_NOTICE_MAX_ITEMS);
-        setHubBackgroundNotices(nextNotices);
+        const storageNotice = buildHubNoticeFromStorageHealth(storageHealth);
+        setHubBackgroundNotices(storageNotice ? [storageNotice, ...nextNotices] : nextNotices);
       } catch (_error) {
         // polling best-effort only.
       }
@@ -1985,6 +2042,33 @@ export default function App() {
     }
   }, [activeConversationId, cancelActiveStream, loadConversationsAndPick]);
 
+  const clearComposerFiles = useCallback(() => {
+    setSelectedFiles([]);
+    setAttachmentPipeline({
+      phase: 'idle',
+      fileIndex: 0,
+      totalFiles: 0,
+      fileName: '',
+      error: ''
+    });
+  }, []);
+
+  const appendComposerFiles = useCallback((files: File[]) => {
+    const incoming = Array.isArray(files) ? files.filter(Boolean) : [];
+    if (incoming.length === 0) return;
+    setSelectedFiles((prev) => {
+      const merged = [...prev, ...incoming].slice(0, 5);
+      setAttachmentPipeline({
+        phase: merged.length > 0 ? 'pending' : 'idle',
+        fileIndex: 0,
+        totalFiles: merged.length,
+        fileName: merged.length > 0 ? String(merged[0]?.name || '') : '',
+        error: ''
+      });
+      return merged;
+    });
+  }, []);
+
   const handleSend = useCallback(
     async (inputText: string) => {
       if (sending) return;
@@ -2009,6 +2093,29 @@ export default function App() {
       }
       if (requestReasoning !== chatReasoningEffort) {
         setChatReasoningEffort(requestReasoning);
+      }
+
+      if (selectedFiles.length > 0) {
+        setAttachmentPipeline({
+          phase: 'processing',
+          fileIndex: 0,
+          totalFiles: selectedFiles.length,
+          fileName: String(selectedFiles[0]?.name || ''),
+          error: ''
+        });
+        try {
+          await preflightAttachmentUpload(selectedFiles, activeConversationId);
+        } catch (error: any) {
+          setAttachmentPipeline({
+            phase: 'error',
+            fileIndex: 0,
+            totalFiles: selectedFiles.length,
+            fileName: String(selectedFiles[0]?.name || ''),
+            error: String(error?.message || 'No se pudo validar espacio para subir adjuntos.')
+          });
+          setStatus(error?.message || 'No se pudo validar espacio para subir adjuntos.');
+          return;
+        }
       }
 
       const now = Date.now();
@@ -2075,7 +2182,7 @@ export default function App() {
       setSending(true);
       setSendStartedAtMs(now);
       setSendElapsedSeconds(0);
-      setStatus('Generando...');
+      setStatus(selectedFiles.length > 0 ? 'Subiendo adjuntos...' : 'Generando...');
 
       const controller = new AbortController();
       streamAbortRef.current = controller;
@@ -2085,6 +2192,7 @@ export default function App() {
       let streamCompleted = false;
       let streamRequestStarted = false;
       let keepRunningIndicator = false;
+      let attachmentsReadyForContext = selectedFiles.length === 0;
 
       const patchReasoningCache = (itemId: string, value: string, mode: 'append' | 'replace') => {
         if (!value) return;
@@ -2145,6 +2253,13 @@ export default function App() {
           const fileSize = Math.max(0, Number(file?.size) || 0);
           let latestLoaded = 0;
           let latestTotal = fileSize;
+          setAttachmentPipeline({
+            phase: 'uploading',
+            fileIndex: index + 1,
+            totalFiles: selectedFiles.length,
+            fileName: String(file?.name || `archivo_${index + 1}`),
+            error: ''
+          });
 
           setUploadProgress({
             percent:
@@ -2206,13 +2321,19 @@ export default function App() {
         }
 
         if (selectedFiles.length > 0) {
+          setAttachmentPipeline({
+            phase: 'processing',
+            fileIndex: selectedFiles.length,
+            totalFiles: selectedFiles.length,
+            fileName: String(selectedFiles[selectedFiles.length - 1]?.name || ''),
+            error: ''
+          });
           await new Promise<void>((resolve) => {
             window.setTimeout(resolve, UPLOAD_PROGRESS_SETTLE_MS);
           });
           if (!isCurrentSession()) return;
         }
         setUploadProgress(null);
-        setSelectedFiles([]);
 
         const response = await startChatStream({
           message: trimmed,
@@ -2230,6 +2351,20 @@ export default function App() {
         });
         if (!isCurrentSession()) return;
         streamRequestStarted = true;
+        attachmentsReadyForContext = true;
+        if (selectedFiles.length > 0) {
+          setAttachmentPipeline({
+            phase: 'ready',
+            fileIndex: selectedFiles.length,
+            totalFiles: selectedFiles.length,
+            fileName: String(selectedFiles[selectedFiles.length - 1]?.name || ''),
+            error: ''
+          });
+          window.setTimeout(() => {
+            if (!isCurrentSession()) return;
+            clearComposerFiles();
+          }, 800);
+        }
 
         const responseConversationId = Number(response.headers.get('X-Conversation-Id'));
         if (Number.isInteger(responseConversationId) && responseConversationId > 0) {
@@ -2465,6 +2600,15 @@ export default function App() {
           setStatus('Conexión cerrada. La ejecución seguirá en segundo plano.');
         } else {
           setStatus(aborted ? 'Solicitud detenida.' : error?.message || 'Error en el envío.');
+          if (!attachmentsReadyForContext && selectedFiles.length > 0) {
+            setAttachmentPipeline({
+              phase: aborted ? 'pending' : 'error',
+              fileIndex: uploadProgress?.fileIndex || 0,
+              totalFiles: selectedFiles.length,
+              fileName: String(uploadProgress?.fileName || selectedFiles[0]?.name || ''),
+              error: aborted ? '' : String(error?.message || 'No se pudo completar la subida de adjuntos.')
+            });
+          }
         }
       } finally {
         if (
@@ -2503,7 +2647,9 @@ export default function App() {
       scheduleDraftPersist,
       selectedFiles,
       sending,
+      uploadProgress,
       draftProjectId,
+      clearComposerFiles,
       clearTerminalForConversation,
       updateActiveDraft,
       upsertTerminal
@@ -2648,6 +2794,7 @@ export default function App() {
           }
           selectedFiles={selectedFiles}
           uploadProgress={uploadProgress}
+          attachmentPipeline={attachmentPipeline}
           activeAgentName={String(options.activeAgentName || 'Codex CLI')}
           model={chatModel}
           reasoningEffort={chatReasoningEffort}
@@ -2656,11 +2803,8 @@ export default function App() {
           onBack={() => navigate('hub')}
           onSend={handleSend}
           onStop={handleStop}
-          onAddFiles={(files) => {
-            const merged = [...selectedFiles, ...files].slice(0, 5);
-            setSelectedFiles(merged);
-          }}
-          onClearFiles={() => setSelectedFiles([])}
+          onAddFiles={appendComposerFiles}
+          onClearFiles={clearComposerFiles}
           onRefresh={handleRefresh}
           onNavigate={navigate}
           onModelChange={handleChatModelChange}
@@ -2693,12 +2837,19 @@ export default function App() {
         <AttachmentsScreen
           selectedFiles={selectedFiles}
           attachments={attachments}
-          onPickFiles={(files) => {
-            const merged = [...selectedFiles, ...files].slice(0, 5);
-            setSelectedFiles(merged);
-          }}
+          onPickFiles={appendComposerFiles}
           onRemoveSelected={(name) => {
-            setSelectedFiles((prev) => prev.filter((item) => item.name !== name));
+            setSelectedFiles((prev) => {
+              const next = prev.filter((item) => item.name !== name);
+              setAttachmentPipeline({
+                phase: next.length > 0 ? 'pending' : 'idle',
+                fileIndex: 0,
+                totalFiles: next.length,
+                fileName: next.length > 0 ? String(next[0]?.name || '') : '',
+                error: ''
+              });
+              return next;
+            });
           }}
           onDeleteAttachments={handleDeleteAttachments}
           onRefresh={() => {

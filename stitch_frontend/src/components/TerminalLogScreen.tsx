@@ -102,6 +102,23 @@ type ResidualCleanupHistoryItem = {
   details: string;
 };
 
+type ResidualDeleteResult = {
+  analysisJobId: string;
+  analysisScannedAt: string;
+  requestedCount: number;
+  deletedCount: number;
+  failedCount: number;
+  freedBytes: number;
+  deletedEntries: Array<{
+    path: string;
+    name: string;
+    type: 'file' | 'directory' | 'other';
+    sizeBytes: number;
+    category: string;
+  }>;
+  failed: Array<{ path: string; error: string }>;
+};
+
 function formatTime(value: string) {
   const date = value ? new Date(value) : null;
   if (!date || Number.isNaN(date.getTime())) return '--:--:--';
@@ -364,6 +381,7 @@ export default function TerminalLogScreen({
   const [residualData, setResidualData] = useState<ToolsStorageResidualAnalysis | null>(null);
   const [residualLoading, setResidualLoading] = useState(false);
   const [residualAnalyzeJob, setResidualAnalyzeJob] = useState<ToolsStorageJob | null>(null);
+  const [residualAnalysisJobId, setResidualAnalysisJobId] = useState('');
   const [residualError, setResidualError] = useState('');
   const [residualNotice, setResidualNotice] = useState('');
   const [residualLatestSummary, setResidualLatestSummary] = useState('');
@@ -371,6 +389,10 @@ export default function TerminalLogScreen({
   const [residualHistoryLoading, setResidualHistoryLoading] = useState(false);
   const [residualSelectedPaths, setResidualSelectedPaths] = useState<Record<string, true>>({});
   const [residualDeleting, setResidualDeleting] = useState(false);
+  const [residualDeleteResult, setResidualDeleteResult] = useState<ResidualDeleteResult | null>(null);
+  const [residualCategoryFilter, setResidualCategoryFilter] = useState<
+    'all' | 'temporary' | 'logs' | 'cache' | 'backup' | 'artifact' | 'residual' | 'other'
+  >('all');
   const [backupsByAppId, setBackupsByAppId] = useState<Record<string, ToolsDeployedAppBackupItem[]>>({});
   const [loadingBackupsAppId, setLoadingBackupsAppId] = useState<string | null>(null);
   const [selectedBackupFileIdByAppId, setSelectedBackupFileIdByAppId] = useState<Record<string, string>>({});
@@ -848,6 +870,59 @@ export default function TerminalLogScreen({
     );
     return selectedLocalPaths.reduce((sum, entryPath) => sum + Number(byPath.get(entryPath) || 0), 0);
   }, [selectedLocalPaths, storageLocalData]);
+  const residualCandidates = useMemo(
+    () => (Array.isArray(residualData?.candidates) ? residualData.candidates : []),
+    [residualData]
+  );
+  const residualCandidatesByPath = useMemo(
+    () =>
+      new Map(
+        residualCandidates.map((entry) => [entry.path, Number.isFinite(Number(entry.sizeBytes)) ? Number(entry.sizeBytes) : 0])
+      ),
+    [residualCandidates]
+  );
+  const residualFilteredCandidates = useMemo(() => {
+    const byCategory =
+      residualCategoryFilter === 'all'
+        ? residualCandidates
+        : residualCandidates.filter((entry) => String(entry.category || '').trim().toLowerCase() === residualCategoryFilter);
+    return byCategory
+      .slice()
+      .sort((a, b) => Number(b.sizeBytes || 0) - Number(a.sizeBytes || 0));
+  }, [residualCandidates, residualCategoryFilter]);
+  const residualSelectedCount = useMemo(
+    () => Object.keys(residualSelectedPaths).filter((entryPath) => residualCandidatesByPath.has(entryPath)).length,
+    [residualSelectedPaths, residualCandidatesByPath]
+  );
+  const residualSelectedTotalBytes = useMemo(
+    () =>
+      Object.keys(residualSelectedPaths).reduce(
+        (sum, entryPath) => sum + Number(residualCandidatesByPath.get(entryPath) || 0),
+        0
+      ),
+    [residualSelectedPaths, residualCandidatesByPath]
+  );
+  const residualAllVisibleSelected = useMemo(
+    () =>
+      residualFilteredCandidates.length > 0 &&
+      residualFilteredCandidates.every((entry) => Boolean(residualSelectedPaths[entry.path])),
+    [residualFilteredCandidates, residualSelectedPaths]
+  );
+  const residualAllCandidatesSelected = useMemo(
+    () =>
+      residualCandidates.length > 0 &&
+      residualCandidates.every((entry) => Boolean(residualSelectedPaths[entry.path])),
+    [residualCandidates, residualSelectedPaths]
+  );
+
+  useEffect(() => {
+    const allowed = new Set(residualCandidates.map((entry) => entry.path));
+    setResidualSelectedPaths((prev) => {
+      const nextEntries = Object.entries(prev).filter(([entryPath]) => allowed.has(entryPath));
+      if (nextEntries.length === Object.keys(prev).length) return prev;
+      return Object.fromEntries(nextEntries) as Record<string, true>;
+    });
+  }, [residualCandidates]);
 
   useEffect(() => {
     const validIds = new Set(deployedApps.map((app) => app.id));
@@ -943,6 +1018,35 @@ export default function TerminalLogScreen({
     if (normalized === 'high') return 'alto';
     if (normalized === 'medium') return 'medio';
     return 'bajo';
+  };
+
+  const formatConfidence = (confidence: string) => {
+    const normalized = String(confidence || '')
+      .trim()
+      .toLowerCase();
+    if (normalized === 'high') return 'alta';
+    if (normalized === 'medium') return 'media';
+    return 'baja';
+  };
+
+  const formatResidualCategory = (category: string) => {
+    const normalized = String(category || '')
+      .trim()
+      .toLowerCase();
+    if (normalized === 'temporary') return 'Temporales';
+    if (normalized === 'logs') return 'Logs';
+    if (normalized === 'cache') return 'Cachés';
+    if (normalized === 'backup') return 'Backups';
+    if (normalized === 'artifact') return 'Artefactos';
+    if (normalized === 'other') return 'Otros';
+    return 'Residuales';
+  };
+
+  const formatResidualSource = (source: string) => {
+    const normalized = String(source || '')
+      .trim()
+      .toLowerCase();
+    return normalized === 'ai' ? 'IA' : 'Heurística';
   };
 
   const formatDeployedStatus = (status: string) => {
@@ -1799,11 +1903,26 @@ export default function TerminalLogScreen({
       }
       const analysis = parseResidualAnalysisFromJob(job);
       if (!analysis) return null;
-      const summary = `Análisis IA completado · ${analysis.candidates.length} candidato(s)`;
+      const totalBytes =
+        Number(analysis.summary?.totalBytes) ||
+        analysis.candidates.reduce((sum, entry) => sum + Number(entry.sizeBytes || 0), 0);
+      const summary = `Análisis IA completado · ${analysis.candidates.length} candidato(s) · ${formatBytes(totalBytes)}`;
       const detailChunks: string[] = [];
-      detailChunks.push(analysis.ai.used ? 'Clasificación IA activa' : 'Clasificación heurística');
+      if (analysis.summary?.pipeline) {
+        detailChunks.push(analysis.summary.pipeline);
+      } else {
+        detailChunks.push(analysis.ai.used ? 'Clasificación IA activa' : 'Clasificación heurística');
+      }
       if (!analysis.ai.used && analysis.ai.fallbackReason) {
         detailChunks.push(`fallback: ${analysis.ai.fallbackReason}`);
+      }
+      const byCategory = analysis.summary?.byCategory || {};
+      const categoryDetail = Object.entries(byCategory)
+        .filter(([, value]) => Number(value) > 0)
+        .map(([key, value]) => `${formatResidualCategory(key)}: ${Number(value)}`)
+        .join(' · ');
+      if (categoryDetail) {
+        detailChunks.push(categoryDetail);
       }
       if (analysis.roots.length > 0) {
         detailChunks.push(`rutas: ${analysis.roots.join(', ')}`);
@@ -1850,16 +1969,24 @@ export default function TerminalLogScreen({
     [buildResidualHistoryItemFromJob]
   );
 
-  const runResidualAnalysis = async () => {
+  const runResidualAnalysis = async (options?: { preserveDeleteResult?: boolean }) => {
     setResidualLoading(true);
     setResidualAnalyzeJob(null);
+    setResidualAnalysisJobId('');
+    setResidualData(null);
+    setResidualSelectedPaths({});
+    setResidualCategoryFilter('all');
     setResidualError('');
     setResidualNotice('');
+    if (!options?.preserveDeleteResult) {
+      setResidualDeleteResult(null);
+    }
     try {
       const payload = await analyzeToolsStorageResidual({
         useAi: true
       });
       setResidualAnalyzeJob(payload.job);
+      setResidualAnalysisJobId(payload.job.id);
       setResidualNotice(`Job ${payload.job.id} iniciado. Analizando en segundo plano...`);
       const finalJob = await waitForStorageJob(payload.job.id, (jobUpdate) => {
         setResidualAnalyzeJob(jobUpdate);
@@ -1873,7 +2000,7 @@ export default function TerminalLogScreen({
         throw new Error('El job terminó sin resultados de análisis.');
       }
       setResidualData(nextAnalysis);
-      setResidualSelectedPaths({});
+      setResidualAnalysisJobId(finalJob.id);
       const aiProvider = String(nextAnalysis.ai.providerName || nextAnalysis.ai.providerId || '').trim();
       const summary = `Análisis completado: ${nextAnalysis.candidates.length} candidato(s). ${
         nextAnalysis.ai.used
@@ -1887,6 +2014,7 @@ export default function TerminalLogScreen({
       const message = error instanceof Error ? error.message : 'No se pudo analizar residuales con IA';
       setResidualError(message);
       setResidualLatestSummary(`Análisis fallido: ${message}`);
+      setResidualAnalysisJobId('');
       await loadResidualHistory(true);
     } finally {
       setResidualLoading(false);
@@ -1894,6 +2022,14 @@ export default function TerminalLogScreen({
   };
 
   const deleteSelectedResidualCandidates = async () => {
+    if (!residualData) {
+      setResidualError('Primero ejecuta análisis y revisa la lista de candidatos.');
+      return;
+    }
+    if (!residualAnalysisJobId) {
+      setResidualError('Falta referencia del análisis. Vuelve a analizar antes de borrar.');
+      return;
+    }
     const selectedPaths = Object.keys(residualSelectedPaths).filter(Boolean);
     if (selectedPaths.length === 0) {
       setResidualError('Selecciona al menos un candidato para borrar.');
@@ -1911,17 +2047,32 @@ export default function TerminalLogScreen({
     setResidualNotice('');
     try {
       const payload = await deleteToolsStorageResidual({
-        paths: selectedPaths
+        paths: selectedPaths,
+        analysisJobId: residualAnalysisJobId
       });
-      const deletedCount = payload.deleted.length;
-      const failedCount = payload.failed.length;
+      const deletedCount = Number(payload.deletedCount) || payload.deleted.length;
+      const failedCount = Number(payload.failedCount) || payload.failed.length;
+      const freedBytes = Number(payload.freedBytes) || 0;
       const deleteSummary =
         failedCount > 0
-          ? `Borrado parcial: ${deletedCount} eliminado(s), ${failedCount} con error.`
-          : `Borrado completado: ${deletedCount} eliminado(s).`;
+          ? `Borrado parcial: ${deletedCount} eliminado(s), ${failedCount} con error · ${formatBytes(freedBytes)} liberados.`
+          : `Borrado completado: ${deletedCount} eliminado(s) · ${formatBytes(freedBytes)} liberados.`;
       setResidualNotice(deleteSummary);
       setResidualLatestSummary(deleteSummary);
-      const deletedPreview = payload.deleted.slice(0, 3).join(', ');
+      setResidualDeleteResult({
+        analysisJobId: payload.analysisJobId,
+        analysisScannedAt: payload.analysisScannedAt,
+        requestedCount: payload.requestedCount,
+        deletedCount,
+        failedCount,
+        freedBytes,
+        deletedEntries: payload.deletedEntries,
+        failed: payload.failed
+      });
+      const deletedPreview = payload.deletedEntries
+        .slice(0, 3)
+        .map((entry) => entry.path)
+        .join(', ');
       const failurePreview = payload.failed.slice(0, 2).map((entry) => `${entry.path}: ${entry.error}`).join(' | ');
       setResidualHistory((prev) =>
         [
@@ -1932,6 +2083,7 @@ export default function TerminalLogScreen({
             createdAt: new Date().toISOString(),
             summary: deleteSummary,
             details: [
+              freedBytes > 0 ? `espacio liberado: ${formatBytes(freedBytes)}` : '',
               deletedPreview ? `eliminados: ${deletedPreview}` : '',
               failurePreview ? `errores: ${failurePreview}` : ''
             ]
@@ -1949,7 +2101,14 @@ export default function TerminalLogScreen({
           setResidualError(`Error en algunos elementos: ${firstFailure.error}`);
         }
       }
-      await runResidualAnalysis();
+      const deletedPathSet = new Set(payload.deletedEntries.map((entry) => entry.path));
+      setResidualData((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          candidates: prev.candidates.filter((entry) => !deletedPathSet.has(entry.path))
+        };
+      });
       await loadResidualHistory(true);
       setResidualSelectedPaths({});
     } catch (error) {
@@ -3949,36 +4108,69 @@ export default function TerminalLogScreen({
 
             {storagePanelView === 'cleanup' ? (
               <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-3">
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-xs text-zinc-300 uppercase">Limpieza residual asistida por IA</p>
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        void runResidualAnalysis();
-                      }}
-                      disabled={residualLoading || residualJobRunning}
-                      className="text-xs px-2.5 py-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 disabled:opacity-50"
-                    >
-                      {residualLoading || residualJobRunning
-                        ? 'Analizando...'
-                        : 'Analizar residuales con IA'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        void deleteSelectedResidualCandidates();
-                      }}
-                      disabled={residualDeleting || Object.keys(residualSelectedPaths).length === 0}
-                      className={`text-xs px-2.5 py-1.5 rounded-lg border ${
-                        Object.keys(residualSelectedPaths).length > 0
-                          ? 'border-red-500/40 bg-red-500/10 text-red-200'
-                          : 'border-zinc-700 text-zinc-500'
-                      } disabled:opacity-50`}
-                    >
-                      {residualDeleting ? 'Borrando...' : `Borrar seleccionados (${Object.keys(residualSelectedPaths).length})`}
-                    </button>
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <p className="text-xs text-zinc-300 uppercase">Limpieza residual asistida por IA</p>
+                    <p className="text-[11px] text-zinc-500 mt-1">
+                      Flujo obligatorio: 1) analizar 2) revisar lista 3) confirmar borrado.
+                    </p>
                   </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void runResidualAnalysis();
+                    }}
+                    disabled={residualLoading || residualJobRunning}
+                    className="text-xs px-2.5 py-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 disabled:opacity-50"
+                  >
+                    {residualLoading || residualJobRunning ? 'Analizando...' : '1. Analizar con IA'}
+                  </button>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <article
+                    className={`rounded border px-2 py-2 ${
+                      residualJobRunning
+                        ? 'border-cyan-500/30 bg-cyan-500/5'
+                        : residualData
+                          ? 'border-emerald-500/30 bg-emerald-500/5'
+                          : 'border-zinc-800 bg-zinc-950/60'
+                    }`}
+                  >
+                    <p className="text-[10px] uppercase text-zinc-400">Paso 1 · Análisis</p>
+                    <p className="text-xs text-zinc-100 mt-1">
+                      {residualJobRunning ? 'En curso…' : residualData ? 'Completado' : 'Pendiente'}
+                    </p>
+                  </article>
+                  <article
+                    className={`rounded border px-2 py-2 ${
+                      residualData && residualData.candidates.length > 0
+                        ? 'border-emerald-500/30 bg-emerald-500/5'
+                        : 'border-zinc-800 bg-zinc-950/60'
+                    }`}
+                  >
+                    <p className="text-[10px] uppercase text-zinc-400">Paso 2 · Revisión</p>
+                    <p className="text-xs text-zinc-100 mt-1">
+                      {residualData
+                        ? residualData.candidates.length > 0
+                          ? `${residualData.candidates.length} candidato(s)`
+                          : 'Sin candidatos'
+                        : 'Primero analiza'}
+                    </p>
+                  </article>
+                  <article
+                    className={`rounded border px-2 py-2 ${
+                      residualSelectedCount > 0
+                        ? 'border-amber-500/30 bg-amber-500/5'
+                        : 'border-zinc-800 bg-zinc-950/60'
+                    }`}
+                  >
+                    <p className="text-[10px] uppercase text-zinc-400">Paso 3 · Confirmación</p>
+                    <p className="text-xs text-zinc-100 mt-1">
+                      {residualSelectedCount > 0
+                        ? `${residualSelectedCount} seleccionado(s)`
+                        : 'Selecciona elementos a borrar'}
+                    </p>
+                  </article>
                 </div>
                 <p className="text-[11px] text-zinc-500">
                   Rutas permitidas: {(residualData?.roots || []).join(', ') || 'sin datos aún'}.
@@ -4014,13 +4206,214 @@ export default function TerminalLogScreen({
                   </article>
                 ) : null}
                 {residualData ? (
-                  <p className="text-[11px] text-zinc-500">
-                    IA {residualData.ai.used ? 'activa' : 'fallback heurístico'}
-                    {residualData.ai.fallbackReason ? ` · ${residualData.ai.fallbackReason}` : ''}
-                  </p>
+                  <article className="rounded border border-zinc-800 bg-zinc-950/60 p-2 space-y-1.5">
+                    <p className="text-[10px] uppercase text-zinc-400">Transparencia del análisis</p>
+                    <p className="text-xs text-zinc-200">
+                      {residualData.summary?.pipeline ||
+                        (residualData.ai.used
+                          ? `Análisis realizado con ${residualData.ai.providerName || residualData.ai.providerId || 'IA'}`
+                          : `Fallback heurístico${residualData.ai.fallbackReason ? ` (${residualData.ai.fallbackReason})` : ''}`)}
+                    </p>
+                    <p className="text-[11px] text-zinc-400">
+                      Total candidatos: {residualData.summary?.totalCandidates || residualData.candidates.length} · Tamaño estimado:{' '}
+                      {formatBytes(
+                        Number(residualData.summary?.totalBytes) ||
+                          residualData.candidates.reduce((sum, entry) => sum + Number(entry.sizeBytes || 0), 0)
+                      )}
+                    </p>
+                    {residualData.summary?.criteria?.length ? (
+                      <p className="text-[11px] text-zinc-500 whitespace-pre-wrap break-words">
+                        Criterio: {residualData.summary.criteria.join(' · ')}
+                      </p>
+                    ) : null}
+                  </article>
                 ) : null}
                 {residualData && residualData.candidates.length === 0 ? (
                   <p className="text-xs text-zinc-500">No se detectaron candidatos residuales en este análisis.</p>
+                ) : null}
+                {residualData && residualData.candidates.length > 0 ? (
+                  <article className="rounded border border-zinc-800 bg-zinc-950/60 p-2 space-y-2">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <p className="text-[10px] uppercase text-zinc-400">Candidatos propuestos para borrar</p>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (residualAllCandidatesSelected) {
+                              setResidualSelectedPaths({});
+                              return;
+                            }
+                            setResidualSelectedPaths((prev) => {
+                              const next = { ...prev };
+                              residualCandidates.forEach((entry) => {
+                                next[entry.path] = true;
+                              });
+                              return next;
+                            });
+                          }}
+                          disabled={residualCandidates.length === 0}
+                          className="text-[10px] px-2 py-1 rounded border border-zinc-700 text-zinc-300 hover:text-zinc-100 disabled:opacity-40"
+                        >
+                          {residualAllCandidatesSelected
+                            ? `Quitar todos (${residualCandidates.length})`
+                            : `Seleccionar todos (${residualCandidates.length})`}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (residualAllVisibleSelected) {
+                              setResidualSelectedPaths((prev) => {
+                                const next = { ...prev };
+                                residualFilteredCandidates.forEach((entry) => {
+                                  delete next[entry.path];
+                                });
+                                return next;
+                              });
+                              return;
+                            }
+                            setResidualSelectedPaths((prev) => {
+                              const next = { ...prev };
+                              residualFilteredCandidates.forEach((entry) => {
+                                next[entry.path] = true;
+                              });
+                              return next;
+                            });
+                          }}
+                          className="text-[10px] px-2 py-1 rounded border border-zinc-700 text-zinc-300 hover:text-zinc-100"
+                        >
+                          {residualAllVisibleSelected ? 'Quitar visibles' : 'Seleccionar visibles'}
+                        </button>
+                        <select
+                          value={residualCategoryFilter}
+                          onChange={(event) =>
+                            setResidualCategoryFilter(
+                              (event.target.value as
+                                | 'all'
+                                | 'temporary'
+                                | 'logs'
+                                | 'cache'
+                                | 'backup'
+                                | 'artifact'
+                                | 'residual'
+                                | 'other') || 'all'
+                            )
+                          }
+                          className="text-[10px] px-2 py-1 rounded border border-zinc-700 bg-black/40 text-zinc-200"
+                        >
+                          <option value="all">Todas las categorías</option>
+                          <option value="temporary">Temporales</option>
+                          <option value="logs">Logs</option>
+                          <option value="cache">Cachés</option>
+                          <option value="backup">Backups</option>
+                          <option value="artifact">Artefactos</option>
+                          <option value="residual">Residuales</option>
+                          <option value="other">Otros</option>
+                        </select>
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-zinc-400">
+                      Seleccionados: {residualSelectedCount} · espacio potencial: {formatBytes(residualSelectedTotalBytes)}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void deleteSelectedResidualCandidates();
+                      }}
+                      disabled={residualDeleting || !residualData || !residualAnalysisJobId || residualSelectedCount === 0}
+                      className={`text-xs px-2.5 py-1.5 rounded-lg border ${
+                        residualSelectedCount > 0 && residualAnalysisJobId
+                          ? 'border-red-500/40 bg-red-500/10 text-red-200'
+                          : 'border-zinc-700 text-zinc-500'
+                      } disabled:opacity-50`}
+                    >
+                      {residualDeleting
+                        ? 'Eliminando...'
+                        : `3. Eliminar seleccionados (${residualSelectedCount})`}
+                    </button>
+                    {!residualAnalysisJobId ? (
+                      <p className="text-[11px] text-zinc-500">
+                        Para borrar, primero completa un análisis y revisa la lista.
+                      </p>
+                    ) : null}
+                    <div className="max-h-[30rem] overflow-auto space-y-1.5 pr-1">
+                      {residualFilteredCandidates.length === 0 ? (
+                        <p className="text-[11px] text-zinc-500">No hay candidatos con el filtro actual.</p>
+                      ) : (
+                        residualFilteredCandidates.map((candidate) => {
+                          const checked = Boolean(residualSelectedPaths[candidate.path]);
+                          return (
+                            <label
+                              key={`residual:${candidate.path}`}
+                              className={`flex items-start gap-2 rounded border p-2 cursor-pointer ${
+                                checked ? 'border-red-500/40 bg-red-500/5' : 'border-zinc-800 bg-zinc-950/70'
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() =>
+                                  setResidualSelectedPaths((prev) => {
+                                    const next = { ...prev };
+                                    if (next[candidate.path]) {
+                                      delete next[candidate.path];
+                                    } else {
+                                      next[candidate.path] = true;
+                                    }
+                                    return next;
+                                  })
+                                }
+                                className="mt-0.5 h-4 w-4 accent-red-400"
+                              />
+                              <div className="min-w-0 space-y-1">
+                                <div className="flex items-center justify-between gap-2">
+                                  <p className="text-xs text-zinc-100 break-all">{candidate.name || candidate.path}</p>
+                                  <span className="text-[10px] text-zinc-400">{formatBytes(candidate.sizeBytes)}</span>
+                                </div>
+                                <p className="text-[10px] text-zinc-500 break-all">{candidate.path}</p>
+                                <p className="text-[10px] text-zinc-400">
+                                  {candidate.type} · {formatResidualCategory(candidate.category)} ·{' '}
+                                  {formatResidualSource(candidate.analysisSource)} · conf {formatConfidence(candidate.confidence)} · riesgo{' '}
+                                  {formatRisk(candidate.risk)} · {formatDateTime(candidate.modifiedAt)}
+                                </p>
+                                <p className="text-[10px] text-zinc-300 break-all">{candidate.reason}</p>
+                              </div>
+                            </label>
+                          );
+                        })
+                      )}
+                    </div>
+                  </article>
+                ) : null}
+                {residualDeleteResult ? (
+                  <article className="rounded border border-emerald-500/20 bg-emerald-500/5 p-2 space-y-2">
+                    <p className="text-[10px] uppercase text-emerald-300/90">Resultado de borrado</p>
+                    <p className="text-xs text-emerald-100">
+                      Eliminados: {residualDeleteResult.deletedCount}/{residualDeleteResult.requestedCount} · errores:{' '}
+                      {residualDeleteResult.failedCount} · espacio liberado: {formatBytes(residualDeleteResult.freedBytes)}
+                    </p>
+                    <p className="text-[10px] text-emerald-200/80">
+                      Análisis de referencia: {residualDeleteResult.analysisJobId || '-'}{' '}
+                      {residualDeleteResult.analysisScannedAt ? `· ${formatDateTime(residualDeleteResult.analysisScannedAt)}` : ''}
+                    </p>
+                    {residualDeleteResult.deletedEntries.length > 0 ? (
+                      <div className="max-h-28 overflow-auto pr-1 space-y-1">
+                        {residualDeleteResult.deletedEntries.map((entry) => (
+                          <p key={`res-del:${entry.path}`} className="text-[10px] text-emerald-100 break-all">
+                            {entry.path} · {formatBytes(entry.sizeBytes)} · {formatResidualCategory(entry.category)}
+                          </p>
+                        ))}
+                      </div>
+                    ) : null}
+                    {residualDeleteResult.failed.length > 0 ? (
+                      <div className="max-h-24 overflow-auto pr-1 space-y-1">
+                        {residualDeleteResult.failed.map((entry) => (
+                          <p key={`res-fail:${entry.path}`} className="text-[10px] text-red-200 break-all">
+                            {entry.path}: {entry.error}
+                          </p>
+                        ))}
+                      </div>
+                    ) : null}
+                  </article>
                 ) : null}
                 <article className="rounded border border-zinc-800 bg-zinc-950/60 p-2 space-y-2">
                   <div className="flex items-center justify-between gap-2">
@@ -4062,43 +4455,6 @@ export default function TerminalLogScreen({
                     </div>
                   )}
                 </article>
-                <div className="max-h-[30rem] overflow-auto space-y-1">
-                  {(residualData?.candidates || []).map((candidate) => {
-                    const checked = Boolean(residualSelectedPaths[candidate.path]);
-                    return (
-                      <label
-                        key={`residual:${candidate.path}`}
-                        className={`flex items-start gap-2 rounded border p-2 cursor-pointer ${
-                          checked ? 'border-red-500/40 bg-red-500/5' : 'border-zinc-800 bg-zinc-950/70'
-                        }`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={() =>
-                            setResidualSelectedPaths((prev) => {
-                              const next = { ...prev };
-                              if (next[candidate.path]) {
-                                delete next[candidate.path];
-                              } else {
-                                next[candidate.path] = true;
-                              }
-                              return next;
-                            })
-                          }
-                          className="mt-0.5 h-4 w-4 accent-red-400"
-                        />
-                        <div className="min-w-0">
-                          <p className="text-xs text-zinc-100 break-all">{candidate.path}</p>
-                          <p className="text-[10px] text-zinc-500">
-                            {candidate.type} · {formatBytes(candidate.sizeBytes)} · {formatDateTime(candidate.modifiedAt)} · conf {candidate.confidence} · riesgo {candidate.risk}
-                          </p>
-                          <p className="text-[10px] text-zinc-400 break-all">{candidate.reason}</p>
-                        </div>
-                      </label>
-                    );
-                  })}
-                </div>
               </article>
             ) : null}
           </section>

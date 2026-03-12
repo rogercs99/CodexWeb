@@ -4,6 +4,7 @@ import type {
   AiProviderQuota,
   AiAgentSettingsItem,
   AiAgentSettingsPayload,
+  AttachmentUploadPreflight,
   AttachmentItem,
   ChatProject,
   ChatProjectRef,
@@ -38,6 +39,7 @@ import type {
   ToolsStorageResidualAnalysis,
   ToolsStorageResidualCandidate,
   RestartState,
+  StorageHealthSnapshot,
   TaskRecovery,
   TaskRunDashboardItem,
   UnifiedSearchPayload,
@@ -1408,9 +1410,35 @@ export async function downloadToolsDriveFile(payload: {
 }
 
 function normalizeToolsStorageResidualCandidate(rawValue: any): ToolsStorageResidualCandidate {
+  const categoryRaw = String(rawValue?.category || '')
+    .trim()
+    .toLowerCase();
+  const normalizedCategory:
+    | 'temporary'
+    | 'logs'
+    | 'cache'
+    | 'backup'
+    | 'artifact'
+    | 'residual'
+    | 'other' =
+    categoryRaw === 'temporary' ||
+    categoryRaw === 'logs' ||
+    categoryRaw === 'cache' ||
+    categoryRaw === 'backup' ||
+    categoryRaw === 'artifact' ||
+    categoryRaw === 'other'
+      ? categoryRaw
+      : 'residual';
+  const sourceRaw = String(rawValue?.analysisSource || '')
+    .trim()
+    .toLowerCase();
   return {
     id: String(rawValue?.id || rawValue?.path || ''),
     path: String(rawValue?.path || ''),
+    name: String(rawValue?.name || rawValue?.path || '')
+      .split(/[\\/]/)
+      .filter(Boolean)
+      .pop() || String(rawValue?.path || ''),
     type: rawValue?.type === 'directory' || rawValue?.type === 'other' ? rawValue.type : 'file',
     sizeBytes: Number.isFinite(Number(rawValue?.sizeBytes)) ? Number(rawValue.sizeBytes) : 0,
     modifiedAt: String(rawValue?.modifiedAt || ''),
@@ -1418,6 +1446,8 @@ function normalizeToolsStorageResidualCandidate(rawValue: any): ToolsStorageResi
     confidence:
       rawValue?.confidence === 'high' || rawValue?.confidence === 'medium' ? rawValue.confidence : 'low',
     risk: rawValue?.risk === 'high' || rawValue?.risk === 'medium' ? rawValue.risk : 'low',
+    category: normalizedCategory,
+    analysisSource: sourceRaw === 'ai' ? 'ai' : 'heuristic',
     score: Number.isFinite(Number(rawValue?.score)) ? Number(rawValue.score) : 0
   };
 }
@@ -1440,7 +1470,26 @@ export function normalizeToolsStorageResidualAnalysis(rawValue: any): ToolsStora
       attemptedProviders: Array.isArray(rawValue?.ai?.attemptedProviders)
         ? rawValue.ai.attemptedProviders.map((entry: any) => String(entry || '').trim()).filter(Boolean)
         : []
-    }
+    },
+    summary:
+      rawValue?.summary && typeof rawValue.summary === 'object'
+        ? {
+            totalCandidates: Number(rawValue.summary?.totalCandidates) || 0,
+            totalBytes: Number(rawValue.summary?.totalBytes) || 0,
+            byCategory:
+              rawValue.summary?.byCategory && typeof rawValue.summary.byCategory === 'object'
+                ? Object.fromEntries(
+                    Object.entries(rawValue.summary.byCategory)
+                      .map(([key, value]) => [String(key || '').trim(), Number(value) || 0])
+                      .filter(([key]) => Boolean(key))
+                  )
+                : {},
+            criteria: Array.isArray(rawValue.summary?.criteria)
+              ? rawValue.summary.criteria.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+              : [],
+            pipeline: String(rawValue.summary?.pipeline || '')
+          }
+        : undefined
   };
 }
 
@@ -1462,20 +1511,71 @@ export async function analyzeToolsStorageResidual(payload?: {
 
 export async function deleteToolsStorageResidual(payload: {
   paths: string[];
-}): Promise<{ deleted: string[]; failed: Array<{ path: string; error: string }> }> {
-  const data = await api<{ deleted: string[]; failed: Array<{ path: string; error: string }> }>(
+  analysisJobId: string;
+}): Promise<{
+  analysisJobId: string;
+  analysisScannedAt: string;
+  requestedCount: number;
+  deletedCount: number;
+  failedCount: number;
+  freedBytes: number;
+  deleted: string[];
+  deletedEntries: Array<{
+    path: string;
+    name: string;
+    type: 'file' | 'directory' | 'other';
+    sizeBytes: number;
+    category: string;
+  }>;
+  failed: Array<{ path: string; error: string }>;
+}> {
+  const data = await api<{
+    analysisJobId?: string;
+    analysisScannedAt?: string;
+    requestedCount?: number;
+    deletedCount?: number;
+    failedCount?: number;
+    freedBytes?: number;
+    deleted: string[];
+    deletedEntries?: Array<{
+      path?: string;
+      name?: string;
+      type?: string;
+      sizeBytes?: number;
+      category?: string;
+    }>;
+    failed: Array<{ path: string; error: string }>;
+  }>(
     '/api/tools/storage/cleanup/delete',
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         paths: Array.isArray(payload?.paths) ? payload.paths : [],
+        analysisJobId: String(payload?.analysisJobId || '').trim(),
         confirm: 'DELETE'
       })
     }
   );
   return {
+    analysisJobId: String(data?.analysisJobId || ''),
+    analysisScannedAt: String(data?.analysisScannedAt || ''),
+    requestedCount: Number(data?.requestedCount) || 0,
+    deletedCount: Number(data?.deletedCount) || 0,
+    failedCount: Number(data?.failedCount) || 0,
+    freedBytes: Number(data?.freedBytes) || 0,
     deleted: Array.isArray(data?.deleted) ? data.deleted.map((entry: any) => String(entry || '')).filter(Boolean) : [],
+    deletedEntries: Array.isArray(data?.deletedEntries)
+      ? data.deletedEntries
+          .map((entry: any) => ({
+            path: String(entry?.path || ''),
+            name: String(entry?.name || ''),
+            type: entry?.type === 'directory' || entry?.type === 'other' ? entry.type : 'file',
+            sizeBytes: Number(entry?.sizeBytes) || 0,
+            category: String(entry?.category || '')
+          }))
+          .filter((entry: any) => Boolean(entry.path))
+      : [],
     failed: Array.isArray(data?.failed)
       ? data.failed.map((entry: any) => ({
           path: String(entry?.path || ''),
@@ -1712,12 +1812,200 @@ export async function deleteAttachment(attachmentId: string): Promise<void> {
   await api(`/api/attachments/${encodeURIComponent(attachmentId)}`, { method: 'DELETE' });
 }
 
+export async function getStorageHealth(path?: string): Promise<StorageHealthSnapshot> {
+  const suffix = path ? `?path=${encodeURIComponent(path)}` : '';
+  const data = await api<{ storage: any }>(`/api/storage/health${suffix}`);
+  const raw = data?.storage && typeof data.storage === 'object' ? data.storage : {};
+  const statusRaw = String(raw.status || '').trim().toLowerCase();
+  return {
+    path: String(raw.path || ''),
+    mountPoint: String(raw.mountPoint || ''),
+    totalBytes: Number.isFinite(Number(raw.totalBytes)) ? Number(raw.totalBytes) : null,
+    usedBytes: Number.isFinite(Number(raw.usedBytes)) ? Number(raw.usedBytes) : null,
+    availableBytes: Number.isFinite(Number(raw.availableBytes)) ? Number(raw.availableBytes) : null,
+    usedPercent: Number.isFinite(Number(raw.usedPercent)) ? Number(raw.usedPercent) : null,
+    status: statusRaw === 'warning' || statusRaw === 'critical' ? statusRaw : 'ok',
+    thresholds: {
+      warningFreeBytes: Number.isFinite(Number(raw?.thresholds?.warningFreeBytes))
+        ? Number(raw.thresholds.warningFreeBytes)
+        : 0,
+      criticalFreeBytes: Number.isFinite(Number(raw?.thresholds?.criticalFreeBytes))
+        ? Number(raw.thresholds.criticalFreeBytes)
+        : 0
+    },
+    requiredBytes: Number.isFinite(Number(raw.requiredBytes)) ? Number(raw.requiredBytes) : null,
+    enoughForRequired:
+      typeof raw.enoughForRequired === 'boolean' ? raw.enoughForRequired : null
+  };
+}
+
+export async function preflightAttachmentUpload(
+  files: File[],
+  conversationId: number | null
+): Promise<AttachmentUploadPreflight> {
+  const payload = {
+    conversationId:
+      Number.isInteger(Number(conversationId)) && Number(conversationId) > 0 ? Number(conversationId) : null,
+    files: (Array.isArray(files) ? files : []).map((file) => ({
+      name: String(file?.name || 'file'),
+      size: Math.max(0, Number(file?.size) || 0)
+    }))
+  };
+  const data = await api<any>('/api/uploads/preflight', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const storageRaw = data?.storage && typeof data.storage === 'object' ? data.storage : {};
+  const storageStatusRaw = String(storageRaw.status || '').trim().toLowerCase();
+  return {
+    accepted: Boolean(data?.accepted),
+    files: Array.isArray(data?.files)
+      ? data.files
+          .map((entry: any) => ({
+            name: String(entry?.name || ''),
+            size: Math.max(0, Number(entry?.size) || 0)
+          }))
+          .filter((entry) => Boolean(entry.name))
+      : [],
+    estimate: {
+      payloadBytes: Math.max(0, Number(data?.estimate?.payloadBytes) || 0),
+      requiredBytes: Math.max(0, Number(data?.estimate?.requiredBytes) || 0)
+    },
+    limits: {
+      maxAttachments: Math.max(0, Number(data?.limits?.maxAttachments) || 0),
+      maxAttachmentSizeBytes: Math.max(0, Number(data?.limits?.maxAttachmentSizeBytes) || 0),
+      maxAttachmentSizeMb: Math.max(0, Number(data?.limits?.maxAttachmentSizeMb) || 0)
+    },
+    storage: {
+      path: String(storageRaw.path || ''),
+      mountPoint: String(storageRaw.mountPoint || ''),
+      totalBytes: Number.isFinite(Number(storageRaw.totalBytes)) ? Number(storageRaw.totalBytes) : null,
+      usedBytes: Number.isFinite(Number(storageRaw.usedBytes)) ? Number(storageRaw.usedBytes) : null,
+      availableBytes: Number.isFinite(Number(storageRaw.availableBytes)) ? Number(storageRaw.availableBytes) : null,
+      usedPercent: Number.isFinite(Number(storageRaw.usedPercent)) ? Number(storageRaw.usedPercent) : null,
+      status: storageStatusRaw === 'warning' || storageStatusRaw === 'critical' ? storageStatusRaw : 'ok',
+      thresholds: {
+        warningFreeBytes: Number.isFinite(Number(storageRaw?.thresholds?.warningFreeBytes))
+          ? Number(storageRaw.thresholds.warningFreeBytes)
+          : 0,
+        criticalFreeBytes: Number.isFinite(Number(storageRaw?.thresholds?.criticalFreeBytes))
+          ? Number(storageRaw.thresholds.criticalFreeBytes)
+          : 0
+      },
+      requiredBytes: Number.isFinite(Number(storageRaw.requiredBytes)) ? Number(storageRaw.requiredBytes) : null,
+      enoughForRequired:
+        typeof storageRaw.enoughForRequired === 'boolean' ? storageRaw.enoughForRequired : null
+    }
+  };
+}
+
+const CHUNKED_UPLOAD_THRESHOLD_BYTES = 90 * 1024 * 1024;
+const CHUNKED_UPLOAD_DEFAULT_CHUNK_BYTES = 8 * 1024 * 1024;
+
+async function uploadAttachmentChunked(
+  file: File,
+  conversationId: number | null,
+  signal?: AbortSignal,
+  onProgress?: (progress: { loaded: number; total: number }) => void
+): Promise<{ uploadId: string }> {
+  const startPayload = {
+    fileName: String(file?.name || 'file'),
+    fileType: String(file?.type || 'application/octet-stream'),
+    totalSize: Math.max(0, Number(file?.size) || 0),
+    conversationId:
+      Number.isInteger(Number(conversationId)) && Number(conversationId) > 0 ? Number(conversationId) : null
+  };
+  const startResp = await fetch('/api/uploads/chunked/start', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(startPayload),
+    signal
+  });
+  const startData = await parseJsonSafe(startResp);
+  if (!startResp.ok) {
+    throw new Error(startData?.error || `No se pudo iniciar subida por partes de ${file.name}`);
+  }
+  const uploadId = String(startData?.uploadId || startData?.attachment?.uploadId || '').trim();
+  if (!uploadId) {
+    throw new Error(`Respuesta invalida al iniciar subida por partes de ${file.name}`);
+  }
+  const chunkSizeRaw = Number(startData?.chunkSizeBytes);
+  const chunkSize =
+    Number.isFinite(chunkSizeRaw) && chunkSizeRaw > 0
+      ? Math.max(512 * 1024, Math.min(Math.round(chunkSizeRaw), 32 * 1024 * 1024))
+      : CHUNKED_UPLOAD_DEFAULT_CHUNK_BYTES;
+  const totalBytes = Math.max(0, Number(file?.size) || 0);
+  let loadedBytes = 0;
+  if (onProgress) {
+    onProgress({ loaded: 0, total: totalBytes });
+  }
+
+  let chunkIndex = 0;
+  while (loadedBytes < totalBytes) {
+    const nextEnd = Math.min(totalBytes, loadedBytes + chunkSize);
+    const chunkBlob = file.slice(loadedBytes, nextEnd);
+    const chunkResp = await fetch(
+      `/api/uploads/chunked/${encodeURIComponent(uploadId)}/chunk?index=${chunkIndex}`,
+      {
+        method: 'PUT',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/octet-stream'
+        },
+        body: chunkBlob,
+        signal
+      }
+    );
+    const chunkData = await parseJsonSafe(chunkResp);
+    if (!chunkResp.ok) {
+      throw new Error(chunkData?.error || `No se pudo subir chunk ${chunkIndex + 1} de ${file.name}`);
+    }
+    loadedBytes = Number.isFinite(Number(chunkData?.receivedBytes))
+      ? Math.max(loadedBytes, Number(chunkData.receivedBytes))
+      : nextEnd;
+    chunkIndex += 1;
+    if (onProgress) {
+      onProgress({
+        loaded: Math.min(totalBytes, loadedBytes),
+        total: totalBytes
+      });
+    }
+  }
+
+  const completeResp = await fetch(`/api/uploads/chunked/${encodeURIComponent(uploadId)}/complete`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    signal
+  });
+  const completeData = await parseJsonSafe(completeResp);
+  if (!completeResp.ok) {
+    throw new Error(completeData?.error || `No se pudo completar la subida por partes de ${file.name}`);
+  }
+  const completeUploadId = String(completeData?.attachment?.uploadId || uploadId).trim();
+  if (!completeUploadId) {
+    throw new Error(`Respuesta invalida al completar subida por partes de ${file.name}`);
+  }
+  if (onProgress) {
+    onProgress({
+      loaded: totalBytes,
+      total: totalBytes
+    });
+  }
+  return { uploadId: completeUploadId };
+}
+
 export async function uploadAttachment(
   file: File,
   conversationId: number | null,
   signal?: AbortSignal,
   onProgress?: (progress: { loaded: number; total: number }) => void
 ): Promise<{ uploadId: string }> {
+  if (Math.max(0, Number(file?.size) || 0) >= CHUNKED_UPLOAD_THRESHOLD_BYTES) {
+    return uploadAttachmentChunked(file, conversationId, signal, onProgress);
+  }
   const headers: Record<string, string> = {
     'Content-Type': file.type || 'application/octet-stream',
     'X-File-Name': encodeURIComponent(file.name || 'file'),

@@ -344,6 +344,27 @@ const restartLogLimit = 200;
 const maxAttachments = 5;
 const maxAttachmentSizeBytes = 500 * 1024 * 1024;
 const maxAttachmentSizeMb = Math.floor(maxAttachmentSizeBytes / (1024 * 1024));
+const configuredStorageLowSpaceWarningBytes = Number.parseInt(
+  String(process.env.STORAGE_LOW_SPACE_WARNING_BYTES || String(2 * 1024 * 1024 * 1024)),
+  10
+);
+const configuredStorageLowSpaceCriticalBytes = Number.parseInt(
+  String(process.env.STORAGE_LOW_SPACE_CRITICAL_BYTES || String(1024 * 1024 * 1024)),
+  10
+);
+const storageLowSpaceWarningBytes =
+  Number.isInteger(configuredStorageLowSpaceWarningBytes) && configuredStorageLowSpaceWarningBytes > 0
+    ? configuredStorageLowSpaceWarningBytes
+    : 2 * 1024 * 1024 * 1024;
+const storageLowSpaceCriticalBytes =
+  Number.isInteger(configuredStorageLowSpaceCriticalBytes) && configuredStorageLowSpaceCriticalBytes > 0
+    ? Math.min(configuredStorageLowSpaceCriticalBytes, storageLowSpaceWarningBytes - 64 * 1024 * 1024)
+    : Math.min(1024 * 1024 * 1024, storageLowSpaceWarningBytes - 64 * 1024 * 1024);
+const storageUploadHeadroomFactor = 0.12;
+const storageUploadPerFileOverheadBytes = 12 * 1024 * 1024;
+const storageUploadReserveBytes = 192 * 1024 * 1024;
+const uploadChunkSizeBytes = 8 * 1024 * 1024;
+const uploadChunkMaxBytes = 16 * 1024 * 1024;
 const maxJsonBodyBytes = 2 * 1024 * 1024;
 const maxJsonBodyMb = Math.floor(maxJsonBodyBytes / (1024 * 1024));
 const configuredAutoContinuationLimit = Number.parseInt(
@@ -393,6 +414,8 @@ const adminUsers = new Set(
 adminUsers.add('admin');
 const pendingUploadTtlMs = 1000 * 60 * 60;
 const pendingUploads = new Map();
+const pendingChunkUploadTtlMs = 1000 * 60 * 60;
+const pendingChunkUploads = new Map();
 let restartScheduled = false;
 let restartState = null;
 const codexQuotaStateByUser = new Map();
@@ -582,6 +605,7 @@ const storageResidualAiMaxCandidates = 80;
 const storageResidualProgressTickMs = 700;
 const storageResidualAiEtaBaseSeconds = 12;
 const storageResidualAiEtaPerCandidateSeconds = 0.2;
+const storageResidualAnalysisMaxAgeMs = 1000 * 60 * 60 * 24;
 const projectContextManualMaxChars = 12000;
 const projectContextAutoMaxChars = 12000;
 const projectContextPromptMessagesLimit = 140;
@@ -1084,6 +1108,104 @@ function getDiskUsageSnapshotForPath(absolutePath) {
   };
 }
 
+function getStorageThresholds() {
+  const warning = Math.max(256 * 1024 * 1024, Number(storageLowSpaceWarningBytes) || 0);
+  const criticalCandidate = Number(storageLowSpaceCriticalBytes) || 0;
+  const critical = Math.max(128 * 1024 * 1024, Math.min(criticalCandidate, warning - 64 * 1024 * 1024));
+  return {
+    warningFreeBytes: warning,
+    criticalFreeBytes: critical
+  };
+}
+
+function estimateAttachmentUploadRequiredBytes(payloadBytes, fileCount = 1) {
+  const safeBytes = Math.max(0, Number(payloadBytes) || 0);
+  const safeFileCount = Math.max(1, Number(fileCount) || 1);
+  const variableHeadroom = Math.ceil(safeBytes * storageUploadHeadroomFactor);
+  const perFileHeadroom = safeFileCount * storageUploadPerFileOverheadBytes;
+  return safeBytes + variableHeadroom + perFileHeadroom + storageUploadReserveBytes;
+}
+
+function buildStorageHealthSnapshotForPath(absolutePath, options = {}) {
+  const targetPath = normalizeAbsoluteStoragePath(absolutePath, uploadsDir) || uploadsDir;
+  const snapshot = getDiskUsageSnapshotForPath(targetPath);
+  const thresholds = getStorageThresholds();
+  const availableBytes = Number(snapshot && snapshot.availableBytes);
+  const usedPercent = Number(snapshot && snapshot.usagePercent);
+  let status = 'ok';
+  if (Number.isFinite(availableBytes)) {
+    if (availableBytes <= thresholds.criticalFreeBytes) {
+      status = 'critical';
+    } else if (availableBytes <= thresholds.warningFreeBytes) {
+      status = 'warning';
+    }
+  } else if (Number.isFinite(usedPercent)) {
+    if (usedPercent >= 97) status = 'critical';
+    else if (usedPercent >= 93) status = 'warning';
+  }
+  const requiredBytesRaw = Number(options.requiredBytes);
+  const requiredBytes = Number.isFinite(requiredBytesRaw) ? Math.max(0, Math.ceil(requiredBytesRaw)) : null;
+  const enoughForRequired =
+    requiredBytes !== null && Number.isFinite(availableBytes) ? availableBytes >= requiredBytes : null;
+  return {
+    path: snapshot && snapshot.path ? snapshot.path : targetPath,
+    mountPoint: snapshot && snapshot.mountPoint ? snapshot.mountPoint : '',
+    totalBytes: snapshot ? snapshot.totalBytes : null,
+    usedBytes: snapshot ? snapshot.usedBytes : null,
+    availableBytes: snapshot ? snapshot.availableBytes : null,
+    usedPercent: snapshot ? snapshot.usagePercent : null,
+    status,
+    thresholds,
+    requiredBytes,
+    enoughForRequired
+  };
+}
+
+function buildStorageInsufficientMessage(health, operationLabel, requiredBytes) {
+  const safeHealth = health && typeof health === 'object' ? health : {};
+  const availableText = Number.isFinite(Number(safeHealth.availableBytes))
+    ? `${Math.max(0, Number(safeHealth.availableBytes))} bytes`
+    : 'desconocido';
+  const requiredText = Number.isFinite(Number(requiredBytes))
+    ? `${Math.max(0, Number(requiredBytes))} bytes`
+    : 'desconocido';
+  const operation = String(operationLabel || 'operación').trim() || 'operación';
+  return `No hay espacio suficiente para ${operation}. Libre: ${availableText}. Requerido aprox: ${requiredText}. Libera espacio antes de continuar.`;
+}
+
+function assertStorageCapacityOrThrow(options = {}) {
+  const targetPath = normalizeAbsoluteStoragePath(options.path, uploadsDir) || uploadsDir;
+  const requiredBytes = Math.max(0, Math.ceil(Number(options.requiredBytes) || 0));
+  const operationLabel = String(options.operationLabel || 'esta operación').trim() || 'esta operación';
+  const health = buildStorageHealthSnapshotForPath(targetPath, {
+    requiredBytes
+  });
+  const availableBytes = Number(health.availableBytes);
+  if (requiredBytes > 0 && Number.isFinite(availableBytes) && availableBytes < requiredBytes) {
+    const clientError = createClientRequestError(
+      buildStorageInsufficientMessage(health, operationLabel, requiredBytes),
+      507
+    );
+    clientError.code = 'INSUFFICIENT_STORAGE';
+    clientError.storage = health;
+    clientError.requiredBytes = requiredBytes;
+    throw clientError;
+  }
+  return health;
+}
+
+function normalizeStorageSpaceError(error, fallbackMessage = 'No hay espacio suficiente en disco.') {
+  const safeError = error && typeof error === 'object' ? error : null;
+  const code = safeError && typeof safeError.code === 'string' ? String(safeError.code).toUpperCase() : '';
+  if (code === 'ENOSPC' || code === 'EDQUOT') {
+    const clientError = createClientRequestError(String(fallbackMessage || 'No hay espacio suficiente en disco.'), 507);
+    clientError.code = 'INSUFFICIENT_STORAGE';
+    clientError.originalCode = code;
+    return clientError;
+  }
+  return error;
+}
+
 function listStorageLocalDirectory(payload = {}) {
   const directoryPath = resolveStorageDirectoryPathForRequest(payload.path);
   const sortBy = normalizeStorageSortField(payload.sortBy);
@@ -1277,6 +1399,70 @@ function scanStorageHeavyPaths(payload = {}) {
   };
 }
 
+function normalizeResidualCandidateCategory(rawValue, fallback = 'residual') {
+  const normalized = String(rawValue || '')
+    .trim()
+    .toLowerCase();
+  if (normalized === 'temporary') return 'temporary';
+  if (normalized === 'logs') return 'logs';
+  if (normalized === 'cache') return 'cache';
+  if (normalized === 'backup') return 'backup';
+  if (normalized === 'artifact') return 'artifact';
+  if (normalized === 'other') return 'other';
+  if (normalized === 'residual') return 'residual';
+  return String(fallback || 'residual').trim().toLowerCase() || 'residual';
+}
+
+function detectResidualCategory(entry) {
+  const absolutePath = normalizeAbsoluteStoragePath(entry && entry.path ? entry.path : '', '');
+  const lowerPath = String(absolutePath || '').toLowerCase();
+  const baseName = path.basename(lowerPath || '');
+  if (/\/(tmp|temp)\//i.test(lowerPath) || /(\.tmp|\.temp)$/i.test(baseName)) return 'temporary';
+  if (/\/logs?\//i.test(lowerPath) || /\.log(\.\d+)?$/i.test(baseName)) return 'logs';
+  if (/\/(cache|caches)\//i.test(lowerPath) || /(\.cache|cache\.)/i.test(baseName)) return 'cache';
+  if (
+    /\/(backup|backups|archives?|old)\//i.test(lowerPath) ||
+    /(\.bak|\.old|\.orig|\.tar|\.tar\.gz|\.zip|\.7z|\.rar)$/i.test(baseName)
+  ) {
+    return 'backup';
+  }
+  if (
+    (entry && entry.type === 'directory' && /(^|\/)(dist|build|out|coverage|\.next|\.nuxt|\.turbo)$/i.test(lowerPath)) ||
+    /\.(dmp|dump)$/i.test(baseName)
+  ) {
+    return 'artifact';
+  }
+  return 'residual';
+}
+
+function summarizeResidualCandidates(candidates = []) {
+  const list = Array.isArray(candidates) ? candidates : [];
+  const byCategory = {
+    temporary: 0,
+    logs: 0,
+    cache: 0,
+    backup: 0,
+    artifact: 0,
+    residual: 0,
+    other: 0
+  };
+  let totalBytes = 0;
+  list.forEach((entry) => {
+    const category = normalizeResidualCandidateCategory(entry && entry.category ? entry.category : '');
+    if (Object.prototype.hasOwnProperty.call(byCategory, category)) {
+      byCategory[category] += 1;
+    } else {
+      byCategory.residual += 1;
+    }
+    totalBytes += Number(entry && entry.sizeBytes ? entry.sizeBytes : 0);
+  });
+  return {
+    totalCandidates: list.length,
+    totalBytes: Math.max(0, Math.round(totalBytes)),
+    byCategory
+  };
+}
+
 function buildResidualHeuristicForEntry(entry) {
   const absolutePath = normalizeAbsoluteStoragePath(entry.path, '');
   const baseName = path.basename(absolutePath || '').toLowerCase();
@@ -1284,6 +1470,7 @@ function buildResidualHeuristicForEntry(entry) {
   const modifiedMs = Number(entry.modifiedMs || 0);
   const ageDays = modifiedMs > 0 ? Math.max(0, (Date.now() - modifiedMs) / (1000 * 60 * 60 * 24)) : 0;
   const sizeBytes = Number(entry.sizeBytes || 0);
+  const category = detectResidualCategory(entry);
   const reasons = [];
   let score = 0;
 
@@ -1314,6 +1501,17 @@ function buildResidualHeuristicForEntry(entry) {
     score += 1;
     reasons.push('archivo oculto potencialmente temporal');
   }
+  if (category === 'temporary') {
+    reasons.push('clasificado como temporal');
+  } else if (category === 'logs') {
+    reasons.push('clasificado como log');
+  } else if (category === 'cache') {
+    reasons.push('clasificado como caché');
+  } else if (category === 'backup') {
+    reasons.push('clasificado como backup/archivo antiguo');
+  } else if (category === 'artifact') {
+    reasons.push('clasificado como artefacto generado');
+  }
 
   const risk = score >= 6 ? 'medium' : 'low';
   const confidence = score >= 6 ? 'high' : score >= 4 ? 'medium' : 'low';
@@ -1321,6 +1519,7 @@ function buildResidualHeuristicForEntry(entry) {
     score,
     confidence,
     risk,
+    category,
     reason: reasons.join(', ') || 'patrón residual detectado'
   };
 }
@@ -1418,12 +1617,15 @@ function scanStorageResidualCandidates(payload = {}, options = {}) {
       candidates.push({
         id: absolutePath,
         path: absolutePath,
+        name: path.basename(absolutePath),
         type: entry.type,
         sizeBytes: entry.sizeBytes,
         modifiedAt: entry.modifiedAt,
         reason: heuristic.reason,
         confidence: heuristic.confidence,
         risk: heuristic.risk,
+        category: heuristic.category,
+        analysisSource: 'heuristic',
         score: heuristic.score
       });
     }
@@ -1528,13 +1730,16 @@ function parseResidualAiPayload(rawText, candidatesByPath) {
     const reason = truncateForNotify(entry && entry.reason ? entry.reason : '', 240);
     const confidenceRaw = String(entry && entry.confidence ? entry.confidence : '').trim().toLowerCase();
     const riskRaw = String(entry && entry.risk ? entry.risk : '').trim().toLowerCase();
+    const categoryRaw = normalizeResidualCandidateCategory(entry && entry.category ? entry.category : '', '');
+    const candidate = candidatesByPath.get(candidatePath);
     map.set(candidatePath, {
       reason: reason || 'clasificado por IA',
       confidence:
         confidenceRaw === 'high' || confidenceRaw === 'medium' || confidenceRaw === 'low'
           ? confidenceRaw
           : 'medium',
-      risk: riskRaw === 'high' || riskRaw === 'medium' || riskRaw === 'low' ? riskRaw : 'low'
+      risk: riskRaw === 'high' || riskRaw === 'medium' || riskRaw === 'low' ? riskRaw : 'low',
+      category: categoryRaw || normalizeResidualCandidateCategory(candidate && candidate.category ? candidate.category : '')
     });
   });
   return map;
@@ -1545,14 +1750,14 @@ function buildResidualAiClassificationPrompt(candidates) {
   const promptLines = [
     'Clasifica candidatos de limpieza de servidor.',
     'Devuelve SOLO JSON válido con esta forma:',
-    '{"items":[{"path":"ABSOLUTE_PATH","reason":"texto corto","confidence":"high|medium|low","risk":"low|medium|high"}]}',
+    '{"items":[{"path":"ABSOLUTE_PATH","reason":"texto corto","confidence":"high|medium|low","risk":"low|medium|high","category":"temporary|logs|cache|backup|artifact|residual"}]}',
     'No añadas texto adicional.',
     '',
     'CANDIDATOS:'
   ];
   list.forEach((entry, index) => {
     promptLines.push(
-      `${index + 1}. path=${entry.path} | type=${entry.type} | size=${entry.sizeBytes} | modifiedAt=${entry.modifiedAt} | heuristic=${entry.reason}`
+      `${index + 1}. path=${entry.path} | type=${entry.type} | size=${entry.sizeBytes} | modifiedAt=${entry.modifiedAt} | category_hint=${entry.category} | heuristic=${entry.reason}`
     );
   });
   return promptLines.join('\n');
@@ -1841,14 +2046,29 @@ async function analyzeStorageResidualFilesForUser(userId, username, payload = {}
   }
   const merged = scanned.candidates.map((entry) => {
     const aiLabel = aiState.labels.get(entry.path);
-    if (!aiLabel) return entry;
+    if (!aiLabel) {
+      return {
+        ...entry,
+        category: normalizeResidualCandidateCategory(entry.category, detectResidualCategory(entry)),
+        analysisSource: 'heuristic'
+      };
+    }
     return {
       ...entry,
       reason: aiLabel.reason,
       confidence: aiLabel.confidence,
-      risk: aiLabel.risk
+      risk: aiLabel.risk,
+      category: normalizeResidualCandidateCategory(aiLabel.category, entry.category),
+      analysisSource: 'ai'
     };
   });
+  const summary = summarizeResidualCandidates(merged);
+  const providerLabel = String(aiState.providerName || aiState.providerId || '').trim();
+  const aiSummary = aiState.used
+    ? `Análisis realizado con ${providerLabel || 'IA'}`
+    : aiRequested
+      ? `IA no disponible; fallback heurístico${aiState.reason ? ` (${aiState.reason})` : ''}`
+      : 'Análisis heurístico (IA desactivada por configuración)';
   const result = {
     scannedAt: scanned.scannedAt,
     roots: scanned.roots,
@@ -1862,6 +2082,15 @@ async function analyzeStorageResidualFilesForUser(userId, username, payload = {}
       providerId: aiState.providerId || '',
       providerName: aiState.providerName || '',
       attemptedProviders: Array.isArray(aiState.attemptedProviders) ? aiState.attemptedProviders : []
+    },
+    summary: {
+      ...summary,
+      criteria: [
+        'Patrones de nombre/extensión (tmp, log, bak, cache, archives)',
+        'Ubicación típica de residuos (tmp/cache/logs/backups)',
+        'Antigüedad y tamaño para priorizar impacto de limpieza'
+      ],
+      pipeline: aiSummary
     }
   };
   if (onProgress) {
@@ -1883,7 +2112,9 @@ async function analyzeStorageResidualFilesForUser(userId, username, payload = {}
 function deleteStorageResidualPaths(payload = {}) {
   const paths = parseStoragePathList(payload.paths, storageResidualDeleteMaxItems);
   const deleted = [];
+  const deletedEntries = [];
   const failed = [];
+  let freedBytes = 0;
   paths.forEach((entryPath) => {
     try {
       const target = assertStorageCleanupPathAllowed(entryPath);
@@ -1897,12 +2128,27 @@ function deleteStorageResidualPaths(payload = {}) {
         failed.push({ path: target, error: 'no_existe' });
         return;
       }
-      if (stats.isDirectory()) {
+      const targetType = stats.isDirectory() ? 'directory' : stats.isFile() ? 'file' : 'other';
+      const sizeBytes = stats.isDirectory()
+        ? Number(getDirectorySizeWithDu(target) || 0)
+        : Number(stats.size || 0);
+      if (targetType === 'directory') {
         fs.rmSync(target, { recursive: true, force: false });
-      } else {
+      } else if (targetType === 'file') {
         fs.unlinkSync(target);
+      } else {
+        failed.push({ path: target, error: 'tipo_no_soportado' });
+        return;
       }
       deleted.push(target);
+      deletedEntries.push({
+        path: target,
+        name: path.basename(target),
+        type: targetType,
+        sizeBytes: Math.max(0, Math.round(sizeBytes)),
+        category: detectResidualCategory({ path: target, type: targetType })
+      });
+      freedBytes += Math.max(0, Number(sizeBytes || 0));
     } catch (error) {
       failed.push({
         path: normalizeAbsoluteStoragePath(entryPath, ''),
@@ -1911,8 +2157,57 @@ function deleteStorageResidualPaths(payload = {}) {
     }
   });
   return {
+    requestedCount: paths.length,
     deleted,
-    failed
+    deletedEntries,
+    failed,
+    deletedCount: deleted.length,
+    failedCount: failed.length,
+    freedBytes: Math.max(0, Math.round(freedBytes))
+  };
+}
+
+function resolveResidualAnalysisForDelete(userId, analysisJobId) {
+  const safeUserId = getSafeUserId(userId);
+  const safeAnalysisJobId = String(analysisJobId || '').trim();
+  if (!safeUserId || !safeAnalysisJobId) {
+    throw createClientRequestError(
+      'Debes ejecutar y revisar un análisis antes de borrar. Falta analysisJobId.',
+      400
+    );
+  }
+  const row = getToolsBackgroundJobForUserStmt.get(safeAnalysisJobId, safeUserId);
+  if (!row) {
+    throw createClientRequestError('El análisis seleccionado no existe o no pertenece al usuario.', 404);
+  }
+  const type = normalizeStorageJobType(row.job_type);
+  if (type !== 'cleanup_residual_analyze') {
+    throw createClientRequestError('analysisJobId no corresponde a un análisis de limpieza IA.', 400);
+  }
+  const status = normalizeStorageJobStatus(row.status);
+  if (status !== 'completed') {
+    throw createClientRequestError('El análisis aún no terminó. Espera a que complete para borrar.', 409);
+  }
+  const scannedAt = String(row.finished_at || row.updated_at || row.created_at || '').trim();
+  const scannedAtMs = Date.parse(scannedAt);
+  if (Number.isFinite(scannedAtMs) && scannedAtMs > 0 && Date.now() - scannedAtMs > storageResidualAnalysisMaxAgeMs) {
+    throw createClientRequestError(
+      'El análisis seleccionado es demasiado antiguo. Ejecuta uno nuevo antes de borrar.',
+      409
+    );
+  }
+  const result = safeParseJsonObject(row.result_json);
+  const candidateRows = Array.isArray(result && result.candidates) ? result.candidates : [];
+  const candidatePaths = new Set(
+    candidateRows
+      .map((entry) => normalizeAbsoluteStoragePath(entry && entry.path ? entry.path : '', ''))
+      .filter(Boolean)
+  );
+  return {
+    analysisJobId: safeAnalysisJobId,
+    scannedAt,
+    candidatePaths,
+    candidateCount: candidatePaths.size
   };
 }
 
@@ -5401,7 +5696,17 @@ function createTarGzArchive(sourcePath, archivePath) {
     maxBuffer: 1024 * 1024 * 4
   });
   if (!result.ok) {
-    throw new Error(truncateForNotify(result.stderr || result.stdout || 'tar_create_failed', 220));
+    const reason = truncateForNotify(result.stderr || result.stdout || 'tar_create_failed', 220);
+    if (/no space left|enospc|disk full|quota exceeded/i.test(String(reason || ''))) {
+      const clientError = createClientRequestError(
+        'No hay espacio suficiente para completar la compresión.',
+        507
+      );
+      clientError.code = 'INSUFFICIENT_STORAGE';
+      clientError.storage = buildStorageHealthSnapshotForPath(path.dirname(absoluteArchive));
+      throw clientError;
+    }
+    throw new Error(reason);
   }
   return absoluteArchive;
 }
@@ -5426,7 +5731,17 @@ function extractTarGzArchive(archivePath, targetPath) {
     maxBuffer: 1024 * 1024 * 4
   });
   if (!result.ok) {
-    throw new Error(truncateForNotify(result.stderr || result.stdout || 'tar_extract_failed', 220));
+    const reason = truncateForNotify(result.stderr || result.stdout || 'tar_extract_failed', 220);
+    if (/no space left|enospc|disk full|quota exceeded/i.test(String(reason || ''))) {
+      const clientError = createClientRequestError(
+        'No hay espacio suficiente para completar la restauración.',
+        507
+      );
+      clientError.code = 'INSUFFICIENT_STORAGE';
+      clientError.storage = buildStorageHealthSnapshotForPath(extractParent);
+      throw clientError;
+    }
+    throw new Error(reason);
   }
   return {
     targetPath: absoluteTarget,
@@ -7089,6 +7404,16 @@ async function downloadDriveFileToPath(context, fileId, outputPath) {
   });
   if (!copyResult.ok) {
     const reason = truncateForNotify(copyResult.stderr || copyResult.stdout || 'drive_download_failed', 220);
+    if (/no space left|enospc|disk full|quota exceeded/i.test(String(reason || ''))) {
+      const storage = buildStorageHealthSnapshotForPath(storageJobsRootDir);
+      const clientError = createClientRequestError(
+        'No hay espacio suficiente para completar la descarga de Google Drive.',
+        507
+      );
+      clientError.code = 'INSUFFICIENT_STORAGE';
+      clientError.storage = storage;
+      throw clientError;
+    }
     throw createClientRequestError(`No se pudo descargar desde Google Drive (rclone): ${reason}`, 502);
   }
   let fileStats = null;
@@ -7135,6 +7460,11 @@ async function handleDeployedBackupRestoreJob(row) {
     );
   }
   assertStorageMutationPathAllowed(targetPath);
+  assertStorageCapacityOrThrow({
+    path: storageJobsRootDir,
+    requiredBytes: 512 * 1024 * 1024,
+    operationLabel: 'restaurar backup de aplicación'
+  });
   setStorageJobProgress(row.id, { stage: 'downloading' }, `Descargando backup ${fileId}`);
   const tmpArchivePath = path.join(storageJobsRootDir, `${buildStorageJobId('restore')}.tar.gz`);
   try {
@@ -8526,6 +8856,22 @@ function cleanupPendingUploads() {
       // best-effort cleanup
     }
   }
+  for (const [uploadId, entry] of pendingChunkUploads.entries()) {
+    const filePath = entry && entry.path ? String(entry.path) : '';
+    if (!filePath || !fs.existsSync(filePath)) {
+      pendingChunkUploads.delete(uploadId);
+      continue;
+    }
+    const updatedAt = Number(entry && entry.updatedAt ? entry.updatedAt : entry && entry.createdAt);
+    const isExpired = !Number.isFinite(updatedAt) || now - updatedAt > pendingChunkUploadTtlMs;
+    if (!isExpired) continue;
+    pendingChunkUploads.delete(uploadId);
+    try {
+      fs.unlinkSync(filePath);
+    } catch (_error) {
+      // best-effort cleanup
+    }
+  }
 }
 
 async function streamRequestToFile(req, destinationPath, maxBytes) {
@@ -8542,8 +8888,16 @@ async function streamRequestToFile(req, destinationPath, maxBytes) {
   });
 
   try {
-    await pipelineAsync(req, limiter, fs.createWriteStream(destinationPath, { flags: 'wx' }));
+    await pipelineAsync(
+      req,
+      limiter,
+      fs.createWriteStream(destinationPath, { flags: 'wx', highWaterMark: 1024 * 1024 })
+    );
   } catch (error) {
+    const normalizedError = normalizeStorageSpaceError(
+      error,
+      'No hay espacio suficiente para completar la subida del adjunto.'
+    );
     try {
       if (fs.existsSync(destinationPath)) {
         fs.unlinkSync(destinationPath);
@@ -8551,10 +8905,35 @@ async function streamRequestToFile(req, destinationPath, maxBytes) {
     } catch (_unlinkError) {
       // best-effort cleanup
     }
-    throw error;
+    throw normalizedError;
   }
 
   return totalBytes;
+}
+
+async function readRequestBodyBuffer(req, maxBytes) {
+  const safeMaxBytes = Math.max(1, Number(maxBytes) || uploadChunkMaxBytes);
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let totalBytes = 0;
+    const handleError = (error) => {
+      reject(error);
+    };
+    req.on('error', handleError);
+    req.on('data', (chunk) => {
+      const chunkBuffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += chunkBuffer.length;
+      if (totalBytes > safeMaxBytes) {
+        reject(createClientRequestError('Chunk demasiado grande.', 413));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunkBuffer);
+    });
+    req.on('end', () => {
+      resolve(Buffer.concat(chunks, totalBytes));
+    });
+  });
 }
 
 function moveFileSync(sourcePath, targetPath) {
@@ -8651,7 +9030,20 @@ function persistAttachments(rawAttachments, conversationId, userId) {
 
       const storedName = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}_${name}`;
       const storedPath = path.join(conversationDir, storedName);
-      moveFileSync(uploaded.path, storedPath);
+      assertStorageCapacityOrThrow({
+        path: conversationDir,
+        requiredBytes: estimateAttachmentUploadRequiredBytes(size, 1),
+        operationLabel: `guardar adjunto ${name}`
+      });
+      try {
+        moveFileSync(uploaded.path, storedPath);
+      } catch (error) {
+        pendingUploads.delete(uploadId);
+        throw normalizeStorageSpaceError(
+          error,
+          `No hay espacio suficiente para guardar el adjunto ${name}.`
+        );
+      }
       pendingUploads.delete(uploadId);
 
       const previewText = buildAttachmentPreviewText(storedPath, name, mimeType, size);
@@ -8683,7 +9075,19 @@ function persistAttachments(rawAttachments, conversationId, userId) {
 
     const storedName = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}_${name}`;
     const storedPath = path.join(conversationDir, storedName);
-    fs.writeFileSync(storedPath, dataBuffer);
+    assertStorageCapacityOrThrow({
+      path: conversationDir,
+      requiredBytes: estimateAttachmentUploadRequiredBytes(dataBuffer.length, 1),
+      operationLabel: `guardar adjunto ${name}`
+    });
+    try {
+      fs.writeFileSync(storedPath, dataBuffer);
+    } catch (error) {
+      throw normalizeStorageSpaceError(
+        error,
+        `No hay espacio suficiente para guardar el adjunto ${name}.`
+      );
+    }
 
     const previewText = buildAttachmentPreviewText(storedPath, name, mimeType, dataBuffer.length);
 
@@ -8845,7 +9249,6 @@ function buildRepoContextIndex() {
       if (entry.isDirectory()) {
         if (shouldIgnoreRepoDir(name)) continue;
         if (
-          normalizedRel === 'dixit/cards' ||
           normalizedRel.startsWith('uploads/') ||
           normalizedRel.startsWith('.codex_users/') ||
           normalizedRel.startsWith('public/assets/')
@@ -12902,6 +13305,17 @@ function removePendingUploadsForConversation(conversationId) {
     }
     pendingUploads.delete(uploadId);
   }
+  for (const [uploadId, upload] of pendingChunkUploads.entries()) {
+    if (!upload || upload.conversationId !== conversationId) continue;
+    try {
+      if (upload.path && fs.existsSync(upload.path)) {
+        fs.unlinkSync(upload.path);
+      }
+    } catch (_error) {
+      // best-effort cleanup
+    }
+    pendingChunkUploads.delete(uploadId);
+  }
 }
 
 function inferMimeTypeFromFilename(filename) {
@@ -14888,6 +15302,19 @@ app.post('/api/tools/storage/local/compress', requireAuth, (req, res) => {
         throw createClientRequestError(`Ruta no encontrada: ${sourcePath}`, 404);
       }
     });
+    const estimatedInputBytes = sourcePaths.reduce((sum, sourcePath) => {
+      const estimated = estimateStoragePathBytes(sourcePath);
+      return sum + (Number.isFinite(Number(estimated)) ? Math.max(0, Number(estimated)) : 0);
+    }, 0);
+    const estimatedRequiredBytes =
+      estimatedInputBytes > 0
+        ? Math.ceil(estimatedInputBytes * 0.35) + storageUploadReserveBytes
+        : 384 * 1024 * 1024;
+    assertStorageCapacityOrThrow({
+      path: destinationDir,
+      requiredBytes: estimatedRequiredBytes,
+      operationLabel: 'comprimir archivos locales'
+    });
     const archivePath = path.join(destinationDir, `${archiveName}.tar.gz`);
     const tarArgs = ['-czf', archivePath];
     sourcePaths.forEach((item) => {
@@ -15009,6 +15436,17 @@ app.post('/api/tools/storage/cleanup/delete', requireAuth, (req, res) => {
     writeIntent: true
   });
   if (!permission) return;
+  const requestPayload = req.body && typeof req.body === 'object' ? req.body : {};
+  const sourcePaths = parseStoragePathList(requestPayload.paths, storageResidualDeleteMaxItems);
+  if (sourcePaths.length === 0) {
+    return res.status(400).json({ error: 'Selecciona al menos un candidato para borrar.' });
+  }
+  const analysisJobId = String(requestPayload.analysisJobId || '').trim();
+  if (!analysisJobId) {
+    return res.status(400).json({
+      error: 'Primero analiza y revisa la lista. Falta analysisJobId para confirmar borrado.'
+    });
+  }
   const confirmDelete = String(req.body && req.body.confirm ? req.body.confirm : '')
     .trim()
     .toUpperCase() === 'DELETE';
@@ -15016,9 +15454,30 @@ app.post('/api/tools/storage/cleanup/delete', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'Confirmación requerida. Envía confirm=DELETE.' });
   }
   try {
-    const result = deleteStorageResidualPaths(req.body && typeof req.body === 'object' ? req.body : {});
+    sourcePaths.forEach((entryPath) => {
+      assertAiPermissionForAction(permission.profile, 'storage', {
+        requiresSensitiveTool: true,
+        writeIntent: true,
+        targetPath: entryPath
+      });
+    });
+    const analysis = resolveResidualAnalysisForDelete(safeUserId, analysisJobId);
+    if (analysis.candidateCount <= 0) {
+      return res.status(409).json({
+        error: 'El análisis seleccionado no contiene candidatos. Ejecuta un nuevo análisis.'
+      });
+    }
+    const invalidPaths = sourcePaths.filter((entryPath) => !analysis.candidatePaths.has(entryPath));
+    if (invalidPaths.length > 0) {
+      return res.status(400).json({
+        error: `Hay rutas fuera del análisis revisado: ${invalidPaths.slice(0, 3).join(', ')}`
+      });
+    }
+    const result = deleteStorageResidualPaths({ paths: sourcePaths });
     return res.json({
       ok: true,
+      analysisJobId: analysis.analysisJobId,
+      analysisScannedAt: analysis.scannedAt,
       ...result
     });
   } catch (error) {
@@ -15047,27 +15506,18 @@ app.get('/api/tools/storage/overview', requireAuth, async (req, res) => {
     targetPath: localPath
   });
   if (!permission) return;
-  const diskResult = localPath
-    ? runSystemCommandSync('df', ['-B1', localPath], {
-        allowNonZero: true,
-        timeoutMs: 12000,
-        maxBuffer: 1024 * 1024
-      })
-    : null;
-  const diskRows = String((diskResult && diskResult.stdout) || '')
-    .replace(/\r/g, '')
-    .split('\n')
-    .filter((line) => line.trim());
-  const diskValues =
-    diskRows.length >= 2
-      ? diskRows[1].trim().split(/\s+/)
-      : [];
+  const localDiskHealth = buildStorageHealthSnapshotForPath(localPath || repoRootDir);
   const localDisk = {
-    path: localPath,
-    totalBytes: Number.isFinite(Number(diskValues[1])) ? Number(diskValues[1]) : null,
-    usedBytes: Number.isFinite(Number(diskValues[2])) ? Number(diskValues[2]) : null,
-    availableBytes: Number.isFinite(Number(diskValues[3])) ? Number(diskValues[3]) : null,
-    usagePercent: diskValues[4] ? String(diskValues[4]) : ''
+    path: String(localDiskHealth.path || localPath || ''),
+    totalBytes: localDiskHealth.totalBytes,
+    usedBytes: localDiskHealth.usedBytes,
+    availableBytes: localDiskHealth.availableBytes,
+    usagePercent:
+      Number.isFinite(Number(localDiskHealth.usedPercent)) && Number(localDiskHealth.usedPercent) >= 0
+        ? `${Number(localDiskHealth.usedPercent)}%`
+        : '',
+    status: localDiskHealth.status,
+    thresholds: localDiskHealth.thresholds
   };
 
   let cloud = {
@@ -15480,6 +15930,11 @@ app.get('/api/tools/storage/:cloudProvider(drive)/files/:fileId/download', requi
   }
   let tmpFilePath = '';
   try {
+    assertStorageCapacityOrThrow({
+      path: storageJobsRootDir,
+      requiredBytes: 256 * 1024 * 1024,
+      operationLabel: 'descargar archivo desde Google Drive'
+    });
     const context = await getDriveContextForUser(safeUserId, accountId);
     tmpFilePath = path.join(storageJobsRootDir, `${buildStorageJobId('drive_dl')}.bin`);
     const downloaded = await downloadDriveFileToPath(context, fileId, tmpFilePath);
@@ -15501,7 +15956,7 @@ app.get('/api/tools/storage/:cloudProvider(drive)/files/:fileId/download', requi
     if (Number.isFinite(Number(sizeHeader)) && Number(sizeHeader) >= 0) {
       res.setHeader('Content-Length', String(sizeHeader));
     }
-    await pipelineAsync(fs.createReadStream(tmpFilePath), res);
+    await pipelineAsync(fs.createReadStream(tmpFilePath, { highWaterMark: 1024 * 1024 }), res);
   } catch (error) {
     if (res.headersSent) {
       return res.end();
@@ -15514,7 +15969,9 @@ app.get('/api/tools/storage/:cloudProvider(drive)/files/:fileId/download', requi
           : `No se pudo descargar archivo de Google Drive (rclone): ${truncateForNotify(
               error && error.message ? error.message : 'drive_download_failed',
               220
-            )}`
+            )}`,
+      code: error && error.exposeToClient && error.code ? String(error.code) : undefined,
+      storage: error && error.exposeToClient && error.storage ? error.storage : undefined
     });
   } finally {
     try {
@@ -16444,6 +16901,319 @@ app.delete('/api/attachments/:id', requireAuth, (req, res) => {
   });
 });
 
+app.get('/api/storage/health', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const requestedPath =
+    typeof req.query.path === 'string'
+      ? normalizeAbsoluteStoragePath(req.query.path, uploadsDir) || uploadsDir
+      : uploadsDir;
+  const storage = buildStorageHealthSnapshotForPath(requestedPath);
+  return res.json({
+    ok: true,
+    storage
+  });
+});
+
+app.post('/api/uploads/preflight', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const rawFiles = req.body && Array.isArray(req.body.files) ? req.body.files : [];
+  if (rawFiles.length === 0) {
+    return res.status(400).json({ error: 'Selecciona al menos un archivo.' });
+  }
+  if (rawFiles.length > maxAttachments) {
+    return res.status(413).json({ error: `Demasiados adjuntos (maximo ${maxAttachments}).` });
+  }
+
+  const conversationIdRaw = Number(req.body && req.body.conversationId);
+  const conversationId =
+    Number.isInteger(conversationIdRaw) && conversationIdRaw > 0 ? conversationIdRaw : null;
+  if (conversationId !== null) {
+    const ownedConversation = getOwnedConversationOrNull(conversationId, safeUserId);
+    if (!ownedConversation) {
+      return res.status(404).json({ error: 'Conversación no encontrada para estos adjuntos.' });
+    }
+  }
+
+  let totalBytes = 0;
+  const files = [];
+  try {
+    rawFiles.forEach((entry, index) => {
+      const name = sanitizeFilename(entry && entry.name ? entry.name : `file_${index + 1}`);
+      const size = Number(entry && entry.size);
+      if (!Number.isFinite(size) || size <= 0) {
+        throw createClientRequestError(`Adjunto invalido: ${name}`, 400);
+      }
+      if (size > maxAttachmentSizeBytes) {
+        throw createClientRequestError(`Adjunto demasiado grande: ${name} (maximo ${maxAttachmentSizeMb}MB)`, 413);
+      }
+      totalBytes += Math.max(0, Math.round(size));
+      files.push({
+        name,
+        size: Math.max(0, Math.round(size))
+      });
+    });
+    const requiredBytes = estimateAttachmentUploadRequiredBytes(totalBytes, files.length || 1);
+    const storage = assertStorageCapacityOrThrow({
+      path: pendingUploadsDir,
+      requiredBytes,
+      operationLabel: 'subir adjuntos al chat'
+    });
+    return res.json({
+      ok: true,
+      accepted: true,
+      files,
+      estimate: {
+        payloadBytes: totalBytes,
+        requiredBytes
+      },
+      limits: {
+        maxAttachments,
+        maxAttachmentSizeBytes,
+        maxAttachmentSizeMb
+      },
+      storage
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    if (error && error.exposeToClient) {
+      return res.status(statusCode).json({
+        error: error.message || 'No se pudo validar la subida.',
+        code: String(error.code || '').trim() || undefined,
+        storage: error && error.storage ? error.storage : undefined
+      });
+    }
+    return res.status(statusCode).json({
+      error: `No se pudo validar subida de adjuntos: ${truncateForNotify(
+        error && error.message ? error.message : 'upload_preflight_failed',
+        220
+      )}`
+    });
+  }
+});
+
+app.post('/api/uploads/chunked/start', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const decodedName = String(req.body && req.body.fileName ? req.body.fileName : '');
+  const name = sanitizeFilename(decodedName || 'file');
+  const mimeType = String(req.body && req.body.fileType ? req.body.fileType : 'application/octet-stream').trim() || 'application/octet-stream';
+  const totalSize = Number(req.body && req.body.totalSize);
+  const conversationIdRaw = Number(req.body && req.body.conversationId);
+  const conversationId =
+    Number.isInteger(conversationIdRaw) && conversationIdRaw > 0 ? conversationIdRaw : null;
+  if (!Number.isFinite(totalSize) || totalSize <= 0) {
+    return res.status(400).json({ error: `Adjunto invalido: ${name}` });
+  }
+  if (totalSize > maxAttachmentSizeBytes) {
+    return res.status(413).json({ error: `Adjunto demasiado grande: ${name} (maximo ${maxAttachmentSizeMb}MB)` });
+  }
+  if (conversationId !== null) {
+    const ownedConversation = getOwnedConversationOrNull(conversationId, safeUserId);
+    if (!ownedConversation) {
+      return res.status(404).json({ error: 'Conversación no encontrada' });
+    }
+  }
+  cleanupPendingUploads();
+  const uploadId = `${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+  const pendingDir = path.join(pendingUploadsDir, String(safeUserId));
+  fs.mkdirSync(pendingDir, { recursive: true });
+  const storedPath = path.join(pendingDir, `${uploadId}_${name}.part`);
+  try {
+    const requiredBytes = estimateAttachmentUploadRequiredBytes(totalSize, 1);
+    const storage = assertStorageCapacityOrThrow({
+      path: pendingDir,
+      requiredBytes,
+      operationLabel: `subir adjunto ${name}`
+    });
+    fs.writeFileSync(storedPath, '', { flag: 'wx' });
+    pendingChunkUploads.set(uploadId, {
+      uploadId,
+      userId: safeUserId,
+      conversationId,
+      name,
+      mimeType,
+      totalSize: Math.round(totalSize),
+      receivedBytes: 0,
+      nextChunkIndex: 0,
+      path: storedPath,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    });
+    return res.json({
+      ok: true,
+      uploadId,
+      chunkSizeBytes: uploadChunkSizeBytes,
+      storage,
+      attachment: {
+        uploadId,
+        name,
+        mimeType,
+        size: Math.round(totalSize)
+      }
+    });
+  } catch (error) {
+    try {
+      if (fs.existsSync(storedPath)) {
+        fs.unlinkSync(storedPath);
+      }
+    } catch (_cleanupError) {
+      // best-effort cleanup
+    }
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    if (error && error.exposeToClient) {
+      return res.status(statusCode).json({
+        error: error.message || 'No se pudo iniciar subida por chunks.',
+        code: String(error.code || '').trim() || undefined,
+        storage: error && error.storage ? error.storage : undefined
+      });
+    }
+    return res.status(statusCode).json({
+      error: `No se pudo iniciar subida por chunks: ${truncateForNotify(
+        error && error.message ? error.message : 'chunk_start_failed',
+        220
+      )}`
+    });
+  }
+});
+
+app.put('/api/uploads/chunked/:uploadId/chunk', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const uploadId = String(req.params.uploadId || '').trim();
+  if (!uploadId) {
+    return res.status(400).json({ error: 'upload_id inválido' });
+  }
+  cleanupPendingUploads();
+  const session = pendingChunkUploads.get(uploadId);
+  if (!session || Number(session.userId) !== Number(safeUserId)) {
+    return res.status(404).json({ error: 'Subida por chunks no encontrada o expirada.' });
+  }
+  const chunkIndexRaw = Number(req.query.index);
+  const chunkIndex = Number.isInteger(chunkIndexRaw) && chunkIndexRaw >= 0 ? chunkIndexRaw : null;
+  if (chunkIndex === null) {
+    return res.status(400).json({ error: 'index de chunk inválido.' });
+  }
+  if (chunkIndex !== Number(session.nextChunkIndex)) {
+    return res.status(409).json({
+      error: `Orden de chunk inválido. Esperado ${session.nextChunkIndex}, recibido ${chunkIndex}.`
+    });
+  }
+  req.setTimeout(0);
+  res.setTimeout(0);
+  try {
+    const chunkBuffer = await readRequestBodyBuffer(req, uploadChunkMaxBytes);
+    if (!chunkBuffer || chunkBuffer.length === 0) {
+      return res.status(400).json({ error: 'Chunk vacío.' });
+    }
+    const nextBytes = Number(session.receivedBytes || 0) + chunkBuffer.length;
+    if (nextBytes > Number(session.totalSize || 0)) {
+      return res.status(400).json({ error: 'Chunk excede el tamaño total declarado.' });
+    }
+    assertStorageCapacityOrThrow({
+      path: session.path,
+      requiredBytes: Math.max(chunkBuffer.length + storageUploadReserveBytes, 64 * 1024 * 1024),
+      operationLabel: `subir chunk de ${session.name}`
+    });
+    fs.appendFileSync(session.path, chunkBuffer);
+    session.receivedBytes = nextBytes;
+    session.nextChunkIndex = Number(session.nextChunkIndex || 0) + 1;
+    session.updatedAt = Date.now();
+    pendingChunkUploads.set(uploadId, session);
+    const percent =
+      Number(session.totalSize) > 0
+        ? Math.min(100, Math.round((Number(session.receivedBytes) / Number(session.totalSize)) * 100))
+        : 0;
+    return res.json({
+      ok: true,
+      uploadId,
+      chunkIndex,
+      receivedBytes: Number(session.receivedBytes),
+      totalSize: Number(session.totalSize),
+      percent
+    });
+  } catch (error) {
+    const normalized = normalizeStorageSpaceError(
+      error,
+      'No hay espacio suficiente para seguir subiendo el archivo.'
+    );
+    const statusCode = Number.isInteger(normalized && normalized.statusCode)
+      ? normalized.statusCode
+      : Number.isInteger(error && error.statusCode)
+        ? error.statusCode
+        : 500;
+    if (normalized && normalized.exposeToClient) {
+      return res.status(statusCode).json({
+        error: normalized.message || 'No se pudo guardar chunk.',
+        code: String(normalized.code || '').trim() || undefined,
+        storage: normalized && normalized.storage ? normalized.storage : undefined
+      });
+    }
+    return res.status(statusCode).json({
+      error: `No se pudo guardar chunk: ${truncateForNotify(
+        normalized && normalized.message ? normalized.message : error && error.message ? error.message : 'chunk_upload_failed',
+        220
+      )}`
+    });
+  }
+});
+
+app.post('/api/uploads/chunked/:uploadId/complete', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const uploadId = String(req.params.uploadId || '').trim();
+  if (!uploadId) {
+    return res.status(400).json({ error: 'upload_id inválido' });
+  }
+  cleanupPendingUploads();
+  const session = pendingChunkUploads.get(uploadId);
+  if (!session || Number(session.userId) !== Number(safeUserId)) {
+    return res.status(404).json({ error: 'Subida por chunks no encontrada o expirada.' });
+  }
+  const receivedBytes = Number(session.receivedBytes || 0);
+  const totalSize = Number(session.totalSize || 0);
+  if (!Number.isFinite(totalSize) || totalSize <= 0 || receivedBytes !== totalSize) {
+    return res.status(409).json({
+      error: `Subida incompleta. Recibido ${receivedBytes} de ${totalSize} bytes.`
+    });
+  }
+  if (!session.path || !fs.existsSync(session.path)) {
+    pendingChunkUploads.delete(uploadId);
+    return res.status(404).json({ error: 'Archivo temporal de subida no disponible.' });
+  }
+  pendingChunkUploads.delete(uploadId);
+  pendingUploads.set(uploadId, {
+    uploadId,
+    userId: safeUserId,
+    conversationId: session.conversationId,
+    name: session.name,
+    mimeType: session.mimeType,
+    size: totalSize,
+    path: session.path,
+    createdAt: Date.now()
+  });
+  return res.json({
+    ok: true,
+    attachment: {
+      uploadId,
+      name: session.name,
+      mimeType: session.mimeType,
+      size: totalSize
+    }
+  });
+});
+
 app.post('/api/uploads', requireAuth, async (req, res) => {
   const username = truncateForNotify(req.session && req.session.username ? req.session.username : 'anon');
   const declaredSize = Number(req.get('content-length'));
@@ -16470,12 +17240,23 @@ app.post('/api/uploads', requireAuth, async (req, res) => {
   }
 
   cleanupPendingUploads();
+  req.setTimeout(0);
+  res.setTimeout(0);
   const uploadId = `${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
   const pendingDir = path.join(pendingUploadsDir, String(req.session.userId));
   fs.mkdirSync(pendingDir, { recursive: true });
   const storedPath = path.join(pendingDir, `${uploadId}_${name}`);
 
   try {
+    const expectedIncomingBytes =
+      Number.isFinite(declaredSize) && declaredSize > 0
+        ? Math.min(Math.max(1, Math.round(declaredSize)), maxAttachmentSizeBytes)
+        : Math.min(maxAttachmentSizeBytes, 128 * 1024 * 1024);
+    assertStorageCapacityOrThrow({
+      path: pendingDir,
+      requiredBytes: estimateAttachmentUploadRequiredBytes(expectedIncomingBytes, 1),
+      operationLabel: `subir adjunto ${name}`
+    });
     const storedSize = await streamRequestToFile(req, storedPath, maxAttachmentSizeBytes);
     if (storedSize <= 0) {
       if (fs.existsSync(storedPath)) {
@@ -16514,7 +17295,11 @@ app.post('/api/uploads', requireAuth, async (req, res) => {
     const reason = truncateForNotify(error && error.message ? error.message : 'upload_error', 160);
     void notify(`Error upload user=${username}: ${reason}`);
     if (error && error.exposeToClient) {
-      return res.status(error.statusCode || 400).json({ error: error.message || 'Adjunto invalido' });
+      return res.status(error.statusCode || 400).json({
+        error: error.message || 'Adjunto invalido',
+        code: String(error.code || '').trim() || undefined,
+        storage: error && error.storage ? error.storage : undefined
+      });
     }
     return res.status(500).json({ error: `No se pudo subir el adjunto: ${name}` });
   }
@@ -16582,6 +17367,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   let assistantMessageId = null;
   let conversationProjectId = null;
   let conversationProjectRow = null;
+  let conversationCreatedForRequest = false;
   let liveDraftId = null;
   const liveDraftRequestId = `${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
   let taskRunId = null;
@@ -16724,45 +17510,44 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       selectedReasoningEffort
     );
     conversationId = Number(created.lastInsertRowid);
+    conversationCreatedForRequest = true;
   }
-
-  try {
-    const taskStartedAt = nowIso();
-    const createdTask = insertTaskRunStmt.run(
-      req.session.userId,
-      conversationId,
-      liveDraftRequestId,
-      prompt,
-      selectedModel,
-      selectedReasoningEffort,
-      taskStartedAt,
-      taskStartedAt
-    );
-    taskRunId = Number(createdTask.lastInsertRowid);
-    taskSnapshot = createTaskSnapshot(taskRunId);
-    if (taskRunId) {
-      updateTaskRunSnapshotStmt.run(
-        String((taskSnapshot && taskSnapshot.snapshotDir) || ''),
-        taskSnapshot && taskSnapshot.snapshotReady ? 1 : 0,
-        nowIso(),
-        taskRunId,
-        req.session.userId
-      );
-    }
-  } catch (error) {
-    const reason = truncateForNotify(error && error.message ? error.message : 'task_start_failed', 160);
-    void notify(`WARN task_start_failed user=${username} conv=${conversationId} reason=${reason}`);
-    taskRunId = null;
-    taskSnapshot = null;
-  }
-
-  const userMessage = insertMessageStmt.run(conversationId, 'user', prompt);
-  userMessageId = Number(userMessage.lastInsertRowid);
-  updateConversationTitleStmt.run(buildConversationTitle(prompt), conversationId);
-  void notify(`Arranca request chat user=${username}`);
 
   try {
     persistedAttachments = persistAttachments(rawAttachments, conversationId, req.session.userId);
+    try {
+      const taskStartedAt = nowIso();
+      const createdTask = insertTaskRunStmt.run(
+        req.session.userId,
+        conversationId,
+        liveDraftRequestId,
+        prompt,
+        selectedModel,
+        selectedReasoningEffort,
+        taskStartedAt,
+        taskStartedAt
+      );
+      taskRunId = Number(createdTask.lastInsertRowid);
+      taskSnapshot = createTaskSnapshot(taskRunId);
+      if (taskRunId) {
+        updateTaskRunSnapshotStmt.run(
+          String((taskSnapshot && taskSnapshot.snapshotDir) || ''),
+          taskSnapshot && taskSnapshot.snapshotReady ? 1 : 0,
+          nowIso(),
+          taskRunId,
+          req.session.userId
+        );
+      }
+    } catch (error) {
+      const reason = truncateForNotify(error && error.message ? error.message : 'task_start_failed', 160);
+      void notify(`WARN task_start_failed user=${username} conv=${conversationId} reason=${reason}`);
+      taskRunId = null;
+      taskSnapshot = null;
+    }
+    const userMessage = insertMessageStmt.run(conversationId, 'user', prompt);
+    userMessageId = Number(userMessage.lastInsertRowid);
+    updateConversationTitleStmt.run(buildConversationTitle(prompt), conversationId);
+    void notify(`Arranca request chat user=${username}`);
     if (userMessageId && Number.isInteger(userMessageId) && persistedAttachments.length > 0) {
       try {
         persistedAttachments.forEach((file) => {
@@ -18748,6 +19533,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       const shortError = truncateForNotify(clientMessage, 140);
       void notify(`Error en chat user=${username}: ${shortError}`);
       const historyMessage = `No se pudo procesar la solicitud: ${clientMessage}`;
+      const shouldPersistConversationError =
+        Number.isInteger(Number(userMessageId)) && Number(userMessageId) > 0;
       finalizeTaskRun({
         status: 'failed',
         closeReason: 'client_error',
@@ -18759,8 +19546,10 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         structured: false,
         clientDisconnected: false
       });
-      scheduleProjectContextRefreshAfterChat('chat_client_error');
-      if (userNotificationSettings.notifyOnFinish) {
+      if (shouldPersistConversationError) {
+        scheduleProjectContextRefreshAfterChat('chat_client_error');
+      }
+      if (shouldPersistConversationError && userNotificationSettings.notifyOnFinish) {
         const message = buildChatCompletionDiscordMessage({
           status: 'error',
           username,
@@ -18777,25 +19566,34 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           });
         }
       }
-      if (assistantMessageId) {
-        updateMessageContentStmt.run(historyMessage, assistantMessageId);
-      } else {
-        insertMessageStmt.run(conversationId, 'assistant', historyMessage);
-      }
-      if (liveDraftId) {
+      if (shouldPersistConversationError) {
+        if (assistantMessageId) {
+          updateMessageContentStmt.run(historyMessage, assistantMessageId);
+        } else {
+          insertMessageStmt.run(conversationId, 'assistant', historyMessage);
+        }
+        if (liveDraftId) {
+          try {
+            updateLiveDraftSnapshotStmt.run(
+              conversationId,
+              assistantMessageId,
+              historyMessage,
+              '{}',
+              1,
+              nowIso(),
+              liveDraftId,
+              req.session.userId
+            );
+          } catch (_draftError) {
+            // ignore draft write errors in fallback path
+          }
+        }
+      } else if (conversationCreatedForRequest && Number.isInteger(Number(conversationId)) && Number(conversationId) > 0) {
         try {
-          updateLiveDraftSnapshotStmt.run(
-            conversationId,
-            assistantMessageId,
-            historyMessage,
-            '{}',
-            1,
-            nowIso(),
-            liveDraftId,
-            req.session.userId
-          );
-        } catch (_draftError) {
-          // ignore draft write errors in fallback path
+          deleteConversationStmt.run(conversationId);
+          removePendingUploadsForConversation(conversationId);
+        } catch (_cleanupError) {
+          // best-effort rollback for empty conversation created in this request
         }
       }
       if (res.headersSent) {
@@ -18824,6 +19622,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       ? 'No se encontró el binario codex en el servidor.'
       : `No se pudo ejecutar ${providerLabel} en el servidor.`;
     const errorMessage = `Error ejecutando ${providerLabel}: ${details}`;
+    const shouldPersistConversationError =
+      Number.isInteger(Number(userMessageId)) && Number(userMessageId) > 0;
     finalizeTaskRun({
       status: 'failed',
       closeReason: codeNotFound ? 'codex_not_found' : 'exec_error',
@@ -18835,8 +19635,10 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       structured: false,
       clientDisconnected: false
     });
-    scheduleProjectContextRefreshAfterChat('chat_exec_error');
-    if (userNotificationSettings.notifyOnFinish) {
+    if (shouldPersistConversationError) {
+      scheduleProjectContextRefreshAfterChat('chat_exec_error');
+    }
+    if (shouldPersistConversationError && userNotificationSettings.notifyOnFinish) {
       const message = buildChatCompletionDiscordMessage({
         status: 'error',
         username,
@@ -18853,25 +19655,34 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         });
       }
     }
-    if (assistantMessageId) {
-      updateMessageContentStmt.run(errorMessage, assistantMessageId);
-    } else {
-      insertMessageStmt.run(conversationId, 'assistant', errorMessage);
-    }
-    if (liveDraftId) {
+    if (shouldPersistConversationError) {
+      if (assistantMessageId) {
+        updateMessageContentStmt.run(errorMessage, assistantMessageId);
+      } else {
+        insertMessageStmt.run(conversationId, 'assistant', errorMessage);
+      }
+      if (liveDraftId) {
+        try {
+          updateLiveDraftSnapshotStmt.run(
+            conversationId,
+            assistantMessageId,
+            errorMessage,
+            '{}',
+            1,
+            nowIso(),
+            liveDraftId,
+            req.session.userId
+          );
+        } catch (_draftError) {
+          // ignore draft write errors in fallback path
+        }
+      }
+    } else if (conversationCreatedForRequest && Number.isInteger(Number(conversationId)) && Number(conversationId) > 0) {
       try {
-        updateLiveDraftSnapshotStmt.run(
-          conversationId,
-          assistantMessageId,
-          errorMessage,
-          '{}',
-          1,
-          nowIso(),
-          liveDraftId,
-          req.session.userId
-        );
-      } catch (_draftError) {
-        // ignore draft write errors in fallback path
+        deleteConversationStmt.run(conversationId);
+        removePendingUploadsForConversation(conversationId);
+      } catch (_cleanupError) {
+        // best-effort rollback for empty conversation created in this request
       }
     }
     return res.status(500).json({ error: `Error ejecutando ${providerLabel}. ${details}` });
