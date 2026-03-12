@@ -38,6 +38,10 @@ import type {
   ToolsStorageOverview,
   ToolsStorageResidualAnalysis,
   ToolsStorageResidualCandidate,
+  ToolsWireGuardDiagnostics,
+  ToolsWireGuardPeer,
+  ToolsWireGuardPeerProfile,
+  ToolsWireGuardStatus,
   RestartState,
   StorageHealthSnapshot,
   TaskRecovery,
@@ -139,7 +143,7 @@ function normalizeAiProviderPermissionProfile(rawValue: any): AiProviderPermissi
     allowBackupRestore: Boolean(rawValue?.allowBackupRestore),
     allowedTools: Array.isArray(rawValue?.allowedTools)
       ? rawValue.allowedTools.map((entry: any) => String(entry || '').trim().toLowerCase()).filter(Boolean)
-      : ['chat', 'git', 'storage', 'drive', 'backups', 'deployments', 'shell'],
+      : ['chat', 'git', 'storage', 'drive', 'backups', 'deployments', 'shell', 'wireguard'],
     updatedAt: String(rawValue?.updatedAt || '')
   };
 }
@@ -1582,6 +1586,312 @@ export async function deleteToolsStorageResidual(payload: {
           error: String(entry?.error || '')
         }))
       : []
+  };
+}
+
+function normalizeToolsWireGuardPeer(rawValue: any): ToolsWireGuardPeer {
+  return {
+    id: String(rawValue?.id || ''),
+    name: String(rawValue?.name || ''),
+    publicKey: String(rawValue?.publicKey || ''),
+    clientIp: String(rawValue?.clientIp || ''),
+    allowedIps: String(rawValue?.allowedIps || ''),
+    endpoint: String(rawValue?.endpoint || ''),
+    latestHandshakeAt: String(rawValue?.latestHandshakeAt || ''),
+    secondsSinceHandshake:
+      Number.isFinite(Number(rawValue?.secondsSinceHandshake)) && Number(rawValue.secondsSinceHandshake) >= 0
+        ? Number(rawValue.secondsSinceHandshake)
+        : null,
+    active: Boolean(rawValue?.active),
+    transferRxBytes: Number.isFinite(Number(rawValue?.transferRxBytes)) ? Number(rawValue.transferRxBytes) : 0,
+    transferTxBytes: Number.isFinite(Number(rawValue?.transferTxBytes)) ? Number(rawValue.transferTxBytes) : 0,
+    persistentKeepalive:
+      Number.isFinite(Number(rawValue?.persistentKeepalive)) && Number(rawValue.persistentKeepalive) >= 0
+        ? Number(rawValue.persistentKeepalive)
+        : null,
+    createdAt: String(rawValue?.createdAt || ''),
+    notes: String(rawValue?.notes || ''),
+    hasProfile: Boolean(rawValue?.hasProfile)
+  };
+}
+
+function normalizeToolsWireGuardStatus(rawValue: any): ToolsWireGuardStatus {
+  const peers = Array.isArray(rawValue?.peers) ? rawValue.peers.map((entry: any) => normalizeToolsWireGuardPeer(entry)) : [];
+  return {
+    runtime: {
+      interfaceName: String(rawValue?.runtime?.interfaceName || ''),
+      availableInterfaces: Array.isArray(rawValue?.runtime?.availableInterfaces)
+        ? rawValue.runtime.availableInterfaces.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+        : [],
+      configPath: String(rawValue?.runtime?.configPath || ''),
+      configExists: Boolean(rawValue?.runtime?.configExists)
+    },
+    binaries: {
+      wg: Boolean(rawValue?.binaries?.wg),
+      wgQuick: Boolean(rawValue?.binaries?.wgQuick),
+      qrencode: Boolean(rawValue?.binaries?.qrencode),
+      systemctl: Boolean(rawValue?.binaries?.systemctl)
+    },
+    service: {
+      unit: String(rawValue?.service?.unit || ''),
+      isActive: Boolean(rawValue?.service?.isActive),
+      activeState: String(rawValue?.service?.activeState || ''),
+      subState: String(rawValue?.service?.subState || ''),
+      unitFileState: String(rawValue?.service?.unitFileState || ''),
+      loadState: String(rawValue?.service?.loadState || ''),
+      description: String(rawValue?.service?.description || ''),
+      fragmentPath: String(rawValue?.service?.fragmentPath || '')
+    },
+    interface: {
+      name: String(rawValue?.interface?.name || ''),
+      address: String(rawValue?.interface?.address || ''),
+      listenPort:
+        Number.isFinite(Number(rawValue?.interface?.listenPort)) && Number(rawValue.interface.listenPort) > 0
+          ? Number(rawValue.interface.listenPort)
+          : null,
+      postUp: String(rawValue?.interface?.postUp || ''),
+      postDown: String(rawValue?.interface?.postDown || ''),
+      hasPrivateKey: Boolean(rawValue?.interface?.hasPrivateKey),
+      publicKey: String(rawValue?.interface?.publicKey || ''),
+      fwmark: String(rawValue?.interface?.fwmark || ''),
+      configError: String(rawValue?.interface?.configError || '')
+    },
+    profileDefaults: {
+      endpointHost: String(rawValue?.profileDefaults?.endpointHost || ''),
+      defaultDns: String(rawValue?.profileDefaults?.defaultDns || ''),
+      defaultAllowedIps: String(rawValue?.profileDefaults?.defaultAllowedIps || ''),
+      defaultKeepaliveSeconds:
+        Number.isFinite(Number(rawValue?.profileDefaults?.defaultKeepaliveSeconds))
+          ? Number(rawValue.profileDefaults.defaultKeepaliveSeconds)
+          : 25,
+      updatedAt: String(rawValue?.profileDefaults?.updatedAt || '')
+    },
+    peers,
+    stats: {
+      configuredPeers: Number(rawValue?.stats?.configuredPeers) || peers.length,
+      activePeers: Number(rawValue?.stats?.activePeers) || peers.filter((entry) => entry.active).length,
+      totalRxBytes: Number(rawValue?.stats?.totalRxBytes) || 0,
+      totalTxBytes: Number(rawValue?.stats?.totalTxBytes) || 0,
+      activeWindowSeconds: Number(rawValue?.stats?.activeWindowSeconds) || 0,
+      updatedAt: String(rawValue?.stats?.updatedAt || '')
+    }
+  };
+}
+
+export async function getToolsWireGuardStatus(interfaceName = ''): Promise<ToolsWireGuardStatus> {
+  const params = new URLSearchParams();
+  if (interfaceName) params.set('interfaceName', interfaceName);
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const data = await api<{ wireguard: any }>(`/api/tools/wireguard/status${suffix}`);
+  return normalizeToolsWireGuardStatus(data?.wireguard);
+}
+
+export async function controlToolsWireGuardService(payload: {
+  action: 'start' | 'stop' | 'restart' | 'reload';
+  confirm?: string;
+  interfaceName?: string;
+}): Promise<{ action: string; effectiveAction: string; output: string; wireguard: ToolsWireGuardStatus }> {
+  const data = await api<{ action: string; effectiveAction: string; output: string; wireguard: any }>(
+    '/api/tools/wireguard/service',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }
+  );
+  return {
+    action: String(data?.action || ''),
+    effectiveAction: String(data?.effectiveAction || ''),
+    output: String(data?.output || ''),
+    wireguard: normalizeToolsWireGuardStatus(data?.wireguard)
+  };
+}
+
+export async function getToolsWireGuardConfig(interfaceName = ''): Promise<{
+  runtime: ToolsWireGuardStatus['runtime'];
+  service: ToolsWireGuardStatus['service'];
+  interface: ToolsWireGuardStatus['interface'];
+  profileDefaults: ToolsWireGuardStatus['profileDefaults'];
+  editable: {
+    profileDefaultsOnly: boolean;
+  };
+}> {
+  const params = new URLSearchParams();
+  if (interfaceName) params.set('interfaceName', interfaceName);
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const data = await api<{
+    config: {
+      runtime: any;
+      service: any;
+      interface: any;
+      profileDefaults: any;
+      editable: { profileDefaultsOnly: boolean };
+    };
+  }>(`/api/tools/wireguard/config${suffix}`);
+  const normalized = normalizeToolsWireGuardStatus({
+    runtime: data?.config?.runtime,
+    service: data?.config?.service,
+    interface: data?.config?.interface,
+    profileDefaults: data?.config?.profileDefaults,
+    peers: [],
+    stats: {}
+  });
+  return {
+    runtime: normalized.runtime,
+    service: normalized.service,
+    interface: normalized.interface,
+    profileDefaults: normalized.profileDefaults,
+    editable: {
+      profileDefaultsOnly: Boolean(data?.config?.editable?.profileDefaultsOnly)
+    }
+  };
+}
+
+export async function updateToolsWireGuardConfig(payload: {
+  interfaceName?: string;
+  endpointHost?: string;
+  defaultDns?: string;
+  defaultAllowedIps?: string;
+  defaultKeepaliveSeconds?: number;
+}): Promise<{ settings: ToolsWireGuardStatus['profileDefaults']; wireguard: ToolsWireGuardStatus }> {
+  const data = await api<{ settings: any; wireguard: any }>('/api/tools/wireguard/config', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {})
+  });
+  const normalizedWireGuard = normalizeToolsWireGuardStatus(data?.wireguard);
+  return {
+    settings: normalizedWireGuard.profileDefaults,
+    wireguard: normalizedWireGuard
+  };
+}
+
+export async function getToolsWireGuardDiagnostics(payload?: {
+  interfaceName?: string;
+  lines?: number;
+}): Promise<ToolsWireGuardDiagnostics> {
+  const params = new URLSearchParams();
+  if (payload?.interfaceName) params.set('interfaceName', String(payload.interfaceName));
+  if (Number.isInteger(Number(payload?.lines))) params.set('lines', String(payload?.lines));
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const data = await api<{ diagnostics: any }>(`/api/tools/wireguard/diagnostics${suffix}`);
+  const statusLike = normalizeToolsWireGuardStatus({
+    runtime: data?.diagnostics?.runtime,
+    service: data?.diagnostics?.service,
+    interface: {},
+    profileDefaults: {},
+    peers: [],
+    stats: {}
+  });
+  return {
+    runtime: statusLike.runtime,
+    service: statusLike.service,
+    checks: {
+      wgBinary: Boolean(data?.diagnostics?.checks?.wgBinary),
+      wgQuickBinary: Boolean(data?.diagnostics?.checks?.wgQuickBinary),
+      systemctlBinary: Boolean(data?.diagnostics?.checks?.systemctlBinary),
+      configExists: Boolean(data?.diagnostics?.checks?.configExists),
+      configStripOk: Boolean(data?.diagnostics?.checks?.configStripOk),
+      configStripError: String(data?.diagnostics?.checks?.configStripError || '')
+    },
+    logs: {
+      lines: Number(data?.diagnostics?.logs?.lines) || 0,
+      output: String(data?.diagnostics?.logs?.output || '')
+    }
+  };
+}
+
+export async function createToolsWireGuardPeer(payload: {
+  interfaceName?: string;
+  name: string;
+  clientIp?: string;
+  dns?: string;
+  allowedIps?: string;
+  keepaliveSeconds?: number;
+  endpointHost?: string;
+  comment?: string;
+}): Promise<{ peer: ToolsWireGuardPeer; profile: { peerId: string; downloadPath: string; qrPath: string }; wireguard: ToolsWireGuardStatus }> {
+  const data = await api<{ peer: any; profile: any; wireguard: any }>('/api/tools/wireguard/peers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {})
+  });
+  return {
+    peer: normalizeToolsWireGuardPeer(data?.peer),
+    profile: {
+      peerId: String(data?.profile?.peerId || ''),
+      downloadPath: String(data?.profile?.downloadPath || ''),
+      qrPath: String(data?.profile?.qrPath || '')
+    },
+    wireguard: normalizeToolsWireGuardStatus(data?.wireguard)
+  };
+}
+
+export async function deleteToolsWireGuardPeer(payload: {
+  peerId: string;
+  interfaceName?: string;
+  publicKey?: string;
+}): Promise<{ deleted: boolean; peerId: string; publicKey: string; wireguard: ToolsWireGuardStatus }> {
+  const peerId = String(payload?.peerId || '').trim();
+  const params = new URLSearchParams();
+  params.set('confirm', 'DELETE');
+  const data = await api<{ deleted: boolean; peerId: string; publicKey: string; wireguard: any }>(
+    `/api/tools/wireguard/peers/${encodeURIComponent(peerId)}?${params.toString()}`,
+    {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        interfaceName: payload?.interfaceName || '',
+        publicKey: payload?.publicKey || ''
+      })
+    }
+  );
+  return {
+    deleted: Boolean(data?.deleted),
+    peerId: String(data?.peerId || ''),
+    publicKey: String(data?.publicKey || ''),
+    wireguard: normalizeToolsWireGuardStatus(data?.wireguard)
+  };
+}
+
+export async function getToolsWireGuardPeerProfile(peerId: string): Promise<ToolsWireGuardPeerProfile> {
+  const data = await api<any>(`/api/tools/wireguard/peers/${encodeURIComponent(String(peerId || '').trim())}/profile`);
+  return {
+    peerId: String(data?.peerId || ''),
+    interfaceName: String(data?.interfaceName || ''),
+    name: String(data?.name || ''),
+    publicKey: String(data?.publicKey || ''),
+    fileName: String(data?.fileName || ''),
+    config: String(data?.config || '')
+  };
+}
+
+export async function downloadToolsWireGuardPeerProfile(peerId: string): Promise<{ blob: Blob; fileName: string }> {
+  const safePeerId = String(peerId || '').trim();
+  const response = await fetch(`/api/tools/wireguard/peers/${encodeURIComponent(safePeerId)}/profile/download`, {
+    method: 'GET',
+    credentials: 'include'
+  });
+  if (!response.ok) {
+    const data = await parseJsonSafe(response);
+    const err = new Error(data?.error || `Request failed (${response.status})`) as ApiError;
+    err.status = response.status;
+    throw err;
+  }
+  const blob = await response.blob();
+  const headerName = parseContentDispositionFileName(String(response.headers.get('content-disposition') || ''));
+  return {
+    blob,
+    fileName: headerName || `${safePeerId || 'wireguard-peer'}.conf`
+  };
+}
+
+export async function getToolsWireGuardPeerQr(peerId: string): Promise<{ mimeType: string; dataUrl: string; generatedAt: string }> {
+  const data = await api<any>(`/api/tools/wireguard/peers/${encodeURIComponent(String(peerId || '').trim())}/profile/qr`);
+  return {
+    mimeType: String(data?.mimeType || 'image/png'),
+    dataUrl: String(data?.dataUrl || ''),
+    generatedAt: String(data?.generatedAt || '')
   };
 }
 

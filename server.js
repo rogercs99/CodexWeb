@@ -3,6 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
+const net = require('net');
 const { execFile, execFileSync, spawn } = require('child_process');
 const { Transform, pipeline, Readable } = require('stream');
 const util = require('util');
@@ -195,9 +196,10 @@ const aiPermissionToolCatalog = [
   'drive',
   'backups',
   'deployments',
-  'shell'
+  'shell',
+  'wireguard'
 ];
-const aiPermissionDefaultAllowedTools = ['chat', 'git', 'storage', 'drive', 'backups', 'deployments', 'shell'];
+const aiPermissionDefaultAllowedTools = ['chat', 'git', 'storage', 'drive', 'backups', 'deployments', 'shell', 'wireguard'];
 const aiProviderQuotaUnits = new Set(['requests', 'tokens', 'credits', 'usd']);
 const aiPermissionAccessModes = new Set(['full_access', 'workspace_only', 'restricted_paths', 'read_only']);
 const aiProviderPermissionProfileDefaults = Object.freeze({
@@ -666,6 +668,41 @@ const rcloneBinary = String(process.env.RCLONE_BIN || 'rclone').trim() || 'rclon
 const rcloneConfigPathDefault = String(process.env.RCLONE_CONFIG_PATH || '').trim();
 const driveDefaultRemoteName = String(process.env.RCLONE_DRIVE_DEFAULT_REMOTE || '').trim();
 const driveDefaultRootPath = String(process.env.RCLONE_DRIVE_DEFAULT_ROOT || 'CodexWeb').trim();
+const configuredWireGuardInterface = normalizeWireGuardInterfaceName(process.env.WIREGUARD_INTERFACE);
+const wireGuardDefaultInterface = configuredWireGuardInterface || 'wg0';
+const wireGuardConfigDir = resolveConfiguredPath(process.env.WIREGUARD_CONFIG_DIR, '/etc/wireguard');
+const wireGuardConfigPathDefault = resolveConfiguredPath(
+  process.env.WIREGUARD_CONFIG_PATH,
+  path.join(wireGuardConfigDir, `${wireGuardDefaultInterface}.conf`)
+);
+const wireGuardProfilesDir = resolveConfiguredPath(
+  process.env.WIREGUARD_CLIENT_PROFILES_DIR,
+  path.join(wireGuardConfigDir, 'codexweb-clients')
+);
+const wireGuardParamsPath = resolveConfiguredPath(
+  process.env.WIREGUARD_PARAMS_PATH,
+  path.join(wireGuardConfigDir, 'params')
+);
+const wireGuardPublicEndpointDefault = String(process.env.WIREGUARD_PUBLIC_ENDPOINT || '').trim();
+const wireGuardAllowedIpsDefault = String(process.env.WIREGUARD_ALLOWED_IPS_DEFAULT || '0.0.0.0/0,::/0').trim() || '0.0.0.0/0,::/0';
+const wireGuardClientDnsDefault = String(process.env.WIREGUARD_CLIENT_DNS_DEFAULT || '1.1.1.1,1.0.0.1').trim() || '1.1.1.1,1.0.0.1';
+const configuredWireGuardKeepaliveDefault = Number.parseInt(
+  String(process.env.WIREGUARD_KEEPALIVE_DEFAULT || '25'),
+  10
+);
+const wireGuardKeepaliveDefault =
+  Number.isInteger(configuredWireGuardKeepaliveDefault) && configuredWireGuardKeepaliveDefault >= 0
+    ? Math.min(configuredWireGuardKeepaliveDefault, 120)
+    : 25;
+const configuredWireGuardActiveHandshakeWindow = Number.parseInt(
+  String(process.env.WIREGUARD_ACTIVE_HANDSHAKE_WINDOW_SECONDS || '180'),
+  10
+);
+const wireGuardActiveHandshakeWindowSeconds =
+  Number.isInteger(configuredWireGuardActiveHandshakeWindow) && configuredWireGuardActiveHandshakeWindow > 0
+    ? Math.min(configuredWireGuardActiveHandshakeWindow, 3600)
+    : 180;
+const wireGuardDiagnosticsMaxLogLines = 400;
 const storageResidualScanMaxItems = 220;
 const storageResidualScanMaxDepth = 5;
 const storageResidualDeleteMaxItems = 80;
@@ -758,6 +795,12 @@ try {
 console.info(`Codex home root configurado en ${codexUsersRootDir}`);
 fs.mkdirSync(taskSnapshotsRootDir, { recursive: true });
 fs.mkdirSync(storageJobsRootDir, { recursive: true });
+fs.mkdirSync(wireGuardProfilesDir, { recursive: true, mode: 0o700 });
+try {
+  fs.chmodSync(wireGuardProfilesDir, 0o700);
+} catch (_error) {
+  // best effort
+}
 
 const observabilityState = {
   startedAtMs: Date.now(),
@@ -4453,6 +4496,1113 @@ function parseKeyValueOutput(rawText) {
     map[key] = String(line.slice(idx + 1) || '').trim();
   });
   return map;
+}
+
+function normalizeWireGuardInterfaceName(rawValue) {
+  const value = String(rawValue || '').trim();
+  if (!value) return '';
+  if (!/^[A-Za-z0-9_.=-]{1,32}$/.test(value)) return '';
+  return value;
+}
+
+function normalizeWireGuardPeerName(rawValue) {
+  return String(rawValue || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+}
+
+function normalizeWireGuardAllowedIps(rawValue, fallbackValue = wireGuardAllowedIpsDefault) {
+  const source = String(rawValue || fallbackValue || '')
+    .split(',')
+    .map((entry) => String(entry || '').trim())
+    .filter(Boolean)
+    .slice(0, 12);
+  if (source.length === 0) {
+    return wireGuardAllowedIpsDefault;
+  }
+  return source.join(',');
+}
+
+function normalizeWireGuardDns(rawValue, fallbackValue = wireGuardClientDnsDefault) {
+  const source = String(rawValue || fallbackValue || '')
+    .split(',')
+    .map((entry) => String(entry || '').trim())
+    .filter(Boolean)
+    .slice(0, 4);
+  if (source.length === 0) {
+    return wireGuardClientDnsDefault;
+  }
+  return source.join(',');
+}
+
+function normalizeWireGuardKeepalive(rawValue, fallbackValue = wireGuardKeepaliveDefault) {
+  const parsed = Number.parseInt(String(rawValue || ''), 10);
+  if (Number.isInteger(parsed) && parsed >= 0) {
+    return Math.min(parsed, 120);
+  }
+  const fallback = Number.parseInt(String(fallbackValue || ''), 10);
+  if (Number.isInteger(fallback) && fallback >= 0) {
+    return Math.min(fallback, 120);
+  }
+  return wireGuardKeepaliveDefault;
+}
+
+function buildWireGuardPeerIdFromPublicKey(publicKey) {
+  const safe = String(publicKey || '').trim();
+  if (!safe) return '';
+  const hash = crypto.createHash('sha1').update(safe, 'utf8').digest('hex');
+  return `wgp_${hash.slice(0, 16)}`;
+}
+
+function parseWireGuardKeyValue(line) {
+  const source = String(line || '');
+  const idx = source.indexOf('=');
+  if (idx <= 0) return null;
+  const key = String(source.slice(0, idx) || '').trim();
+  if (!key) return null;
+  return {
+    key,
+    keyLower: key.toLowerCase(),
+    value: String(source.slice(idx + 1) || '').trim()
+  };
+}
+
+function parseWireGuardPeerBlock(lines) {
+  const peer = {
+    lines: Array.isArray(lines) ? lines.slice() : [],
+    publicKey: '',
+    allowedIps: '',
+    presharedKey: '',
+    endpoint: '',
+    persistentKeepalive: '',
+    name: '',
+    createdAt: ''
+  };
+  peer.lines.forEach((line) => {
+    const trimmed = String(line || '').trim();
+    if (!trimmed) return;
+    const lower = trimmed.toLowerCase();
+    if (lower.startsWith('# codexweb-name:')) {
+      peer.name = normalizeWireGuardPeerName(trimmed.slice(trimmed.indexOf(':') + 1));
+      return;
+    }
+    if (lower.startsWith('# codexweb-created-at:')) {
+      peer.createdAt = String(trimmed.slice(trimmed.indexOf(':') + 1) || '').trim();
+      return;
+    }
+    if (trimmed.startsWith('#')) return;
+    const kv = parseWireGuardKeyValue(trimmed);
+    if (!kv) return;
+    if (kv.keyLower === 'publickey') peer.publicKey = kv.value;
+    if (kv.keyLower === 'allowedips') peer.allowedIps = kv.value;
+    if (kv.keyLower === 'presharedkey') peer.presharedKey = kv.value;
+    if (kv.keyLower === 'endpoint') peer.endpoint = kv.value;
+    if (kv.keyLower === 'persistentkeepalive') peer.persistentKeepalive = kv.value;
+  });
+  return peer;
+}
+
+function parseWireGuardConfigText(rawText) {
+  const normalized = String(rawText || '').replace(/\r/g, '');
+  const lines = normalized.split('\n');
+  const interfaceLines = [];
+  const peers = [];
+  let currentPeerLines = null;
+  lines.forEach((line) => {
+    const trimmed = String(line || '').trim();
+    if (/^\[peer\]$/i.test(trimmed)) {
+      if (currentPeerLines && currentPeerLines.length > 0) {
+        const parsedPeer = parseWireGuardPeerBlock(currentPeerLines);
+        if (parsedPeer.publicKey) {
+          peers.push(parsedPeer);
+        }
+      }
+      currentPeerLines = ['[Peer]'];
+      return;
+    }
+    if (currentPeerLines) {
+      currentPeerLines.push(line);
+      return;
+    }
+    interfaceLines.push(line);
+  });
+  if (currentPeerLines && currentPeerLines.length > 0) {
+    const parsedPeer = parseWireGuardPeerBlock(currentPeerLines);
+    if (parsedPeer.publicKey) {
+      peers.push(parsedPeer);
+    }
+  }
+
+  const interfaceData = {
+    address: '',
+    listenPort: '',
+    dns: '',
+    postUp: '',
+    postDown: '',
+    hasPrivateKey: false
+  };
+  interfaceLines.forEach((line) => {
+    const kv = parseWireGuardKeyValue(line);
+    if (!kv) return;
+    if (kv.keyLower === 'address') interfaceData.address = kv.value;
+    if (kv.keyLower === 'listenport') interfaceData.listenPort = kv.value;
+    if (kv.keyLower === 'dns') interfaceData.dns = kv.value;
+    if (kv.keyLower === 'postup') interfaceData.postUp = kv.value;
+    if (kv.keyLower === 'postdown') interfaceData.postDown = kv.value;
+    if (kv.keyLower === 'privatekey') interfaceData.hasPrivateKey = Boolean(kv.value);
+  });
+
+  return {
+    interfaceLines,
+    peers,
+    interfaceData
+  };
+}
+
+function renderWireGuardConfig(parsedConfig) {
+  const source = parsedConfig && typeof parsedConfig === 'object' ? parsedConfig : {};
+  const interfaceLines = Array.isArray(source.interfaceLines) ? source.interfaceLines.slice() : [];
+  if (!interfaceLines.some((line) => /^\s*\[interface\]\s*$/i.test(String(line || '')))) {
+    interfaceLines.unshift('[Interface]');
+  }
+  const peerBlocks = Array.isArray(source.peers) ? source.peers : [];
+  const sections = [interfaceLines.join('\n').trimEnd()].filter(Boolean);
+  peerBlocks.forEach((peer) => {
+    if (!peer || !Array.isArray(peer.lines) || peer.lines.length === 0) return;
+    sections.push(peer.lines.join('\n').trimEnd());
+  });
+  return `${sections.filter(Boolean).join('\n\n').trimEnd()}\n`;
+}
+
+function writeWireGuardConfig(runtime, parsedConfig) {
+  const safeRuntime = runtime && typeof runtime === 'object' ? runtime : {};
+  const configPath = String(safeRuntime.configPath || '').trim();
+  if (!configPath) {
+    throw createClientRequestError('Ruta de configuración WireGuard inválida.', 400);
+  }
+  const configDir = path.dirname(configPath);
+  fs.mkdirSync(configDir, { recursive: true });
+  const nextText = renderWireGuardConfig(parsedConfig);
+  const backupPath = `${configPath}.bak.${new Date().toISOString().replace(/[:.]/g, '-')}`;
+  if (fs.existsSync(configPath)) {
+    fs.copyFileSync(configPath, backupPath);
+  }
+  const tmpPath = `${configPath}.tmp.${Date.now()}.${Math.random().toString(16).slice(2, 8)}`;
+  try {
+    fs.writeFileSync(tmpPath, nextText, { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tmpPath, configPath);
+    fs.chmodSync(configPath, 0o600);
+  } catch (error) {
+    try {
+      if (fs.existsSync(tmpPath)) {
+        fs.unlinkSync(tmpPath);
+      }
+    } catch (_cleanupError) {
+      // ignore temp cleanup failures.
+    }
+    throw error;
+  }
+  return {
+    backupPath
+  };
+}
+
+function listWireGuardInterfacesFromConfigDir() {
+  try {
+    const entries = fs.readdirSync(wireGuardConfigDir, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry && entry.isFile())
+      .map((entry) => String(entry.name || '').trim())
+      .filter((name) => name.endsWith('.conf'))
+      .filter((name) => !name.includes('.bak.') && !name.includes('.broken.'))
+      .map((name) => normalizeWireGuardInterfaceName(name.slice(0, -5)))
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b));
+  } catch (_error) {
+    return [];
+  }
+}
+
+function resolveWireGuardRuntime(rawInterface = '') {
+  const requested = normalizeWireGuardInterfaceName(rawInterface);
+  const discovered = listWireGuardInterfacesFromConfigDir();
+  let interfaceName = requested || wireGuardDefaultInterface;
+  if (discovered.length > 0 && !discovered.includes(interfaceName)) {
+    interfaceName = discovered.includes(wireGuardDefaultInterface)
+      ? wireGuardDefaultInterface
+      : discovered.includes('wg0')
+        ? 'wg0'
+        : discovered[0];
+  }
+  const defaultInterfaceFromConfig = normalizeWireGuardInterfaceName(
+    path.basename(String(wireGuardConfigPathDefault || ''), '.conf')
+  );
+  const configPath =
+    defaultInterfaceFromConfig && defaultInterfaceFromConfig === interfaceName
+      ? wireGuardConfigPathDefault
+      : path.join(wireGuardConfigDir, `${interfaceName}.conf`);
+  return {
+    interfaceName,
+    serviceUnit: `wg-quick@${interfaceName}`,
+    configPath,
+    configExists: fs.existsSync(configPath),
+    availableInterfaces: discovered
+  };
+}
+
+function loadWireGuardParams() {
+  if (!wireGuardParamsPath || !fs.existsSync(wireGuardParamsPath)) {
+    return {};
+  }
+  try {
+    const raw = fs.readFileSync(wireGuardParamsPath, 'utf8');
+    return parseKeyValueOutput(raw);
+  } catch (_error) {
+    return {};
+  }
+}
+
+function loadWireGuardConfig(runtime) {
+  const safeRuntime = runtime && typeof runtime === 'object' ? runtime : {};
+  const configPath = String(safeRuntime.configPath || '').trim();
+  if (!configPath || !fs.existsSync(configPath)) {
+    throw createClientRequestError('No se encontró archivo de configuración WireGuard.', 404);
+  }
+  const raw = fs.readFileSync(configPath, 'utf8');
+  return parseWireGuardConfigText(raw);
+}
+
+function parseWgDumpForInterface(interfaceName) {
+  const safeInterface = normalizeWireGuardInterfaceName(interfaceName);
+  if (!safeInterface) {
+    return {
+      available: false,
+      interface: null,
+      peers: []
+    };
+  }
+  if (!commandExistsSync('wg')) {
+    return {
+      available: false,
+      interface: null,
+      peers: []
+    };
+  }
+  const dumpResult = runSystemCommandSync('wg', ['show', safeInterface, 'dump'], {
+    allowNonZero: true,
+    timeoutMs: 8000,
+    maxBuffer: 1024 * 1024 * 4
+  });
+  if (!dumpResult.ok || Number(dumpResult.code) !== 0) {
+    return {
+      available: false,
+      interface: null,
+      peers: [],
+      error: truncateForNotify(dumpResult.stderr || dumpResult.stdout || 'wg_show_dump_failed', 220)
+    };
+  }
+  const lines = String(dumpResult.stdout || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return {
+      available: true,
+      interface: null,
+      peers: []
+    };
+  }
+  const rows = lines.map((line) => line.split('\t'));
+  const ifaceRow = rows[0] || [];
+  const peerRows = rows.slice(1);
+  const iface = {
+    interfaceName: String(ifaceRow[0] || safeInterface),
+    publicKey: String(ifaceRow[2] || '').trim(),
+    listenPort: Number.isFinite(Number(ifaceRow[3])) ? Number(ifaceRow[3]) : null,
+    fwmark: String(ifaceRow[4] || '').trim()
+  };
+  const peers = peerRows
+    .map((columns) => ({
+      interfaceName: String(columns[0] || safeInterface),
+      publicKey: String(columns[1] || '').trim(),
+      presharedKey: String(columns[2] || '').trim(),
+      endpoint: String(columns[3] || '').trim(),
+      allowedIps: String(columns[4] || '').trim(),
+      latestHandshakeEpoch: Number.isFinite(Number(columns[5])) ? Number(columns[5]) : 0,
+      transferRxBytes: Number.isFinite(Number(columns[6])) ? Number(columns[6]) : 0,
+      transferTxBytes: Number.isFinite(Number(columns[7])) ? Number(columns[7]) : 0,
+      persistentKeepalive: Number.isFinite(Number(columns[8])) ? Number(columns[8]) : null
+    }))
+    .filter((peer) => Boolean(peer.publicKey));
+  return {
+    available: true,
+    interface: iface,
+    peers
+  };
+}
+
+function getWireGuardServiceState(runtime) {
+  const safeRuntime = runtime && typeof runtime === 'object' ? runtime : {};
+  const unit = String(safeRuntime.serviceUnit || '').trim();
+  if (!unit) {
+    return {
+      unit: '',
+      isActive: false,
+      activeState: 'unknown',
+      subState: '',
+      unitFileState: '',
+      loadState: ''
+    };
+  }
+  const showResult = runSystemCommandSync(
+    'systemctl',
+    ['show', unit, '--property=LoadState,ActiveState,SubState,UnitFileState,Description,FragmentPath'],
+    { allowNonZero: true, timeoutMs: 8000, maxBuffer: 1024 * 1024 }
+  );
+  const details = parseKeyValueOutput(showResult.stdout || '');
+  const activeState = String(details.ActiveState || '').trim().toLowerCase() || 'unknown';
+  const subState = String(details.SubState || '').trim().toLowerCase();
+  const loadState = String(details.LoadState || '').trim().toLowerCase();
+  const unitFileState = String(details.UnitFileState || '').trim().toLowerCase();
+  return {
+    unit,
+    isActive: activeState === 'active',
+    activeState,
+    subState,
+    unitFileState,
+    loadState,
+    description: String(details.Description || '').trim(),
+    fragmentPath: String(details.FragmentPath || '').trim()
+  };
+}
+
+function parseIpv4Address(rawValue) {
+  const source = String(rawValue || '').trim();
+  if (net.isIP(source) !== 4) return null;
+  const parts = source.split('.').map((entry) => Number.parseInt(entry, 10));
+  if (parts.length !== 4 || parts.some((entry) => !Number.isInteger(entry) || entry < 0 || entry > 255)) {
+    return null;
+  }
+  return ((parts[0] << 24) >>> 0) + ((parts[1] << 16) >>> 0) + ((parts[2] << 8) >>> 0) + (parts[3] >>> 0);
+}
+
+function formatIpv4Address(value) {
+  const safe = Number(value) >>> 0;
+  return [
+    (safe >>> 24) & 255,
+    (safe >>> 16) & 255,
+    (safe >>> 8) & 255,
+    safe & 255
+  ].join('.');
+}
+
+function parseIpv4Cidr(rawValue) {
+  const source = String(rawValue || '').trim();
+  const match = /^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/.exec(source);
+  if (!match) return null;
+  const ip = parseIpv4Address(match[1]);
+  const prefix = Number.parseInt(match[2], 10);
+  if (ip === null || !Number.isInteger(prefix) || prefix < 1 || prefix > 32) return null;
+  const mask = prefix === 0 ? 0 : ((0xffffffff << (32 - prefix)) >>> 0);
+  const network = ip & mask;
+  const broadcast = (network | (~mask >>> 0)) >>> 0;
+  return {
+    ip,
+    prefix,
+    mask,
+    network,
+    broadcast,
+    cidr: `${match[1]}/${prefix}`
+  };
+}
+
+function extractWireGuardServerIpv4Network(interfaceAddressValue) {
+  const values = String(interfaceAddressValue || '')
+    .split(',')
+    .map((entry) => String(entry || '').trim())
+    .filter(Boolean);
+  for (const value of values) {
+    const parsed = parseIpv4Cidr(value);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function extractIpv4FromAllowedIps(allowedIpsValue) {
+  const values = String(allowedIpsValue || '')
+    .split(',')
+    .map((entry) => String(entry || '').trim())
+    .filter(Boolean);
+  for (const value of values) {
+    const parsed = parseIpv4Cidr(value);
+    if (parsed && parsed.prefix === 32) {
+      return formatIpv4Address(parsed.ip);
+    }
+  }
+  return '';
+}
+
+function collectUsedWireGuardIpv4(peers) {
+  const used = new Set();
+  (Array.isArray(peers) ? peers : []).forEach((peer) => {
+    const candidate = extractIpv4FromAllowedIps(peer && peer.allowedIps ? peer.allowedIps : '');
+    const parsed = parseIpv4Address(candidate);
+    if (parsed !== null) {
+      used.add(parsed);
+    }
+  });
+  return used;
+}
+
+function resolveWireGuardClientIp(parsedConfig, requestedIp = '') {
+  const network = extractWireGuardServerIpv4Network(parsedConfig && parsedConfig.interfaceData ? parsedConfig.interfaceData.address : '');
+  if (!network) {
+    throw createClientRequestError('No se pudo determinar la red IPv4 de WireGuard desde [Interface].Address.', 400);
+  }
+  const used = collectUsedWireGuardIpv4(parsedConfig && parsedConfig.peers ? parsedConfig.peers : []);
+  const requested = String(requestedIp || '').trim();
+  if (requested) {
+    const parsedRequested = parseIpv4Address(requested);
+    if (parsedRequested === null) {
+      throw createClientRequestError('IP cliente inválida. Usa formato IPv4 (ej: 10.8.0.9).', 400);
+    }
+    if ((parsedRequested & network.mask) !== network.network) {
+      throw createClientRequestError('La IP cliente debe pertenecer a la subred WireGuard de la interfaz.', 400);
+    }
+    if (parsedRequested === network.ip) {
+      throw createClientRequestError('La IP cliente no puede ser la IP del servidor WireGuard.', 400);
+    }
+    if (used.has(parsedRequested)) {
+      throw createClientRequestError('La IP cliente ya está asignada a otro peer.', 409);
+    }
+    return requested;
+  }
+  const firstHost = Math.max(network.network + 1, network.network + 2);
+  const lastHost = network.broadcast - 1;
+  const maxCandidates = Math.min(Math.max(lastHost - firstHost + 1, 0), 65535);
+  for (let offset = 0; offset < maxCandidates; offset += 1) {
+    const candidate = firstHost + offset;
+    if (candidate === network.ip) continue;
+    if (candidate <= network.network || candidate >= network.broadcast) continue;
+    if (used.has(candidate)) continue;
+    return formatIpv4Address(candidate >>> 0);
+  }
+  throw createClientRequestError('No hay IP disponible para asignar a un nuevo peer WireGuard.', 409);
+}
+
+function deriveWireGuardPublicKey(privateKey) {
+  const safePrivate = String(privateKey || '').trim();
+  if (!safePrivate) return '';
+  try {
+    const output = execFileSync('wg', ['pubkey'], {
+      input: `${safePrivate}\n`,
+      encoding: 'utf8',
+      timeout: 6000,
+      maxBuffer: 1024 * 128
+    });
+    return String(output || '').trim();
+  } catch (_error) {
+    return '';
+  }
+}
+
+function generateWireGuardKeyPair() {
+  if (!commandExistsSync('wg')) {
+    throw createClientRequestError('El binario "wg" no está disponible en el servidor.', 500);
+  }
+  const privateResult = runSystemCommandSync('wg', ['genkey'], {
+    allowNonZero: true,
+    timeoutMs: 8000,
+    maxBuffer: 1024 * 128
+  });
+  if (!privateResult.ok || Number(privateResult.code) !== 0) {
+    throw createClientRequestError(
+      `No se pudo generar clave privada de WireGuard: ${truncateForNotify(privateResult.stderr || privateResult.stdout || 'wg_genkey_failed', 220)}`,
+      500
+    );
+  }
+  const privateKey = String(privateResult.stdout || '').trim();
+  const publicKey = deriveWireGuardPublicKey(privateKey);
+  if (!publicKey) {
+    throw createClientRequestError('No se pudo derivar la clave pública del nuevo peer.', 500);
+  }
+  return {
+    privateKey,
+    publicKey
+  };
+}
+
+function readWireGuardInterfacePrivateKey(interfaceLines) {
+  const lines = Array.isArray(interfaceLines) ? interfaceLines : [];
+  for (const line of lines) {
+    const kv = parseWireGuardKeyValue(line);
+    if (!kv) continue;
+    if (kv.keyLower === 'privatekey') {
+      return String(kv.value || '').trim();
+    }
+  }
+  return '';
+}
+
+function getWireGuardServerPublicKey(runtime, parsedConfig, wgDump) {
+  const dumpPublic = String(wgDump && wgDump.interface && wgDump.interface.publicKey ? wgDump.interface.publicKey : '').trim();
+  if (dumpPublic) return dumpPublic;
+  const interfacePrivate = readWireGuardInterfacePrivateKey(parsedConfig && parsedConfig.interfaceLines ? parsedConfig.interfaceLines : []);
+  const derived = deriveWireGuardPublicKey(interfacePrivate);
+  if (derived) return derived;
+  const params = loadWireGuardParams();
+  const fromParams = String(params.SERVER_PUB_KEY || '').trim();
+  if (fromParams) return fromParams;
+  throw createClientRequestError('No se pudo determinar la clave pública del servidor WireGuard.', 500);
+}
+
+function getWireGuardPeerProfileForUser(userId, peerId) {
+  const safeUserId = getSafeUserId(userId);
+  const safePeerId = String(peerId || '').trim();
+  if (!safePeerId) return null;
+  const row = getWireGuardPeerProfileByIdStmt.get(safePeerId);
+  if (!row) return null;
+  const ownerId = getSafeUserId(row.user_id);
+  if (safeUserId && ownerId && safeUserId !== ownerId) {
+    return {
+      ...row,
+      _ownerMismatch: true
+    };
+  }
+  return row;
+}
+
+function serializeWireGuardPeerProfileRow(row) {
+  if (!row || typeof row !== 'object') return null;
+  return {
+    id: String(row.id || ''),
+    userId: getSafeUserId(row.user_id),
+    interfaceName: normalizeWireGuardInterfaceName(row.interface_name),
+    name: normalizeWireGuardPeerName(row.peer_name),
+    publicKey: String(row.public_key || '').trim(),
+    clientIp: String(row.client_ip || '').trim(),
+    allowedIps: String(row.allowed_ips || '').trim(),
+    dns: String(row.dns || '').trim(),
+    endpoint: String(row.endpoint || '').trim(),
+    keepaliveSeconds: Number.isFinite(Number(row.keepalive_seconds)) ? Number(row.keepalive_seconds) : wireGuardKeepaliveDefault,
+    notes: String(row.notes || '').trim(),
+    createdAt: String(row.created_at || '').trim(),
+    updatedAt: String(row.updated_at || '').trim(),
+    revokedAt: String(row.revoked_at || '').trim()
+  };
+}
+
+function getWireGuardSettingsForUser(userId) {
+  const safeUserId = getSafeUserId(userId);
+  const row = safeUserId ? getWireGuardSettingsForUserStmt.get(safeUserId) : null;
+  const params = loadWireGuardParams();
+  const endpointFromParams = String(params.SERVER_PUB_IP || '').trim();
+  const dnsFromParams = [String(params.CLIENT_DNS_1 || '').trim(), String(params.CLIENT_DNS_2 || '').trim()]
+    .filter(Boolean)
+    .join(',');
+  const allowedFromParams = String(params.ALLOWED_IPS || '').trim();
+  return {
+    endpointHost: String(row && row.endpoint_host ? row.endpoint_host : wireGuardPublicEndpointDefault || endpointFromParams).trim(),
+    defaultDns: normalizeWireGuardDns(row && row.default_dns ? row.default_dns : dnsFromParams || wireGuardClientDnsDefault),
+    defaultAllowedIps: normalizeWireGuardAllowedIps(
+      row && row.default_allowed_ips ? row.default_allowed_ips : allowedFromParams || wireGuardAllowedIpsDefault
+    ),
+    defaultKeepaliveSeconds: normalizeWireGuardKeepalive(
+      row && Number.isFinite(Number(row.default_keepalive_seconds)) ? row.default_keepalive_seconds : wireGuardKeepaliveDefault
+    ),
+    updatedAt: String(row && row.updated_at ? row.updated_at : '').trim()
+  };
+}
+
+function upsertWireGuardSettingsForUser(userId, payload = {}) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) {
+    throw createClientRequestError('user_id inválido', 400);
+  }
+  const current = getWireGuardSettingsForUser(safeUserId);
+  const source = payload && typeof payload === 'object' ? payload : {};
+  const next = {
+    endpointHost: String(source.endpointHost || current.endpointHost || '')
+      .replace(/\s+/g, '')
+      .trim()
+      .slice(0, 255),
+    defaultDns: normalizeWireGuardDns(source.defaultDns, current.defaultDns),
+    defaultAllowedIps: normalizeWireGuardAllowedIps(source.defaultAllowedIps, current.defaultAllowedIps),
+    defaultKeepaliveSeconds: normalizeWireGuardKeepalive(source.defaultKeepaliveSeconds, current.defaultKeepaliveSeconds),
+    updatedAt: nowIso()
+  };
+  upsertWireGuardSettingsForUserStmt.run(
+    safeUserId,
+    next.endpointHost,
+    next.defaultDns,
+    next.defaultAllowedIps,
+    next.defaultKeepaliveSeconds,
+    next.updatedAt
+  );
+  return getWireGuardSettingsForUser(safeUserId);
+}
+
+function buildWireGuardPeerBlock(peerData) {
+  const source = peerData && typeof peerData === 'object' ? peerData : {};
+  const alias = normalizeWireGuardPeerName(source.name || '');
+  const createdAt = String(source.createdAt || nowIso()).trim();
+  const lines = [];
+  if (alias) {
+    lines.push(`# codexweb-name: ${alias}`);
+  }
+  lines.push(`# codexweb-created-at: ${createdAt}`);
+  lines.push('[Peer]');
+  lines.push(`PublicKey = ${String(source.publicKey || '').trim()}`);
+  lines.push(`AllowedIPs = ${String(source.allowedIps || '').trim()}`);
+  return lines;
+}
+
+function buildWireGuardClientConfig(payload) {
+  const source = payload && typeof payload === 'object' ? payload : {};
+  const dns = normalizeWireGuardDns(source.dns || '');
+  const lines = [
+    '[Interface]',
+    `PrivateKey = ${String(source.clientPrivateKey || '').trim()}`,
+    `Address = ${String(source.clientIp || '').trim()}/32`
+  ];
+  if (dns) {
+    lines.push(`DNS = ${dns}`);
+  }
+  lines.push('');
+  lines.push('[Peer]');
+  lines.push(`PublicKey = ${String(source.serverPublicKey || '').trim()}`);
+  lines.push(`Endpoint = ${String(source.endpoint || '').trim()}`);
+  lines.push(`AllowedIPs = ${normalizeWireGuardAllowedIps(source.allowedIps || '')}`);
+  const keepalive = normalizeWireGuardKeepalive(source.keepaliveSeconds, wireGuardKeepaliveDefault);
+  if (keepalive > 0) {
+    lines.push(`PersistentKeepalive = ${keepalive}`);
+  }
+  return `${lines.join('\n').trim()}\n`;
+}
+
+function buildWireGuardStatusSnapshot(userId, options = {}) {
+  const runtime = resolveWireGuardRuntime(options.interfaceName);
+  const settings = getWireGuardSettingsForUser(userId);
+  const service = getWireGuardServiceState(runtime);
+  const params = loadWireGuardParams();
+  let parsedConfig = {
+    interfaceLines: [],
+    peers: [],
+    interfaceData: {
+      address: '',
+      listenPort: '',
+      dns: '',
+      postUp: '',
+      postDown: '',
+      hasPrivateKey: false
+    }
+  };
+  let configError = '';
+  if (runtime.configExists) {
+    try {
+      parsedConfig = loadWireGuardConfig(runtime);
+    } catch (error) {
+      configError = truncateForNotify(error && error.message ? error.message : 'wireguard_config_read_failed', 220);
+    }
+  } else {
+    configError = 'No existe archivo de configuración WireGuard para esta interfaz.';
+  }
+  const wgDump = parseWgDumpForInterface(runtime.interfaceName);
+  const runtimePeerByPublicKey = new Map();
+  (Array.isArray(wgDump.peers) ? wgDump.peers : []).forEach((peer) => {
+    const key = String(peer.publicKey || '').trim();
+    if (!key) return;
+    runtimePeerByPublicKey.set(key, peer);
+  });
+  const profileRows = listWireGuardPeerProfilesByInterfaceStmt
+    .all(runtime.interfaceName)
+    .filter((row) => String(row.revoked_at || '').trim() === '');
+  const profileByPublicKey = new Map();
+  profileRows.forEach((row) => {
+    const key = String(row.public_key || '').trim();
+    if (!key) return;
+    if (profileByPublicKey.has(key)) return;
+    profileByPublicKey.set(key, row);
+  });
+  const unionKeys = new Set();
+  (Array.isArray(parsedConfig.peers) ? parsedConfig.peers : []).forEach((peer) => {
+    if (peer.publicKey) unionKeys.add(peer.publicKey);
+  });
+  runtimePeerByPublicKey.forEach((_value, key) => unionKeys.add(key));
+  profileByPublicKey.forEach((_value, key) => unionKeys.add(key));
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const peers = Array.from(unionKeys)
+    .map((publicKey) => {
+      const configPeer = (parsedConfig.peers || []).find((entry) => String(entry.publicKey || '').trim() === publicKey) || null;
+      const runtimePeer = runtimePeerByPublicKey.get(publicKey) || null;
+      const profileRow = profileByPublicKey.get(publicKey) || null;
+      const profile = serializeWireGuardPeerProfileRow(profileRow);
+      const latestHandshakeEpoch =
+        runtimePeer && Number.isFinite(Number(runtimePeer.latestHandshakeEpoch))
+          ? Number(runtimePeer.latestHandshakeEpoch)
+          : 0;
+      const secondsSinceHandshake = latestHandshakeEpoch > 0 ? Math.max(0, nowSeconds - latestHandshakeEpoch) : null;
+      const isActive = secondsSinceHandshake !== null && secondsSinceHandshake <= wireGuardActiveHandshakeWindowSeconds;
+      const peerId = buildWireGuardPeerIdFromPublicKey(publicKey);
+      const clientIp =
+        String(profile && profile.clientIp ? profile.clientIp : '') ||
+        extractIpv4FromAllowedIps(runtimePeer ? runtimePeer.allowedIps : configPeer ? configPeer.allowedIps : '');
+      const name =
+        normalizeWireGuardPeerName(profile && profile.name ? profile.name : '') ||
+        normalizeWireGuardPeerName(configPeer && configPeer.name ? configPeer.name : '') ||
+        `peer-${String(publicKey || '').slice(0, 8)}`;
+      return {
+        id: peerId,
+        name,
+        publicKey,
+        clientIp,
+        allowedIps: String(
+          runtimePeer && runtimePeer.allowedIps
+            ? runtimePeer.allowedIps
+            : configPeer && configPeer.allowedIps
+              ? configPeer.allowedIps
+              : profile && profile.allowedIps
+                ? profile.allowedIps
+                : ''
+        ).trim(),
+        endpoint: String(runtimePeer && runtimePeer.endpoint ? runtimePeer.endpoint : configPeer && configPeer.endpoint ? configPeer.endpoint : '').trim(),
+        latestHandshakeAt: latestHandshakeEpoch > 0 ? new Date(latestHandshakeEpoch * 1000).toISOString() : '',
+        secondsSinceHandshake,
+        active: Boolean(isActive),
+        transferRxBytes: Number(runtimePeer && runtimePeer.transferRxBytes ? runtimePeer.transferRxBytes : 0),
+        transferTxBytes: Number(runtimePeer && runtimePeer.transferTxBytes ? runtimePeer.transferTxBytes : 0),
+        persistentKeepalive:
+          runtimePeer && Number.isFinite(Number(runtimePeer.persistentKeepalive))
+            ? Number(runtimePeer.persistentKeepalive)
+            : profile && Number.isFinite(Number(profile.keepaliveSeconds))
+              ? Number(profile.keepaliveSeconds)
+              : null,
+        createdAt: String(
+          profile && profile.createdAt
+            ? profile.createdAt
+            : configPeer && configPeer.createdAt
+              ? configPeer.createdAt
+              : ''
+        ).trim(),
+        notes: String(profile && profile.notes ? profile.notes : '').trim(),
+        hasProfile: Boolean(profileRow && String(profileRow.config_cipher || '').trim())
+      };
+    })
+    .sort((a, b) => {
+      const aTs = a.latestHandshakeAt ? Date.parse(a.latestHandshakeAt) : 0;
+      const bTs = b.latestHandshakeAt ? Date.parse(b.latestHandshakeAt) : 0;
+      if (aTs !== bTs) return bTs - aTs;
+      return a.name.localeCompare(b.name);
+    });
+
+  const totalRxBytes = peers.reduce((sum, peer) => sum + Number(peer.transferRxBytes || 0), 0);
+  const totalTxBytes = peers.reduce((sum, peer) => sum + Number(peer.transferTxBytes || 0), 0);
+  const listenPortFromConfig = Number.parseInt(String(parsedConfig.interfaceData.listenPort || ''), 10);
+  const listenPort =
+    Number.isInteger(listenPortFromConfig) && listenPortFromConfig > 0
+      ? listenPortFromConfig
+      : wgDump.interface && Number.isInteger(Number(wgDump.interface.listenPort))
+        ? Number(wgDump.interface.listenPort)
+        : Number.parseInt(String(params.SERVER_PORT || ''), 10) || null;
+  return {
+    runtime: {
+      interfaceName: runtime.interfaceName,
+      availableInterfaces: runtime.availableInterfaces,
+      configPath: runtime.configPath,
+      configExists: runtime.configExists
+    },
+    binaries: {
+      wg: commandExistsSync('wg'),
+      wgQuick: commandExistsSync('wg-quick'),
+      qrencode: commandExistsSync('qrencode'),
+      systemctl: commandExistsSync('systemctl')
+    },
+    service,
+    interface: {
+      name: runtime.interfaceName,
+      address: String(parsedConfig.interfaceData.address || '').trim(),
+      listenPort,
+      postUp: String(parsedConfig.interfaceData.postUp || '').trim(),
+      postDown: String(parsedConfig.interfaceData.postDown || '').trim(),
+      hasPrivateKey: Boolean(parsedConfig.interfaceData.hasPrivateKey),
+      publicKey: String(wgDump.interface && wgDump.interface.publicKey ? wgDump.interface.publicKey : '').trim(),
+      fwmark: String(wgDump.interface && wgDump.interface.fwmark ? wgDump.interface.fwmark : '').trim(),
+      configError
+    },
+    profileDefaults: settings,
+    peers,
+    stats: {
+      configuredPeers: peers.length,
+      activePeers: peers.filter((peer) => peer.active).length,
+      totalRxBytes,
+      totalTxBytes,
+      activeWindowSeconds: wireGuardActiveHandshakeWindowSeconds,
+      updatedAt: nowIso()
+    }
+  };
+}
+
+function createWireGuardPeerProfile(userId, payload = {}, options = {}) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) {
+    throw createClientRequestError('user_id inválido', 400);
+  }
+  const runtime = resolveWireGuardRuntime(options.interfaceName || payload.interfaceName);
+  if (!runtime.configExists) {
+    throw createClientRequestError(
+      `No existe configuración WireGuard para ${runtime.interfaceName} (${runtime.configPath}).`,
+      404
+    );
+  }
+  const parsedConfig = loadWireGuardConfig(runtime);
+  const profileSettings = getWireGuardSettingsForUser(safeUserId);
+  const peerName = normalizeWireGuardPeerName(payload.name || payload.alias || '');
+  if (!peerName) {
+    throw createClientRequestError('Indica nombre/alias del perfil WireGuard.', 400);
+  }
+  const clientIp = resolveWireGuardClientIp(parsedConfig, payload.clientIp || payload.clientIpv4 || '');
+  const allowedIps = normalizeWireGuardAllowedIps(payload.allowedIps, profileSettings.defaultAllowedIps);
+  const dns = normalizeWireGuardDns(payload.dns, profileSettings.defaultDns);
+  const keepaliveSeconds = normalizeWireGuardKeepalive(payload.keepaliveSeconds, profileSettings.defaultKeepaliveSeconds);
+  const notes = String(payload.notes || payload.comment || '').trim().slice(0, 280);
+  const endpointHost = String(
+    payload.endpointHost ||
+      profileSettings.endpointHost ||
+      wireGuardPublicEndpointDefault ||
+      loadWireGuardParams().SERVER_PUB_IP ||
+      ''
+  )
+    .replace(/\s+/g, '')
+    .trim()
+    .slice(0, 255);
+  if (!endpointHost) {
+    throw createClientRequestError('No se pudo resolver endpoint público para el perfil WireGuard.', 400);
+  }
+  const wgDump = parseWgDumpForInterface(runtime.interfaceName);
+  const serverPublicKey = getWireGuardServerPublicKey(runtime, parsedConfig, wgDump);
+  const listenPort =
+    Number.parseInt(String(parsedConfig.interfaceData.listenPort || ''), 10) ||
+    Number.parseInt(String(loadWireGuardParams().SERVER_PORT || ''), 10);
+  if (!Number.isInteger(listenPort) || listenPort <= 0) {
+    throw createClientRequestError('No se pudo resolver ListenPort de WireGuard.', 400);
+  }
+  const keyPair = generateWireGuardKeyPair();
+  const peerId = buildWireGuardPeerIdFromPublicKey(keyPair.publicKey);
+  if (!peerId) {
+    throw createClientRequestError('No se pudo generar identificador del peer.', 500);
+  }
+  const existingByPublicKey = getWireGuardPeerProfileByPublicKeyStmt.get(runtime.interfaceName, keyPair.publicKey);
+  if (existingByPublicKey) {
+    throw createClientRequestError('Conflicto inesperado de clave pública. Reintenta crear el perfil.', 409);
+  }
+  const endpoint = `${endpointHost}:${listenPort}`;
+  const clientConfig = buildWireGuardClientConfig({
+    clientPrivateKey: keyPair.privateKey,
+    clientIp,
+    dns,
+    serverPublicKey,
+    endpoint,
+    allowedIps,
+    keepaliveSeconds
+  });
+  const createdAt = nowIso();
+  const peerBlock = parseWireGuardPeerBlock(
+    buildWireGuardPeerBlock({
+      name: peerName,
+      publicKey: keyPair.publicKey,
+      allowedIps: `${clientIp}/32`,
+      createdAt
+    })
+  );
+  const nextConfig = {
+    ...parsedConfig,
+    peers: [...parsedConfig.peers, peerBlock]
+  };
+  writeWireGuardConfig(runtime, nextConfig);
+  const service = getWireGuardServiceState(runtime);
+  if (service.isActive) {
+    const applyResult = runSystemCommandSync(
+      'wg',
+      ['set', runtime.interfaceName, 'peer', keyPair.publicKey, 'allowed-ips', `${clientIp}/32`],
+      {
+        allowNonZero: true,
+        timeoutMs: 12000,
+        maxBuffer: 1024 * 1024
+      }
+    );
+    if (!applyResult.ok || Number(applyResult.code) !== 0) {
+      try {
+        writeWireGuardConfig(runtime, parsedConfig);
+      } catch (_rollbackError) {
+        // ignore rollback failure
+      }
+      throw createClientRequestError(
+        `No se pudo aplicar peer en runtime WireGuard: ${truncateForNotify(
+          applyResult.stderr || applyResult.stdout || 'wg_set_failed',
+          220
+        )}`,
+        500
+      );
+    }
+  }
+  upsertWireGuardPeerProfileStmt.run(
+    peerId,
+    safeUserId,
+    runtime.interfaceName,
+    peerName,
+    keyPair.publicKey,
+    clientIp,
+    allowedIps,
+    dns,
+    endpoint,
+    keepaliveSeconds,
+    notes,
+    encryptSecretText(clientConfig),
+    createdAt,
+    createdAt
+  );
+  return {
+    id: peerId,
+    name: peerName,
+    publicKey: keyPair.publicKey,
+    clientIp,
+    allowedIps: `${clientIp}/32`,
+    profileAllowedIps: allowedIps,
+    dns,
+    endpoint,
+    keepaliveSeconds,
+    createdAt,
+    hasProfile: true
+  };
+}
+
+function deleteWireGuardPeer(runtime, payload = {}) {
+  const safeRuntime = runtime && typeof runtime === 'object' ? runtime : resolveWireGuardRuntime();
+  const parsedConfig = loadWireGuardConfig(safeRuntime);
+  const requestedPeerId = String(payload.peerId || '').trim();
+  const requestedPublicKey = String(payload.publicKey || '').trim();
+  let targetPeer = null;
+  if (requestedPublicKey) {
+    targetPeer = parsedConfig.peers.find((entry) => String(entry.publicKey || '').trim() === requestedPublicKey) || null;
+  }
+  if (!targetPeer && requestedPeerId) {
+    targetPeer =
+      parsedConfig.peers.find((entry) => buildWireGuardPeerIdFromPublicKey(entry.publicKey) === requestedPeerId) || null;
+  }
+  if (!targetPeer || !targetPeer.publicKey) {
+    throw createClientRequestError('Peer WireGuard no encontrado.', 404);
+  }
+  const service = getWireGuardServiceState(safeRuntime);
+  if (service.isActive) {
+    const removeRuntimeResult = runSystemCommandSync(
+      'wg',
+      ['set', safeRuntime.interfaceName, 'peer', targetPeer.publicKey, 'remove'],
+      {
+        allowNonZero: true,
+        timeoutMs: 12000,
+        maxBuffer: 1024 * 1024
+      }
+    );
+    if (!removeRuntimeResult.ok || Number(removeRuntimeResult.code) !== 0) {
+      throw createClientRequestError(
+        `No se pudo revocar peer en runtime WireGuard: ${truncateForNotify(
+          removeRuntimeResult.stderr || removeRuntimeResult.stdout || 'wg_peer_remove_failed',
+          220
+        )}`,
+        500
+      );
+    }
+  }
+  const nextConfig = {
+    ...parsedConfig,
+    peers: parsedConfig.peers.filter((entry) => String(entry.publicKey || '').trim() !== targetPeer.publicKey)
+  };
+  writeWireGuardConfig(safeRuntime, nextConfig);
+  return {
+    publicKey: targetPeer.publicKey,
+    peerId: buildWireGuardPeerIdFromPublicKey(targetPeer.publicKey),
+    clientIp: extractIpv4FromAllowedIps(targetPeer.allowedIps),
+    allowedIps: targetPeer.allowedIps
+  };
+}
+
+function getWireGuardPeerProfileConfigById(peerId) {
+  const safePeerId = String(peerId || '').trim();
+  if (!safePeerId) {
+    throw createClientRequestError('peer_id inválido', 400);
+  }
+  const row = getWireGuardPeerProfileByIdStmt.get(safePeerId);
+  if (!row) {
+    throw createClientRequestError('Perfil WireGuard no encontrado para este peer.', 404);
+  }
+  if (String(row.revoked_at || '').trim()) {
+    throw createClientRequestError('El perfil WireGuard está revocado y ya no es descargable.', 404);
+  }
+  const cipher = String(row.config_cipher || '').trim();
+  if (!cipher) {
+    throw createClientRequestError('El peer no tiene perfil descargable almacenado.', 404);
+  }
+  let configText = '';
+  try {
+    configText = decryptSecretText(cipher);
+  } catch (_error) {
+    throw createClientRequestError('No se pudo descifrar el perfil WireGuard almacenado.', 500);
+  }
+  const safeName = sanitizeDriveFileName(row.peer_name || row.id || 'wireguard-peer', 'wireguard-peer')
+    .replace(/\s+/g, '_')
+    .toLowerCase();
+  return {
+    row,
+    configText,
+    fileName: `${safeName}.conf`
+  };
+}
+
+function buildWireGuardDiagnostics(userId, options = {}) {
+  const runtime = resolveWireGuardRuntime(options.interfaceName);
+  const service = getWireGuardServiceState(runtime);
+  const lineLimitRaw = Number.parseInt(String(options.lines || ''), 10);
+  const lines = Number.isInteger(lineLimitRaw) ? Math.min(Math.max(lineLimitRaw, 10), wireGuardDiagnosticsMaxLogLines) : 120;
+  const logsResult = runSystemCommandSync(
+    'journalctl',
+    ['-u', runtime.serviceUnit, '-n', String(lines), '--no-pager', '--output=short-iso'],
+    {
+      allowNonZero: true,
+      timeoutMs: 12000,
+      maxBuffer: 1024 * 1024 * 8
+    }
+  );
+  const stripResult = runtime.configExists
+    ? runSystemCommandSync('wg-quick', ['strip', runtime.configPath], {
+        allowNonZero: true,
+        timeoutMs: 12000,
+        maxBuffer: 1024 * 1024 * 4
+      })
+    : { ok: false, code: 1, stdout: '', stderr: 'config_missing' };
+  const statusSnapshot = buildWireGuardStatusSnapshot(userId, {
+    interfaceName: runtime.interfaceName
+  });
+  return {
+    runtime: statusSnapshot.runtime,
+    service: statusSnapshot.service,
+    checks: {
+      wgBinary: commandExistsSync('wg'),
+      wgQuickBinary: commandExistsSync('wg-quick'),
+      systemctlBinary: commandExistsSync('systemctl'),
+      configExists: runtime.configExists,
+      configStripOk: Boolean(stripResult.ok && Number(stripResult.code) === 0),
+      configStripError:
+        stripResult.ok && Number(stripResult.code) === 0
+          ? ''
+          : truncateForNotify(stripResult.stderr || stripResult.stdout || 'wg_quick_strip_failed', 220)
+    },
+    logs: {
+      lines,
+      output: String(logsResult.stdout || '').trim() || String(logsResult.stderr || '').trim() || '-- No entries --'
+    }
+  };
 }
 
 function buildDeployedAppId(source, locator) {
@@ -10017,7 +11167,7 @@ CREATE TABLE IF NOT EXISTS user_agent_permissions (
   allow_network INTEGER NOT NULL DEFAULT 1,
   allow_git INTEGER NOT NULL DEFAULT 1,
   allow_backup_restore INTEGER NOT NULL DEFAULT 1,
-  allowed_tools_json TEXT NOT NULL DEFAULT '["chat","git","storage","drive","backups","deployments","shell"]',
+  allowed_tools_json TEXT NOT NULL DEFAULT '["chat","git","storage","drive","backups","deployments","shell","wireguard"]',
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (user_id, agent_id),
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -10266,6 +11416,41 @@ ON deployed_app_cloud_backups(user_id, app_id, created_at DESC, id DESC);
 
 CREATE INDEX IF NOT EXISTS idx_deployed_app_cloud_backups_account_created
 ON deployed_app_cloud_backups(account_id, created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS wireguard_peer_profiles (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  interface_name TEXT NOT NULL,
+  peer_name TEXT NOT NULL DEFAULT '',
+  public_key TEXT NOT NULL,
+  client_ip TEXT NOT NULL DEFAULT '',
+  allowed_ips TEXT NOT NULL DEFAULT '',
+  dns TEXT NOT NULL DEFAULT '',
+  endpoint TEXT NOT NULL DEFAULT '',
+  keepalive_seconds INTEGER NOT NULL DEFAULT 25,
+  notes TEXT NOT NULL DEFAULT '',
+  config_cipher TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  revoked_at TEXT NOT NULL DEFAULT '',
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_wireguard_peer_profiles_user_interface
+ON wireguard_peer_profiles(user_id, interface_name, created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_wireguard_peer_profiles_public_key
+ON wireguard_peer_profiles(public_key, revoked_at, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS wireguard_settings (
+  user_id INTEGER PRIMARY KEY,
+  endpoint_host TEXT NOT NULL DEFAULT '',
+  default_dns TEXT NOT NULL DEFAULT '',
+  default_allowed_ips TEXT NOT NULL DEFAULT '',
+  default_keepalive_seconds INTEGER NOT NULL DEFAULT 25,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
 `);
 
 function hasConversationColumn(columnName) {
@@ -10374,6 +11559,16 @@ WHERE allowed_tools_json LIKE '%"dropbox"%'
 `);
 db.exec(`
 UPDATE user_agent_permissions
+SET allowed_tools_json = CASE
+  WHEN allowed_tools_json LIKE '%"wireguard"%' THEN allowed_tools_json
+  WHEN TRIM(COALESCE(allowed_tools_json, '')) = '' THEN '${JSON.stringify(aiPermissionDefaultAllowedTools)}'
+  WHEN SUBSTR(TRIM(allowed_tools_json), -1, 1) = ']'
+    THEN SUBSTR(TRIM(allowed_tools_json), 1, LENGTH(TRIM(allowed_tools_json)) - 1) || ',"wireguard"]'
+  ELSE '${JSON.stringify(aiPermissionDefaultAllowedTools)}'
+END
+`);
+db.exec(`
+UPDATE user_agent_permissions
 SET
   can_write_files = CASE
     WHEN read_only = 1 THEN 0
@@ -10401,6 +11596,24 @@ SET
     WHEN root_folder_id = 'root' THEN ''
     ELSE COALESCE(root_folder_id, '')
   END
+`);
+db.exec(`
+UPDATE wireguard_settings
+SET
+  endpoint_host = COALESCE(endpoint_host, ''),
+  default_dns = CASE
+    WHEN TRIM(COALESCE(default_dns, '')) = '' THEN '${wireGuardClientDnsDefault}'
+    ELSE default_dns
+  END,
+  default_allowed_ips = CASE
+    WHEN TRIM(COALESCE(default_allowed_ips, '')) = '' THEN '${wireGuardAllowedIpsDefault}'
+    ELSE default_allowed_ips
+  END,
+  default_keepalive_seconds = CASE
+    WHEN default_keepalive_seconds >= 0 THEN default_keepalive_seconds
+    ELSE ${wireGuardKeepaliveDefault}
+  END,
+  updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)
 `);
 db.exec(`
 UPDATE chat_projects
@@ -11246,6 +12459,152 @@ const listDeployedCloudBackupsForUserAndAppStmt = db.prepare(`
     AND deleted_at = ''
   ORDER BY created_at DESC, id DESC
   LIMIT ?
+`);
+const getWireGuardSettingsForUserStmt = db.prepare(`
+  SELECT
+    user_id,
+    endpoint_host,
+    default_dns,
+    default_allowed_ips,
+    default_keepalive_seconds,
+    updated_at
+  FROM wireguard_settings
+  WHERE user_id = ?
+  LIMIT 1
+`);
+const upsertWireGuardSettingsForUserStmt = db.prepare(`
+  INSERT INTO wireguard_settings (
+    user_id,
+    endpoint_host,
+    default_dns,
+    default_allowed_ips,
+    default_keepalive_seconds,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?)
+  ON CONFLICT(user_id) DO UPDATE SET
+    endpoint_host = excluded.endpoint_host,
+    default_dns = excluded.default_dns,
+    default_allowed_ips = excluded.default_allowed_ips,
+    default_keepalive_seconds = excluded.default_keepalive_seconds,
+    updated_at = excluded.updated_at
+`);
+const listWireGuardPeerProfilesByInterfaceStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    interface_name,
+    peer_name,
+    public_key,
+    client_ip,
+    allowed_ips,
+    dns,
+    endpoint,
+    keepalive_seconds,
+    notes,
+    config_cipher,
+    created_at,
+    updated_at,
+    revoked_at
+  FROM wireguard_peer_profiles
+  WHERE interface_name = ?
+    AND revoked_at = ''
+  ORDER BY created_at DESC, id DESC
+`);
+const getWireGuardPeerProfileByIdStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    interface_name,
+    peer_name,
+    public_key,
+    client_ip,
+    allowed_ips,
+    dns,
+    endpoint,
+    keepalive_seconds,
+    notes,
+    config_cipher,
+    created_at,
+    updated_at,
+    revoked_at
+  FROM wireguard_peer_profiles
+  WHERE id = ?
+  LIMIT 1
+`);
+const getWireGuardPeerProfileByPublicKeyStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    interface_name,
+    peer_name,
+    public_key,
+    client_ip,
+    allowed_ips,
+    dns,
+    endpoint,
+    keepalive_seconds,
+    notes,
+    config_cipher,
+    created_at,
+    updated_at,
+    revoked_at
+  FROM wireguard_peer_profiles
+  WHERE interface_name = ?
+    AND public_key = ?
+    AND revoked_at = ''
+  ORDER BY created_at DESC, id DESC
+  LIMIT 1
+`);
+const upsertWireGuardPeerProfileStmt = db.prepare(`
+  INSERT INTO wireguard_peer_profiles (
+    id,
+    user_id,
+    interface_name,
+    peer_name,
+    public_key,
+    client_ip,
+    allowed_ips,
+    dns,
+    endpoint,
+    keepalive_seconds,
+    notes,
+    config_cipher,
+    created_at,
+    updated_at,
+    revoked_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '')
+  ON CONFLICT(id) DO UPDATE SET
+    user_id = excluded.user_id,
+    interface_name = excluded.interface_name,
+    peer_name = excluded.peer_name,
+    public_key = excluded.public_key,
+    client_ip = excluded.client_ip,
+    allowed_ips = excluded.allowed_ips,
+    dns = excluded.dns,
+    endpoint = excluded.endpoint,
+    keepalive_seconds = excluded.keepalive_seconds,
+    notes = excluded.notes,
+    config_cipher = excluded.config_cipher,
+    updated_at = excluded.updated_at,
+    revoked_at = ''
+`);
+const revokeWireGuardPeerProfileByIdStmt = db.prepare(`
+  UPDATE wireguard_peer_profiles
+  SET
+    revoked_at = ?,
+    updated_at = ?
+  WHERE id = ?
+`);
+const revokeWireGuardPeerProfileByPublicKeyStmt = db.prepare(`
+  UPDATE wireguard_peer_profiles
+  SET
+    revoked_at = ?,
+    updated_at = ?
+  WHERE interface_name = ?
+    AND public_key = ?
+    AND revoked_at = ''
 `);
 const listMessagesStmt = db.prepare(`
   SELECT id, role, content, created_at
@@ -15479,6 +16838,454 @@ app.get('/api/tools/deployed-apps/:appId/logs', requireAuth, (req, res) => {
     logs: logsPayload.logs,
     fetchedAt: nowIso()
   });
+});
+
+app.get('/api/tools/wireguard/status', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'wireguard', {
+    requiresSensitiveTool: false,
+    requiresShell: true
+  });
+  if (!permission) return;
+  try {
+    const status = buildWireGuardStatusSnapshot(safeUserId, {
+      interfaceName: req.query.interfaceName
+    });
+    return res.json({
+      ok: true,
+      wireguard: status
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo leer estado de WireGuard: ${truncateForNotify(
+              error && error.message ? error.message : 'wireguard_status_failed',
+              220
+            )}`
+    });
+  }
+});
+
+app.post('/api/tools/wireguard/service', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'wireguard', {
+    requiresSensitiveTool: true,
+    requiresShell: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  const action = String(req.body && req.body.action ? req.body.action : '')
+    .trim()
+    .toLowerCase();
+  if (!['start', 'stop', 'restart', 'reload'].includes(action)) {
+    return res.status(400).json({ error: 'Acción inválida. Usa start, stop, restart o reload.' });
+  }
+  const confirmText = String(req.body && req.body.confirm ? req.body.confirm : '')
+    .trim()
+    .toUpperCase();
+  if (action === 'stop' && confirmText !== 'STOP') {
+    return res.status(400).json({ error: 'Confirmación requerida para stop. Envía confirm=STOP.' });
+  }
+  if ((action === 'restart' || action === 'reload') && confirmText !== 'RESTART') {
+    return res.status(400).json({ error: 'Confirmación requerida para restart/reload. Envía confirm=RESTART.' });
+  }
+  try {
+    const runtime = resolveWireGuardRuntime(req.body && req.body.interfaceName);
+    const currentService = getWireGuardServiceState(runtime);
+    const effectiveAction =
+      action === 'reload'
+        ? currentService.isActive
+          ? 'restart'
+          : 'start'
+        : action;
+    const result = runSystemCommandSync('systemctl', [effectiveAction, runtime.serviceUnit, '--no-pager'], {
+      allowNonZero: true,
+      timeoutMs: 20000,
+      maxBuffer: 1024 * 1024 * 2
+    });
+    if (!result.ok || Number(result.code) !== 0) {
+      const status = buildWireGuardStatusSnapshot(safeUserId, { interfaceName: runtime.interfaceName });
+      return res.status(500).json({
+        error: `No se pudo ejecutar ${action} en ${runtime.serviceUnit}: ${truncateForNotify(
+          result.stderr || result.stdout || 'wireguard_service_action_failed',
+          220
+        )}`,
+        wireguard: status
+      });
+    }
+    const status = buildWireGuardStatusSnapshot(safeUserId, { interfaceName: runtime.interfaceName });
+    return res.json({
+      ok: true,
+      action,
+      effectiveAction,
+      output: truncateRawText(
+        stripAnsi([result.stdout, result.stderr].filter(Boolean).join('\n')).trim(),
+        8000
+      ),
+      wireguard: status
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo controlar WireGuard: ${truncateForNotify(
+              error && error.message ? error.message : 'wireguard_service_control_failed',
+              220
+            )}`
+    });
+  }
+});
+
+app.get('/api/tools/wireguard/config', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'wireguard', {
+    requiresSensitiveTool: false,
+    requiresShell: true
+  });
+  if (!permission) return;
+  try {
+    const status = buildWireGuardStatusSnapshot(safeUserId, {
+      interfaceName: req.query.interfaceName
+    });
+    return res.json({
+      ok: true,
+      config: {
+        runtime: status.runtime,
+        service: status.service,
+        interface: status.interface,
+        profileDefaults: status.profileDefaults,
+        editable: {
+          profileDefaultsOnly: true
+        }
+      }
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo leer configuración de WireGuard: ${truncateForNotify(
+              error && error.message ? error.message : 'wireguard_config_fetch_failed',
+              220
+            )}`
+    });
+  }
+});
+
+app.patch('/api/tools/wireguard/config', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'wireguard', {
+    requiresSensitiveTool: true,
+    requiresShell: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  try {
+    const settings = upsertWireGuardSettingsForUser(safeUserId, req.body || {});
+    const status = buildWireGuardStatusSnapshot(safeUserId, {
+      interfaceName: req.body && req.body.interfaceName
+    });
+    return res.json({
+      ok: true,
+      settings,
+      wireguard: status
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo actualizar configuración WireGuard: ${truncateForNotify(
+              error && error.message ? error.message : 'wireguard_config_update_failed',
+              220
+            )}`
+    });
+  }
+});
+
+app.get('/api/tools/wireguard/diagnostics', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'wireguard', {
+    requiresSensitiveTool: false,
+    requiresShell: true
+  });
+  if (!permission) return;
+  try {
+    const diagnostics = buildWireGuardDiagnostics(safeUserId, {
+      interfaceName: req.query.interfaceName,
+      lines: req.query.lines
+    });
+    return res.json({
+      ok: true,
+      diagnostics
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo generar diagnóstico WireGuard: ${truncateForNotify(
+              error && error.message ? error.message : 'wireguard_diagnostics_failed',
+              220
+            )}`
+    });
+  }
+});
+
+app.post('/api/tools/wireguard/peers', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'wireguard', {
+    requiresSensitiveTool: true,
+    requiresShell: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  try {
+    const created = createWireGuardPeerProfile(safeUserId, req.body || {}, {
+      interfaceName: req.body && req.body.interfaceName
+    });
+    const status = buildWireGuardStatusSnapshot(safeUserId, {
+      interfaceName: req.body && req.body.interfaceName
+    });
+    const createdPeer =
+      status.peers.find((entry) => entry.id === created.id) || {
+        id: created.id,
+        name: created.name,
+        publicKey: created.publicKey,
+        clientIp: created.clientIp,
+        allowedIps: created.allowedIps,
+        endpoint: created.endpoint,
+        latestHandshakeAt: '',
+        secondsSinceHandshake: null,
+        active: false,
+        transferRxBytes: 0,
+        transferTxBytes: 0,
+        persistentKeepalive: created.keepaliveSeconds,
+        createdAt: created.createdAt,
+        notes: '',
+        hasProfile: true
+      };
+    return res.json({
+      ok: true,
+      peer: createdPeer,
+      profile: {
+        peerId: created.id,
+        downloadPath: `/api/tools/wireguard/peers/${encodeURIComponent(created.id)}/profile/download`,
+        qrPath: `/api/tools/wireguard/peers/${encodeURIComponent(created.id)}/profile/qr`
+      },
+      wireguard: status
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo crear peer WireGuard: ${truncateForNotify(
+              error && error.message ? error.message : 'wireguard_create_peer_failed',
+              220
+            )}`
+    });
+  }
+});
+
+app.delete('/api/tools/wireguard/peers/:peerId', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'wireguard', {
+    requiresSensitiveTool: true,
+    requiresShell: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  const confirmDelete = String(req.query.confirm || req.body && req.body.confirm || '').trim().toUpperCase();
+  if (confirmDelete !== 'DELETE') {
+    return res.status(400).json({ error: 'Confirmación requerida. Envía confirm=DELETE.' });
+  }
+  try {
+    const runtime = resolveWireGuardRuntime(req.body && req.body.interfaceName);
+    const result = deleteWireGuardPeer(runtime, {
+      peerId: req.params.peerId,
+      publicKey: req.body && req.body.publicKey
+    });
+    const revokedAt = nowIso();
+    if (result.peerId) {
+      revokeWireGuardPeerProfileByIdStmt.run(revokedAt, revokedAt, result.peerId);
+    }
+    if (result.publicKey) {
+      revokeWireGuardPeerProfileByPublicKeyStmt.run(revokedAt, revokedAt, runtime.interfaceName, result.publicKey);
+    }
+    const status = buildWireGuardStatusSnapshot(safeUserId, {
+      interfaceName: runtime.interfaceName
+    });
+    return res.json({
+      ok: true,
+      deleted: true,
+      peerId: result.peerId,
+      publicKey: result.publicKey,
+      wireguard: status
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo eliminar/revocar peer WireGuard: ${truncateForNotify(
+              error && error.message ? error.message : 'wireguard_delete_peer_failed',
+              220
+            )}`
+    });
+  }
+});
+
+app.get('/api/tools/wireguard/peers/:peerId/profile', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'wireguard', {
+    requiresSensitiveTool: false,
+    requiresShell: true
+  });
+  if (!permission) return;
+  try {
+    const profile = getWireGuardPeerProfileConfigById(req.params.peerId);
+    const ownerId = getSafeUserId(profile.row && profile.row.user_id);
+    if (ownerId && ownerId !== safeUserId && !isAdmin(req)) {
+      return res.status(403).json({ error: 'No autorizado para ver este perfil WireGuard.' });
+    }
+    return res.json({
+      ok: true,
+      peerId: String(profile.row.id || ''),
+      interfaceName: normalizeWireGuardInterfaceName(profile.row.interface_name),
+      name: normalizeWireGuardPeerName(profile.row.peer_name),
+      publicKey: String(profile.row.public_key || '').trim(),
+      fileName: profile.fileName,
+      config: profile.configText
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo obtener perfil WireGuard: ${truncateForNotify(
+              error && error.message ? error.message : 'wireguard_profile_fetch_failed',
+              220
+            )}`
+    });
+  }
+});
+
+app.get('/api/tools/wireguard/peers/:peerId/profile/download', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'wireguard', {
+    requiresSensitiveTool: false,
+    requiresShell: true
+  });
+  if (!permission) return;
+  try {
+    const profile = getWireGuardPeerProfileConfigById(req.params.peerId);
+    const ownerId = getSafeUserId(profile.row && profile.row.user_id);
+    if (ownerId && ownerId !== safeUserId && !isAdmin(req)) {
+      return res.status(403).json({ error: 'No autorizado para descargar este perfil WireGuard.' });
+    }
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', buildAttachmentContentDisposition(profile.fileName, 'wireguard-peer'));
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.send(profile.configText);
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo descargar perfil WireGuard: ${truncateForNotify(
+              error && error.message ? error.message : 'wireguard_profile_download_failed',
+              220
+            )}`
+    });
+  }
+});
+
+app.get('/api/tools/wireguard/peers/:peerId/profile/qr', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'wireguard', {
+    requiresSensitiveTool: false,
+    requiresShell: true
+  });
+  if (!permission) return;
+  if (!commandExistsSync('qrencode')) {
+    return res.status(503).json({ error: 'qrencode no está disponible en este servidor.' });
+  }
+  try {
+    const profile = getWireGuardPeerProfileConfigById(req.params.peerId);
+    const ownerId = getSafeUserId(profile.row && profile.row.user_id);
+    if (ownerId && ownerId !== safeUserId && !isAdmin(req)) {
+      return res.status(403).json({ error: 'No autorizado para generar QR de este perfil WireGuard.' });
+    }
+    const pngBuffer = execFileSync('qrencode', ['-t', 'PNG', '-o', '-'], {
+      input: profile.configText,
+      encoding: null,
+      timeout: 8000,
+      maxBuffer: 1024 * 1024 * 8
+    });
+    return res.json({
+      ok: true,
+      peerId: String(profile.row.id || ''),
+      fileName: profile.fileName,
+      mimeType: 'image/png',
+      dataUrl: `data:image/png;base64,${Buffer.from(pngBuffer).toString('base64')}`,
+      generatedAt: nowIso()
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo generar QR WireGuard: ${truncateForNotify(
+              error && error.message ? error.message : 'wireguard_qr_failed',
+              220
+            )}`
+    });
+  }
 });
 
 app.get('/api/tools/storage/local/list', requireAuth, (req, res) => {

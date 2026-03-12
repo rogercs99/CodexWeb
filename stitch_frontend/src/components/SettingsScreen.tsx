@@ -79,7 +79,8 @@ const providerPermissionToolCatalog = [
   'drive',
   'backups',
   'deployments',
-  'shell'
+  'shell',
+  'wireguard'
 ];
 
 const providerAccessModeOptions: Array<{

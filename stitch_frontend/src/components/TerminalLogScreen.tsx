@@ -11,13 +11,19 @@ import {
   GitBranch,
   HardDrive,
   LayoutDashboard,
+  Power,
+  QrCode,
   RefreshCw,
+  Settings2,
   Search as SearchIcon,
   Server,
+  Shield,
   Square,
   Terminal as TerminalIcon,
   Trash2,
-  Upload
+  Upload,
+  UserPlus,
+  Wifi
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -57,6 +63,15 @@ import {
   pushToolsGitRepo,
   resolveToolsGitConflicts,
   rollbackTaskRun,
+  createToolsWireGuardPeer,
+  deleteToolsWireGuardPeer,
+  downloadToolsWireGuardPeerProfile,
+  getToolsWireGuardDiagnostics,
+  getToolsWireGuardPeerProfile,
+  getToolsWireGuardPeerQr,
+  getToolsWireGuardStatus,
+  controlToolsWireGuardService,
+  updateToolsWireGuardConfig,
   uploadToolsDriveFiles,
   validateToolsDriveRcloneRemote,
   validateToolsDriveAccount,
@@ -79,6 +94,9 @@ import type {
   ToolsStorageJob,
   ToolsStorageLocalListPayload,
   ToolsStorageResidualAnalysis,
+  ToolsWireGuardDiagnostics,
+  ToolsWireGuardPeerProfile,
+  ToolsWireGuardStatus,
   UnifiedSearchPayload
 } from '../lib/types';
 
@@ -91,6 +109,7 @@ type ToolsView =
   | 'observability'
   | 'git'
   | 'storage'
+  | 'wireguard'
   | 'deployments';
 
 type ResidualCleanupHistoryItem = {
@@ -201,6 +220,15 @@ function formatUptime(seconds: number) {
     return `${days}d ${String(hours).padStart(2, '0')}h ${String(mins).padStart(2, '0')}m`;
   }
   return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+function formatSecondsAgo(value: number | null) {
+  if (!Number.isFinite(Number(value)) || Number(value) < 0) return 'n/a';
+  const total = Math.round(Number(value));
+  if (total < 60) return `${total}s`;
+  if (total < 3600) return `${Math.floor(total / 60)}m`;
+  if (total < 86400) return `${Math.floor(total / 3600)}h`;
+  return `${Math.floor(total / 86400)}d`;
 }
 
 function normalizeConversationId(value: unknown): number | null {
@@ -393,6 +421,34 @@ export default function TerminalLogScreen({
   const [residualCategoryFilter, setResidualCategoryFilter] = useState<
     'all' | 'temporary' | 'logs' | 'cache' | 'backup' | 'artifact' | 'residual' | 'other'
   >('all');
+  const [wireGuardStatus, setWireGuardStatus] = useState<ToolsWireGuardStatus | null>(null);
+  const [wireGuardLoading, setWireGuardLoading] = useState(false);
+  const [wireGuardError, setWireGuardError] = useState('');
+  const [wireGuardNotice, setWireGuardNotice] = useState('');
+  const [wireGuardActionBusy, setWireGuardActionBusy] = useState<'start' | 'stop' | 'restart' | 'reload' | null>(null);
+  const [wireGuardTab, setWireGuardTab] = useState<'overview' | 'peers' | 'new' | 'config' | 'diagnostics'>('overview');
+  const [wireGuardCreateName, setWireGuardCreateName] = useState('');
+  const [wireGuardCreateIp, setWireGuardCreateIp] = useState('');
+  const [wireGuardCreateDns, setWireGuardCreateDns] = useState('');
+  const [wireGuardCreateAllowedIps, setWireGuardCreateAllowedIps] = useState('');
+  const [wireGuardCreateKeepalive, setWireGuardCreateKeepalive] = useState('25');
+  const [wireGuardCreateEndpoint, setWireGuardCreateEndpoint] = useState('');
+  const [wireGuardCreateComment, setWireGuardCreateComment] = useState('');
+  const [wireGuardCreateBusy, setWireGuardCreateBusy] = useState(false);
+  const [wireGuardDeletePeerId, setWireGuardDeletePeerId] = useState<string | null>(null);
+  const [wireGuardProfileLoadingPeerId, setWireGuardProfileLoadingPeerId] = useState<string | null>(null);
+  const [wireGuardProfilePreview, setWireGuardProfilePreview] = useState<ToolsWireGuardPeerProfile | null>(null);
+  const [wireGuardQrPeerId, setWireGuardQrPeerId] = useState<string | null>(null);
+  const [wireGuardQrDataUrl, setWireGuardQrDataUrl] = useState('');
+  const [wireGuardDiagnostics, setWireGuardDiagnostics] = useState<ToolsWireGuardDiagnostics | null>(null);
+  const [wireGuardDiagnosticsLoading, setWireGuardDiagnosticsLoading] = useState(false);
+  const [wireGuardConfigBusy, setWireGuardConfigBusy] = useState(false);
+  const [wireGuardConfigDraft, setWireGuardConfigDraft] = useState({
+    endpointHost: '',
+    defaultDns: '',
+    defaultAllowedIps: '',
+    defaultKeepaliveSeconds: '25'
+  });
   const [backupsByAppId, setBackupsByAppId] = useState<Record<string, ToolsDeployedAppBackupItem[]>>({});
   const [loadingBackupsAppId, setLoadingBackupsAppId] = useState<string | null>(null);
   const [selectedBackupFileIdByAppId, setSelectedBackupFileIdByAppId] = useState<Record<string, string>>({});
@@ -635,6 +691,243 @@ export default function TerminalLogScreen({
       window.clearInterval(pollId);
     };
   }, [activeView, loadDeployedAppsView]);
+
+  const loadWireGuardStatus = useCallback(async (silent = false) => {
+    if (!silent) {
+      setWireGuardLoading(true);
+    }
+    setWireGuardError('');
+    try {
+      const status = await getToolsWireGuardStatus();
+      setWireGuardStatus(status);
+      setWireGuardConfigDraft((prev) => ({
+        endpointHost: prev.endpointHost || status.profileDefaults.endpointHost || '',
+        defaultDns: prev.defaultDns || status.profileDefaults.defaultDns || '',
+        defaultAllowedIps: prev.defaultAllowedIps || status.profileDefaults.defaultAllowedIps || '',
+        defaultKeepaliveSeconds:
+          prev.defaultKeepaliveSeconds ||
+          String(status.profileDefaults.defaultKeepaliveSeconds || 25)
+      }));
+      setWireGuardCreateDns((prev) => prev || status.profileDefaults.defaultDns || '');
+      setWireGuardCreateAllowedIps((prev) => prev || status.profileDefaults.defaultAllowedIps || '');
+      setWireGuardCreateKeepalive((prev) =>
+        prev && prev.trim() ? prev : String(status.profileDefaults.defaultKeepaliveSeconds || 25)
+      );
+      setWireGuardCreateEndpoint((prev) => prev || status.profileDefaults.endpointHost || '');
+    } catch (error) {
+      setWireGuardError(error instanceof Error ? error.message : 'No se pudo cargar estado WireGuard');
+    } finally {
+      if (!silent) {
+        setWireGuardLoading(false);
+      }
+    }
+  }, []);
+
+  const loadWireGuardDiagnostics = useCallback(async (silent = false) => {
+    if (!silent) {
+      setWireGuardDiagnosticsLoading(true);
+    }
+    setWireGuardError('');
+    try {
+      const diagnostics = await getToolsWireGuardDiagnostics({ lines: 160 });
+      setWireGuardDiagnostics(diagnostics);
+    } catch (error) {
+      setWireGuardError(error instanceof Error ? error.message : 'No se pudo cargar diagnóstico WireGuard');
+    } finally {
+      if (!silent) {
+        setWireGuardDiagnosticsLoading(false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeView !== 'wireguard') return;
+    void loadWireGuardStatus();
+    const pollId = window.setInterval(() => {
+      void loadWireGuardStatus(true);
+    }, 5500);
+    return () => {
+      window.clearInterval(pollId);
+    };
+  }, [activeView, loadWireGuardStatus]);
+
+  useEffect(() => {
+    if (activeView !== 'wireguard') return;
+    if (wireGuardTab !== 'diagnostics') return;
+    void loadWireGuardDiagnostics();
+  }, [activeView, wireGuardTab, loadWireGuardDiagnostics]);
+
+  const runWireGuardServiceAction = async (action: 'start' | 'stop' | 'restart' | 'reload') => {
+    setWireGuardError('');
+    setWireGuardNotice('');
+    if (action === 'stop') {
+      const value = window.prompt('Escribe STOP para confirmar que quieres detener WireGuard.');
+      if (value !== 'STOP') return;
+    }
+    if (action === 'restart' || action === 'reload') {
+      const value = window.prompt('Escribe RESTART para confirmar el reinicio/reload de WireGuard.');
+      if (value !== 'RESTART') return;
+    }
+    setWireGuardActionBusy(action);
+    try {
+      const payload = await controlToolsWireGuardService({
+        action,
+        confirm: action === 'stop' ? 'STOP' : action === 'start' ? '' : 'RESTART'
+      });
+      setWireGuardStatus(payload.wireguard);
+      setWireGuardNotice(
+        payload.output
+          ? `Acción ${payload.action} aplicada. ${payload.output.slice(0, 180)}`
+          : `Acción ${payload.action} aplicada correctamente.`
+      );
+      if (wireGuardTab === 'diagnostics') {
+        void loadWireGuardDiagnostics(true);
+      }
+    } catch (error) {
+      setWireGuardError(error instanceof Error ? error.message : 'No se pudo controlar servicio WireGuard');
+    } finally {
+      setWireGuardActionBusy(null);
+    }
+  };
+
+  const createWireGuardPeerProfile = async () => {
+    const name = wireGuardCreateName.trim();
+    if (!name) {
+      setWireGuardError('Indica nombre/alias para el perfil WireGuard.');
+      return;
+    }
+    setWireGuardError('');
+    setWireGuardNotice('');
+    setWireGuardCreateBusy(true);
+    try {
+      const payload = await createToolsWireGuardPeer({
+        name,
+        clientIp: wireGuardCreateIp.trim() || undefined,
+        dns: wireGuardCreateDns.trim() || undefined,
+        allowedIps: wireGuardCreateAllowedIps.trim() || undefined,
+        keepaliveSeconds: Number.isFinite(Number(wireGuardCreateKeepalive))
+          ? Number(wireGuardCreateKeepalive)
+          : undefined,
+        endpointHost: wireGuardCreateEndpoint.trim() || undefined,
+        comment: wireGuardCreateComment.trim() || undefined
+      });
+      setWireGuardStatus(payload.wireguard);
+      setWireGuardNotice(`Perfil WireGuard creado: ${payload.peer.name}. Ya puedes descargar .conf o QR.`);
+      setWireGuardCreateName('');
+      setWireGuardCreateIp('');
+      setWireGuardCreateComment('');
+      setWireGuardTab('peers');
+    } catch (error) {
+      setWireGuardError(error instanceof Error ? error.message : 'No se pudo crear perfil WireGuard');
+    } finally {
+      setWireGuardCreateBusy(false);
+    }
+  };
+
+  const deleteWireGuardPeerProfileById = async (peerId: string, publicKey: string) => {
+    const safePeerId = String(peerId || '').trim();
+    if (!safePeerId) return;
+    const confirmation = window.prompt('Esta acción revoca/elimina el peer. Escribe DELETE para confirmar.');
+    if (confirmation !== 'DELETE') return;
+    setWireGuardDeletePeerId(safePeerId);
+    setWireGuardError('');
+    setWireGuardNotice('');
+    try {
+      const payload = await deleteToolsWireGuardPeer({
+        peerId: safePeerId,
+        publicKey
+      });
+      setWireGuardStatus(payload.wireguard);
+      setWireGuardNotice(`Peer revocado correctamente (${payload.peerId || safePeerId}).`);
+      if (wireGuardProfilePreview && wireGuardProfilePreview.peerId === safePeerId) {
+        setWireGuardProfilePreview(null);
+        setWireGuardQrDataUrl('');
+      }
+    } catch (error) {
+      setWireGuardError(error instanceof Error ? error.message : 'No se pudo revocar peer WireGuard');
+    } finally {
+      setWireGuardDeletePeerId(null);
+    }
+  };
+
+  const downloadWireGuardPeerProfileById = async (peerId: string) => {
+    const safePeerId = String(peerId || '').trim();
+    if (!safePeerId) return;
+    setWireGuardProfileLoadingPeerId(safePeerId);
+    setWireGuardError('');
+    setWireGuardNotice('');
+    try {
+      const payload = await downloadToolsWireGuardPeerProfile(safePeerId);
+      const url = window.URL.createObjectURL(payload.blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = payload.fileName || `${safePeerId}.conf`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(url);
+      setWireGuardNotice(`Descarga iniciada: ${payload.fileName || `${safePeerId}.conf`}`);
+    } catch (error) {
+      setWireGuardError(error instanceof Error ? error.message : 'No se pudo descargar perfil WireGuard');
+    } finally {
+      setWireGuardProfileLoadingPeerId(null);
+    }
+  };
+
+  const previewWireGuardPeerProfileById = async (peerId: string) => {
+    const safePeerId = String(peerId || '').trim();
+    if (!safePeerId) return;
+    setWireGuardProfileLoadingPeerId(safePeerId);
+    setWireGuardError('');
+    setWireGuardNotice('');
+    try {
+      const payload = await getToolsWireGuardPeerProfile(safePeerId);
+      setWireGuardProfilePreview(payload);
+    } catch (error) {
+      setWireGuardError(error instanceof Error ? error.message : 'No se pudo obtener perfil WireGuard');
+    } finally {
+      setWireGuardProfileLoadingPeerId(null);
+    }
+  };
+
+  const loadWireGuardQrByPeerId = async (peerId: string) => {
+    const safePeerId = String(peerId || '').trim();
+    if (!safePeerId) return;
+    setWireGuardQrPeerId(safePeerId);
+    setWireGuardError('');
+    setWireGuardNotice('');
+    try {
+      const payload = await getToolsWireGuardPeerQr(safePeerId);
+      setWireGuardQrDataUrl(payload.dataUrl || '');
+      setWireGuardNotice('QR generado para importación en móvil.');
+    } catch (error) {
+      setWireGuardError(error instanceof Error ? error.message : 'No se pudo generar QR del perfil');
+    } finally {
+      setWireGuardQrPeerId(null);
+    }
+  };
+
+  const saveWireGuardConfigDefaults = async () => {
+    setWireGuardConfigBusy(true);
+    setWireGuardError('');
+    setWireGuardNotice('');
+    try {
+      const payload = await updateToolsWireGuardConfig({
+        endpointHost: wireGuardConfigDraft.endpointHost.trim(),
+        defaultDns: wireGuardConfigDraft.defaultDns.trim(),
+        defaultAllowedIps: wireGuardConfigDraft.defaultAllowedIps.trim(),
+        defaultKeepaliveSeconds: Number.isFinite(Number(wireGuardConfigDraft.defaultKeepaliveSeconds))
+          ? Number(wireGuardConfigDraft.defaultKeepaliveSeconds)
+          : 25
+      });
+      setWireGuardStatus(payload.wireguard);
+      setWireGuardNotice('Parámetros de perfiles WireGuard actualizados.');
+    } catch (error) {
+      setWireGuardError(error instanceof Error ? error.message : 'No se pudo guardar configuración WireGuard');
+    } finally {
+      setWireGuardConfigBusy(false);
+    }
+  };
 
   const filtered = useMemo(
     () => entries.filter((entry) => (filter === 'all' ? true : entry.kind === filter)),
@@ -2404,6 +2697,8 @@ export default function TerminalLogScreen({
                 ? 'Tools · Git'
                 : activeView === 'storage'
                   ? 'Tools · Copias y espacio'
+                  : activeView === 'wireguard'
+                    ? 'Tools · WireGuard'
                   : 'Tools · Apps desplegadas';
 
   const residualJobStage = String(
@@ -2461,6 +2756,13 @@ export default function TerminalLogScreen({
       void loadStorageHeavy();
       void loadDriveAccounts(true);
       void loadDriveFiles();
+      return;
+    }
+    if (activeView === 'wireguard') {
+      void loadWireGuardStatus();
+      if (wireGuardTab === 'diagnostics') {
+        void loadWireGuardDiagnostics();
+      }
       return;
     }
     void loadRuns();
@@ -2608,6 +2910,25 @@ export default function TerminalLogScreen({
                       <p className="text-sm text-zinc-100">Storage local + nube</p>
                       <p className="text-xs text-zinc-500 truncate">
                         {storageLocalData?.entries?.length || 0} item(s) locales · {driveAccounts.length} cuenta(s) Google Drive
+                      </p>
+                    </div>
+                  </div>
+                  <ChevronRight size={16} className="text-zinc-600" />
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveView('wireguard')}
+                className="w-full text-left rounded-xl border border-zinc-800 bg-black/40 p-3 hover:border-zinc-700 transition-colors"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Shield size={18} className="text-teal-300 shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-sm text-zinc-100">WireGuard VPN</p>
+                      <p className="text-xs text-zinc-500 truncate">
+                        {wireGuardStatus?.runtime?.interfaceName || 'wg0'} · {wireGuardStatus?.stats?.configuredPeers || 0} peer(s)
                       </p>
                     </div>
                   </div>
@@ -4455,6 +4776,461 @@ export default function TerminalLogScreen({
                     </div>
                   )}
                 </article>
+              </article>
+            ) : null}
+          </section>
+        ) : null}
+
+        {activeView === 'wireguard' ? (
+          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold text-zinc-100">WireGuard</h2>
+                <p className="text-xs text-zinc-500">
+                  Gestión real de VPN: estado, control del servicio, peers, perfiles, configuración y diagnóstico.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  void loadWireGuardStatus();
+                  if (wireGuardTab === 'diagnostics') {
+                    void loadWireGuardDiagnostics();
+                  }
+                }}
+                className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-200"
+              >
+                Refrescar
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
+              <article className="rounded-lg border border-zinc-800 bg-black/40 px-3 py-2">
+                <p className="text-[10px] uppercase text-zinc-500">Servicio</p>
+                <p className="text-xs text-zinc-100 mt-1">
+                  {wireGuardStatus?.service?.isActive ? 'Activo' : 'Inactivo'} · {wireGuardStatus?.service?.subState || 'n/a'}
+                </p>
+              </article>
+              <article className="rounded-lg border border-zinc-800 bg-black/40 px-3 py-2">
+                <p className="text-[10px] uppercase text-zinc-500">Interfaz</p>
+                <p className="text-xs text-zinc-100 mt-1">{wireGuardStatus?.runtime?.interfaceName || 'n/a'}</p>
+              </article>
+              <article className="rounded-lg border border-zinc-800 bg-black/40 px-3 py-2">
+                <p className="text-[10px] uppercase text-zinc-500">Peers</p>
+                <p className="text-xs text-zinc-100 mt-1">
+                  {wireGuardStatus?.stats?.configuredPeers || 0} total · {wireGuardStatus?.stats?.activePeers || 0} activos
+                </p>
+              </article>
+              <article className="rounded-lg border border-zinc-800 bg-black/40 px-3 py-2">
+                <p className="text-[10px] uppercase text-zinc-500">Transferencia</p>
+                <p className="text-xs text-zinc-100 mt-1">
+                  RX {formatBytes(wireGuardStatus?.stats?.totalRxBytes || 0)} · TX {formatBytes(wireGuardStatus?.stats?.totalTxBytes || 0)}
+                </p>
+              </article>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap">
+              {(['overview', 'peers', 'new', 'config', 'diagnostics'] as const).map((tab) => (
+                <button
+                  key={`wg-tab:${tab}`}
+                  type="button"
+                  onClick={() => setWireGuardTab(tab)}
+                  className={`text-xs px-2.5 py-1.5 rounded-lg border ${
+                    wireGuardTab === tab
+                      ? 'border-cyan-500/40 bg-cyan-500/10 text-cyan-200'
+                      : 'border-zinc-700 text-zinc-300'
+                  }`}
+                >
+                  {tab === 'overview'
+                    ? 'Resumen'
+                    : tab === 'peers'
+                      ? 'Peers'
+                      : tab === 'new'
+                        ? 'Nuevo perfil'
+                        : tab === 'config'
+                          ? 'Configuración'
+                          : 'Diagnóstico'}
+                </button>
+              ))}
+            </div>
+
+            {wireGuardError ? <p className="text-xs text-red-300">{wireGuardError}</p> : null}
+            {wireGuardNotice ? <p className="text-xs text-emerald-300">{wireGuardNotice}</p> : null}
+            {wireGuardLoading ? <p className="text-xs text-zinc-500">Cargando estado de WireGuard...</p> : null}
+
+            {wireGuardTab === 'overview' ? (
+              <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-3">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void runWireGuardServiceAction('start');
+                    }}
+                    disabled={wireGuardActionBusy !== null}
+                    className="text-xs px-2.5 py-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 disabled:opacity-50"
+                  >
+                    <span className="inline-flex items-center gap-1">
+                      <Power size={12} />
+                      {wireGuardActionBusy === 'start' ? 'Iniciando...' : 'Iniciar'}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void runWireGuardServiceAction('stop');
+                    }}
+                    disabled={wireGuardActionBusy !== null}
+                    className="text-xs px-2.5 py-1.5 rounded-lg border border-red-500/40 bg-red-500/10 text-red-200 disabled:opacity-50"
+                  >
+                    <span className="inline-flex items-center gap-1">
+                      <Power size={12} />
+                      {wireGuardActionBusy === 'stop' ? 'Deteniendo...' : 'Detener'}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void runWireGuardServiceAction('restart');
+                    }}
+                    disabled={wireGuardActionBusy !== null}
+                    className="text-xs px-2.5 py-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-200 disabled:opacity-50"
+                  >
+                    {wireGuardActionBusy === 'restart' ? 'Reiniciando...' : 'Reiniciar'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void runWireGuardServiceAction('reload');
+                    }}
+                    disabled={wireGuardActionBusy !== null}
+                    className="text-xs px-2.5 py-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 disabled:opacity-50"
+                  >
+                    {wireGuardActionBusy === 'reload' ? 'Aplicando...' : 'Reconfigurar'}
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <article className="rounded border border-zinc-800 bg-zinc-950/60 px-2.5 py-2">
+                    <p className="text-[10px] uppercase text-zinc-500">Servicio systemd</p>
+                    <p className="text-xs text-zinc-100 mt-1">{wireGuardStatus?.service?.unit || 'n/a'}</p>
+                    <p className="text-[11px] text-zinc-400 mt-1">
+                      {wireGuardStatus?.service?.activeState || 'unknown'} · {wireGuardStatus?.service?.unitFileState || 'n/a'}
+                    </p>
+                  </article>
+                  <article className="rounded border border-zinc-800 bg-zinc-950/60 px-2.5 py-2">
+                    <p className="text-[10px] uppercase text-zinc-500">Interfaz</p>
+                    <p className="text-xs text-zinc-100 mt-1">
+                      {wireGuardStatus?.interface?.name || 'n/a'} · puerto {wireGuardStatus?.interface?.listenPort || 'n/a'}
+                    </p>
+                    <p className="text-[11px] text-zinc-400 mt-1 break-all">
+                      Address: {wireGuardStatus?.interface?.address || 'n/a'}
+                    </p>
+                  </article>
+                </div>
+
+                <article className="rounded border border-zinc-800 bg-zinc-950/60 px-2.5 py-2">
+                  <p className="text-[10px] uppercase text-zinc-500">Rutas y binarios</p>
+                  <p className="text-[11px] text-zinc-400 mt-1 break-all">
+                    config: {wireGuardStatus?.runtime?.configPath || 'n/a'}
+                  </p>
+                  <p className="text-[11px] text-zinc-400 mt-1">
+                    wg {wireGuardStatus?.binaries?.wg ? 'OK' : 'NO'} · wg-quick {wireGuardStatus?.binaries?.wgQuick ? 'OK' : 'NO'} ·
+                    qrencode {wireGuardStatus?.binaries?.qrencode ? 'OK' : 'NO'}
+                  </p>
+                  {wireGuardStatus?.interface?.configError ? (
+                    <p className="text-[11px] text-red-300 mt-1">{wireGuardStatus.interface.configError}</p>
+                  ) : null}
+                </article>
+              </article>
+            ) : null}
+
+            {wireGuardTab === 'peers' ? (
+              <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-2">
+                {!wireGuardStatus || wireGuardStatus.peers.length === 0 ? (
+                  <p className="text-xs text-zinc-500">No hay peers configurados en esta interfaz.</p>
+                ) : (
+                  <div className="space-y-2 max-h-[34rem] overflow-auto pr-1">
+                    {wireGuardStatus.peers.map((peer) => (
+                      <article key={`wg-peer:${peer.id}`} className="rounded-lg border border-zinc-800 bg-zinc-950/60 p-2.5 space-y-2">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <p className="text-xs text-zinc-100 truncate">{peer.name}</p>
+                            <p className="text-[10px] text-zinc-500 break-all">{peer.publicKey}</p>
+                          </div>
+                          <span
+                            className={`text-[10px] px-2 py-1 rounded border ${
+                              peer.active
+                                ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                                : 'border-zinc-700 text-zinc-400'
+                            }`}
+                          >
+                            {peer.active ? 'activo' : 'inactivo'}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-zinc-400">
+                          IP {peer.clientIp || 'n/a'} · Allowed {peer.allowedIps || 'n/a'} · endpoint {peer.endpoint || 'n/a'}
+                        </p>
+                        <p className="text-[11px] text-zinc-400">
+                          Handshake {peer.latestHandshakeAt ? formatDateTime(peer.latestHandshakeAt) : 'sin datos'} · hace{' '}
+                          {formatSecondsAgo(peer.secondsSinceHandshake)} · RX {formatBytes(peer.transferRxBytes)} · TX{' '}
+                          {formatBytes(peer.transferTxBytes)}
+                        </p>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void previewWireGuardPeerProfileById(peer.id);
+                            }}
+                            disabled={!peer.hasProfile || wireGuardProfileLoadingPeerId === peer.id}
+                            className={`text-xs px-2 py-1 rounded border ${
+                              peer.hasProfile ? 'border-zinc-700 text-zinc-200' : 'border-zinc-700 text-zinc-500'
+                            } disabled:opacity-50`}
+                          >
+                            {wireGuardProfileLoadingPeerId === peer.id ? 'Abriendo...' : 'Ver perfil'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void downloadWireGuardPeerProfileById(peer.id);
+                            }}
+                            disabled={!peer.hasProfile || wireGuardProfileLoadingPeerId === peer.id}
+                            className={`text-xs px-2 py-1 rounded border ${
+                              peer.hasProfile
+                                ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                                : 'border-zinc-700 text-zinc-500'
+                            } disabled:opacity-50`}
+                          >
+                            <span className="inline-flex items-center gap-1">
+                              <Download size={12} />
+                              Descargar .conf
+                            </span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void loadWireGuardQrByPeerId(peer.id);
+                            }}
+                            disabled={!peer.hasProfile || wireGuardQrPeerId === peer.id}
+                            className={`text-xs px-2 py-1 rounded border ${
+                              peer.hasProfile ? 'border-cyan-500/40 bg-cyan-500/10 text-cyan-200' : 'border-zinc-700 text-zinc-500'
+                            } disabled:opacity-50`}
+                          >
+                            <span className="inline-flex items-center gap-1">
+                              <QrCode size={12} />
+                              {wireGuardQrPeerId === peer.id ? 'Generando QR...' : 'QR'}
+                            </span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void deleteWireGuardPeerProfileById(peer.id, peer.publicKey);
+                            }}
+                            disabled={wireGuardDeletePeerId === peer.id}
+                            className="text-xs px-2 py-1 rounded border border-red-500/40 bg-red-500/10 text-red-200 disabled:opacity-50"
+                          >
+                            {wireGuardDeletePeerId === peer.id ? 'Revocando...' : 'Eliminar/Re-vocar'}
+                          </button>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </article>
+            ) : null}
+
+            {wireGuardTab === 'new' ? (
+              <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-2">
+                <div className="flex items-center gap-2">
+                  <UserPlus size={16} className="text-cyan-300" />
+                  <p className="text-xs text-zinc-200">Nuevo perfil WireGuard</p>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <input
+                    value={wireGuardCreateName}
+                    onChange={(event) => setWireGuardCreateName(event.target.value)}
+                    placeholder="Nombre/alias (ej. iPhone Roger)"
+                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-100"
+                  />
+                  <input
+                    value={wireGuardCreateIp}
+                    onChange={(event) => setWireGuardCreateIp(event.target.value)}
+                    placeholder="IP cliente opcional (ej. 10.8.0.12)"
+                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-100"
+                  />
+                  <input
+                    value={wireGuardCreateDns}
+                    onChange={(event) => setWireGuardCreateDns(event.target.value)}
+                    placeholder="DNS (ej. 1.1.1.1,1.0.0.1)"
+                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-100"
+                  />
+                  <input
+                    value={wireGuardCreateAllowedIps}
+                    onChange={(event) => setWireGuardCreateAllowedIps(event.target.value)}
+                    placeholder="Allowed IPs perfil (ej. 0.0.0.0/0,::/0)"
+                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-100"
+                  />
+                  <input
+                    value={wireGuardCreateEndpoint}
+                    onChange={(event) => setWireGuardCreateEndpoint(event.target.value)}
+                    placeholder="Endpoint público (host/IP)"
+                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-100"
+                  />
+                  <input
+                    value={wireGuardCreateKeepalive}
+                    onChange={(event) => setWireGuardCreateKeepalive(event.target.value)}
+                    placeholder="Keepalive (segundos)"
+                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-100"
+                  />
+                </div>
+                <textarea
+                  value={wireGuardCreateComment}
+                  onChange={(event) => setWireGuardCreateComment(event.target.value)}
+                  placeholder="Comentario opcional"
+                  className="w-full min-h-[72px] rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-100"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    void createWireGuardPeerProfile();
+                  }}
+                  disabled={wireGuardCreateBusy}
+                  className="text-xs px-2.5 py-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 disabled:opacity-50"
+                >
+                  {wireGuardCreateBusy ? 'Creando perfil...' : 'Crear perfil real en WireGuard'}
+                </button>
+              </article>
+            ) : null}
+
+            {wireGuardTab === 'config' ? (
+              <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-2">
+                <div className="flex items-center gap-2">
+                  <Settings2 size={16} className="text-cyan-300" />
+                  <p className="text-xs text-zinc-200">Configuración y defaults de perfiles</p>
+                </div>
+                <p className="text-[11px] text-zinc-500 break-all">
+                  Config WireGuard: {wireGuardStatus?.runtime?.configPath || 'n/a'}
+                </p>
+                <p className="text-[11px] text-zinc-500">
+                  Interfaz: {wireGuardStatus?.interface?.name || 'n/a'} · ListenPort {wireGuardStatus?.interface?.listenPort || 'n/a'} ·
+                  Address {wireGuardStatus?.interface?.address || 'n/a'}
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <input
+                    value={wireGuardConfigDraft.endpointHost}
+                    onChange={(event) =>
+                      setWireGuardConfigDraft((prev) => ({ ...prev, endpointHost: event.target.value }))
+                    }
+                    placeholder="Endpoint host por defecto"
+                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-100"
+                  />
+                  <input
+                    value={wireGuardConfigDraft.defaultDns}
+                    onChange={(event) =>
+                      setWireGuardConfigDraft((prev) => ({ ...prev, defaultDns: event.target.value }))
+                    }
+                    placeholder="DNS por defecto"
+                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-100"
+                  />
+                  <input
+                    value={wireGuardConfigDraft.defaultAllowedIps}
+                    onChange={(event) =>
+                      setWireGuardConfigDraft((prev) => ({ ...prev, defaultAllowedIps: event.target.value }))
+                    }
+                    placeholder="Allowed IPs por defecto"
+                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-100"
+                  />
+                  <input
+                    value={wireGuardConfigDraft.defaultKeepaliveSeconds}
+                    onChange={(event) =>
+                      setWireGuardConfigDraft((prev) => ({ ...prev, defaultKeepaliveSeconds: event.target.value }))
+                    }
+                    placeholder="Keepalive por defecto"
+                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-100"
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void saveWireGuardConfigDefaults();
+                  }}
+                  disabled={wireGuardConfigBusy}
+                  className="text-xs px-2.5 py-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 disabled:opacity-50"
+                >
+                  {wireGuardConfigBusy ? 'Guardando...' : 'Guardar defaults de perfiles'}
+                </button>
+              </article>
+            ) : null}
+
+            {wireGuardTab === 'diagnostics' ? (
+              <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Wifi size={16} className="text-cyan-300" />
+                    <p className="text-xs text-zinc-200">Diagnóstico WireGuard</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void loadWireGuardDiagnostics();
+                    }}
+                    disabled={wireGuardDiagnosticsLoading}
+                    className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-200 disabled:opacity-50"
+                  >
+                    {wireGuardDiagnosticsLoading ? 'Cargando...' : 'Refrescar diagnóstico'}
+                  </button>
+                </div>
+                <p className="text-[11px] text-zinc-400">
+                  config strip: {wireGuardDiagnostics?.checks?.configStripOk ? 'OK' : 'ERROR'} · wg:{' '}
+                  {wireGuardDiagnostics?.checks?.wgBinary ? 'OK' : 'NO'} · wg-quick:{' '}
+                  {wireGuardDiagnostics?.checks?.wgQuickBinary ? 'OK' : 'NO'}
+                </p>
+                {wireGuardDiagnostics?.checks?.configStripError ? (
+                  <p className="text-[11px] text-red-300">{wireGuardDiagnostics.checks.configStripError}</p>
+                ) : null}
+                <pre className="max-h-[24rem] overflow-auto rounded-lg border border-zinc-800 bg-zinc-950/70 p-2 text-[11px] text-zinc-300 whitespace-pre-wrap">
+                  {wireGuardDiagnostics?.logs?.output || '-- sin logs --'}
+                </pre>
+              </article>
+            ) : null}
+
+            {wireGuardProfilePreview ? (
+              <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs text-zinc-200">Perfil seleccionado: {wireGuardProfilePreview.name || wireGuardProfilePreview.peerId}</p>
+                  <button
+                    type="button"
+                    onClick={() => setWireGuardProfilePreview(null)}
+                    className="text-[11px] px-2 py-1 rounded border border-zinc-700 text-zinc-300"
+                  >
+                    Cerrar
+                  </button>
+                </div>
+                <p className="text-[11px] text-zinc-500 break-all">
+                  {wireGuardProfilePreview.fileName} · {wireGuardProfilePreview.publicKey}
+                </p>
+                <pre className="max-h-56 overflow-auto rounded-lg border border-zinc-800 bg-zinc-950/70 p-2 text-[11px] text-zinc-300 whitespace-pre-wrap">
+                  {wireGuardProfilePreview.config}
+                </pre>
+              </article>
+            ) : null}
+
+            {wireGuardQrDataUrl ? (
+              <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs text-zinc-200">QR del perfil WireGuard</p>
+                  <button
+                    type="button"
+                    onClick={() => setWireGuardQrDataUrl('')}
+                    className="text-[11px] px-2 py-1 rounded border border-zinc-700 text-zinc-300"
+                  >
+                    Ocultar QR
+                  </button>
+                </div>
+                <img
+                  src={wireGuardQrDataUrl}
+                  alt="QR WireGuard"
+                  className="w-56 h-56 rounded-lg border border-zinc-700 bg-white p-2"
+                />
               </article>
             ) : null}
           </section>

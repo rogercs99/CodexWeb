@@ -680,6 +680,104 @@ export interface ToolsStorageOverview {
   jobs: ToolsStorageJob[];
 }
 
+export interface ToolsWireGuardServiceState {
+  unit: string;
+  isActive: boolean;
+  activeState: string;
+  subState: string;
+  unitFileState: string;
+  loadState: string;
+  description?: string;
+  fragmentPath?: string;
+}
+
+export interface ToolsWireGuardPeer {
+  id: string;
+  name: string;
+  publicKey: string;
+  clientIp: string;
+  allowedIps: string;
+  endpoint: string;
+  latestHandshakeAt: string;
+  secondsSinceHandshake: number | null;
+  active: boolean;
+  transferRxBytes: number;
+  transferTxBytes: number;
+  persistentKeepalive: number | null;
+  createdAt: string;
+  notes: string;
+  hasProfile: boolean;
+}
+
+export interface ToolsWireGuardStatus {
+  runtime: {
+    interfaceName: string;
+    availableInterfaces: string[];
+    configPath: string;
+    configExists: boolean;
+  };
+  binaries: {
+    wg: boolean;
+    wgQuick: boolean;
+    qrencode: boolean;
+    systemctl: boolean;
+  };
+  service: ToolsWireGuardServiceState;
+  interface: {
+    name: string;
+    address: string;
+    listenPort: number | null;
+    postUp: string;
+    postDown: string;
+    hasPrivateKey: boolean;
+    publicKey: string;
+    fwmark: string;
+    configError: string;
+  };
+  profileDefaults: {
+    endpointHost: string;
+    defaultDns: string;
+    defaultAllowedIps: string;
+    defaultKeepaliveSeconds: number;
+    updatedAt: string;
+  };
+  peers: ToolsWireGuardPeer[];
+  stats: {
+    configuredPeers: number;
+    activePeers: number;
+    totalRxBytes: number;
+    totalTxBytes: number;
+    activeWindowSeconds: number;
+    updatedAt: string;
+  };
+}
+
+export interface ToolsWireGuardDiagnostics {
+  runtime: ToolsWireGuardStatus['runtime'];
+  service: ToolsWireGuardServiceState;
+  checks: {
+    wgBinary: boolean;
+    wgQuickBinary: boolean;
+    systemctlBinary: boolean;
+    configExists: boolean;
+    configStripOk: boolean;
+    configStripError: string;
+  };
+  logs: {
+    lines: number;
+    output: string;
+  };
+}
+
+export interface ToolsWireGuardPeerProfile {
+  peerId: string;
+  interfaceName: string;
+  name: string;
+  publicKey: string;
+  fileName: string;
+  config: string;
+}
+
 export interface ToolsStorageResidualCandidate {
   id: string;
   path: string;
