@@ -1,0 +1,29 @@
+# Mapa de pantallas y flujo (frontend objetivo: DIXIT/client)
+
+## Estado global de navegación (sin react-router)
+- `authLoading` -> spinner inicial
+- `user == null` -> AuthGate (login/registro)
+- `isLanding` (`!state || !state.phase`) -> Landing + sub-vistas por `landingView`
+- `state.phase` -> flujo de juego en tiempo real
+
+## Sub-vistas de landing (`landingView`)
+- `home` -> `Landing`
+- `rooms` -> `ActiveRoomsView`
+- `profile` -> `ProfileView`
+
+## Fases de partida (`state.phase`)
+- `lobby` -> `Lobby`
+- `clue` -> `Clue` (si storyteller) o `Submit` en modo espera (si no storyteller)
+- `submit` -> `Submit`
+- `vote` -> `Vote` (no storyteller) o `Submit` espera (storyteller)
+- `reveal` (y default) -> `Score`
+
+## Overlays/transversales
+- `ProgressOverlay` (evento global `dixit:progress`)
+- Banner error servidor (`serverError`)
+- Banner desbloqueo audio (`audioNeedsInteraction`)
+- Banner estado reconexion (`!connected && !isLanding`)
+
+## Modales
+- Modal eliminar sala en `ActiveRoomsView`
+- Drawer de menu en `Landing` (`menuOpen`)

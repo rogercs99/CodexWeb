@@ -11,7 +11,6 @@ const helmet = require('helmet');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
 const Database = require('better-sqlite3');
-const { google } = require('googleapis');
 
 const execFileAsync = util.promisify(execFile);
 const pipelineAsync = util.promisify(pipeline);
@@ -36,10 +35,6 @@ const OPENROUTER_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 const OLLAMA_DEFAULT_BASE_URL = 'http://127.0.0.1:11434';
 const GROQ_DEFAULT_BASE_URL = 'https://api.groq.com/openai/v1';
 const LMSTUDIO_DEFAULT_BASE_URL = 'http://127.0.0.1:1234/v1';
-const DROPBOX_API_BASE_URL = 'https://api.dropboxapi.com/2';
-const DROPBOX_CONTENT_BASE_URL = 'https://content.dropboxapi.com/2';
-const DROPBOX_OAUTH_AUTHORIZE_URL = 'https://www.dropbox.com/oauth2/authorize';
-const DROPBOX_OAUTH_TOKEN_URL = 'https://api.dropboxapi.com/oauth2/token';
 const chatGptModelOptions = [
   DEFAULT_CHAT_MODEL,
   'gpt-5',
@@ -197,19 +192,21 @@ const aiPermissionToolCatalog = [
   'chat',
   'git',
   'storage',
-  'dropbox',
   'drive',
   'backups',
   'deployments',
   'shell'
 ];
-const aiPermissionDefaultAllowedTools = ['chat', 'git', 'storage', 'dropbox', 'backups', 'deployments', 'shell'];
+const aiPermissionDefaultAllowedTools = ['chat', 'git', 'storage', 'drive', 'backups', 'deployments', 'shell'];
 const aiProviderQuotaUnits = new Set(['requests', 'tokens', 'credits', 'usd']);
+const aiPermissionAccessModes = new Set(['full_access', 'workspace_only', 'restricted_paths', 'read_only']);
 const aiProviderPermissionProfileDefaults = Object.freeze({
+  accessMode: 'full_access',
   allowRoot: true,
   runAsUser: '',
   allowedPaths: ['/'],
   deniedPaths: [],
+  canWriteFiles: true,
   readOnly: false,
   allowShell: true,
   allowSensitiveTools: true,
@@ -316,12 +313,33 @@ const geminiReasoningInstructionsByEffort = {
   xhigh:
     'Haz un análisis profundo, con validaciones explícitas, posibles riesgos y alternativas.'
 };
-const uploadsDir = path.join(__dirname, 'uploads');
+function resolveConfiguredPath(rawValue, fallbackPath) {
+  const fallback = path.resolve(fallbackPath);
+  const text = String(rawValue || '').trim();
+  if (!text) return fallback;
+  try {
+    return path.isAbsolute(text) ? path.resolve(text) : path.resolve(__dirname, text);
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+const uploadsDir = resolveConfiguredPath(process.env.UPLOADS_DIR, path.join(__dirname, 'uploads'));
 const pendingUploadsDir = path.join(uploadsDir, 'pending');
 const uploadsDirUrlPath = uploadsDir.replace(/\\/g, '/');
 const legacyUploadsRouteBasePath = uploadsDirUrlPath.startsWith('/') ? uploadsDirUrlPath : `/${uploadsDirUrlPath}`;
-const codexUsersRootDir = path.join(__dirname, '.codex_users');
-const restartStatePath = path.join(__dirname, 'restart-state.json');
+const legacyCodexUsersRootDir = path.join(__dirname, '.codex_users');
+const codexUsersRootDir = path.resolve(
+  String(process.env.CODEX_HOME_ROOT || '/var/lib/codexweb/codex_users').trim() || '/var/lib/codexweb/codex_users'
+);
+const restartStatePath = resolveConfiguredPath(
+  process.env.RESTART_STATE_PATH,
+  path.join(__dirname, 'restart-state.json')
+);
+const staticAssetsDir = resolveConfiguredPath(
+  process.env.STATIC_ASSETS_DIR,
+  path.join(__dirname, 'public')
+);
 const restartLogLimit = 200;
 const maxAttachments = 5;
 const maxAttachmentSizeBytes = 500 * 1024 * 1024;
@@ -514,8 +532,14 @@ const workspaceFileBlockedBaseNames = new Set([
 ]);
 const workspaceFileBlockedExtensions = new Set(['.db', '.sqlite', '.sqlite3', '.pem', '.key']);
 let repoContextIndexCache = null;
-const taskSnapshotsRootDir = path.join(__dirname, 'tmp', 'task-snapshots');
-const storageJobsRootDir = path.join(__dirname, 'tmp', 'storage-jobs');
+const taskSnapshotsRootDir = resolveConfiguredPath(
+  process.env.TASK_SNAPSHOTS_DIR,
+  path.join(__dirname, 'tmp', 'task-snapshots')
+);
+const storageJobsRootDir = resolveConfiguredPath(
+  process.env.STORAGE_JOBS_DIR,
+  path.join(__dirname, 'tmp', 'storage-jobs')
+);
 const taskCommandOutputMaxChars = 12000;
 const taskResultSummaryMaxChars = 5000;
 const taskPlanMaxChars = 8000;
@@ -547,7 +571,24 @@ const storageBackupMaxSourceBytes = 8 * 1024 * 1024 * 1024;
 const storageBackupReserveBytes = 512 * 1024 * 1024;
 const storageUploadJobMaxFiles = 40;
 const storageJobLogMaxChars = 12000;
-const dropboxOauthFallbackRedirectUri = 'http://localhost';
+const rcloneBinary = String(process.env.RCLONE_BIN || 'rclone').trim() || 'rclone';
+const rcloneConfigPathDefault = String(process.env.RCLONE_CONFIG_PATH || '').trim();
+const driveDefaultRemoteName = String(process.env.RCLONE_DRIVE_DEFAULT_REMOTE || '').trim();
+const driveDefaultRootPath = String(process.env.RCLONE_DRIVE_DEFAULT_ROOT || 'CodexWeb').trim();
+const storageResidualScanMaxItems = 220;
+const storageResidualScanMaxDepth = 5;
+const storageResidualDeleteMaxItems = 80;
+const storageResidualAiMaxCandidates = 80;
+const storageResidualProgressTickMs = 700;
+const storageResidualAiEtaBaseSeconds = 12;
+const storageResidualAiEtaPerCandidateSeconds = 0.2;
+const projectContextManualMaxChars = 12000;
+const projectContextAutoMaxChars = 12000;
+const projectContextPromptMessagesLimit = 140;
+const projectContextPromptMessageChars = 700;
+const projectContextNameMaxChars = 90;
+const projectContextModeOptions = new Set(['manual', 'automatic', 'mixed']);
+const projectContextAutoRegenerateDebounceMs = 1800;
 const storageProtectedMutationRoots = new Set([
   '/',
   '/bin',
@@ -562,6 +603,16 @@ const storageProtectedMutationRoots = new Set([
   '/sys',
   '/usr'
 ]);
+const storageResidualScanRoots = resolveStorageCleanupScanRoots(
+  process.env.STORAGE_RESIDUAL_SCAN_ROOTS,
+  [
+    path.join(__dirname, 'tmp'),
+    storageJobsRootDir,
+    uploadsDir,
+    '/tmp',
+    '/var/tmp'
+  ]
+);
 const gitToolsIgnoredDirs = new Set([
   '.git',
   '.hg',
@@ -593,17 +644,26 @@ let deployedAppsCache = {
 };
 const activeDeployedDescriptionWorkers = new Set();
 const activeStorageJobWorkers = new Set();
+const queuedProjectContextRefreshTimers = new Map();
 
 const sessionSecret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 
 const defaultDbPath = fs.existsSync(path.join(__dirname, 'app.db')) ? 'app.db' : 'chat.db';
-const dbPath = process.env.DB_PATH || defaultDbPath;
-const db = new Database(path.join(__dirname, dbPath));
+const dbPath = String(process.env.DB_PATH || defaultDbPath).trim() || defaultDbPath;
+const dbAbsolutePath = path.isAbsolute(dbPath) ? path.resolve(dbPath) : path.resolve(__dirname, dbPath);
+fs.mkdirSync(path.dirname(dbAbsolutePath), { recursive: true });
+const db = new Database(dbAbsolutePath);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 fs.mkdirSync(uploadsDir, { recursive: true });
 fs.mkdirSync(pendingUploadsDir, { recursive: true });
-fs.mkdirSync(codexUsersRootDir, { recursive: true });
+fs.mkdirSync(codexUsersRootDir, { recursive: true, mode: 0o755 });
+try {
+  fs.chmodSync(codexUsersRootDir, 0o755);
+} catch (_error) {
+  // best effort
+}
+console.info(`Codex home root configurado en ${codexUsersRootDir}`);
 fs.mkdirSync(taskSnapshotsRootDir, { recursive: true });
 fs.mkdirSync(storageJobsRootDir, { recursive: true });
 
@@ -637,7 +697,7 @@ function resolveCredentialsEncryptionKey() {
   let source = configured;
   if (!source) {
     const uid = typeof process.getuid === 'function' ? String(process.getuid()) : '0';
-    source = `${os.hostname()}:${path.resolve(__dirname, dbPath)}:${uid}`;
+    source = `${os.hostname()}:${dbAbsolutePath}:${uid}`;
   }
   if (/^[A-Za-z0-9+/=]+$/.test(source) && source.length >= 40) {
     try {
@@ -684,8 +744,8 @@ function normalizeDriveAuthMode(rawMode) {
   const value = String(rawMode || '')
     .trim()
     .toLowerCase();
-  if (value === 'oauth_app' || value === 'oauth_client' || value === 'oauth') return 'oauth_app';
-  return 'token';
+  if (value === 'rclone' || value === 'remote' || value === 'drive') return 'rclone';
+  return 'rclone';
 }
 
 function normalizeDriveAccountStatus(rawStatus) {
@@ -714,13 +774,62 @@ function normalizeStorageJobType(rawType) {
     .toLowerCase();
   if (
     value === 'drive_upload_files' ||
-    value === 'dropbox_upload_files' ||
     value === 'deployed_backup_create' ||
-    value === 'deployed_backup_restore'
+    value === 'deployed_backup_restore' ||
+    value === 'cleanup_residual_analyze' ||
+    value === 'git_merge_branches' ||
+    value === 'local_delete_paths' ||
+    value === 'project_context_refresh'
   ) {
     return value;
   }
   return '';
+}
+
+function normalizeProjectContextMode(rawMode, fallback = 'mixed') {
+  const mode = String(rawMode || '')
+    .trim()
+    .toLowerCase();
+  if (projectContextModeOptions.has(mode)) {
+    return mode;
+  }
+  const safeFallback = String(fallback || '')
+    .trim()
+    .toLowerCase();
+  return projectContextModeOptions.has(safeFallback) ? safeFallback : 'mixed';
+}
+
+function sanitizeProjectName(rawName) {
+  const compact = String(rawName || '')
+    .replace(/[\r\n\t]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!compact) return '';
+  if (compact.length <= projectContextNameMaxChars) return compact;
+  return compact.slice(0, projectContextNameMaxChars).trim();
+}
+
+function normalizeProjectContextText(rawValue, maxChars = projectContextManualMaxChars) {
+  const value = String(rawValue || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim();
+  if (!value) return '';
+  const safeMax = Number.isInteger(Number(maxChars)) && Number(maxChars) > 0 ? Number(maxChars) : 4000;
+  if (value.length <= safeMax) return value;
+  return value.slice(0, safeMax).trimEnd();
+}
+
+function normalizeProjectAutoEnabled(rawValue, fallback = true) {
+  if (typeof rawValue === 'boolean') return rawValue;
+  if (rawValue === 1 || rawValue === '1') return true;
+  if (rawValue === 0 || rawValue === '0') return false;
+  if (typeof rawValue === 'string') {
+    const lowered = rawValue.trim().toLowerCase();
+    if (['true', 'yes', 'on', 'enabled'].includes(lowered)) return true;
+    if (['false', 'no', 'off', 'disabled'].includes(lowered)) return false;
+  }
+  return Boolean(fallback);
 }
 
 function sanitizeDriveAccountAlias(rawAlias) {
@@ -733,7 +842,7 @@ function sanitizeDriveAccountAlias(rawAlias) {
 }
 
 function buildDriveAccountId() {
-  return `dbx_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;
+  return `drv_${Date.now()}_${crypto.randomBytes(5).toString('hex')}`;
 }
 
 function buildStorageJobId(prefix = 'job') {
@@ -829,6 +938,51 @@ function resolveStorageDirectoryPathForRequest(rawPath) {
   return absolutePath;
 }
 
+function resolveStorageCleanupScanRoots(rawValue, fallback = []) {
+  const requested = String(rawValue || '')
+    .split(/[\r\n,]+/g)
+    .map((entry) => normalizeAbsoluteStoragePath(entry, ''))
+    .filter(Boolean);
+  const source = requested.length > 0 ? requested : Array.isArray(fallback) ? fallback : [];
+  const deduped = [];
+  const seen = new Set();
+  source.forEach((entry) => {
+    const normalized = normalizeAbsoluteStoragePath(entry, '');
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    if (isStorageMutationPathProtected(normalized) && !isPathWithin('/tmp', normalized) && !isPathWithin('/var/tmp', normalized)) {
+      return;
+    }
+    deduped.push(normalized);
+  });
+  return deduped.slice(0, 20);
+}
+
+function isPathWithinAny(paths, targetPath) {
+  const safeTarget = normalizeAbsoluteStoragePath(targetPath, '');
+  if (!safeTarget) return false;
+  const list = Array.isArray(paths) ? paths : [];
+  return list.some((entry) => {
+    const root = normalizeAbsoluteStoragePath(entry, '');
+    if (!root) return false;
+    return root === safeTarget || isPathWithin(root, safeTarget);
+  });
+}
+
+function assertStorageCleanupPathAllowed(absolutePath) {
+  const normalized = normalizeAbsoluteStoragePath(absolutePath, '');
+  if (!normalized) {
+    throw createClientRequestError('Ruta inválida para limpieza', 400);
+  }
+  if (!isPathWithinAny(storageResidualScanRoots, normalized)) {
+    throw createClientRequestError('Ruta fuera de las raíces permitidas para limpieza', 403);
+  }
+  if (isStorageMutationPathProtected(normalized)) {
+    throw createClientRequestError('Ruta protegida: no se permite borrar por limpieza', 403);
+  }
+  return normalized;
+}
+
 function normalizeStorageSortField(rawSort) {
   const value = String(rawSort || '')
     .trim()
@@ -897,6 +1051,37 @@ function getDiskAvailableBytesForPath(absolutePath) {
   const cols = rows[1].trim().split(/\s+/);
   const available = Number.parseInt(String(cols[3] || ''), 10);
   return Number.isFinite(available) ? Math.max(0, available) : null;
+}
+
+function getDiskUsageSnapshotForPath(absolutePath) {
+  const target = normalizeAbsoluteStoragePath(absolutePath, repoRootDir);
+  if (!target) return null;
+  const result = runSystemCommandSync('df', ['-B1', '-P', target], {
+    allowNonZero: true,
+    timeoutMs: 10000,
+    maxBuffer: 1024 * 512
+  });
+  if (!result || Number(result.code) !== 0) return null;
+  const rows = String(result.stdout || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .filter((line) => line.trim());
+  if (rows.length < 2) return null;
+  const cols = rows[1].trim().split(/\s+/);
+  const totalBytes = Number.parseInt(String(cols[1] || ''), 10);
+  const usedBytes = Number.parseInt(String(cols[2] || ''), 10);
+  const availableBytes = Number.parseInt(String(cols[3] || ''), 10);
+  const usedPercentText = String(cols[4] || '').trim().replace('%', '');
+  const mountPoint = String(cols[5] || '').trim();
+  const usagePercent = Number.parseFloat(usedPercentText);
+  return {
+    path: target,
+    mountPoint,
+    totalBytes: Number.isFinite(totalBytes) ? Math.max(0, totalBytes) : null,
+    usedBytes: Number.isFinite(usedBytes) ? Math.max(0, usedBytes) : null,
+    availableBytes: Number.isFinite(availableBytes) ? Math.max(0, availableBytes) : null,
+    usagePercent: Number.isFinite(usagePercent) ? Number(usagePercent.toFixed(1)) : null
+  };
 }
 
 function listStorageLocalDirectory(payload = {}) {
@@ -1092,6 +1277,645 @@ function scanStorageHeavyPaths(payload = {}) {
   };
 }
 
+function buildResidualHeuristicForEntry(entry) {
+  const absolutePath = normalizeAbsoluteStoragePath(entry.path, '');
+  const baseName = path.basename(absolutePath || '').toLowerCase();
+  const lowerPath = String(absolutePath || '').toLowerCase();
+  const modifiedMs = Number(entry.modifiedMs || 0);
+  const ageDays = modifiedMs > 0 ? Math.max(0, (Date.now() - modifiedMs) / (1000 * 60 * 60 * 24)) : 0;
+  const sizeBytes = Number(entry.sizeBytes || 0);
+  const reasons = [];
+  let score = 0;
+
+  if (/(\.log|\.tmp|\.bak|\.old|\.cache|\.gz|\.tar|\.tar\.gz)$/i.test(baseName)) {
+    score += 2;
+    reasons.push('extensión típica de archivo residual');
+  }
+  if (/\/(tmp|temp|cache|caches|logs?|old|backup|archives?)\//i.test(lowerPath)) {
+    score += 2;
+    reasons.push('ubicación típica de residuales');
+  }
+  if (ageDays >= 7) {
+    score += 1;
+    reasons.push(`sin cambios recientes (${Math.round(ageDays)} días)`);
+  }
+  if (sizeBytes >= 250 * 1024 * 1024) {
+    score += 2;
+    reasons.push('muy grande (>250MB)');
+  } else if (sizeBytes >= 50 * 1024 * 1024) {
+    score += 1;
+    reasons.push('grande (>50MB)');
+  }
+  if (entry.type === 'directory' && /cache|tmp|logs?|old|backup/i.test(baseName)) {
+    score += 1;
+    reasons.push('directorio candidato de limpieza');
+  }
+  if (entry.type === 'file' && baseName.startsWith('.')) {
+    score += 1;
+    reasons.push('archivo oculto potencialmente temporal');
+  }
+
+  const risk = score >= 6 ? 'medium' : 'low';
+  const confidence = score >= 6 ? 'high' : score >= 4 ? 'medium' : 'low';
+  return {
+    score,
+    confidence,
+    risk,
+    reason: reasons.join(', ') || 'patrón residual detectado'
+  };
+}
+
+function estimateResidualEtaSeconds(startedAtMs, percentValue) {
+  const safeStart = Number.isFinite(Number(startedAtMs)) ? Number(startedAtMs) : 0;
+  const percent = clampPercentage(percentValue);
+  if (!safeStart || !Number.isFinite(percent) || percent <= 0 || percent >= 100) return null;
+  const elapsedSeconds = Math.max(1, Math.floor((Date.now() - safeStart) / 1000));
+  const estimatedTotalSeconds = elapsedSeconds / (Number(percent) / 100);
+  const remainingSeconds = Math.ceil(estimatedTotalSeconds - elapsedSeconds);
+  if (!Number.isFinite(remainingSeconds)) return null;
+  return Math.max(1, remainingSeconds);
+}
+
+function scanStorageResidualCandidates(payload = {}, options = {}) {
+  const onProgress = options && typeof options.onProgress === 'function' ? options.onProgress : null;
+  const rootsRequested = Array.isArray(payload.roots) ? payload.roots : [];
+  const normalizedRootsRequested = rootsRequested
+    .map((entry) => normalizeAbsoluteStoragePath(entry, ''))
+    .filter(Boolean);
+  const roots = normalizedRootsRequested.length > 0
+    ? normalizedRootsRequested.filter((entry) => isPathWithinAny(storageResidualScanRoots, entry))
+    : storageResidualScanRoots;
+  const rawLimit = Number.parseInt(String(payload.limit || ''), 10);
+  const limit = Number.isInteger(rawLimit)
+    ? Math.min(Math.max(rawLimit, 1), storageResidualScanMaxItems)
+    : 80;
+  const rawDepth = Number.parseInt(String(payload.maxDepth || ''), 10);
+  const maxDepth = Number.isInteger(rawDepth)
+    ? Math.min(Math.max(rawDepth, 1), storageResidualScanMaxDepth)
+    : 3;
+  const candidates = [];
+  const queue = [];
+  const visited = new Set();
+  const startedAtMs = Date.now();
+  let visitedCount = 0;
+  let lastProgressAtMs = 0;
+  const emitProgress = (force = false) => {
+    if (!onProgress) return;
+    const nowMs = Date.now();
+    if (!force && nowMs - lastProgressAtMs < storageResidualProgressTickMs) {
+      return;
+    }
+    lastProgressAtMs = nowMs;
+    const processed = Math.max(visitedCount, 1);
+    const totalEstimate = Math.max(processed + queue.length, processed);
+    const scanPercent = Math.max(1, Math.min(88, Math.round((processed / totalEstimate) * 88)));
+    onProgress({
+      stage: 'scanning',
+      stageLabel: 'Escaneando rutas residuales',
+      processed,
+      totalEstimate,
+      queued: queue.length,
+      candidates: candidates.length,
+      percent: scanPercent,
+      etaSeconds: estimateResidualEtaSeconds(startedAtMs, scanPercent)
+    });
+  };
+  roots.forEach((root) => {
+    const safeRoot = normalizeAbsoluteStoragePath(root, '');
+    if (!safeRoot || visited.has(safeRoot)) return;
+    queue.push({ path: safeRoot, depth: 0 });
+  });
+  emitProgress(true);
+
+  while (queue.length > 0 && candidates.length < limit * 8) {
+    const current = queue.shift();
+    if (!current) continue;
+    const absolutePath = normalizeAbsoluteStoragePath(current.path, '');
+    if (!absolutePath || visited.has(absolutePath)) continue;
+    visited.add(absolutePath);
+    visitedCount += 1;
+    if (!isPathWithinAny(storageResidualScanRoots, absolutePath)) continue;
+    if (isStorageMutationPathProtected(absolutePath)) continue;
+    let stats = null;
+    try {
+      stats = fs.lstatSync(absolutePath);
+    } catch (_error) {
+      stats = null;
+    }
+    if (!stats) continue;
+    const isDirectory = stats.isDirectory();
+    const isFile = stats.isFile();
+    if (stats.isSymbolicLink()) continue;
+    const entry = {
+      path: absolutePath,
+      type: isDirectory ? 'directory' : isFile ? 'file' : 'other',
+      sizeBytes: isFile ? Number(stats.size || 0) : Number(getDirectorySizeWithDu(absolutePath) || 0),
+      modifiedAt: stats.mtime ? stats.mtime.toISOString() : '',
+      modifiedMs: Number(stats.mtimeMs || 0)
+    };
+    const heuristic = buildResidualHeuristicForEntry(entry);
+    if (heuristic.score >= 3) {
+      candidates.push({
+        id: absolutePath,
+        path: absolutePath,
+        type: entry.type,
+        sizeBytes: entry.sizeBytes,
+        modifiedAt: entry.modifiedAt,
+        reason: heuristic.reason,
+        confidence: heuristic.confidence,
+        risk: heuristic.risk,
+        score: heuristic.score
+      });
+    }
+    if (!isDirectory || current.depth >= maxDepth) {
+      emitProgress(false);
+      continue;
+    }
+    let children = [];
+    try {
+      children = fs.readdirSync(absolutePath, { withFileTypes: true });
+    } catch (_error) {
+      children = [];
+    }
+    children.forEach((child) => {
+      const name = String(child && child.name ? child.name : '').trim();
+      if (!name || name === '.' || name === '..') return;
+      queue.push({
+        path: path.join(absolutePath, name),
+        depth: current.depth + 1
+      });
+    });
+    emitProgress(false);
+  }
+  emitProgress(true);
+
+  const sorted = candidates
+    .sort((a, b) => {
+      if (Number(b.score || 0) !== Number(a.score || 0)) {
+        return Number(b.score || 0) - Number(a.score || 0);
+      }
+      return Number(b.sizeBytes || 0) - Number(a.sizeBytes || 0);
+    })
+    .slice(0, limit);
+  return {
+    scannedAt: nowIso(),
+    roots,
+    maxDepth,
+    limit,
+    candidates: sorted
+  };
+}
+
+function parseResidualAiPayload(rawText, candidatesByPath) {
+  const source = String(rawText || '').trim();
+  if (!source) return new Map();
+  const cleaned = source
+    .replace(/```json/gi, '')
+    .replace(/```/g, '')
+    .trim();
+  const parseItemsFromCandidate = (candidateText) => {
+    const parsed = parseRcloneJsonOutput(candidateText, null);
+    if (!parsed || typeof parsed !== 'object') return [];
+    if (Array.isArray(parsed)) return parsed;
+    if (Array.isArray(parsed.items)) return parsed.items;
+    if (Array.isArray(parsed.candidates)) return parsed.candidates;
+    if (Array.isArray(parsed.files)) return parsed.files;
+    return [];
+  };
+  const parseCandidates = [];
+  parseCandidates.push(cleaned);
+  const lines = cleaned
+    .split('\n')
+    .map((line) => String(line || '').trim())
+    .filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    if (
+      (line.startsWith('{') && line.endsWith('}')) ||
+      (line.startsWith('[') && line.endsWith(']'))
+    ) {
+      parseCandidates.push(line);
+    }
+  }
+  const itemsJsonMatches = cleaned.match(/\{"items":\[[\s\S]*?\]\}/g);
+  if (Array.isArray(itemsJsonMatches)) {
+    itemsJsonMatches.forEach((entry) => {
+      parseCandidates.push(String(entry || '').trim());
+    });
+  }
+  const firstBrace = cleaned.indexOf('{');
+  const lastBrace = cleaned.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    parseCandidates.push(cleaned.slice(firstBrace, lastBrace + 1));
+  }
+  const firstBracket = cleaned.indexOf('[');
+  const lastBracket = cleaned.lastIndexOf(']');
+  if (firstBracket >= 0 && lastBracket > firstBracket) {
+    parseCandidates.push(cleaned.slice(firstBracket, lastBracket + 1));
+  }
+
+  let items = [];
+  for (let index = 0; index < parseCandidates.length; index += 1) {
+    const candidateText = String(parseCandidates[index] || '').trim();
+    if (!candidateText) continue;
+    items = parseItemsFromCandidate(candidateText);
+    if (items.length > 0) break;
+  }
+  const map = new Map();
+  items.forEach((entry) => {
+    const candidatePath = normalizeAbsoluteStoragePath(entry && entry.path ? entry.path : '', '');
+    if (!candidatePath || !candidatesByPath.has(candidatePath)) return;
+    const reason = truncateForNotify(entry && entry.reason ? entry.reason : '', 240);
+    const confidenceRaw = String(entry && entry.confidence ? entry.confidence : '').trim().toLowerCase();
+    const riskRaw = String(entry && entry.risk ? entry.risk : '').trim().toLowerCase();
+    map.set(candidatePath, {
+      reason: reason || 'clasificado por IA',
+      confidence:
+        confidenceRaw === 'high' || confidenceRaw === 'medium' || confidenceRaw === 'low'
+          ? confidenceRaw
+          : 'medium',
+      risk: riskRaw === 'high' || riskRaw === 'medium' || riskRaw === 'low' ? riskRaw : 'low'
+    });
+  });
+  return map;
+}
+
+function buildResidualAiClassificationPrompt(candidates) {
+  const list = Array.isArray(candidates) ? candidates : [];
+  const promptLines = [
+    'Clasifica candidatos de limpieza de servidor.',
+    'Devuelve SOLO JSON válido con esta forma:',
+    '{"items":[{"path":"ABSOLUTE_PATH","reason":"texto corto","confidence":"high|medium|low","risk":"low|medium|high"}]}',
+    'No añadas texto adicional.',
+    '',
+    'CANDIDATOS:'
+  ];
+  list.forEach((entry, index) => {
+    promptLines.push(
+      `${index + 1}. path=${entry.path} | type=${entry.type} | size=${entry.sizeBytes} | modifiedAt=${entry.modifiedAt} | heuristic=${entry.reason}`
+    );
+  });
+  return promptLines.join('\n');
+}
+
+function getResidualAiStageLabelForUser(userId) {
+  const runtime = resolveChatAgentRuntimeForUser(userId);
+  const providerId = normalizeSupportedAiAgentId(runtime && runtime.activeAgentId ? runtime.activeAgentId : '');
+  const providerDef = getAiProviderDefinition(providerId);
+  const providerName = String((providerDef && providerDef.name) || runtime.activeAgentName || 'IA').trim() || 'IA';
+  return `Analizando residuos con ${providerName}`;
+}
+
+async function classifyResidualCandidatesWithAi(userId, username, candidates) {
+  const list = Array.isArray(candidates) ? candidates.slice(0, storageResidualAiMaxCandidates) : [];
+  if (list.length === 0) {
+    return {
+      used: false,
+      reason: 'no_candidates',
+      labels: new Map(),
+      providerId: '',
+      providerName: '',
+      attemptedProviders: []
+    };
+  }
+
+  const prompt = buildResidualAiClassificationPrompt(list);
+  const candidateMap = new Map(list.map((entry) => [entry.path, entry]));
+  const attemptedProviders = [];
+  const runtime = resolveChatAgentRuntimeForUser(userId);
+  const activeProviderId = normalizeSupportedAiAgentId(runtime && runtime.activeAgentId ? runtime.activeAgentId : '');
+  const activeProviderDef = getAiProviderDefinition(activeProviderId);
+  const activeProviderName =
+    String((activeProviderDef && activeProviderDef.name) || runtime.activeAgentName || activeProviderId || '').trim();
+
+  const tryHttpProvider = async (providerId, providerName) => {
+    const adapter = getAiHttpProviderAdapter(providerId);
+    if (!adapter || typeof adapter.buildChatRequest !== 'function') {
+      return {
+        used: false,
+        reason: 'provider_not_http',
+        labels: new Map(),
+        providerId,
+        providerName
+      };
+    }
+    const integration = getUserAiAgentIntegration(userId, providerId);
+    const configured = isAiAgentConfiguredForUser(
+      providerId,
+      integration,
+      getAiAgentSerializationOptionsForUser(userId)
+    );
+    if (!configured) {
+      return {
+        used: false,
+        reason: 'provider_not_configured',
+        labels: new Map(),
+        providerId,
+        providerName
+      };
+    }
+    const model = normalizeChatAgentModel(providerId, runtime.defaults.model || getChatAgentDefaultModel(providerId));
+    const baseUrl = resolveAiProviderBaseUrl(providerId, integration) || adapter.defaultBaseUrl;
+    const request = adapter.buildChatRequest({
+      model,
+      prompt,
+      integration,
+      baseUrl,
+      reasoningEffort: runtime.defaults.reasoningEffort
+    });
+    const endpoint = String(request && request.endpoint ? request.endpoint : '').trim();
+    if (!endpoint) {
+      return {
+        used: false,
+        reason: 'provider_endpoint_missing',
+        labels: new Map(),
+        providerId,
+        providerName
+      };
+    }
+    const headers =
+      request && request.headers && typeof request.headers === 'object'
+        ? request.headers
+        : { 'Content-Type': 'application/json' };
+    const body =
+      request && request.body && typeof request.body === 'object'
+        ? { ...request.body, stream: false }
+        : {
+            model,
+            stream: false,
+            messages: [{ role: 'user', content: prompt }]
+          };
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body)
+      });
+      if (!response.ok) {
+        let reason = '';
+        try {
+          reason = truncateForNotify(await response.text(), 220);
+        } catch (_error) {
+          reason = '';
+        }
+        return {
+          used: false,
+          reason: reason || `http_${response.status}`,
+          labels: new Map(),
+          providerId,
+          providerName
+        };
+      }
+      let output = '';
+      try {
+        const payload = await response.json();
+        const choice = payload && Array.isArray(payload.choices) ? payload.choices[0] : null;
+        const messageObject = choice && choice.message && typeof choice.message === 'object' ? choice.message : {};
+        output =
+          extractTextFromProviderPayload(messageObject.content) ||
+          extractTextFromProviderPayload(choice && choice.text ? choice.text : '') ||
+          extractTextFromProviderPayload(payload && payload.response ? payload.response : '') ||
+          extractTextFromProviderPayload(payload && payload.message ? payload.message : '');
+      } catch (_jsonError) {
+        try {
+          output = String(await response.text()).trim();
+        } catch (_textError) {
+          output = '';
+        }
+      }
+      const labels = parseResidualAiPayload(output, candidateMap);
+      return {
+        used: labels.size > 0,
+        reason: labels.size > 0 ? '' : 'ai_parse_empty',
+        labels,
+        providerId,
+        providerName
+      };
+    } catch (error) {
+      return {
+        used: false,
+        reason: truncateForNotify(error && error.message ? error.message : 'provider_request_failed', 180),
+        labels: new Map(),
+        providerId,
+        providerName
+      };
+    }
+  };
+
+  const tryCodexCli = async () => {
+    let codexPath = '';
+    try {
+      codexPath = await resolveCodexPath();
+    } catch (_error) {
+      codexPath = '';
+    }
+    if (!codexPath) {
+      return {
+        used: false,
+        reason: 'codex_unavailable',
+        labels: new Map(),
+        providerId: 'codex-cli',
+        providerName: 'Codex CLI'
+      };
+    }
+    try {
+      const result = await execFileAsync(
+        codexPath,
+        [
+          '-c',
+          'shell_environment_policy.inherit=all',
+          'exec',
+          '--skip-git-repo-check',
+          '--sandbox',
+          'danger-full-access',
+          '--color',
+          'never',
+          prompt
+        ],
+        {
+          env: getCodexEnvForUser(userId, { username }),
+          cwd: process.cwd(),
+          timeout: 1000 * 60,
+          maxBuffer: 1024 * 1024 * 6
+        }
+      );
+      const stdout = truncateRawText(stripAnsi(String(result && result.stdout ? result.stdout : '')).trim(), 80000);
+      const stderr = truncateRawText(stripAnsi(String(result && result.stderr ? result.stderr : '')).trim(), 80000);
+      const combined = [stdout, stderr].filter(Boolean).join('\n').trim();
+      const labels = parseResidualAiPayload(combined, candidateMap);
+      return {
+        used: labels.size > 0,
+        reason: labels.size > 0 ? '' : 'ai_parse_empty',
+        labels,
+        providerId: 'codex-cli',
+        providerName: 'Codex CLI'
+      };
+    } catch (error) {
+      return {
+        used: false,
+        reason: truncateForNotify(error && error.message ? error.message : 'ai_failed', 160),
+        labels: new Map(),
+        providerId: 'codex-cli',
+        providerName: 'Codex CLI'
+      };
+    }
+  };
+
+  if (activeProviderId && activeProviderId !== 'codex-cli') {
+    attemptedProviders.push(activeProviderId);
+    const activeAttempt = await tryHttpProvider(activeProviderId, activeProviderName || activeProviderId);
+    if (activeAttempt.used) {
+      return {
+        ...activeAttempt,
+        attemptedProviders
+      };
+    }
+  }
+
+  attemptedProviders.push('codex-cli');
+  const codexAttempt = await tryCodexCli();
+  if (codexAttempt.used) {
+    return {
+      ...codexAttempt,
+      attemptedProviders
+    };
+  }
+
+  return {
+    used: false,
+    reason: codexAttempt.reason || 'ai_unavailable',
+    labels: new Map(),
+    providerId: codexAttempt.providerId || '',
+    providerName: codexAttempt.providerName || '',
+    attemptedProviders
+  };
+}
+
+async function analyzeStorageResidualFilesForUser(userId, username, payload = {}, options = {}) {
+  const onProgress = options && typeof options.onProgress === 'function' ? options.onProgress : null;
+  const startedAtMs = Date.now();
+  const scanned = scanStorageResidualCandidates(payload, {
+    onProgress: (scanProgress) => {
+      if (!onProgress) return;
+      onProgress({
+        stage: 'scanning',
+        stageLabel: 'Escaneando rutas residuales',
+        percent: Number(scanProgress && scanProgress.percent ? scanProgress.percent : 1),
+        etaSeconds: scanProgress && scanProgress.etaSeconds ? scanProgress.etaSeconds : null,
+        processed: Number(scanProgress && scanProgress.processed ? scanProgress.processed : 0),
+        totalEstimate: Number(scanProgress && scanProgress.totalEstimate ? scanProgress.totalEstimate : 0),
+        queued: Number(scanProgress && scanProgress.queued ? scanProgress.queued : 0),
+        candidates: Number(scanProgress && scanProgress.candidates ? scanProgress.candidates : 0),
+        startedAt: new Date(startedAtMs).toISOString()
+      });
+    }
+  });
+  const aiRequested = payload && payload.useAi !== false;
+  let aiState = {
+    used: false,
+    reason: 'disabled',
+    labels: new Map(),
+    providerId: '',
+    providerName: '',
+    attemptedProviders: []
+  };
+  if (aiRequested) {
+    if (onProgress) {
+      const aiEtaSeconds = Math.max(
+        3,
+        Math.round(storageResidualAiEtaBaseSeconds + scanned.candidates.length * storageResidualAiEtaPerCandidateSeconds)
+      );
+      onProgress({
+        stage: 'ai_classification',
+        stageLabel: getResidualAiStageLabelForUser(userId),
+        percent: 90,
+        etaSeconds: aiEtaSeconds,
+        processed: scanned.candidates.length,
+        totalEstimate: scanned.candidates.length,
+        queued: 0,
+        candidates: scanned.candidates.length,
+        startedAt: new Date(startedAtMs).toISOString()
+      });
+    }
+    aiState = await classifyResidualCandidatesWithAi(userId, username, scanned.candidates);
+  }
+  const merged = scanned.candidates.map((entry) => {
+    const aiLabel = aiState.labels.get(entry.path);
+    if (!aiLabel) return entry;
+    return {
+      ...entry,
+      reason: aiLabel.reason,
+      confidence: aiLabel.confidence,
+      risk: aiLabel.risk
+    };
+  });
+  const result = {
+    scannedAt: scanned.scannedAt,
+    roots: scanned.roots,
+    maxDepth: scanned.maxDepth,
+    limit: scanned.limit,
+    candidates: merged,
+    ai: {
+      requested: aiRequested,
+      used: aiState.used,
+      fallbackReason: aiState.reason,
+      providerId: aiState.providerId || '',
+      providerName: aiState.providerName || '',
+      attemptedProviders: Array.isArray(aiState.attemptedProviders) ? aiState.attemptedProviders : []
+    }
+  };
+  if (onProgress) {
+    onProgress({
+      stage: 'completed',
+      stageLabel: 'Análisis completado',
+      percent: 100,
+      etaSeconds: 0,
+      processed: merged.length,
+      totalEstimate: merged.length,
+      queued: 0,
+      candidates: merged.length,
+      startedAt: new Date(startedAtMs).toISOString()
+    });
+  }
+  return result;
+}
+
+function deleteStorageResidualPaths(payload = {}) {
+  const paths = parseStoragePathList(payload.paths, storageResidualDeleteMaxItems);
+  const deleted = [];
+  const failed = [];
+  paths.forEach((entryPath) => {
+    try {
+      const target = assertStorageCleanupPathAllowed(entryPath);
+      let stats = null;
+      try {
+        stats = fs.lstatSync(target);
+      } catch (_error) {
+        stats = null;
+      }
+      if (!stats) {
+        failed.push({ path: target, error: 'no_existe' });
+        return;
+      }
+      if (stats.isDirectory()) {
+        fs.rmSync(target, { recursive: true, force: false });
+      } else {
+        fs.unlinkSync(target);
+      }
+      deleted.push(target);
+    } catch (error) {
+      failed.push({
+        path: normalizeAbsoluteStoragePath(entryPath, ''),
+        error: truncateForNotify(error && error.message ? error.message : 'delete_failed', 200)
+      });
+    }
+  });
+  return {
+    deleted,
+    failed
+  };
+}
+
 function parseStoragePathList(rawPaths, maxItems = storageUploadJobMaxFiles) {
   const values = Array.isArray(rawPaths) ? rawPaths : [];
   const unique = [];
@@ -1117,6 +1941,15 @@ function sanitizeDriveFileName(rawName, fallbackName = 'archivo') {
   return compact.length > 120 ? compact.slice(0, 120).trim() : compact;
 }
 
+function buildAttachmentContentDisposition(rawName, fallbackName = 'archivo') {
+  const normalizedName = sanitizeDriveFileName(rawName, fallbackName);
+  const asciiName = normalizedName
+    .replace(/[^\x20-\x7E]/g, '_')
+    .replace(/["\\]/g, '_')
+    .trim() || sanitizeDriveFileName(fallbackName, 'archivo');
+  return `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(normalizedName)}`;
+}
+
 function sanitizeDriveQueryLiteral(rawValue) {
   return String(rawValue || '')
     .replace(/\\/g, '\\\\')
@@ -1131,116 +1964,399 @@ function buildBackupFileName(appName, appId, createdAtIso) {
 
 function parseIsoDateOrEmpty(rawValue) {
   if (rawValue === null || rawValue === undefined) return '';
-  const numeric = Number(rawValue);
-  if (Number.isFinite(numeric)) {
-    const asMs = numeric > 9999999999 ? numeric : numeric * 1000;
+  if (typeof rawValue === 'number' && Number.isFinite(rawValue)) {
+    const asMs = rawValue > 9999999999 ? rawValue : rawValue * 1000;
     const dt = new Date(asMs);
     return Number.isFinite(dt.getTime()) ? dt.toISOString() : '';
   }
   const text = String(rawValue || '').trim();
   if (!text) return '';
+  if (/^-?\d+(\.\d+)?$/.test(text)) {
+    const numeric = Number(text);
+    const asMs = numeric > 9999999999 ? numeric : numeric * 1000;
+    const dt = new Date(asMs);
+    return Number.isFinite(dt.getTime()) ? dt.toISOString() : '';
+  }
   const parsed = Date.parse(text);
   if (!Number.isFinite(parsed)) return '';
   return new Date(parsed).toISOString();
 }
 
-function normalizeDropboxPath(rawValue, fallback = '') {
-  const input = String(rawValue || '').trim();
-  const value = input || String(fallback || '').trim();
-  if (!value) return '';
-  if (value === '/') return '';
-  let normalized = value.replace(/\\/g, '/').replace(/\/+/g, '/');
-  if (!normalized.startsWith('/')) normalized = `/${normalized}`;
-  if (normalized.length > 1 && normalized.endsWith('/')) {
-    normalized = normalized.slice(0, -1);
-  }
+function normalizeDriveRemoteName(rawValue, fallback = '') {
+  const source = String(rawValue || '').trim() || String(fallback || '').trim();
+  const normalized = source
+    .replace(/[^a-zA-Z0-9._-]+/g, '')
+    .replace(/^\.+/, '')
+    .trim();
+  if (!normalized) return '';
+  return normalized.slice(0, 80);
+}
+
+function normalizeDriveRemotePath(rawValue, fallback = '') {
+  const source = String(rawValue || '').trim() || String(fallback || '').trim();
+  if (!source || source === '/' || source === '.') return '';
+  const compact = source
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .replace(/\/+/g, '/')
+    .replace(/\/+$/, '')
+    .trim();
+  if (!compact || compact === '.') return '';
+  const normalized = path.posix.normalize(`/${compact}`).replace(/^\/+/, '');
+  if (!normalized || normalized === '.' || normalized.startsWith('..')) return '';
+  return normalized.slice(0, 400);
+}
+
+function joinDriveRemotePath(...segments) {
+  const cleaned = segments
+    .map((entry) => normalizeDriveRemotePath(entry))
+    .filter(Boolean);
+  if (cleaned.length === 0) return '';
+  const normalized = path.posix.normalize(cleaned.join('/')).replace(/^\/+/, '');
+  if (!normalized || normalized === '.') return '';
   return normalized;
 }
 
-function normalizeDriveCredentialPayload(rawValue) {
-  const parsed =
-    rawValue && typeof rawValue === 'object'
-      ? rawValue
-      : (() => {
-          try {
-            return JSON.parse(String(rawValue || '{}'));
-          } catch (_error) {
-            return {};
-          }
-        })();
-  const payload = parsed && typeof parsed === 'object' ? parsed : {};
-  const nested = payload.dropbox && typeof payload.dropbox === 'object' ? payload.dropbox : payload;
+function buildDriveFileIdFromPath(relativePath = '') {
+  const normalized = normalizeDriveRemotePath(relativePath);
+  if (!normalized) return '/';
+  return `/${normalized}`;
+}
 
-  const accessToken = String(
-    nested.access_token || nested.accessToken || nested.token || nested.access || ''
-  ).trim();
-  const refreshToken = String(nested.refresh_token || nested.refreshToken || '').trim();
-  const appKey = String(nested.app_key || nested.appKey || nested.client_id || nested.clientId || '').trim();
-  const appSecret = String(
-    nested.app_secret || nested.appSecret || nested.client_secret || nested.clientSecret || ''
-  ).trim();
-  const expiresAt = parseIsoDateOrEmpty(nested.expires_at || nested.expiresAt || nested.expires);
-  const redirectUrisSource = Array.isArray(nested.redirect_uris)
-    ? nested.redirect_uris
-    : Array.isArray(nested.redirectUris)
-      ? nested.redirectUris
-      : [];
-  const redirectUris = redirectUrisSource
-    .map((entry) => String(entry || '').trim())
-    .filter(Boolean)
-    .slice(0, 8);
+function parseDrivePathFromFileId(fileId = '') {
+  return normalizeDriveRemotePath(fileId);
+}
 
-  if (!accessToken && !(refreshToken && appKey && appSecret) && !(appKey && appSecret)) {
+function resolveRcloneConfigPath(preferredConfigPath = '') {
+  const fallback = path.join(os.homedir(), '.config', 'rclone', 'rclone.conf');
+  const configured = String(preferredConfigPath || '').trim() || rcloneConfigPathDefault;
+  return normalizeAbsoluteStoragePath(configured, fallback);
+}
+
+function buildRcloneTarget(remoteName, relativePath = '') {
+  const safeRemote = normalizeDriveRemoteName(remoteName);
+  if (!safeRemote) {
+    throw createClientRequestError('Remote de rclone inválido.', 400);
+  }
+  const safePath = normalizeDriveRemotePath(relativePath);
+  return safePath ? `${safeRemote}:${safePath}` : `${safeRemote}:`;
+}
+
+function ensureRcloneBinaryAvailable() {
+  if (!commandExistsSync(rcloneBinary)) {
     throw createClientRequestError(
-      'Credenciales Dropbox inválidas. Usa access token o refresh_token + app_key + app_secret.',
-      400
+      `No se encontró rclone (${rcloneBinary}). Instálalo/configúralo en el entorno DEV.`,
+      503
     );
   }
+}
 
-  const authMode = accessToken || (refreshToken && appKey && appSecret) ? 'token' : 'oauth_app';
-  const normalized = {
-    provider: 'dropbox',
-    access_token: accessToken,
-    refresh_token: refreshToken,
-    app_key: appKey,
-    app_secret: appSecret,
-    expires_at: expiresAt,
-    redirect_uris: redirectUris.length > 0 ? redirectUris : [dropboxOauthFallbackRedirectUri],
-    root_path: normalizeDropboxPath(nested.root_path || nested.rootPath || '')
-  };
-  const tokenSeed = {};
-  if (accessToken) tokenSeed.access_token = accessToken;
-  if (refreshToken) tokenSeed.refresh_token = refreshToken;
-  if (expiresAt) tokenSeed.expires_at = expiresAt;
-
+function runRcloneCommandSync(args, options = {}) {
+  ensureRcloneBinaryAvailable();
+  const safeArgs = Array.isArray(args) ? args.map((entry) => String(entry || '')) : [];
+  const configPath = resolveRcloneConfigPath(options.configPath);
+  const commandArgs = [];
+  if (configPath) {
+    commandArgs.push('--config', configPath);
+  }
+  if (options.transferTuning === true) {
+    commandArgs.push('--checkers', '4', '--transfers', '2');
+  }
+  commandArgs.push(...safeArgs);
+  const timeoutMs = Number.isInteger(Number(options.timeoutMs))
+    ? Math.max(2000, Number(options.timeoutMs))
+    : 1000 * 60 * 2;
+  const maxBuffer = Number.isInteger(Number(options.maxBuffer))
+    ? Math.max(1024 * 32, Number(options.maxBuffer))
+    : 1024 * 1024 * 16;
+  const commandResult = runSystemCommandSync(rcloneBinary, commandArgs, {
+    // Always capture stdout/stderr and normalize success using exit code.
+    allowNonZero: true,
+    timeoutMs,
+    maxBuffer
+  });
   return {
-    credentialType: authMode === 'oauth_app' ? 'dropbox_oauth_app' : 'dropbox_token',
-    authMode,
-    normalized,
-    tokenSeed,
-    details: {
-      credentialType: authMode === 'oauth_app' ? 'dropbox_oauth_app' : 'dropbox_token',
-      clientId: appKey,
-      redirectUris: normalized.redirect_uris,
-      clientEmail: '',
-      projectId: ''
-    }
+    ...commandResult,
+    ok: Number(commandResult.code) === 0,
+    configPath
   };
 }
 
-function extractDriveOauthClientConfig(credentialsObject, preferredRedirectUri = '') {
-  const payload = credentialsObject && typeof credentialsObject === 'object' ? credentialsObject : {};
-  const redirectUris = Array.isArray(payload.redirect_uris)
-    ? payload.redirect_uris.map((entry) => String(entry || '').trim()).filter(Boolean)
-    : [];
-  const redirectUri = preferredRedirectUri && redirectUris.includes(preferredRedirectUri)
-    ? preferredRedirectUri
-    : redirectUris[0] || dropboxOauthFallbackRedirectUri;
+function parseRcloneJsonOutput(rawText, fallback = null) {
+  const text = String(rawText || '').trim();
+  if (!text) return fallback;
+  try {
+    return JSON.parse(text);
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+function listRcloneRemoteNames(configPath = '') {
+  const result = runRcloneCommandSync(['listremotes'], {
+    configPath,
+    timeoutMs: 10000,
+    maxBuffer: 1024 * 256
+  });
+  if (!result.ok) return [];
+  return String(result.stdout || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((entry) => String(entry || '').trim().replace(/:$/, ''))
+    .filter(Boolean);
+}
+
+function assertRcloneRemoteExists(remoteName, configPath = '') {
+  const safeRemote = normalizeDriveRemoteName(remoteName);
+  const remotes = listRcloneRemoteNames(configPath);
+  if (!safeRemote || !remotes.includes(safeRemote)) {
+    throw createClientRequestError(
+      `El remote "${safeRemote || remoteName}" no existe en rclone config (${resolveRcloneConfigPath(configPath)}).`,
+      400
+    );
+  }
+}
+
+function normalizeRcloneDriveScope(rawScope) {
+  const value = String(rawScope || '').trim().toLowerCase();
+  if (!value) return 'drive';
+  if (
+    value === 'drive' ||
+    value === 'drive.readonly' ||
+    value === 'drive.file' ||
+    value === 'drive.appfolder' ||
+    value === 'drive.metadata.readonly'
+  ) {
+    return value;
+  }
+  return 'drive';
+}
+
+function normalizeRcloneRemoteAuthMode(rawMode) {
+  const value = String(rawMode || '')
+    .trim()
+    .toLowerCase();
+  if (value === 'service_account' || value === 'service-account' || value === 'service') {
+    return 'service_account';
+  }
+  if (value === 'oauth_token' || value === 'oauth' || value === 'token') {
+    return 'oauth_token';
+  }
+  return 'none';
+}
+
+function normalizeRcloneTokenJson(rawValue) {
+  const source = String(rawValue || '').trim();
+  if (!source) return '';
+  const parsed = parseRcloneJsonOutput(source, null);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw createClientRequestError('tokenJson inválido. Debe ser un JSON de token OAuth válido.', 400);
+  }
+  return JSON.stringify(parsed);
+}
+
+function storeRcloneServiceAccountJson(userId, remoteName, rawJson) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) {
+    throw createClientRequestError('user_id inválido', 400);
+  }
+  const safeRemote = normalizeDriveRemoteName(remoteName);
+  if (!safeRemote) {
+    throw createClientRequestError('remoteName inválido', 400);
+  }
+  const source = String(rawJson || '').trim();
+  if (!source) {
+    throw createClientRequestError('Debes pegar el JSON de service account.', 400);
+  }
+  const parsed = parseRcloneJsonOutput(source, null);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw createClientRequestError('serviceAccountJson inválido. Debe ser JSON.', 400);
+  }
+  const dir = path.join(storageJobsRootDir, 'rclone-service-accounts', `user_${safeUserId}`);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const filePath = path.join(dir, `${safeRemote}.json`);
+  fs.writeFileSync(filePath, JSON.stringify(parsed, null, 2), { encoding: 'utf8', mode: 0o600 });
+  return filePath;
+}
+
+function getRcloneStatusPayload(configPath = '') {
+  const resolvedConfig = resolveRcloneConfigPath(configPath);
+  const configExists = pathExistsSyncSafe(resolvedConfig);
+  const remotes = listRcloneRemoteNames(resolvedConfig);
   return {
-    clientId: String(payload.app_key || '').trim(),
-    clientSecret: String(payload.app_secret || '').trim(),
-    redirectUri,
-    redirectUris
+    binary: rcloneBinary,
+    configPath: resolvedConfig,
+    configExists,
+    remotes,
+    defaultRemote: driveDefaultRemoteName || '',
+    defaultRootPath: driveDefaultRootPath || ''
+  };
+}
+
+function createOrUpdateRcloneDriveRemote(userId, payload = {}) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) {
+    throw createClientRequestError('user_id inválido', 400);
+  }
+  const remoteName = normalizeDriveRemoteName(payload.remoteName || payload.remote || payload.name || '');
+  if (!remoteName) {
+    throw createClientRequestError('Debes indicar remoteName.', 400);
+  }
+  const configPath = resolveRcloneConfigPath(payload.configPath || payload.rcloneConfigPath || '');
+  const scope = normalizeRcloneDriveScope(payload.scope || payload.driveScope || 'drive');
+  const rootFolderId = normalizeDriveRemotePath(payload.rootFolderId || payload.rootPath || '');
+  const teamDrive = normalizeDriveRemotePath(payload.teamDrive || payload.teamDriveId || '');
+  const clientId = String(payload.clientId || '').trim();
+  const clientSecret = String(payload.clientSecret || '').trim();
+  const authMode = normalizeRcloneRemoteAuthMode(payload.authMode || payload.credentialMode || payload.mode);
+  const existingRemotes = listRcloneRemoteNames(configPath);
+  const remoteAlreadyExists = existingRemotes.includes(remoteName);
+  if (!remoteAlreadyExists && authMode === 'none') {
+    throw createClientRequestError(
+      'Para crear un remote nuevo desde CodexWeb debes usar authMode oauth_token o service_account.',
+      400
+    );
+  }
+  const args = remoteAlreadyExists
+    ? ['config', 'update', remoteName, 'scope', scope]
+    : ['config', 'create', remoteName, 'drive', 'scope', scope];
+  if (clientId) {
+    args.push('client_id', clientId);
+  }
+  if (clientSecret) {
+    args.push('client_secret', clientSecret);
+  }
+  if (rootFolderId) {
+    args.push('root_folder_id', rootFolderId);
+  }
+  if (teamDrive) {
+    args.push('team_drive', teamDrive);
+  }
+  if (authMode === 'service_account') {
+    const serviceAccountFile = storeRcloneServiceAccountJson(
+      safeUserId,
+      remoteName,
+      payload.serviceAccountJson || payload.serviceAccountKey || ''
+    );
+    args.push('service_account_file', serviceAccountFile);
+  } else if (authMode === 'oauth_token') {
+    const tokenJson = normalizeRcloneTokenJson(payload.tokenJson || payload.oauthTokenJson || '');
+    if (!tokenJson) {
+      throw createClientRequestError('Debes indicar tokenJson para modo oauth_token.', 400);
+    }
+    args.push('token', tokenJson);
+  }
+  const result = runRcloneCommandSync(args, {
+    configPath,
+    timeoutMs: 1000 * 60,
+    noCheckDest: false
+  });
+  if (Number(result.code) !== 0) {
+    const reason = truncateForNotify(result.stderr || result.stdout || 'rclone_config_create_failed', 260);
+    throw createClientRequestError(`No se pudo crear/actualizar el remote "${remoteName}": ${reason}`, 502);
+  }
+  assertRcloneRemoteExists(remoteName, configPath);
+  const status = getRcloneStatusPayload(configPath);
+  return {
+    remoteName,
+    configPath: status.configPath,
+    authMode,
+    scope,
+    rootFolderId,
+    teamDrive,
+    remotes: status.remotes,
+    existedBefore: remoteAlreadyExists
+  };
+}
+
+function deleteRcloneRemote(remoteName, configPath = '') {
+  const safeRemote = normalizeDriveRemoteName(remoteName);
+  if (!safeRemote) {
+    throw createClientRequestError('remoteName inválido', 400);
+  }
+  const resolvedConfigPath = resolveRcloneConfigPath(configPath);
+  const result = runRcloneCommandSync(['config', 'delete', safeRemote], {
+    configPath: resolvedConfigPath,
+    timeoutMs: 15000
+  });
+  if (Number(result.code) !== 0) {
+    const reason = truncateForNotify(result.stderr || result.stdout || 'rclone_config_delete_failed', 240);
+    throw createClientRequestError(`No se pudo eliminar remote "${safeRemote}": ${reason}`, 502);
+  }
+  return {
+    remoteName: safeRemote,
+    ...getRcloneStatusPayload(resolvedConfigPath)
+  };
+}
+
+function validateRcloneRemote(remoteName, configPath = '') {
+  const safeRemote = normalizeDriveRemoteName(remoteName);
+  if (!safeRemote) {
+    throw createClientRequestError('remoteName inválido', 400);
+  }
+  const resolvedConfigPath = resolveRcloneConfigPath(configPath);
+  assertRcloneRemoteExists(safeRemote, resolvedConfigPath);
+  const result = runRcloneCommandSync(['about', `${safeRemote}:`, '--json'], {
+    configPath: resolvedConfigPath,
+    timeoutMs: 1000 * 60,
+    noCheckDest: false
+  });
+  if (Number(result.code) !== 0) {
+    const reason = truncateForNotify(result.stderr || result.stdout || 'rclone_remote_validate_failed', 260);
+    throw createClientRequestError(`No se pudo validar remote "${safeRemote}": ${reason}`, 502);
+  }
+  const payload = parseRcloneJsonOutput(result.stdout, {});
+  return {
+    remoteName: safeRemote,
+    configPath: resolvedConfigPath,
+    about:
+      payload && typeof payload === 'object' && !Array.isArray(payload)
+        ? payload
+        : {}
+  };
+}
+
+function normalizeDriveCreateAccountPayload(rawValue) {
+  const payload = rawValue && typeof rawValue === 'object' ? rawValue : {};
+  const remoteName = normalizeDriveRemoteName(
+    payload.remoteName ||
+      payload.remote ||
+      payload.rcloneRemote ||
+      payload.driveRemote ||
+      driveDefaultRemoteName
+  );
+  if (!remoteName) {
+    throw createClientRequestError(
+      'Debes indicar el nombre del remote de rclone (ej: codexwebdev-gdrive).',
+      400
+    );
+  }
+  const configPath = resolveRcloneConfigPath(payload.configPath || payload.rcloneConfigPath || '');
+  const rootPath = normalizeDriveRemotePath(
+    payload.rootPath || payload.rootFolderId || payload.root_folder_id || driveDefaultRootPath
+  );
+  const normalized = {
+    provider: 'rclone_drive',
+    remote_name: remoteName,
+    config_path: configPath,
+    root_path: rootPath
+  };
+  const details = {
+    credentialType: 'rclone_remote',
+    provider: 'rclone',
+    remoteName,
+    configPath,
+    rootPath,
+    docs: [
+      'https://rclone.org/drive/',
+      'https://rclone.org/commands/rclone_config/',
+      'https://developers.google.com/drive/api/guides/api-specific-auth'
+    ]
+  };
+  return {
+    authMode: 'rclone',
+    normalized,
+    details
   };
 }
 
@@ -1313,18 +2429,124 @@ function getSafeUserId(value) {
   return parsed;
 }
 
-function getUserCodexHome(userId) {
+function isDirectoryEmptySync(targetPath) {
+  try {
+    return fs.readdirSync(targetPath).length === 0;
+  } catch (_error) {
+    return true;
+  }
+}
+
+function ensureDirectoryWithMode(targetPath, mode) {
+  fs.mkdirSync(targetPath, { recursive: true, mode });
+  try {
+    fs.chmodSync(targetPath, mode);
+  } catch (_error) {
+    // best effort
+  }
+}
+
+function copyCodexHomeSeedEntry(sourcePath, targetPath) {
+  if (!pathExistsSyncSafe(sourcePath) || pathExistsSyncSafe(targetPath)) {
+    return false;
+  }
+  fs.cpSync(sourcePath, targetPath, {
+    recursive: true,
+    force: false,
+    errorOnExist: false
+  });
+  return true;
+}
+
+function migrateLegacyCodexHomeIfNeeded(safeUserId, targetPath) {
+  if (legacyCodexUsersRootDir === codexUsersRootDir) {
+    return false;
+  }
+  const legacyPath = path.join(legacyCodexUsersRootDir, `user_${safeUserId}`);
+  if (!pathExistsSyncSafe(legacyPath)) {
+    return false;
+  }
+  if (isDirectoryEmptySync(targetPath)) {
+    fs.cpSync(legacyPath, targetPath, {
+      recursive: true,
+      force: false,
+      errorOnExist: false
+    });
+    return true;
+  }
+  let copied = false;
+  copied = copyCodexHomeSeedEntry(path.join(legacyPath, 'auth.json'), path.join(targetPath, 'auth.json')) || copied;
+  copied =
+    copyCodexHomeSeedEntry(path.join(legacyPath, 'models_cache.json'), path.join(targetPath, 'models_cache.json')) ||
+    copied;
+  copied = copyCodexHomeSeedEntry(path.join(legacyPath, 'sessions'), path.join(targetPath, 'sessions')) || copied;
+  copied = copyCodexHomeSeedEntry(path.join(legacyPath, 'tmp'), path.join(targetPath, 'tmp')) || copied;
+  return copied;
+}
+
+function chownRecursiveSync(targetPath, uid, gid) {
+  if (!Number.isInteger(uid) || uid < 0 || !Number.isInteger(gid) || gid < 0) {
+    return;
+  }
+  const pending = [targetPath];
+  while (pending.length > 0) {
+    const currentPath = pending.pop();
+    let stats = null;
+    try {
+      stats = fs.lstatSync(currentPath);
+    } catch (_error) {
+      continue;
+    }
+    if (stats.isSymbolicLink()) {
+      continue;
+    }
+    if (stats.uid !== uid || stats.gid !== gid) {
+      fs.chownSync(currentPath, uid, gid);
+    }
+    if (!stats.isDirectory()) {
+      continue;
+    }
+    const entries = fs.readdirSync(currentPath, { withFileTypes: true });
+    entries.forEach((entry) => {
+      pending.push(path.join(currentPath, entry.name));
+    });
+  }
+}
+
+function ensureCodexHome(userId, options = {}) {
   const safeUserId = getSafeUserId(userId);
   if (!safeUserId) {
     throw new Error('INVALID_USER_ID');
   }
+  ensureDirectoryWithMode(codexUsersRootDir, 0o755);
   const target = path.join(codexUsersRootDir, `user_${safeUserId}`);
-  fs.mkdirSync(target, { recursive: true });
+  ensureDirectoryWithMode(target, 0o700);
+  ensureDirectoryWithMode(path.join(target, 'sessions'), 0o700);
+  ensureDirectoryWithMode(path.join(target, 'tmp'), 0o700);
+  ensureDirectoryWithMode(path.join(target, '.cache'), 0o700);
+  const migrated = migrateLegacyCodexHomeIfNeeded(safeUserId, target);
+  const ownerUid = Number(options.ownerUid);
+  const ownerGid = Number(options.ownerGid);
+  if (Number.isInteger(ownerUid) && ownerUid >= 0 && Number.isInteger(ownerGid) && ownerGid >= 0) {
+    chownRecursiveSync(target, ownerUid, ownerGid);
+  }
+  if (migrated) {
+    console.info(`Codex home migrado a ${target} para user_${safeUserId}`);
+  }
   return target;
 }
 
-function getUserCodexSessionsDir(userId) {
-  return path.join(getUserCodexHome(userId), 'sessions');
+function getUserCodexHome(userId, options = {}) {
+  try {
+    return ensureCodexHome(userId, options);
+  } catch (error) {
+    const reason = error && error.message ? error.message : 'codex_home_error';
+    throw new Error(`CODEX_HOME_PREP_FAILED: ${reason}`);
+  }
+}
+
+function getUserCodexSessionsDir(userId, options = {}) {
+  return path.join(getUserCodexHome(userId, options), 'sessions');
 }
 
 function getCodexEnvForUser(userId, options = {}) {
@@ -1333,9 +2555,13 @@ function getCodexEnvForUser(userId, options = {}) {
       ? options.username
       : '';
   const gitIdentity = buildGitIdentityFromUsername(username);
+  const codexHome = getUserCodexHome(userId, options);
   return {
     ...process.env,
-    CODEX_HOME: getUserCodexHome(userId),
+    CODEX_HOME: codexHome,
+    HOME: codexHome,
+    XDG_CACHE_HOME: path.join(codexHome, '.cache'),
+    TMPDIR: path.join(codexHome, 'tmp'),
     ...buildGitIdentityEnv(gitIdentity)
   };
 }
@@ -2714,28 +3940,64 @@ function ensureGitBranchForRepo(repoPath, branchName, options = {}) {
     };
   }
   const createIfMissing = Boolean(options && options.createIfMissing);
-  const exists = gitBranchExists(safeRepoPath, requestedBranch);
-  if (!exists && !createIfMissing) {
+  let remoteBranchRef = resolveGitRemoteBranchRef(safeRepoPath, requestedBranch);
+  let localBranchName = remoteBranchRef ? remoteBranchRef.branch : requestedBranch;
+  let exists = gitBranchExists(safeRepoPath, localBranchName);
+  let remoteExists = remoteBranchRef
+    ? gitRemoteBranchExists(safeRepoPath, remoteBranchRef.remote, remoteBranchRef.branch)
+    : false;
+  let defaultRemoteExists = gitRemoteBranchExists(safeRepoPath, 'origin', requestedBranch);
+  let fetchErrors = [];
+  if (!exists && !remoteExists && !defaultRemoteExists) {
+    const preferredRemote = remoteBranchRef ? remoteBranchRef.remote : 'origin';
+    const refreshResult = refreshGitRemoteRefs(safeRepoPath, preferredRemote);
+    fetchErrors = Array.isArray(refreshResult.errors) ? refreshResult.errors : [];
+    if (refreshResult.fetched) {
+      remoteBranchRef = resolveGitRemoteBranchRef(safeRepoPath, requestedBranch);
+      localBranchName = remoteBranchRef ? remoteBranchRef.branch : requestedBranch;
+      exists = gitBranchExists(safeRepoPath, localBranchName);
+      remoteExists = remoteBranchRef
+        ? gitRemoteBranchExists(safeRepoPath, remoteBranchRef.remote, remoteBranchRef.branch)
+        : false;
+      defaultRemoteExists = gitRemoteBranchExists(safeRepoPath, 'origin', requestedBranch);
+    }
+  }
+  const checkoutArgs =
+    exists
+      ? ['checkout', localBranchName]
+      : remoteExists
+        ? ['checkout', '-b', localBranchName, '--track', `${remoteBranchRef.remote}/${remoteBranchRef.branch}`]
+        : !remoteBranchRef && defaultRemoteExists
+          ? ['checkout', '-b', requestedBranch, '--track', `origin/${requestedBranch}`]
+          : ['checkout', '-b', localBranchName];
+  if (!exists && !remoteExists && !defaultRemoteExists && !createIfMissing) {
+    const fetchNote = fetchErrors.length > 0 ? ` · fetch: ${fetchErrors.join(' | ')}` : '';
     return {
       ok: false,
-      error: `La rama no existe: ${requestedBranch}`,
-      branch: requestedBranch
+      error: `La rama no existe (local/remota): ${requestedBranch}${fetchNote}`,
+      branch: localBranchName
     };
   }
-  const checkoutArgs = exists ? ['checkout', requestedBranch] : ['checkout', '-b', requestedBranch];
+  if (!exists && (remoteExists || defaultRemoteExists) && createIfMissing) {
+    // Si existe rama remota, priorizamos tracking sobre crear rama huérfana.
+  }
   const checkoutResult = runGitInRepoSync(safeRepoPath, checkoutArgs, {
     allowNonZero: true
   });
-  if (!checkoutResult.ok) {
+  if (Number(checkoutResult.code) !== 0) {
     return {
       ok: false,
-      error: truncateForNotify(checkoutResult.stderr || checkoutResult.stdout || 'git_checkout_failed', 220),
-      branch: requestedBranch
+      error: normalizeGitCheckoutError(
+        checkoutResult.stderr || checkoutResult.stdout || 'git_checkout_failed',
+        requestedBranch
+      ),
+      branch: localBranchName
     };
   }
+  const activeBranch = resolveCurrentGitBranchName(safeRepoPath) || localBranchName;
   return {
     ok: true,
-    branch: requestedBranch,
+    branch: activeBranch,
     created: !exists,
     output: String(checkoutResult.stdout || checkoutResult.stderr || '')
   };
@@ -3910,32 +5172,6 @@ function resumePendingDeployedDescriptionJobs() {
   });
 }
 
-function serializeDriveAccountRow(row) {
-  if (!row || typeof row !== 'object') return null;
-  const details = safeParseJsonObject(row.details_json);
-  const rootFolderRaw = String(row.root_folder_id || '').trim();
-  const normalizedRoot = normalizeDropboxPath(rootFolderRaw === 'root' ? '' : rootFolderRaw);
-  return {
-    id: String(row.id || '').trim(),
-    alias: String(row.alias || '').trim(),
-    authMode: normalizeDriveAuthMode(row.auth_mode),
-    rootFolderId: normalizedRoot || '/',
-    status: normalizeDriveAccountStatus(row.status),
-    lastError: String(row.last_error || '').trim(),
-    details: {
-      credentialType: String(details.credentialType || '').trim(),
-      projectId: String(details.projectId || '').trim(),
-      clientEmail: String(details.clientEmail || '').trim(),
-      clientId: String(details.clientId || '').trim(),
-      redirectUris: Array.isArray(details.redirectUris)
-        ? details.redirectUris.map((entry) => String(entry || '').trim()).filter(Boolean)
-        : []
-    },
-    createdAt: String(row.created_at || '').trim(),
-    updatedAt: String(row.updated_at || '').trim()
-  };
-}
-
 function parseDriveAccountCredentials(row) {
   if (!row || typeof row !== 'object') {
     throw new Error('drive_account_not_found');
@@ -3950,330 +5186,6 @@ function parseDriveAccountCredentials(row) {
     throw new Error('drive_credentials_invalid_json');
   }
   return parsed;
-}
-
-function parseDriveAccountTokens(row) {
-  if (!row || typeof row !== 'object') return {};
-  const cipher = String(row.token_cipher || '').trim();
-  if (!cipher) return {};
-  try {
-    const decrypted = decryptSecretText(cipher);
-    return safeParseJsonObject(decrypted);
-  } catch (_error) {
-    return {};
-  }
-}
-
-function upsertDriveAccountTokenCipher(row, tokenPayload) {
-  const safeRow = row && typeof row === 'object' ? row : null;
-  if (!safeRow || !safeRow.id) return;
-  const merged = safeParseJsonObject(tokenPayload);
-  const tokenCipher = Object.keys(merged).length > 0 ? encryptSecretText(JSON.stringify(merged)) : '';
-  updateDriveAccountTokenStmt.run(tokenCipher, 'active', '', nowIso(), String(safeRow.id));
-}
-
-function buildOAuth2ClientFromDriveAccount(row, credentials, preferredRedirectUri = '') {
-  const oauthConfig = extractDriveOauthClientConfig(credentials, preferredRedirectUri);
-  if (!oauthConfig.clientId || !oauthConfig.clientSecret) {
-    throw new Error('oauth_client_credentials_incomplete');
-  }
-  const oauthClient = {
-    generateAuthUrl() {
-      const params = new URLSearchParams();
-      params.set('client_id', oauthConfig.clientId);
-      params.set('response_type', 'code');
-      params.set('token_access_type', 'offline');
-      params.set('redirect_uri', oauthConfig.redirectUri || dropboxOauthFallbackRedirectUri);
-      return `${DROPBOX_OAUTH_AUTHORIZE_URL}?${params.toString()}`;
-    },
-    async getToken(code) {
-      const params = new URLSearchParams();
-      params.set('grant_type', 'authorization_code');
-      params.set('code', String(code || '').trim());
-      params.set('client_id', oauthConfig.clientId);
-      params.set('client_secret', oauthConfig.clientSecret);
-      params.set('redirect_uri', oauthConfig.redirectUri || dropboxOauthFallbackRedirectUri);
-      const response = await fetch(DROPBOX_OAUTH_TOKEN_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded'
-        },
-        body: params.toString()
-      });
-      const bodyText = String(await response.text()).trim();
-      let parsed = {};
-      try {
-        parsed = bodyText ? JSON.parse(bodyText) : {};
-      } catch (_error) {
-        parsed = {};
-      }
-      if (!response.ok) {
-        const reason = truncateForNotify(
-          (parsed && (parsed.error_description || parsed.error_summary || parsed.error)) || bodyText || 'dropbox_oauth_exchange_failed',
-          220
-        );
-        throw createClientRequestError(`Dropbox OAuth failed: ${reason}`, 400);
-      }
-      return { tokens: parsed };
-    }
-  };
-  return {
-    oauthClient,
-    oauthConfig
-  };
-}
-
-function resolveDropboxEffectiveFolderPath(rootFolderId, requestedFolderId = '') {
-  const normalizedRoot = normalizeDropboxPath(String(rootFolderId || '').trim() === 'root' ? '' : rootFolderId);
-  const normalizedRequested = normalizeDropboxPath(String(requestedFolderId || '').trim());
-  if (!normalizedRequested) return normalizedRoot;
-  if (!normalizedRoot) return normalizedRequested;
-  return normalizeDropboxPath(`${normalizedRoot}/${normalizedRequested}`);
-}
-
-function buildDropboxPathFromParentAndName(parentPath, fileName) {
-  const safeParent = normalizeDropboxPath(parentPath);
-  const safeName = sanitizeDriveFileName(fileName || '', 'archivo');
-  if (!safeParent) return `/${safeName}`;
-  return `${safeParent}/${safeName}`;
-}
-
-function isDropboxTokenFresh(tokenPayload) {
-  const tokens = tokenPayload && typeof tokenPayload === 'object' ? tokenPayload : {};
-  const accessToken = String(tokens.access_token || '').trim();
-  if (!accessToken) return false;
-  const expiresAtRaw = String(tokens.expires_at || '').trim();
-  if (!expiresAtRaw) return true;
-  const expiresMs = Date.parse(expiresAtRaw);
-  if (!Number.isFinite(expiresMs)) return true;
-  return expiresMs - Date.now() > 60 * 1000;
-}
-
-async function refreshDropboxAccessTokenIfNeeded(row, credentials, currentTokens = {}) {
-  const tokens = currentTokens && typeof currentTokens === 'object' ? { ...currentTokens } : {};
-  if (isDropboxTokenFresh(tokens)) {
-    return tokens;
-  }
-  const refreshToken =
-    String(tokens.refresh_token || '').trim() || String(credentials.refresh_token || '').trim();
-  const appKey = String(credentials.app_key || '').trim();
-  const appSecret = String(credentials.app_secret || '').trim();
-  if (!refreshToken || !appKey || !appSecret) {
-    return tokens;
-  }
-  const params = new URLSearchParams();
-  params.set('grant_type', 'refresh_token');
-  params.set('refresh_token', refreshToken);
-  params.set('client_id', appKey);
-  params.set('client_secret', appSecret);
-  const response = await fetch(DROPBOX_OAUTH_TOKEN_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded'
-    },
-    body: params.toString()
-  });
-  const bodyText = String(await response.text()).trim();
-  let parsed = {};
-  try {
-    parsed = bodyText ? JSON.parse(bodyText) : {};
-  } catch (_error) {
-    parsed = {};
-  }
-  if (!response.ok) {
-    const reason = truncateForNotify(
-      (parsed && (parsed.error_description || parsed.error_summary || parsed.error)) || bodyText || 'dropbox_refresh_failed',
-      220
-    );
-    throw createClientRequestError(`No se pudo refrescar token de Dropbox: ${reason}`, 401);
-  }
-  const expiresIn = Number(parsed && (parsed.expires_in || parsed.expiresIn));
-  const expiresAt = Number.isFinite(expiresIn) ? new Date(Date.now() + expiresIn * 1000).toISOString() : '';
-  const merged = {
-    ...tokens,
-    ...(parsed && typeof parsed === 'object' ? parsed : {})
-  };
-  merged.refresh_token = refreshToken;
-  if (expiresAt) {
-    merged.expires_at = expiresAt;
-  }
-  upsertDriveAccountTokenCipher(row, merged);
-  return merged;
-}
-
-async function dropboxApiRequest(accessToken, endpoint, body = {}, options = {}) {
-  const safeToken = String(accessToken || '').trim();
-  if (!safeToken) {
-    throw createClientRequestError('Cuenta de Dropbox sin access token válido.', 401);
-  }
-  const response = await fetch(`${DROPBOX_API_BASE_URL}${endpoint}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${safeToken}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(body && typeof body === 'object' ? body : {})
-  });
-  const bodyText = String(await response.text()).trim();
-  let parsed = {};
-  try {
-    parsed = bodyText ? JSON.parse(bodyText) : {};
-  } catch (_error) {
-    parsed = {};
-  }
-  if (!response.ok) {
-    const reason = truncateForNotify(
-      (parsed && (parsed.error_summary || parsed.error_description || parsed.error)) || bodyText || options.fallbackError || 'dropbox_api_failed',
-      260
-    );
-    throw createClientRequestError(`Dropbox API error: ${reason}`, response.status >= 400 ? response.status : 500);
-  }
-  return parsed;
-}
-
-async function getDriveContextForUser(userId, accountId, options = {}) {
-  const safeUserId = getSafeUserId(userId);
-  const safeAccountId = String(accountId || '').trim();
-  if (!safeUserId || !safeAccountId) {
-    throw createClientRequestError('Cuenta de Dropbox inválida', 400);
-  }
-  const row = getDriveAccountByIdForUserStmt.get(safeAccountId, safeUserId);
-  if (!row) {
-    throw createClientRequestError('Cuenta de Dropbox no encontrada', 404);
-  }
-  const serialized = serializeDriveAccountRow(row);
-  const credentials = parseDriveAccountCredentials(row);
-  const authMode = normalizeDriveAuthMode(row.auth_mode);
-  const allowNeedsOauth = Boolean(options.allowNeedsOauth);
-  const preferredRedirectUri = String(options.redirectUri || '').trim();
-  const oauthConfig = extractDriveOauthClientConfig(credentials, preferredRedirectUri);
-
-  const tokens = {
-    ...parseDriveAccountTokens(row)
-  };
-  if (!tokens.access_token && credentials.access_token) {
-    tokens.access_token = String(credentials.access_token || '').trim();
-  }
-  if (!tokens.refresh_token && credentials.refresh_token) {
-    tokens.refresh_token = String(credentials.refresh_token || '').trim();
-  }
-  if (!tokens.expires_at && credentials.expires_at) {
-    tokens.expires_at = String(credentials.expires_at || '').trim();
-  }
-  let resolvedTokens = tokens;
-  try {
-    resolvedTokens = await refreshDropboxAccessTokenIfNeeded(row, credentials, tokens);
-  } catch (error) {
-    if (!allowNeedsOauth) throw error;
-  }
-  const accessToken = String(resolvedTokens && resolvedTokens.access_token ? resolvedTokens.access_token : '').trim();
-  if (!accessToken && !allowNeedsOauth) {
-    throw createClientRequestError('Esta cuenta de Dropbox aún no está autorizada. Completa OAuth o agrega token.', 409);
-  }
-  return {
-    row,
-    account: serialized,
-    authMode,
-    credentials,
-    oauthConfig,
-    tokens: resolvedTokens,
-    accessToken
-  };
-}
-
-async function validateDriveAccountByIdForUser(userId, accountId) {
-  const context = await getDriveContextForUser(userId, accountId, { allowNeedsOauth: false });
-  const accountInfo = await dropboxApiRequest(
-    context.accessToken,
-    '/users/get_current_account',
-    {},
-    { fallbackError: 'dropbox_account_fetch_failed' }
-  );
-  const spaceInfo = await dropboxApiRequest(
-    context.accessToken,
-    '/users/get_space_usage',
-    {},
-    { fallbackError: 'dropbox_space_usage_failed' }
-  );
-  const quotaAlloc = spaceInfo && spaceInfo.allocation && typeof spaceInfo.allocation === 'object'
-    ? spaceInfo.allocation
-    : {};
-  const allocatedRaw =
-    quotaAlloc &&
-    quotaAlloc.allocated &&
-    Number.isFinite(Number(quotaAlloc.allocated))
-      ? Number(quotaAlloc.allocated)
-      : null;
-  const usedRaw = Number.isFinite(Number(spaceInfo && spaceInfo.used)) ? Number(spaceInfo.used) : null;
-  const details = safeParseJsonObject(context.row.details_json);
-  details.validatedAt = nowIso();
-  details.accountEmail = String(accountInfo.email || '').trim();
-  details.accountDisplayName = String(
-    (accountInfo.name && (accountInfo.name.display_name || accountInfo.name.familiar_name)) || ''
-  ).trim();
-  details.storageQuota = {
-    limit: allocatedRaw !== null ? String(allocatedRaw) : '',
-    usage: usedRaw !== null ? String(usedRaw) : '',
-    usageInDrive: usedRaw !== null ? String(usedRaw) : ''
-  };
-  updateDriveAccountMetaStmt.run(
-    String(context.row.alias || '').trim(),
-    normalizeDropboxPath(String(context.row.root_folder_id || '').trim() === 'root' ? '' : context.row.root_folder_id),
-    'active',
-    '',
-    JSON.stringify(details),
-    nowIso(),
-    String(context.row.id || '').trim(),
-    getSafeUserId(userId)
-  );
-  return {
-    account: serializeDriveAccountRow(getDriveAccountByIdForUserStmt.get(String(context.row.id), getSafeUserId(userId))),
-    about: {
-      email: String(accountInfo.email || '').trim(),
-      displayName: String(
-        (accountInfo.name && (accountInfo.name.display_name || accountInfo.name.familiar_name)) || ''
-      ).trim(),
-      quota: {
-        limit: allocatedRaw,
-        usage: usedRaw,
-        usageInDrive: usedRaw
-      }
-    }
-  };
-}
-
-async function ensureDriveFolder(context, parentId, folderName) {
-  const safeName = sanitizeDriveFileName(folderName, 'CodexWeb');
-  const parentPath = normalizeDropboxPath(parentId);
-  const childPath = buildDropboxPathFromParentAndName(parentPath, safeName);
-  await dropboxApiRequest(
-    context.accessToken,
-    '/files/create_folder_v2',
-    {
-      path: childPath,
-      autorename: false
-    },
-    { fallbackError: 'dropbox_create_folder_failed' }
-  ).catch((error) => {
-    const msg = String(error && error.message ? error.message : '');
-    if (!/path\/conflict|already exists/i.test(msg)) {
-      throw error;
-    }
-  });
-  return childPath;
-}
-
-async function ensureDriveBackupFolder(context, appId) {
-  const rootPath = normalizeDropboxPath(
-    String(context.row.root_folder_id || '').trim() === 'root' ? '' : context.row.root_folder_id
-  );
-  const codexFolderPath = await ensureDriveFolder(context, rootPath, 'CodexWebBackups');
-  const appFolderName = sanitizeDriveFileName(`app_${String(appId || '').slice(0, 80)}`, 'app');
-  const appFolderPath = await ensureDriveFolder(context, codexFolderPath, appFolderName);
-  return {
-    codexFolderId: codexFolderPath,
-    appFolderId: appFolderPath
-  };
 }
 
 function serializeToolsBackgroundJobRow(row) {
@@ -4378,284 +5290,84 @@ function createStorageJob(userId, jobType, payload) {
   return serializeToolsBackgroundJobRow(getToolsBackgroundJobForUserStmt.get(jobId, safeUserId));
 }
 
-async function listDriveFilesForAccount(userId, accountId, options = {}) {
-  const context = await getDriveContextForUser(userId, accountId, { allowNeedsOauth: false });
-  const folderId = resolveDropboxEffectiveFolderPath(
-    String(context.row.root_folder_id || '').trim(),
-    String(options.folderId || '').trim()
-  );
-  const pageSizeRaw = Number.parseInt(String(options.pageSize || ''), 10);
-  const pageSize = Number.isInteger(pageSizeRaw) ? Math.min(Math.max(pageSizeRaw, 1), 200) : 80;
-  const pageToken = String(options.pageToken || '').trim();
-  const queryText = String(options.query || '').trim();
-  let payload = null;
-  try {
-    if (pageToken) {
-      payload = await dropboxApiRequest(
-        context.accessToken,
-        '/files/list_folder/continue',
-        { cursor: pageToken },
-        { fallbackError: 'dropbox_list_folder_continue_failed' }
-      );
-    } else {
-      payload = await dropboxApiRequest(
-        context.accessToken,
-        '/files/list_folder',
-        {
-          path: folderId || '',
-          recursive: false,
-          include_deleted: false,
-          include_media_info: false,
-          include_non_downloadable_files: true,
-          limit: pageSize
-        },
-        { fallbackError: 'dropbox_list_folder_failed' }
-      );
-    }
-  } catch (error) {
-    const msg = String(error && error.message ? error.message : '');
-    if (/path\/not_found/i.test(msg)) {
-      return {
-        account: context.account,
-        folderId: folderId || '/',
-        nextPageToken: '',
-        files: []
-      };
-    }
-    throw error;
+function findOpenProjectContextJobForUser(userId, projectId) {
+  const safeUserId = getSafeUserId(userId);
+  const safeProjectId = Number(projectId);
+  if (!safeUserId || !Number.isInteger(safeProjectId) || safeProjectId <= 0) {
+    return null;
   }
-  const entries = Array.isArray(payload && payload.entries) ? payload.entries : [];
-  const files = entries
-    .filter((entry) => entry && typeof entry === 'object')
-    .filter((entry) => {
-      if (!queryText) return true;
-      return String(entry.name || '').toLowerCase().includes(queryText.toLowerCase());
-    })
-    .map((entry) => {
-      const tag = String(entry['.tag'] || '').trim().toLowerCase();
-      const pathDisplay = String(entry.path_display || '').trim();
-      const pathLower = String(entry.path_lower || '').trim();
-      const id = pathLower || String(entry.id || '').trim();
-      const parentPath = pathDisplay ? normalizeDropboxPath(path.posix.dirname(pathDisplay)) : folderId;
-      return {
-        id,
-        name: String(entry.name || '').trim(),
-        mimeType:
-          tag === 'folder'
-            ? 'application/vnd.dropbox.folder'
-            : inferMimeTypeFromFilename(String(entry.name || '').trim()),
-        sizeBytes: Number.isFinite(Number(entry.size)) ? Number(entry.size) : null,
-        createdAt: String(entry.client_modified || entry.server_modified || '').trim(),
-        modifiedAt: String(entry.server_modified || entry.client_modified || '').trim(),
-        parents: parentPath ? [parentPath] : [],
-        appProperties: {
-          dropboxTag: tag,
-          dropboxId: String(entry.id || '').trim(),
-          pathDisplay,
-          pathLower
-        }
-      };
-    });
-  return {
-    account: context.account,
-    folderId: folderId || '/',
-    nextPageToken:
-      payload && payload.has_more && payload.cursor ? String(payload.cursor).trim() : '',
-    files
-  };
+  const rows = listRecentToolsBackgroundJobsForUserStmt.all(safeUserId, 90);
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    const type = normalizeStorageJobType(row && row.job_type ? row.job_type : '');
+    if (type !== 'project_context_refresh') continue;
+    const status = normalizeStorageJobStatus(row && row.status ? row.status : '');
+    if (status !== 'pending' && status !== 'running') continue;
+    const payload = safeParseJsonObject(row && row.payload_json ? row.payload_json : '{}');
+    const payloadProjectId = Number(payload && payload.projectId);
+    if (!Number.isInteger(payloadProjectId) || payloadProjectId !== safeProjectId) continue;
+    return serializeToolsBackgroundJobRow(row);
+  }
+  return null;
 }
 
-async function resolveDropboxPathFromIdentifier(context, fileId) {
-  const identifier = String(fileId || '').trim();
-  if (!identifier) {
-    throw createClientRequestError('fileId inválido', 400);
+function clearQueuedProjectContextRefreshTimer(userId, projectId) {
+  const key = `${Number(userId)}:${Number(projectId)}`;
+  const timer = queuedProjectContextRefreshTimers.get(key);
+  if (timer) {
+    clearTimeout(timer);
+    queuedProjectContextRefreshTimers.delete(key);
   }
-  if (identifier.startsWith('/')) {
-    return normalizeDropboxPath(identifier);
-  }
-  if (identifier.startsWith('id:')) {
-    const metadata = await dropboxApiRequest(
-      context.accessToken,
-      '/files/get_metadata',
-      {
-        path: identifier,
-        include_deleted: false
-      },
-      { fallbackError: 'dropbox_metadata_failed' }
-    );
-    return normalizeDropboxPath(metadata.path_lower || metadata.path_display || identifier);
-  }
-  return normalizeDropboxPath(identifier);
 }
 
-async function deleteDriveFileForAccount(userId, accountId, fileId) {
-  const context = await getDriveContextForUser(userId, accountId, { allowNeedsOauth: false });
-  const safeFileId = String(fileId || '').trim();
-  if (!safeFileId) {
-    throw createClientRequestError('fileId inválido', 400);
+function enqueueProjectContextRefreshJob(userId, projectId, options = {}) {
+  const safeUserId = getSafeUserId(userId);
+  const safeProjectId = Number(projectId);
+  if (!safeUserId || !Number.isInteger(safeProjectId) || safeProjectId <= 0) {
+    return null;
   }
-  const dropboxPath = await resolveDropboxPathFromIdentifier(context, safeFileId);
-  await dropboxApiRequest(
-    context.accessToken,
-    '/files/delete_v2',
-    { path: dropboxPath },
-    { fallbackError: 'dropbox_delete_failed' }
-  );
-  markDeployedCloudBackupDeletedByDriveFileStmt.run(nowIso(), getSafeUserId(userId), String(accountId), safeFileId);
-  if (dropboxPath !== safeFileId) {
-    markDeployedCloudBackupDeletedByDriveFileStmt.run(
-      nowIso(),
-      getSafeUserId(userId),
-      String(accountId),
-      dropboxPath
-    );
+  const project = getOwnedProjectOrNull(safeProjectId, safeUserId);
+  if (!project) return null;
+  const force = Boolean(options.force);
+  if (!force && !normalizeProjectAutoEnabled(project.auto_context_enabled, true)) {
+    return null;
   }
-  return {
-    deleted: true,
-    fileId: dropboxPath,
-    account: context.account
+  const openJob = findOpenProjectContextJobForUser(safeUserId, safeProjectId);
+  if (openJob) return openJob;
+
+  const trigger = normalizeProjectContextText(options.trigger || 'auto', 64) || 'auto';
+  const payload = {
+    projectId: safeProjectId,
+    trigger,
+    force
   };
+  const immediate = Boolean(options.immediate);
+  if (immediate) {
+    return createStorageJob(safeUserId, 'project_context_refresh', payload);
+  }
+  const delayMs =
+    Number.isFinite(Number(options.delayMs)) && Number(options.delayMs) >= 0
+      ? Number(options.delayMs)
+      : projectContextAutoRegenerateDebounceMs;
+  const key = `${safeUserId}:${safeProjectId}`;
+  clearQueuedProjectContextRefreshTimer(safeUserId, safeProjectId);
+  const timer = setTimeout(() => {
+    queuedProjectContextRefreshTimers.delete(key);
+    const stillOpen = findOpenProjectContextJobForUser(safeUserId, safeProjectId);
+    if (stillOpen) return;
+    try {
+      createStorageJob(safeUserId, 'project_context_refresh', payload);
+    } catch (_error) {
+      // best-effort async refresh
+    }
+  }, delayMs);
+  queuedProjectContextRefreshTimers.set(key, timer);
+  return null;
 }
 
 function buildAppBackupQuery(appId) {
   const safeAppId = String(appId || '').trim().slice(0, 80);
   return sanitizeDriveFileName(`app_${safeAppId}`, 'app');
-}
-
-async function listAppBackupsInDriveForAccount(userId, appId, accountId) {
-  const safeAppId = String(appId || '').trim();
-  if (!safeAppId) {
-    throw createClientRequestError('appId inválido', 400);
-  }
-  const context = await getDriveContextForUser(userId, accountId, { allowNeedsOauth: false });
-  const rootPath = normalizeDropboxPath(
-    String(context.row.root_folder_id || '').trim() === 'root' ? '' : context.row.root_folder_id
-  );
-  const backupFolder = normalizeDropboxPath(`${rootPath || ''}/CodexWebBackups/${buildAppBackupQuery(safeAppId)}`);
-  const cachedRows = listDeployedCloudBackupsForUserAndAppStmt.all(getSafeUserId(userId), safeAppId, 200);
-  const cacheByFileId = new Map(
-    cachedRows.map((entry) => [String(entry && entry.drive_file_id ? entry.drive_file_id : '').trim(), entry])
-  );
-  const entries = [];
-  let cursor = '';
-  let keepFetching = true;
-  while (keepFetching && entries.length < 240) {
-    let payload = null;
-    try {
-      payload = cursor
-        ? await dropboxApiRequest(
-            context.accessToken,
-            '/files/list_folder/continue',
-            { cursor },
-            { fallbackError: 'dropbox_backups_list_continue_failed' }
-          )
-        : await dropboxApiRequest(
-            context.accessToken,
-            '/files/list_folder',
-            {
-              path: backupFolder || '',
-              recursive: false,
-              include_deleted: false,
-              include_media_info: false,
-              limit: 120
-            },
-            { fallbackError: 'dropbox_backups_list_failed' }
-          );
-    } catch (error) {
-      const msg = String(error && error.message ? error.message : '');
-      if (/path\/not_found/i.test(msg)) {
-        break;
-      }
-      throw error;
-    }
-    const pageEntries = Array.isArray(payload && payload.entries) ? payload.entries : [];
-    pageEntries.forEach((entry) => entries.push(entry));
-    cursor = payload && payload.has_more ? String(payload.cursor || '').trim() : '';
-    keepFetching = Boolean(cursor);
-  }
-  return entries
-    .filter((entry) => String(entry && entry['.tag'] ? entry['.tag'] : '').trim().toLowerCase() === 'file')
-    .map((file) => {
-      const fileIdentifier = String(file.path_lower || file.id || '').trim();
-      const cached = cacheByFileId.get(fileIdentifier) || null;
-      const metadata = cached ? safeParseJsonObject(cached.metadata_json) : {};
-      const appProperties = metadata && typeof metadata === 'object' ? metadata : {};
-      const targetPath = cached ? String(cached.target_path || '').trim() : String(appProperties.targetPath || '').trim();
-      const createdAt = String(file.client_modified || file.server_modified || '').trim();
-      const modifiedAt = String(file.server_modified || file.client_modified || '').trim();
-      const sizeBytes = Number.isFinite(Number(file.size))
-        ? Number(file.size)
-        : cached && Number.isFinite(Number(cached.size_bytes))
-          ? Number(cached.size_bytes)
-          : null;
-      const stableId = `drvbackup_${String(context.account.id)}_${Buffer.from(fileIdentifier || String(file.name || ''), 'utf8').toString('hex').slice(0, 48)}`;
-      return {
-        id: stableId,
-        appId: safeAppId,
-        driveFileId: fileIdentifier,
-        accountId: String(context.account.id),
-        accountAlias: String(context.account.alias || context.account.id),
-        name: String(file && file.name ? file.name : '').trim(),
-        targetPath,
-        sizeBytes,
-        createdAt,
-        modifiedAt,
-        appProperties
-      };
-    });
-}
-
-async function listAppBackupsFromDrive(userId, appId, accountId = '') {
-  const safeUserId = getSafeUserId(userId);
-  const safeAppId = String(appId || '').trim();
-  if (!safeUserId || !safeAppId) {
-    throw createClientRequestError('Parámetros inválidos para listar backups', 400);
-  }
-
-  const accountIds = [];
-  const singleAccount = String(accountId || '').trim();
-  if (singleAccount) {
-    accountIds.push(singleAccount);
-  } else {
-    const rows = listDriveAccountsForUserStmt.all(safeUserId);
-    rows.forEach((row) => {
-      const id = String(row && row.id ? row.id : '').trim();
-      if (!id) return;
-      accountIds.push(id);
-    });
-  }
-
-  const all = [];
-  for (const currentAccountId of accountIds) {
-    try {
-      const items = await listAppBackupsInDriveForAccount(safeUserId, safeAppId, currentAccountId);
-      items.forEach((item) => all.push(item));
-    } catch (_error) {
-      // Keep listing across other accounts.
-    }
-  }
-  all.sort((a, b) => Date.parse(String(b.createdAt || '')) - Date.parse(String(a.createdAt || '')));
-  return all;
-}
-
-async function pruneDriveBackupsForRetention(userId, accountId, appId) {
-  const cutoffMs = Date.now() - storageBackupRetentionDays * 24 * 60 * 60 * 1000;
-  const items = await listAppBackupsInDriveForAccount(userId, appId, accountId);
-  let removed = 0;
-  for (const item of items) {
-    const createdMs = Date.parse(String(item.createdAt || ''));
-    if (!Number.isFinite(createdMs) || createdMs >= cutoffMs) continue;
-    try {
-      await deleteDriveFileForAccount(userId, accountId, item.driveFileId);
-      removed += 1;
-    } catch (_error) {
-      // Keep cleanup best effort.
-    }
-  }
-  return {
-    retentionDays: storageBackupRetentionDays,
-    removed
-  };
 }
 
 function resolveBackupTargetFromApp(app) {
@@ -4722,10 +5434,423 @@ function extractTarGzArchive(archivePath, targetPath) {
   };
 }
 
+async function runStorageJobById(jobId) {
+  const safeJobId = String(jobId || '').trim();
+  if (!safeJobId) return;
+  const row = getToolsBackgroundJobByIdStmt.get(safeJobId);
+  if (!row) return;
+  const status = normalizeStorageJobStatus(row.status);
+  if (status === 'completed' || status === 'error') return;
+  const runningAt = nowIso();
+  updateToolsBackgroundJobRunningStmt.run(runningAt, runningAt, safeJobId);
+  const freshRow = getToolsBackgroundJobByIdStmt.get(safeJobId);
+  if (!freshRow) return;
+  const type = normalizeStorageJobType(freshRow.job_type);
+  try {
+    let result = {};
+    if (type === 'cleanup_residual_analyze') {
+      result = await handleStorageCleanupAnalyzeJob(freshRow);
+    } else if (type === 'git_merge_branches') {
+      result = await handleGitMergeBranchesJob(freshRow);
+    } else if (type === 'project_context_refresh') {
+      result = await handleProjectContextRefreshJob(freshRow);
+    } else if (type === 'local_delete_paths') {
+      result = await handleLocalDeletePathsJob(freshRow);
+    } else if (type === 'drive_upload_files') {
+      result = await handleDriveUploadFilesJob(freshRow);
+    } else if (type === 'deployed_backup_create') {
+      result = await handleDeployedBackupCreateJob(freshRow);
+    } else if (type === 'deployed_backup_restore') {
+      result = await handleDeployedBackupRestoreJob(freshRow);
+    } else {
+      throw new Error('storage_job_type_not_supported');
+    }
+    const safeResult =
+      result && typeof result === 'object'
+        ? { ...result }
+        : {};
+    const completionStage = String(safeResult.__stage || 'completed').trim() || 'completed';
+    const completionLog = String(safeResult.__logMessage || 'Job completado').trim() || 'Job completado';
+    delete safeResult.__stage;
+    delete safeResult.__logMessage;
+    markStorageJobCompleted(safeJobId, safeResult, { stage: completionStage }, completionLog);
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'storage_job_failed', 900);
+    markStorageJobError(safeJobId, reason, { stage: 'error' });
+  }
+}
+
+function scheduleStorageJob(jobId) {
+  const safeJobId = String(jobId || '').trim();
+  if (!safeJobId || activeStorageJobWorkers.has(safeJobId)) return;
+  activeStorageJobWorkers.add(safeJobId);
+  setTimeout(() => {
+    void runStorageJobById(safeJobId).finally(() => {
+      activeStorageJobWorkers.delete(safeJobId);
+    });
+  }, 15);
+}
+
+function resumePendingStorageJobs() {
+  const rows = listPendingToolsBackgroundJobsStmt.all(storageJobPollMaxItems);
+  rows.forEach((row) => {
+    const jobId = String(row && row.id ? row.id : '').trim();
+    if (!jobId) return;
+    scheduleStorageJob(jobId);
+  });
+}
+
+function normalizeDrivePathFromRoot(rootPath, fullPath) {
+  const safeRoot = normalizeDriveRemotePath(rootPath);
+  const safeFull = normalizeDriveRemotePath(fullPath);
+  if (!safeFull) return '';
+  if (!safeRoot) return safeFull;
+  if (safeFull === safeRoot) return '';
+  const rel = path.posix.relative(safeRoot, safeFull);
+  if (!rel || rel === '.' || rel.startsWith('..')) {
+    return safeFull;
+  }
+  return normalizeDriveRemotePath(rel);
+}
+
+function resolveDrivePathFromRoot(rootPath, requestedPath = '') {
+  const safeRoot = normalizeDriveRemotePath(rootPath);
+  const safeRequested = normalizeDriveRemotePath(requestedPath);
+  if (!safeRequested) return safeRoot;
+  if (!safeRoot) return safeRequested;
+  if (safeRequested === safeRoot || safeRequested.startsWith(`${safeRoot}/`)) {
+    return safeRequested;
+  }
+  return joinDriveRemotePath(safeRoot, safeRequested);
+}
+
+function buildDriveAboutFromRclonePayload(payload = {}) {
+  const toBytes = (value) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.max(0, parsed) : null;
+  };
+  const total = toBytes(payload.total);
+  const used = toBytes(payload.used);
+  const free = toBytes(payload.free);
+  const usage = used;
+  const usageInDrive = used;
+  return {
+    email: '',
+    displayName: '',
+    quota: {
+      limit: total,
+      usage,
+      usageInDrive,
+      free
+    }
+  };
+}
+
+function buildDriveAccountCredentialSummary(credentials = {}, details = {}) {
+  const remoteName = normalizeDriveRemoteName(
+    credentials.remote_name || credentials.remoteName || details.remoteName || driveDefaultRemoteName
+  );
+  const configPath = resolveRcloneConfigPath(credentials.config_path || credentials.configPath || details.configPath);
+  const rootPath = normalizeDriveRemotePath(credentials.root_path || credentials.rootPath || details.rootPath || '');
+  return {
+    remoteName,
+    configPath,
+    rootPath
+  };
+}
+
+function serializeDriveAccountRow(row) {
+  if (!row || typeof row !== 'object') return null;
+  const details = safeParseJsonObject(row.details_json);
+  let credentials = {};
+  try {
+    credentials = parseDriveAccountCredentials(row);
+  } catch (_error) {
+    credentials = {};
+  }
+  const summary = buildDriveAccountCredentialSummary(credentials, details);
+  const remoteName = summary.remoteName;
+  const configPath = summary.configPath;
+  const rootPath = normalizeDriveRemotePath(
+    String(row.root_folder_id || '').trim() || summary.rootPath || driveDefaultRootPath
+  );
+  const status = normalizeDriveAccountStatus(row.status);
+  const validatedAt = parseIsoDateOrEmpty(details.validatedAt || '');
+  const connectionState =
+    status === 'active'
+      ? 'active'
+      : status === 'error'
+        ? 'invalid'
+        : status === 'pending'
+          ? 'pending'
+          : 'unknown';
+  const about = details.about && typeof details.about === 'object' ? details.about : {};
+  return {
+    id: String(row.id || '').trim(),
+    alias: String(row.alias || '').trim() || `Drive ${String(row.id || '').slice(-6)}`,
+    authMode: 'rclone',
+    rootFolderId: buildDriveFileIdFromPath(rootPath),
+    status,
+    lastError: String(row.last_error || '').trim(),
+    details: {
+      remoteName,
+      configPath,
+      rootPath: buildDriveFileIdFromPath(rootPath),
+      provider: 'rclone',
+      connectionState,
+      validatedAt,
+      about: {
+        limit: Number.isFinite(Number(about.limit)) ? Number(about.limit) : null,
+        usage: Number.isFinite(Number(about.usage)) ? Number(about.usage) : null,
+        usageInDrive: Number.isFinite(Number(about.usageInDrive)) ? Number(about.usageInDrive) : null,
+        free: Number.isFinite(Number(about.free)) ? Number(about.free) : null
+      }
+    },
+    createdAt: String(row.created_at || '').trim(),
+    updatedAt: String(row.updated_at || '').trim()
+  };
+}
+
+async function getDriveContextForUser(userId, accountId, options = {}) {
+  const safeUserId = getSafeUserId(userId);
+  const safeAccountId = String(accountId || '').trim();
+  if (!safeUserId || !safeAccountId) {
+    throw createClientRequestError('Cuenta de Google Drive inválida.', 400);
+  }
+  const row = getDriveAccountByIdForUserStmt.get(safeAccountId, safeUserId);
+  if (!row) {
+    throw createClientRequestError('Cuenta de Google Drive no encontrada.', 404);
+  }
+  const account = serializeDriveAccountRow(row);
+  const credentials = parseDriveAccountCredentials(row);
+  const summary = buildDriveAccountCredentialSummary(credentials, safeParseJsonObject(row.details_json));
+  const remoteName = normalizeDriveRemoteName(summary.remoteName || driveDefaultRemoteName);
+  if (!remoteName) {
+    throw createClientRequestError(
+      'La cuenta no tiene remote de rclone. Reconfigúrala en Tools > Storage > Google Drive.',
+      409
+    );
+  }
+  const rootPath = normalizeDriveRemotePath(
+    String(row.root_folder_id || '').trim() || summary.rootPath || driveDefaultRootPath
+  );
+  const configPath = resolveRcloneConfigPath(
+    String(options.configPath || '').trim() || summary.configPath || ''
+  );
+  assertRcloneRemoteExists(remoteName, configPath);
+  return {
+    row,
+    account,
+    credentials,
+    remoteName,
+    rootPath,
+    configPath
+  };
+}
+
+async function validateDriveAccountByIdForUser(userId, accountId) {
+  const safeUserId = getSafeUserId(userId);
+  const context = await getDriveContextForUser(safeUserId, accountId);
+  const rootTarget = buildRcloneTarget(context.remoteName, context.rootPath);
+  const aboutResult = runRcloneCommandSync(['about', rootTarget, '--json'], {
+    configPath: context.configPath,
+    allowNonZero: true,
+    timeoutMs: 1000 * 30
+  });
+  if (!aboutResult.ok) {
+    const reason = truncateForNotify(
+      aboutResult.stderr || aboutResult.stdout || 'drive_about_failed',
+      220
+    );
+    throw createClientRequestError(`No se pudo validar cuota en Google Drive (rclone): ${reason}`, 502);
+  }
+  const aboutPayload = parseRcloneJsonOutput(aboutResult.stdout, {});
+  const probeResult = runRcloneCommandSync(['lsjson', rootTarget, '--max-depth', '1'], {
+    configPath: context.configPath,
+    allowNonZero: true,
+    timeoutMs: 1000 * 30
+  });
+  if (!probeResult.ok) {
+    const mkdirResult = runRcloneCommandSync(['mkdir', rootTarget], {
+      configPath: context.configPath,
+      allowNonZero: true,
+      timeoutMs: 1000 * 30
+    });
+    if (!mkdirResult.ok) {
+      const reason = truncateForNotify(
+        probeResult.stderr || probeResult.stdout || mkdirResult.stderr || mkdirResult.stdout || 'drive_probe_failed',
+        220
+      );
+      throw createClientRequestError(`No se pudo acceder a Google Drive por rclone: ${reason}`, 502);
+    }
+  }
+  const about = buildDriveAboutFromRclonePayload(aboutPayload);
+  const details = safeParseJsonObject(context.row.details_json);
+  details.provider = 'rclone';
+  details.remoteName = context.remoteName;
+  details.configPath = context.configPath;
+  details.rootPath = buildDriveFileIdFromPath(context.rootPath);
+  details.validatedAt = nowIso();
+  details.about = {
+    limit: about.quota.limit,
+    usage: about.quota.usage,
+    usageInDrive: about.quota.usageInDrive,
+    free: about.quota.free
+  };
+  updateDriveAccountMetaStmt.run(
+    String(context.row.alias || '').trim(),
+    normalizeDriveRemotePath(context.rootPath),
+    'active',
+    '',
+    JSON.stringify(details),
+    nowIso(),
+    String(context.row.id || '').trim(),
+    safeUserId
+  );
+  const refreshed = getDriveAccountByIdForUserStmt.get(String(context.row.id || '').trim(), safeUserId);
+  return {
+    account: serializeDriveAccountRow(refreshed),
+    about
+  };
+}
+
+async function listDriveFilesForAccount(userId, accountId, options = {}) {
+  const context = await getDriveContextForUser(userId, accountId);
+  const requestedFolder = normalizeDriveRemotePath(options.folderId || '');
+  const fullFolderPath = resolveDrivePathFromRoot(context.rootPath, requestedFolder);
+  const folderTarget = buildRcloneTarget(context.remoteName, fullFolderPath);
+  const result = runRcloneCommandSync(['lsjson', folderTarget, '--max-depth', '1'], {
+    configPath: context.configPath,
+    allowNonZero: true,
+    timeoutMs: 1000 * 60
+  });
+  const stderrLower = String(result.stderr || '').toLowerCase();
+  if (!result.ok && !stderrLower.includes('directory not found') && !stderrLower.includes('not found')) {
+    const reason = truncateForNotify(result.stderr || result.stdout || 'drive_list_failed', 220);
+    throw createClientRequestError(`No se pudo listar Google Drive (rclone): ${reason}`, 502);
+  }
+  const rawItems = result.ok ? parseRcloneJsonOutput(result.stdout, []) : [];
+  const query = String(options.query || '').trim().toLowerCase();
+  const items = (Array.isArray(rawItems) ? rawItems : [])
+    .map((entry) => {
+      const isDir = Boolean(entry && entry.IsDir);
+      const name = String(
+        (entry && (entry.Name || entry.Path || entry.name || entry.path)) || ''
+      ).trim();
+      if (!name || name === '.' || name === '..') return null;
+      const fullPath = joinDriveRemotePath(fullFolderPath, name);
+      const relativePath = normalizeDrivePathFromRoot(context.rootPath, fullPath);
+      const parentRelative = normalizeDrivePathFromRoot(context.rootPath, fullFolderPath);
+      const modifiedAt = parseIsoDateOrEmpty(entry && (entry.ModTime || entry.modTime || entry.ModifiedAt));
+      const sizeRaw = Number(entry && (entry.Size ?? entry.size));
+      return {
+        id: buildDriveFileIdFromPath(relativePath),
+        name,
+        mimeType: isDir ? 'application/vnd.google-apps.folder' : inferMimeTypeFromFilename(name),
+        sizeBytes: isDir ? null : Number.isFinite(sizeRaw) ? Math.max(0, sizeRaw) : null,
+        createdAt: modifiedAt || '',
+        modifiedAt: modifiedAt || '',
+        parents: [buildDriveFileIdFromPath(parentRelative)],
+        appProperties: {
+          remotePath: buildDriveFileIdFromPath(relativePath)
+        }
+      };
+    })
+    .filter(Boolean)
+    .filter((entry) => !query || String(entry.name || '').toLowerCase().includes(query))
+    .sort((a, b) => {
+      const aDir = a.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+      const bDir = b.mimeType === 'application/vnd.google-apps.folder' ? 0 : 1;
+      if (aDir !== bDir) return aDir - bDir;
+      return String(a.name || '').localeCompare(String(b.name || ''));
+    });
+  return {
+    account: serializeDriveAccountRow(context.row),
+    folderId: buildDriveFileIdFromPath(normalizeDrivePathFromRoot(context.rootPath, fullFolderPath)),
+    nextPageToken: '',
+    files: items
+  };
+}
+
+async function deleteDriveFileForAccount(userId, accountId, fileId) {
+  const context = await getDriveContextForUser(userId, accountId);
+  const requestedPath = parseDrivePathFromFileId(fileId);
+  if (!requestedPath) {
+    throw createClientRequestError('fileId inválido para borrar en Google Drive.', 400);
+  }
+  const fullPath = resolveDrivePathFromRoot(context.rootPath, requestedPath);
+  const target = buildRcloneTarget(context.remoteName, fullPath);
+  let deleted = false;
+  const deleteFileResult = runRcloneCommandSync(['deletefile', target], {
+    configPath: context.configPath,
+    allowNonZero: true,
+    timeoutMs: 1000 * 60
+  });
+  if (deleteFileResult.ok) {
+    deleted = true;
+  } else {
+    const purgeResult = runRcloneCommandSync(['purge', target], {
+      configPath: context.configPath,
+      allowNonZero: true,
+      timeoutMs: 1000 * 60 * 2
+    });
+    if (purgeResult.ok) {
+      deleted = true;
+    } else {
+      const reason = truncateForNotify(
+        deleteFileResult.stderr ||
+          deleteFileResult.stdout ||
+          purgeResult.stderr ||
+          purgeResult.stdout ||
+          'drive_delete_failed',
+        220
+      );
+      throw createClientRequestError(`No se pudo borrar en Google Drive (rclone): ${reason}`, 502);
+    }
+  }
+  const normalizedFileId = buildDriveFileIdFromPath(normalizeDrivePathFromRoot(context.rootPath, fullPath));
+  markDeployedCloudBackupDeletedByDriveFileStmt.run(nowIso(), getSafeUserId(userId), String(accountId), normalizedFileId);
+  if (normalizedFileId !== String(fileId || '').trim()) {
+    markDeployedCloudBackupDeletedByDriveFileStmt.run(
+      nowIso(),
+      getSafeUserId(userId),
+      String(accountId),
+      String(fileId || '').trim()
+    );
+  }
+  return {
+    deleted,
+    fileId: normalizedFileId,
+    account: serializeDriveAccountRow(context.row)
+  };
+}
+
+async function ensureDriveBackupFolder(context, appId) {
+  const codexFolderPath = joinDriveRemotePath(context.rootPath, 'CodexWebBackups');
+  const appFolderPath = joinDriveRemotePath(codexFolderPath, buildAppBackupQuery(appId));
+  const codexTarget = buildRcloneTarget(context.remoteName, codexFolderPath);
+  const appTarget = buildRcloneTarget(context.remoteName, appFolderPath);
+  runRcloneCommandSync(['mkdir', codexTarget], {
+    configPath: context.configPath,
+    allowNonZero: true,
+    timeoutMs: 1000 * 30
+  });
+  runRcloneCommandSync(['mkdir', appTarget], {
+    configPath: context.configPath,
+    allowNonZero: true,
+    timeoutMs: 1000 * 30
+  });
+  return {
+    codexFolderId: buildDriveFileIdFromPath(normalizeDrivePathFromRoot(context.rootPath, codexFolderPath)),
+    appFolderId: buildDriveFileIdFromPath(normalizeDrivePathFromRoot(context.rootPath, appFolderPath)),
+    appFolderPath
+  };
+}
+
 async function uploadFileToDrive(context, payload) {
   const localPath = normalizeAbsoluteStoragePath(payload.localPath);
   if (!localPath) {
-    throw createClientRequestError('Ruta local inválida para subir a Dropbox', 400);
+    throw createClientRequestError('Ruta local inválida para subir a Google Drive.', 400);
   }
   let stats = null;
   try {
@@ -4734,60 +5859,939 @@ async function uploadFileToDrive(context, payload) {
     stats = null;
   }
   if (!stats || !stats.isFile()) {
-    throw createClientRequestError('Solo se pueden subir archivos existentes', 400);
+    throw createClientRequestError('Solo se pueden subir archivos locales existentes.', 400);
   }
-  const parentId = resolveDropboxEffectiveFolderPath(
-    String(context.row.root_folder_id || '').trim(),
-    String(payload.parentId || '').trim()
-  );
+  const parentPath = resolveDrivePathFromRoot(context.rootPath, payload.parentId);
   const driveName = sanitizeDriveFileName(payload.fileName || path.basename(localPath), path.basename(localPath));
-  const mediaType = inferMimeTypeFromFilename(driveName);
-  const dropboxPath = buildDropboxPathFromParentAndName(parentId, driveName);
-  const requestBody = {
-    path: dropboxPath,
-    mode: 'add',
-    autorename: true,
-    mute: false,
-    strict_conflict: false
-  };
-  const response = await fetch(`${DROPBOX_CONTENT_BASE_URL}/files/upload`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${String(context.accessToken || '').trim()}`,
-      'Content-Type': 'application/octet-stream',
-      'Dropbox-API-Arg': JSON.stringify(requestBody)
-    },
-    body: fs.createReadStream(localPath),
-    duplex: 'half'
+  const fullRemotePath = joinDriveRemotePath(parentPath, driveName);
+  const target = buildRcloneTarget(context.remoteName, fullRemotePath);
+  const copyResult = runRcloneCommandSync(['copyto', localPath, target], {
+    configPath: context.configPath,
+    allowNonZero: true,
+    timeoutMs: 1000 * 60 * 10
   });
-  const bodyText = String(await response.text()).trim();
-  let file = {};
-  try {
-    file = bodyText ? JSON.parse(bodyText) : {};
-  } catch (_error) {
-    file = {};
+  if (!copyResult.ok) {
+    const reason = truncateForNotify(copyResult.stderr || copyResult.stdout || 'drive_upload_failed', 220);
+    throw createClientRequestError(`No se pudo subir a Google Drive (rclone): ${reason}`, 502);
   }
-  if (!response.ok) {
-    const reason = truncateForNotify(
-      (file && (file.error_summary || file.error_description || file.error)) || bodyText || 'dropbox_upload_failed',
-      220
-    );
-    throw createClientRequestError(`Error subiendo a Dropbox: ${reason}`, response.status >= 400 ? response.status : 500);
-  }
-  const fileIdentifier = String(file.path_lower || file.id || dropboxPath).trim();
+  const relativePath = normalizeDrivePathFromRoot(context.rootPath, fullRemotePath);
+  const parentRelative = normalizeDrivePathFromRoot(context.rootPath, parentPath);
   return {
-    id: fileIdentifier,
-    name: String(file.name || driveName).trim(),
-    sizeBytes: Number.isFinite(Number(file.size)) ? Number(file.size) : Number(stats.size || 0),
-    mimeType: mediaType,
-    createdAt: String(file.client_modified || file.server_modified || nowIso()).trim(),
-    parents: parentId ? [parentId] : [],
+    id: buildDriveFileIdFromPath(relativePath),
+    name: driveName,
+    sizeBytes: Number(stats.size || 0),
+    mimeType: inferMimeTypeFromFilename(driveName),
+    createdAt: nowIso(),
+    parents: [buildDriveFileIdFromPath(parentRelative)],
     appProperties:
       payload && payload.appProperties && typeof payload.appProperties === 'object'
         ? payload.appProperties
         : {},
     localPath
   };
+}
+
+function extractJsonObjectFromFreeText(rawValue) {
+  const source = String(rawValue || '').trim();
+  if (!source) return null;
+  const candidates = [source];
+  const fencedMatch = source.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fencedMatch && fencedMatch[1]) {
+    candidates.push(String(fencedMatch[1]).trim());
+  }
+  const firstBrace = source.indexOf('{');
+  const lastBrace = source.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(source.slice(firstBrace, lastBrace + 1));
+  }
+  const pushBalancedObjects = (text) => {
+    const raw = String(text || '');
+    if (!raw) return;
+    let depth = 0;
+    let start = -1;
+    let inString = false;
+    let escape = false;
+    for (let index = 0; index < raw.length; index += 1) {
+      const char = raw[index];
+      if (inString) {
+        if (escape) {
+          escape = false;
+        } else if (char === '\\\\') {
+          escape = true;
+        } else if (char === '\"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (char === '\"') {
+        inString = true;
+        continue;
+      }
+      if (char === '{') {
+        if (depth === 0) {
+          start = index;
+        }
+        depth += 1;
+        continue;
+      }
+      if (char === '}') {
+        if (depth <= 0) continue;
+        depth -= 1;
+        if (depth === 0 && start >= 0) {
+          const segment = raw.slice(start, index + 1).trim();
+          if (segment) {
+            candidates.push(segment);
+          }
+          start = -1;
+        }
+      }
+    }
+  };
+  pushBalancedObjects(source);
+  if (fencedMatch && fencedMatch[1]) {
+    pushBalancedObjects(String(fencedMatch[1] || ''));
+  }
+  let fallbackObject = null;
+  for (let index = 0; index < candidates.length; index += 1) {
+    const item = String(candidates[index] || '').trim();
+    if (!item) continue;
+    try {
+      const parsed = JSON.parse(item);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const summaryText = normalizeProjectContextText(
+          parsed.summary || parsed.resumen || parsed.projectSummary || '',
+          280
+        );
+        const listFields = [
+          parsed.objectives,
+          parsed.objetivos,
+          parsed.decisions,
+          parsed.decisiones,
+          parsed.constraints,
+          parsed.restricciones,
+          parsed.facts,
+          parsed.hechos,
+          parsed.openQuestions,
+          parsed.open_questions,
+          parsed.nextSteps,
+          parsed.next_steps
+        ];
+        const hasListContent = listFields.some((field) => {
+          if (!Array.isArray(field)) return false;
+          return field.some((entry) => {
+            const text = normalizeProjectContextText(entry, 80);
+            return Boolean(text && text !== '...');
+          });
+        });
+        const hasDomainKey =
+          Object.prototype.hasOwnProperty.call(parsed, 'summary') ||
+          Object.prototype.hasOwnProperty.call(parsed, 'resumen') ||
+          Object.prototype.hasOwnProperty.call(parsed, 'objectives') ||
+          Object.prototype.hasOwnProperty.call(parsed, 'decisions') ||
+          Object.prototype.hasOwnProperty.call(parsed, 'constraints') ||
+          Object.prototype.hasOwnProperty.call(parsed, 'facts') ||
+          Object.prototype.hasOwnProperty.call(parsed, 'nextSteps');
+        const meaningfulSummary = Boolean(summaryText && summaryText !== '...');
+        if (hasDomainKey && (meaningfulSummary || hasListContent)) {
+          return parsed;
+        }
+        if (!fallbackObject) {
+          fallbackObject = parsed;
+        }
+      }
+    } catch (_error) {
+      // ignore malformed candidate
+    }
+  }
+  return fallbackObject;
+}
+
+function normalizeProjectContextList(value, maxItems = 12, maxCharsPerItem = 220) {
+  const source = Array.isArray(value) ? value : [];
+  const normalized = [];
+  for (let index = 0; index < source.length; index += 1) {
+    if (normalized.length >= maxItems) break;
+    const item = normalizeProjectContextText(source[index], maxCharsPerItem);
+    if (!item) continue;
+    normalized.push(item);
+  }
+  return normalized;
+}
+
+function formatProjectContextSummaryFromPayload(payload) {
+  const data = payload && typeof payload === 'object' ? payload : {};
+  const headline = normalizeProjectContextText(
+    data.summary || data.resumen || data.projectSummary || '',
+    1400
+  );
+  const objectives = normalizeProjectContextList(data.objectives || data.objetivos, 10, 200);
+  const decisions = normalizeProjectContextList(data.decisions || data.decisiones, 12, 220);
+  const constraints = normalizeProjectContextList(data.constraints || data.restricciones, 10, 220);
+  const openQuestions = normalizeProjectContextList(
+    data.openQuestions || data.open_questions || data.preguntasAbiertas,
+    10,
+    220
+  );
+  const nextSteps = normalizeProjectContextList(
+    data.nextSteps || data.next_steps || data.siguientesPasos,
+    10,
+    220
+  );
+  const facts = normalizeProjectContextList(data.facts || data.hechos, 12, 220);
+  const lines = [];
+  if (headline) {
+    lines.push(`Resumen: ${headline}`);
+  }
+  if (objectives.length > 0) {
+    lines.push('Objetivos:');
+    objectives.forEach((entry) => lines.push(`- ${entry}`));
+  }
+  if (decisions.length > 0) {
+    lines.push('Decisiones:');
+    decisions.forEach((entry) => lines.push(`- ${entry}`));
+  }
+  if (constraints.length > 0) {
+    lines.push('Restricciones:');
+    constraints.forEach((entry) => lines.push(`- ${entry}`));
+  }
+  if (facts.length > 0) {
+    lines.push('Hechos relevantes:');
+    facts.forEach((entry) => lines.push(`- ${entry}`));
+  }
+  if (openQuestions.length > 0) {
+    lines.push('Preguntas abiertas:');
+    openQuestions.forEach((entry) => lines.push(`- ${entry}`));
+  }
+  if (nextSteps.length > 0) {
+    lines.push('Siguientes pasos:');
+    nextSteps.forEach((entry) => lines.push(`- ${entry}`));
+  }
+  return normalizeProjectContextText(lines.join('\n').trim(), projectContextAutoMaxChars);
+}
+
+function buildProjectContextMessageDigest(rows) {
+  const list = Array.isArray(rows) ? rows.slice().reverse() : [];
+  const lines = [];
+  list.forEach((entry) => {
+    const role = String(entry && entry.role ? entry.role : '').trim().toLowerCase();
+    if (role !== 'user' && role !== 'assistant' && role !== 'system') return;
+    const content = normalizeProjectContextText(entry && entry.content ? entry.content : '', projectContextPromptMessageChars);
+    if (!content) return;
+    const conversationId = Number(entry && entry.conversation_id);
+    const conversationTitle = normalizeProjectContextText(entry && entry.conversation_title ? entry.conversation_title : '', 80);
+    const label = role === 'user' ? 'Usuario' : role === 'assistant' ? 'Asistente' : 'Sistema';
+    lines.push(
+      `${label} [chat:${Number.isInteger(conversationId) ? conversationId : 'n/a'} ${conversationTitle}]: ${content}`
+    );
+  });
+  return lines.join('\n');
+}
+
+function buildProjectContextAiPrompt(projectRow, messageRows) {
+  const projectName = sanitizeProjectName(projectRow && projectRow.name ? projectRow.name : '') || 'Proyecto';
+  const mode = normalizeProjectContextMode(projectRow && projectRow.context_mode ? projectRow.context_mode : 'mixed', 'mixed');
+  const manualContext = normalizeProjectContextText(projectRow && projectRow.manual_context ? projectRow.manual_context : '', 5000);
+  const existingAutoContext = normalizeProjectContextText(projectRow && projectRow.auto_context ? projectRow.auto_context : '', 5000);
+  const digest = buildProjectContextMessageDigest(messageRows);
+  const lines = [
+    'Eres un sintetizador de memoria persistente para un proyecto con varios chats.',
+    'Devuelve SOLO JSON válido (sin markdown, sin texto adicional) con esta forma:',
+    '{"summary":"...", "objectives":["..."], "decisions":["..."], "constraints":["..."], "facts":["..."], "openQuestions":["..."], "nextSteps":["..."]}',
+    'No inventes datos. Mantén información concreta y útil para continuar futuros chats.',
+    'Evita ruido y duplicados. Si algo no es seguro, no lo afirmes como hecho.',
+    '',
+    `Proyecto: ${projectName}`,
+    `Modo de contexto: ${mode}`,
+    manualContext ? `Contexto manual base:\n${manualContext}` : 'Contexto manual base: (vacío)',
+    existingAutoContext ? `Memoria automática previa:\n${existingAutoContext}` : 'Memoria automática previa: (vacía)',
+    '',
+    'Mensajes recientes del proyecto (multichat):',
+    digest || '(sin mensajes)',
+    '',
+    'Genera una memoria breve y accionable para reutilizar en próximos chats.'
+  ];
+  return lines.join('\n');
+}
+
+function buildProjectContextHeuristicFallback(projectRow, messageRows) {
+  const rows = Array.isArray(messageRows) ? messageRows.slice().reverse() : [];
+  const latestUser = [];
+  const latestAssistant = [];
+  rows.forEach((entry) => {
+    const role = String(entry && entry.role ? entry.role : '').trim().toLowerCase();
+    const content = normalizeProjectContextText(entry && entry.content ? entry.content : '', 220);
+    if (!content) return;
+    if (role === 'user' && latestUser.length < 8) {
+      latestUser.push(content);
+    } else if (role === 'assistant' && latestAssistant.length < 8) {
+      latestAssistant.push(content);
+    }
+  });
+  const lines = [];
+  const manual = normalizeProjectContextText(projectRow && projectRow.manual_context ? projectRow.manual_context : '', 2200);
+  if (manual) {
+    lines.push('Contexto manual vigente:');
+    lines.push(manual);
+  }
+  if (latestUser.length > 0) {
+    lines.push('Últimas peticiones del usuario:');
+    latestUser.slice(0, 6).forEach((entry) => lines.push(`- ${entry}`));
+  }
+  if (latestAssistant.length > 0) {
+    lines.push('Últimas respuestas útiles:');
+    latestAssistant.slice(0, 6).forEach((entry) => lines.push(`- ${entry}`));
+  }
+  if (lines.length === 0) {
+    lines.push('Aún no hay suficiente conversación para generar memoria automática.');
+  }
+  return normalizeProjectContextText(lines.join('\n'), projectContextAutoMaxChars);
+}
+
+async function summarizeProjectContextWithAi(userId, username, projectRow, messageRows) {
+  const prompt = buildProjectContextAiPrompt(projectRow, messageRows);
+  const runtime = resolveChatAgentRuntimeForUser(userId);
+  const attemptedProviders = [];
+  const activeProviderId = normalizeSupportedAiAgentId(runtime && runtime.activeAgentId ? runtime.activeAgentId : '');
+  const activeProviderDef = getAiProviderDefinition(activeProviderId);
+  const activeProviderName =
+    String((activeProviderDef && activeProviderDef.name) || runtime.activeAgentName || activeProviderId || '').trim();
+
+  const parseOutputSummary = (output) => {
+    const text = normalizeProjectContextText(output, 16000);
+    if (!text) return '';
+    const parsed = extractJsonObjectFromFreeText(text);
+    if (parsed) {
+      const summarized = formatProjectContextSummaryFromPayload(parsed);
+      if (summarized) return summarized;
+    }
+    return normalizeProjectContextText(text, projectContextAutoMaxChars);
+  };
+
+  const tryHttpProvider = async (providerId, providerName) => {
+    const adapter = getAiHttpProviderAdapter(providerId);
+    if (!adapter || typeof adapter.buildChatRequest !== 'function') {
+      return {
+        used: false,
+        reason: 'provider_not_http',
+        summary: '',
+        providerId,
+        providerName
+      };
+    }
+    const integration = getUserAiAgentIntegration(userId, providerId);
+    const configured = isAiAgentConfiguredForUser(
+      providerId,
+      integration,
+      getAiAgentSerializationOptionsForUser(userId)
+    );
+    if (!configured) {
+      return {
+        used: false,
+        reason: 'provider_not_configured',
+        summary: '',
+        providerId,
+        providerName
+      };
+    }
+    const model = normalizeChatAgentModel(providerId, runtime.defaults.model || getChatAgentDefaultModel(providerId));
+    const baseUrl = resolveAiProviderBaseUrl(providerId, integration) || adapter.defaultBaseUrl;
+    const request = adapter.buildChatRequest({
+      model,
+      prompt,
+      integration,
+      baseUrl,
+      reasoningEffort: runtime.defaults.reasoningEffort
+    });
+    const endpoint = String(request && request.endpoint ? request.endpoint : '').trim();
+    if (!endpoint) {
+      return {
+        used: false,
+        reason: 'provider_endpoint_missing',
+        summary: '',
+        providerId,
+        providerName
+      };
+    }
+    const headers =
+      request && request.headers && typeof request.headers === 'object'
+        ? request.headers
+        : { 'Content-Type': 'application/json' };
+    const body =
+      request && request.body && typeof request.body === 'object'
+        ? { ...request.body, stream: false }
+        : {
+            model,
+            stream: false,
+            messages: [{ role: 'user', content: prompt }]
+          };
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body)
+      });
+      if (!response.ok) {
+        let reason = '';
+        try {
+          reason = truncateForNotify(await response.text(), 220);
+        } catch (_error) {
+          reason = '';
+        }
+        return {
+          used: false,
+          reason: reason || `http_${response.status}`,
+          summary: '',
+          providerId,
+          providerName
+        };
+      }
+      let output = '';
+      try {
+        const payload = await response.json();
+        const choice = payload && Array.isArray(payload.choices) ? payload.choices[0] : null;
+        const messageObject = choice && choice.message && typeof choice.message === 'object' ? choice.message : {};
+        output =
+          extractTextFromProviderPayload(messageObject.content) ||
+          extractTextFromProviderPayload(choice && choice.text ? choice.text : '') ||
+          extractTextFromProviderPayload(payload && payload.response ? payload.response : '') ||
+          extractTextFromProviderPayload(payload && payload.message ? payload.message : '');
+      } catch (_jsonError) {
+        try {
+          output = String(await response.text()).trim();
+        } catch (_textError) {
+          output = '';
+        }
+      }
+      const summary = parseOutputSummary(output);
+      return {
+        used: Boolean(summary),
+        reason: summary ? '' : 'ai_parse_empty',
+        summary,
+        providerId,
+        providerName
+      };
+    } catch (error) {
+      return {
+        used: false,
+        reason: truncateForNotify(error && error.message ? error.message : 'provider_request_failed', 180),
+        summary: '',
+        providerId,
+        providerName
+      };
+    }
+  };
+
+  const tryCodexCli = async () => {
+    let codexPath = '';
+    try {
+      codexPath = await resolveCodexPath();
+    } catch (_error) {
+      codexPath = '';
+    }
+    if (!codexPath) {
+      return {
+        used: false,
+        reason: 'codex_unavailable',
+        summary: '',
+        providerId: 'codex-cli',
+        providerName: 'Codex CLI'
+      };
+    }
+    try {
+      const result = await execFileAsync(
+        codexPath,
+        [
+          '-c',
+          'shell_environment_policy.inherit=all',
+          'exec',
+          '--skip-git-repo-check',
+          '--sandbox',
+          'danger-full-access',
+          '--color',
+          'never',
+          prompt
+        ],
+        {
+          env: getCodexEnvForUser(userId, { username }),
+          cwd: process.cwd(),
+          timeout: 1000 * 90,
+          maxBuffer: 1024 * 1024 * 8
+        }
+      );
+      const stdout = truncateRawText(stripAnsi(String(result && result.stdout ? result.stdout : '')).trim(), 160000);
+      const stderr = truncateRawText(stripAnsi(String(result && result.stderr ? result.stderr : '')).trim(), 160000);
+      const combined = [stdout, stderr].filter(Boolean).join('\n').trim();
+      const summary = parseOutputSummary(combined);
+      return {
+        used: Boolean(summary),
+        reason: summary ? '' : 'ai_parse_empty',
+        summary,
+        providerId: 'codex-cli',
+        providerName: 'Codex CLI'
+      };
+    } catch (error) {
+      return {
+        used: false,
+        reason: truncateForNotify(error && error.message ? error.message : 'ai_failed', 180),
+        summary: '',
+        providerId: 'codex-cli',
+        providerName: 'Codex CLI'
+      };
+    }
+  };
+
+  if (activeProviderId && activeProviderId !== 'codex-cli') {
+    attemptedProviders.push(activeProviderId);
+    const activeAttempt = await tryHttpProvider(activeProviderId, activeProviderName || activeProviderId);
+    if (activeAttempt.used) {
+      return {
+        ...activeAttempt,
+        attemptedProviders
+      };
+    }
+  }
+
+  attemptedProviders.push('codex-cli');
+  const codexAttempt = await tryCodexCli();
+  if (codexAttempt.used) {
+    return {
+      ...codexAttempt,
+      attemptedProviders
+    };
+  }
+
+  return {
+    used: false,
+    reason: codexAttempt.reason || 'ai_unavailable',
+    summary: '',
+    providerId: codexAttempt.providerId || '',
+    providerName: codexAttempt.providerName || '',
+    attemptedProviders
+  };
+}
+
+async function regenerateProjectAutoContext(userId, projectId, options = {}) {
+  const safeUserId = getSafeUserId(userId);
+  const safeProjectId = Number(projectId);
+  if (!safeUserId || !Number.isInteger(safeProjectId) || safeProjectId <= 0) {
+    throw createClientRequestError('Proyecto inválido para regenerar contexto.', 400);
+  }
+  const force = Boolean(options.force);
+  const projectRow = getChatProjectByIdForUserStmt.get(safeProjectId, safeUserId);
+  if (!projectRow) {
+    throw createClientRequestError('Proyecto no encontrado.', 404);
+  }
+  const latestMessageRow = getProjectMessageMaxIdStmt.get(safeUserId, safeProjectId);
+  const latestMessageId = Math.max(0, Number(latestMessageRow && latestMessageRow.max_message_id) || 0);
+  const previousMessageId = Math.max(0, Number(projectRow.auto_last_message_id) || 0);
+  const hasNewMessages = latestMessageId > previousMessageId;
+  if (!force && !hasNewMessages) {
+    return {
+      updated: false,
+      skipped: true,
+      reason: 'no_new_messages',
+      project: serializeChatProjectRow(projectRow, { includeContext: true }),
+      ai: {
+        used: false,
+        providerId: '',
+        providerName: '',
+        fallbackReason: 'no_new_messages',
+        attemptedProviders: []
+      },
+      summary: normalizeProjectContextText(projectRow.auto_context, projectContextAutoMaxChars),
+      latestMessageId,
+      messageCount: 0
+    };
+  }
+
+  const messageRows = listRecentProjectMessagesForSummaryStmt.all(
+    safeUserId,
+    safeProjectId,
+    projectContextPromptMessagesLimit
+  );
+  const usernameRow = getUsernameByIdStmt.get(safeUserId);
+  const username = String((usernameRow && usernameRow.username) || '').trim();
+
+  let aiState = {
+    used: false,
+    summary: '',
+    reason: 'ai_unavailable',
+    providerId: '',
+    providerName: '',
+    attemptedProviders: []
+  };
+  if (typeof options.onProgress === 'function') {
+    options.onProgress({
+      stage: 'ai',
+      stageLabel: 'Sintetizando memoria de proyecto',
+      percent: 72,
+      messages: messageRows.length
+    });
+  }
+  aiState = await summarizeProjectContextWithAi(safeUserId, username, projectRow, messageRows);
+  const fallbackSummary = buildProjectContextHeuristicFallback(projectRow, messageRows);
+  const summary = normalizeProjectContextText(
+    aiState.used ? aiState.summary : fallbackSummary,
+    projectContextAutoMaxChars
+  );
+  const generatedAt = nowIso();
+  const meta = {
+    generatedAt,
+    messagesUsed: Array.isArray(messageRows) ? messageRows.length : 0,
+    aiUsed: Boolean(aiState.used),
+    providerId: String(aiState.providerId || '').trim(),
+    providerName: String(aiState.providerName || '').trim(),
+    fallbackReason: aiState.used ? '' : String(aiState.reason || 'heuristic_fallback'),
+    attemptedProviders: Array.isArray(aiState.attemptedProviders)
+      ? aiState.attemptedProviders.map((entry) => String(entry || '').trim()).filter(Boolean)
+      : []
+  };
+  updateChatProjectAutoContextStmt.run(
+    summary,
+    JSON.stringify(meta),
+    latestMessageId,
+    generatedAt,
+    nowIso(),
+    safeProjectId,
+    safeUserId
+  );
+  const refreshed = getChatProjectByIdForUserStmt.get(safeProjectId, safeUserId);
+  return {
+    updated: true,
+    skipped: false,
+    reason: '',
+    project: serializeChatProjectRow(refreshed, { includeContext: true }),
+    ai: {
+      used: Boolean(aiState.used),
+      providerId: String(aiState.providerId || '').trim(),
+      providerName: String(aiState.providerName || '').trim(),
+      fallbackReason: aiState.used ? '' : String(aiState.reason || 'heuristic_fallback'),
+      attemptedProviders: Array.isArray(aiState.attemptedProviders)
+        ? aiState.attemptedProviders.map((entry) => String(entry || '').trim()).filter(Boolean)
+        : []
+    },
+    summary,
+    latestMessageId,
+    messageCount: Array.isArray(messageRows) ? messageRows.length : 0
+  };
+}
+
+async function handleProjectContextRefreshJob(row) {
+  const payload = safeParseJsonObject(row.payload_json);
+  const safeUserId = getSafeUserId(row.user_id);
+  if (!safeUserId) {
+    throw createClientRequestError('Job de contexto de proyecto inválido: user_id.', 400);
+  }
+  const projectId = parseProjectIdInput(payload.projectId);
+  if (!projectId) {
+    throw createClientRequestError('Job de contexto de proyecto inválido: projectId.', 400);
+  }
+  const trigger = normalizeProjectContextText(payload.trigger || 'auto', 80) || 'auto';
+  const project = getOwnedProjectOrNull(projectId, safeUserId);
+  if (!project) {
+    throw createClientRequestError('Proyecto no encontrado para job de contexto.', 404);
+  }
+  setStorageJobProgress(
+    row.id,
+    {
+      stage: 'collecting',
+      stageLabel: 'Recopilando mensajes del proyecto',
+      percent: 12,
+      projectId,
+      projectName: sanitizeProjectName(project.name)
+    },
+    `Actualizando contexto de proyecto (${sanitizeProjectName(project.name) || projectId})`
+  );
+  const result = await regenerateProjectAutoContext(safeUserId, projectId, {
+    force: Boolean(payload.force),
+    onProgress: (progress) => {
+      setStorageJobProgress(
+        row.id,
+        {
+          stage: String(progress && progress.stage ? progress.stage : 'running'),
+          stageLabel: String(progress && progress.stageLabel ? progress.stageLabel : 'Actualizando contexto'),
+          percent: Number.isFinite(Number(progress && progress.percent)) ? Number(progress.percent) : 70,
+          projectId,
+          projectName: sanitizeProjectName(project.name)
+        },
+        'Procesando memoria automática del proyecto'
+      );
+    }
+  });
+  setStorageJobProgress(
+    row.id,
+    {
+      stage: 'completed',
+      stageLabel: 'Contexto de proyecto actualizado',
+      percent: 100,
+      projectId,
+      projectName: sanitizeProjectName(project.name)
+    },
+    result.ai.used
+      ? `Contexto actualizado con ${result.ai.providerName || result.ai.providerId || 'IA'}`
+      : `Contexto actualizado con fallback heurístico (${result.ai.fallbackReason || 'ia_unavailable'})`
+  );
+  return {
+    __stage: 'project_context_completed',
+    __logMessage: result.ai.used
+      ? 'Regeneración de contexto completada con IA'
+      : 'Regeneración de contexto completada con fallback heurístico',
+    trigger,
+    project: result.project,
+    ai: result.ai,
+    summary: result.summary,
+    messageCount: result.messageCount,
+    latestMessageId: result.latestMessageId
+  };
+}
+
+async function handleGitMergeBranchesJob(row) {
+  const payload = safeParseJsonObject(row.payload_json);
+  const safeUserId = getSafeUserId(row.user_id);
+  if (!safeUserId) {
+    throw createClientRequestError('Job de merge inválido: user_id.', 400);
+  }
+  const repoId = String(payload.repoId || '').trim();
+  const sourceBranch = normalizeGitBranchName(payload.sourceBranch);
+  const targetBranch = normalizeGitBranchName(payload.targetBranch);
+  const repo = findGitRepoById(repoId, { forceRefresh: true });
+  if (!repo) {
+    throw createClientRequestError('Repositorio Git no encontrado para merge.', 404);
+  }
+  if (!sourceBranch || !targetBranch) {
+    throw createClientRequestError('Job de merge inválido: sourceBranch/targetBranch.', 400);
+  }
+  if (sourceBranch === targetBranch) {
+    throw createClientRequestError('No se puede mergear la misma rama.', 400);
+  }
+  if (!gitBranchRefExists(repo.absolutePath, sourceBranch)) {
+    throw createClientRequestError(`La rama origen no existe: ${sourceBranch}`, 404);
+  }
+  if (!gitBranchRefExists(repo.absolutePath, targetBranch)) {
+    throw createClientRequestError(`La rama destino no existe: ${targetBranch}`, 404);
+  }
+
+  const gitIdentity = normalizeGitIdentity(payload.gitIdentity || {});
+  const ensuredIdentity = ensureGitIdentityForRepo(repo.absolutePath, gitIdentity);
+  if (!ensuredIdentity.ok) {
+    throw createClientRequestError(
+      `No se pudo preparar identidad Git: ${ensuredIdentity.error || 'git_identity_failed'}`,
+      500
+    );
+  }
+  const gitIdentityEnv = buildGitIdentityEnv(ensuredIdentity.identity);
+  setStorageJobProgress(
+    row.id,
+    {
+      stage: 'preparing',
+      stageLabel: `Preparando merge ${sourceBranch} -> ${targetBranch}`,
+      percent: 10,
+      sourceBranch,
+      targetBranch,
+      repoId,
+      repoPath: repo.absolutePath
+    },
+    `Merge en cola: ${sourceBranch} -> ${targetBranch}`
+  );
+
+  const checkoutTarget = ensureGitBranchForRepo(repo.absolutePath, targetBranch, { createIfMissing: false });
+  if (!checkoutTarget.ok) {
+    throw createClientRequestError(`No se pudo cambiar a rama destino: ${checkoutTarget.error}`, 400);
+  }
+  setStorageJobProgress(
+    row.id,
+    {
+      stage: 'merging',
+      stageLabel: `Mergeando ${sourceBranch} -> ${targetBranch}`,
+      percent: 45,
+      sourceBranch,
+      targetBranch,
+      repoId
+    },
+    `Checkout destino OK (${checkoutTarget.branch})`
+  );
+
+  const mergeResult = await runGitInRepoAsync(repo.absolutePath, ['merge', '--no-ff', sourceBranch], {
+    allowNonZero: true,
+    env: gitIdentityEnv,
+    timeoutMs: gitToolsCommandTimeoutMs
+  });
+  const refreshed = collectGitRepoSummary(repo.absolutePath, nowIso(), repo.scanRoot);
+  const output = truncateForNotify(
+    [checkoutTarget.output, mergeResult.stdout, mergeResult.stderr].filter(Boolean).join('\n'),
+    6000
+  );
+  if (Number(mergeResult.code) !== 0) {
+    const hasConflicts = Boolean(refreshed && refreshed.hasConflicts);
+    if (hasConflicts) {
+      setStorageJobProgress(
+        row.id,
+        {
+          stage: 'conflicts',
+          stageLabel: 'Merge con conflictos',
+          percent: 100,
+          sourceBranch,
+          targetBranch,
+          hasConflicts: true
+        },
+        'Merge terminó con conflictos. Requiere resolución manual.'
+      );
+      return {
+        __stage: 'conflicts',
+        __logMessage: 'Merge completado con conflictos',
+        repo: refreshed || repo,
+        merge: {
+          sourceBranch,
+          targetBranch,
+          status: 'conflict',
+          hasConflicts: true,
+          conflictFiles: refreshed && Array.isArray(refreshed.conflictFiles) ? refreshed.conflictFiles : [],
+          output
+        }
+      };
+    }
+    throw createClientRequestError(
+      `Merge fallido: ${truncateForNotify(mergeResult.stderr || mergeResult.stdout || 'git_merge_failed', 260)}`,
+      500
+    );
+  }
+
+  setStorageJobProgress(
+    row.id,
+    {
+      stage: 'completed',
+      stageLabel: 'Merge completado',
+      percent: 100,
+      sourceBranch,
+      targetBranch,
+      hasConflicts: Boolean(refreshed && refreshed.hasConflicts)
+    },
+    `Merge completado: ${sourceBranch} -> ${targetBranch}`
+  );
+  return {
+    repo: refreshed || repo,
+    merge: {
+      sourceBranch,
+      targetBranch,
+      status: 'merged',
+      hasConflicts: Boolean(refreshed && refreshed.hasConflicts),
+      conflictFiles: refreshed && Array.isArray(refreshed.conflictFiles) ? refreshed.conflictFiles : [],
+      output
+    }
+  };
+}
+
+async function handleLocalDeletePathsJob(row) {
+  const payload = safeParseJsonObject(row.payload_json);
+  const paths = parseStoragePathList(payload.paths, 160);
+  if (paths.length === 0) {
+    throw createClientRequestError('Job de borrado inválido: selecciona al menos una ruta.', 400);
+  }
+  const deleted = [];
+  const failed = [];
+  setStorageJobProgress(
+    row.id,
+    {
+      stage: 'deleting',
+      stageLabel: 'Borrando rutas locales',
+      percent: 1,
+      total: paths.length,
+      done: 0,
+      failed: 0
+    },
+    `Borrado local iniciado (${paths.length} ruta(s))`
+  );
+  for (let index = 0; index < paths.length; index += 1) {
+    const item = paths[index];
+    try {
+      const target = assertStorageMutationPathAllowed(item);
+      const stats = fs.lstatSync(target);
+      if (stats.isDirectory()) {
+        fs.rmSync(target, { recursive: true, force: false });
+      } else {
+        fs.unlinkSync(target);
+      }
+      deleted.push(target);
+    } catch (error) {
+      failed.push({
+        path: normalizeAbsoluteStoragePath(item, ''),
+        error: truncateForNotify(error && error.message ? error.message : 'delete_failed', 260)
+      });
+    }
+    const processed = index + 1;
+    setStorageJobProgress(
+      row.id,
+      {
+        stage: 'deleting',
+        stageLabel: 'Borrando rutas locales',
+        percent: Math.min(99, Math.max(1, Math.round((processed / paths.length) * 100))),
+        total: paths.length,
+        done: deleted.length,
+        failed: failed.length
+      },
+      `Borrado local: ${processed}/${paths.length}`
+    );
+  }
+  return {
+    deleted,
+    failed,
+    total: paths.length,
+    deletedCount: deleted.length,
+    failedCount: failed.length,
+    summary:
+      failed.length > 0
+        ? `Borrado parcial: ${deleted.length} eliminado(s), ${failed.length} con error.`
+        : `Borrado completado: ${deleted.length} eliminado(s).`
+  };
+}
+
+async function handleStorageCleanupAnalyzeJob(row) {
+  const payload = safeParseJsonObject(row.payload_json);
+  const safeUserId = getSafeUserId(row.user_id);
+  if (!safeUserId) {
+    throw createClientRequestError('Job de análisis residual inválido: user_id.', 400);
+  }
+  const usernameRow = getUsernameByIdStmt.get(safeUserId);
+  const username = String((usernameRow && usernameRow.username) || '').trim();
+  const startedAt = nowIso();
+  let lastProgressTick = 0;
+  setStorageJobProgress(
+    row.id,
+    {
+      stage: 'scanning',
+      stageLabel: 'Escaneando rutas residuales',
+      percent: 1,
+      etaSeconds: null,
+      startedAt
+    },
+    'Análisis residual IA iniciado'
+  );
+  const result = await analyzeStorageResidualFilesForUser(
+    safeUserId,
+    username,
+    payload && typeof payload === 'object' ? payload : {},
+    {
+      onProgress: (progress) => {
+        const nowMs = Date.now();
+        const stage = String(progress && progress.stage ? progress.stage : '').trim();
+        if (stage !== 'completed' && nowMs - lastProgressTick < storageResidualProgressTickMs) {
+          return;
+        }
+        lastProgressTick = nowMs;
+        setStorageJobProgress(
+          row.id,
+          {
+            ...(progress && typeof progress === 'object' ? progress : {}),
+            startedAt
+          },
+          stage === 'completed'
+            ? 'Análisis residual IA completado'
+            : `Limpieza IA: ${String(progress && progress.stageLabel ? progress.stageLabel : stage || 'en progreso')}`
+        );
+      }
+    }
+  );
+  return result;
 }
 
 async function handleDriveUploadFilesJob(row) {
@@ -4797,15 +6801,15 @@ async function handleDriveUploadFilesJob(row) {
   const localPaths = parseStoragePathList(payload.paths, storageUploadJobMaxFiles);
   const parentId = String(payload.parentId || '').trim();
   if (!accountId || localPaths.length === 0) {
-    throw createClientRequestError('Job de subida inválido: cuenta/archivos faltantes', 400);
+    throw createClientRequestError('Job de subida inválido: faltan cuenta o archivos.', 400);
   }
-  const context = await getDriveContextForUser(safeUserId, accountId, { allowNeedsOauth: false });
+  const context = await getDriveContextForUser(safeUserId, accountId);
   const uploaded = [];
   const failed = [];
   setStorageJobProgress(
     row.id,
     { total: localPaths.length, done: 0, failed: 0, stage: 'uploading' },
-    'Subida a Dropbox iniciada'
+    'Subida a Google Drive (rclone) iniciada'
   );
   for (let index = 0; index < localPaths.length; index += 1) {
     const localPath = localPaths[index];
@@ -4829,7 +6833,7 @@ async function handleDriveUploadFilesJob(row) {
     } catch (error) {
       failed.push({
         localPath,
-        error: truncateForNotify(error && error.message ? error.message : 'upload_failed', 260)
+        error: truncateForNotify(error && error.message ? error.message : 'drive_upload_failed', 260)
       });
       setStorageJobProgress(
         row.id,
@@ -4839,13 +6843,16 @@ async function handleDriveUploadFilesJob(row) {
           failed: failed.length,
           stage: 'uploading'
         },
-        `Error subiendo ${path.basename(localPath)}`
+        `Error subiendo: ${path.basename(localPath)}`
       );
     }
   }
   if (uploaded.length === 0 && failed.length > 0) {
     throw new Error(
-      `No se pudo subir ningun archivo. Primer error: ${truncateForNotify(failed[0] && failed[0].error ? failed[0].error : 'upload_failed', 220)}`
+      `No se pudo subir ningún archivo. Primer error: ${truncateForNotify(
+        failed[0] && failed[0].error ? failed[0].error : 'drive_upload_failed',
+        220
+      )}`
     );
   }
   return {
@@ -4853,6 +6860,126 @@ async function handleDriveUploadFilesJob(row) {
     accountAlias: context.account.alias || context.account.id,
     uploaded,
     failed
+  };
+}
+
+async function listAppBackupsInDriveForAccount(userId, appId, accountId) {
+  const safeUserId = getSafeUserId(userId);
+  const safeAppId = String(appId || '').trim();
+  if (!safeUserId || !safeAppId) {
+    return [];
+  }
+  const context = await getDriveContextForUser(safeUserId, accountId);
+  const appFolderPath = joinDriveRemotePath(context.rootPath, 'CodexWebBackups', buildAppBackupQuery(safeAppId));
+  const target = buildRcloneTarget(context.remoteName, appFolderPath);
+  const result = runRcloneCommandSync(['lsjson', target, '--max-depth', '1'], {
+    configPath: context.configPath,
+    allowNonZero: true,
+    timeoutMs: 1000 * 60
+  });
+  const stderrLower = String(result.stderr || '').toLowerCase();
+  if (!result.ok && !stderrLower.includes('directory not found') && !stderrLower.includes('not found')) {
+    const reason = truncateForNotify(result.stderr || result.stdout || 'backup_list_failed', 220);
+    throw createClientRequestError(`No se pudieron listar backups en Drive (rclone): ${reason}`, 502);
+  }
+  const rawItems = result.ok ? parseRcloneJsonOutput(result.stdout, []) : [];
+  const cachedRows = listDeployedCloudBackupsForUserAndAppStmt.all(safeUserId, safeAppId, 200);
+  const cachedByFileId = new Map(
+    cachedRows.map((entry) => [String(entry && entry.drive_file_id ? entry.drive_file_id : '').trim(), entry])
+  );
+  const mapped = (Array.isArray(rawItems) ? rawItems : [])
+    .filter((entry) => entry && !entry.IsDir)
+    .map((entry) => {
+      const name = String((entry && (entry.Name || entry.Path)) || '').trim();
+      if (!name) return null;
+      const fullPath = joinDriveRemotePath(appFolderPath, name);
+      const relativePath = normalizeDrivePathFromRoot(context.rootPath, fullPath);
+      const fileId = buildDriveFileIdFromPath(relativePath);
+      const cached = cachedByFileId.get(fileId) || null;
+      const modifiedAt = parseIsoDateOrEmpty(entry && (entry.ModTime || entry.modifiedAt));
+      const sizeRaw = Number(entry && (entry.Size ?? entry.size));
+      return {
+        id: cached ? String(cached.id || '') : buildStorageJobId('backup'),
+        appId: safeAppId,
+        driveFileId: fileId,
+        remoteFileId: fileId,
+        accountId: String(accountId || ''),
+        accountAlias: String(context.account.alias || context.account.id || '').trim(),
+        name,
+        targetPath: cached ? String(cached.target_path || '') : '',
+        sizeBytes: Number.isFinite(sizeRaw) ? Math.max(0, sizeRaw) : null,
+        createdAt: modifiedAt || nowIso(),
+        modifiedAt: modifiedAt || '',
+        appProperties: {
+          remotePath: fileId
+        },
+        source: 'cloud'
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      const aTs = Date.parse(String(a.modifiedAt || a.createdAt || '')) || 0;
+      const bTs = Date.parse(String(b.modifiedAt || b.createdAt || '')) || 0;
+      return bTs - aTs;
+    });
+  return mapped;
+}
+
+async function listAppBackupsFromDrive(userId, appId, accountId = '') {
+  const safeUserId = getSafeUserId(userId);
+  const safeAppId = String(appId || '').trim();
+  if (!safeUserId || !safeAppId) {
+    return [];
+  }
+  const candidateAccountIds = [];
+  if (String(accountId || '').trim()) {
+    candidateAccountIds.push(String(accountId || '').trim());
+  } else {
+    const rows = listDriveAccountsForUserStmt.all(safeUserId);
+    rows.forEach((row) => {
+      const id = String(row && row.id ? row.id : '').trim();
+      if (!id) return;
+      candidateAccountIds.push(id);
+    });
+  }
+  const deduped = Array.from(new Set(candidateAccountIds));
+  const all = [];
+  for (const currentAccountId of deduped) {
+    try {
+      const items = await listAppBackupsInDriveForAccount(safeUserId, safeAppId, currentAccountId);
+      all.push(...items);
+    } catch (_error) {
+      // ignore broken account and continue with remaining ones
+    }
+  }
+  return all.sort((a, b) => {
+    const aTs = Date.parse(String(a.modifiedAt || a.createdAt || '')) || 0;
+    const bTs = Date.parse(String(b.modifiedAt || b.createdAt || '')) || 0;
+    return bTs - aTs;
+  });
+}
+
+async function pruneDriveBackupsForRetention(userId, accountId, appId) {
+  const cutoffMs = Date.now() - storageBackupRetentionDays * 24 * 60 * 60 * 1000;
+  const items = await listAppBackupsInDriveForAccount(userId, appId, accountId);
+  const removed = [];
+  for (const item of items) {
+    const createdMs = Date.parse(String(item.modifiedAt || item.createdAt || ''));
+    if (!Number.isFinite(createdMs) || createdMs >= cutoffMs) continue;
+    try {
+      await deleteDriveFileForAccount(userId, accountId, item.driveFileId);
+      removed.push({
+        id: item.id,
+        driveFileId: item.driveFileId,
+        createdAt: item.createdAt
+      });
+    } catch (_error) {
+      // keep retention best-effort.
+    }
+  }
+  return {
+    retentionDays: storageBackupRetentionDays,
+    removed
   };
 }
 
@@ -4881,25 +7008,20 @@ async function handleDeployedBackupCreateJob(row) {
     Number(estimatedSourceBytes) + storageBackupReserveBytes >= Number(availableBytes)
   ) {
     throw createClientRequestError(
-      'No hay espacio temporal suficiente para generar el backup local antes de subirlo a Dropbox.',
+      'No hay espacio temporal suficiente para generar el backup local antes de subirlo a Google Drive.',
       507
     );
   }
-
-  const context = await getDriveContextForUser(safeUserId, accountId, { allowNeedsOauth: false });
+  const context = await getDriveContextForUser(safeUserId, accountId);
   setStorageJobProgress(row.id, { stage: 'archiving' }, `Empaquetando ${sourcePath}`);
-  const tmpArchivePath = path.join(
-    storageJobsRootDir,
-    `${buildStorageJobId('backup')}.tar.gz`
-  );
-  let uploadedItem = null;
+  const tmpArchivePath = path.join(storageJobsRootDir, `${buildStorageJobId('backup')}.tar.gz`);
   try {
     createTarGzArchive(sourcePath, tmpArchivePath);
     const folders = await ensureDriveBackupFolder(context, appId);
-    setStorageJobProgress(row.id, { stage: 'uploading' }, 'Subiendo backup a Dropbox');
+    setStorageJobProgress(row.id, { stage: 'uploading' }, 'Subiendo backup a Google Drive (rclone)');
     const uploaded = await uploadFileToDrive(context, {
       localPath: tmpArchivePath,
-      parentId: folders.appFolderId,
+      parentId: folders.appFolderPath,
       fileName: buildBackupFileName(appName, appId, nowIso()),
       appProperties: {
         codexwebType: 'app-backup',
@@ -4908,8 +7030,6 @@ async function handleDeployedBackupCreateJob(row) {
         createdAt: nowIso()
       }
     });
-    uploadedItem = uploaded;
-
     const backupId = buildStorageJobId('cloudbackup');
     upsertDeployedCloudBackupStmt.run(
       backupId,
@@ -4925,7 +7045,7 @@ async function handleDeployedBackupCreateJob(row) {
         appName,
         sourcePath,
         targetPath: targetPath || '',
-        parentId: folders.appFolderId
+        parentId: folders.appFolderPath
       })
     );
     const retention = await pruneDriveBackupsForRetention(safeUserId, accountId, appId);
@@ -4949,42 +7069,40 @@ async function handleDeployedBackupCreateJob(row) {
         fs.unlinkSync(tmpArchivePath);
       }
     } catch (_error) {
-      // ignore temp cleanup failure
+      // ignore cleanup failures.
     }
   }
 }
 
 async function downloadDriveFileToPath(context, fileId, outputPath) {
+  const requestedPath = parseDrivePathFromFileId(fileId);
+  if (!requestedPath) {
+    throw createClientRequestError('fileId de Google Drive inválido.', 400);
+  }
   ensureParentDirForFile(outputPath);
-  const dropboxPath = await resolveDropboxPathFromIdentifier(context, fileId);
-  const response = await fetch(`${DROPBOX_CONTENT_BASE_URL}/files/download`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${String(context.accessToken || '').trim()}`,
-      'Dropbox-API-Arg': JSON.stringify({ path: dropboxPath })
-    }
+  const fullPath = resolveDrivePathFromRoot(context.rootPath, requestedPath);
+  const source = buildRcloneTarget(context.remoteName, fullPath);
+  const copyResult = runRcloneCommandSync(['copyto', source, outputPath], {
+    configPath: context.configPath,
+    allowNonZero: true,
+    timeoutMs: 1000 * 60 * 10
   });
-  if (!response.ok) {
-    const bodyText = String(await response.text()).trim();
-    throw createClientRequestError(
-      `No se pudo descargar archivo desde Dropbox: ${truncateForNotify(bodyText || 'dropbox_download_failed', 220)}`,
-      response.status >= 400 ? response.status : 500
-    );
+  if (!copyResult.ok) {
+    const reason = truncateForNotify(copyResult.stderr || copyResult.stdout || 'drive_download_failed', 220);
+    throw createClientRequestError(`No se pudo descargar desde Google Drive (rclone): ${reason}`, 502);
   }
-  if (!response.body) {
-    throw createClientRequestError('Dropbox no devolvió stream de descarga', 502);
-  }
-  await pipelineAsync(Readable.fromWeb(response.body), fs.createWriteStream(outputPath));
-  const metadataHeader = String(response.headers.get('dropbox-api-result') || '').trim();
-  let metadata = {};
+  let fileStats = null;
   try {
-    metadata = metadataHeader ? JSON.parse(metadataHeader) : {};
+    fileStats = fs.statSync(outputPath);
   } catch (_error) {
-    metadata = {};
+    fileStats = null;
   }
   return {
-    metadata,
-    path: dropboxPath
+    metadata: {
+      name: path.posix.basename(fullPath),
+      size: fileStats ? Number(fileStats.size || 0) : null
+    },
+    path: buildDriveFileIdFromPath(normalizeDrivePathFromRoot(context.rootPath, fullPath))
   };
 }
 
@@ -4996,23 +7114,14 @@ async function handleDeployedBackupRestoreJob(row) {
   const fileId = String(payload.fileId || '').trim();
   const requestedTargetPath = normalizeAbsoluteStoragePath(payload.targetPath);
   if (!safeUserId || !accountId || !appId || !fileId) {
-    throw createClientRequestError('Restauración inválida: faltan datos requeridos', 400);
+    throw createClientRequestError('Restauración inválida: faltan datos requeridos.', 400);
   }
-  const context = await getDriveContextForUser(safeUserId, accountId, { allowNeedsOauth: false });
-  const metadata = await dropboxApiRequest(
-    context.accessToken,
-    '/files/get_metadata',
-    {
-      path: String(fileId || '').trim(),
-      include_deleted: false
-    },
-    { fallbackError: 'dropbox_metadata_failed' }
-  );
+  const context = await getDriveContextForUser(safeUserId, accountId);
   const cachedRows = listDeployedCloudBackupsForUserAndAppStmt.all(safeUserId, appId, 200);
   const cachedByFileId = new Map(
     cachedRows.map((entry) => [String(entry && entry.drive_file_id ? entry.drive_file_id : '').trim(), entry])
   );
-  const cached = cachedByFileId.get(String(metadata.path_lower || fileId).trim()) || null;
+  const cached = cachedByFileId.get(String(fileId || '').trim()) || null;
   const targetPath =
     requestedTargetPath ||
     normalizeAbsoluteStoragePath(
@@ -5020,24 +7129,28 @@ async function handleDeployedBackupRestoreJob(row) {
         ((cached && safeParseJsonObject(cached.metadata_json).targetPath) || '')
     );
   if (!targetPath) {
-    throw createClientRequestError('Este backup no tiene targetPath. Indica ruta de restauración manualmente.', 400);
+    throw createClientRequestError(
+      'Este backup no tiene targetPath. Indica ruta de restauración manualmente.',
+      400
+    );
   }
   assertStorageMutationPathAllowed(targetPath);
-  setStorageJobProgress(row.id, { stage: 'downloading' }, `Descargando backup ${String(metadata.name || fileId)}`);
+  setStorageJobProgress(row.id, { stage: 'downloading' }, `Descargando backup ${fileId}`);
   const tmpArchivePath = path.join(storageJobsRootDir, `${buildStorageJobId('restore')}.tar.gz`);
   try {
     const downloaded = await downloadDriveFileToPath(context, fileId, tmpArchivePath);
-    const metadataResolved = downloaded && downloaded.metadata && typeof downloaded.metadata === 'object'
-      ? downloaded.metadata
-      : metadata;
     setStorageJobProgress(row.id, { stage: 'extracting' }, `Restaurando en ${targetPath}`);
     const extraction = extractTarGzArchive(tmpArchivePath, targetPath);
+    const backupName =
+      String((downloaded && downloaded.metadata && downloaded.metadata.name) || '').trim() ||
+      path.posix.basename(String(fileId || '')) ||
+      'backup.tar.gz';
     return {
       appId,
       accountId,
       accountAlias: context.account.alias || context.account.id,
       fileId,
-      backupName: String((metadataResolved && metadataResolved.name) || metadata.name || '').trim(),
+      backupName,
       targetPath,
       extractParent: extraction.extractParent,
       restoredAt: nowIso()
@@ -5048,59 +7161,9 @@ async function handleDeployedBackupRestoreJob(row) {
         fs.unlinkSync(tmpArchivePath);
       }
     } catch (_error) {
-      // ignore temp cleanup failures.
+      // ignore cleanup failures.
     }
   }
-}
-
-async function runStorageJobById(jobId) {
-  const safeJobId = String(jobId || '').trim();
-  if (!safeJobId) return;
-  const row = getToolsBackgroundJobByIdStmt.get(safeJobId);
-  if (!row) return;
-  const status = normalizeStorageJobStatus(row.status);
-  if (status === 'completed' || status === 'error') return;
-  const runningAt = nowIso();
-  updateToolsBackgroundJobRunningStmt.run(runningAt, runningAt, safeJobId);
-  const freshRow = getToolsBackgroundJobByIdStmt.get(safeJobId);
-  if (!freshRow) return;
-  const type = normalizeStorageJobType(freshRow.job_type);
-  try {
-    let result = {};
-    if (type === 'drive_upload_files' || type === 'dropbox_upload_files') {
-      result = await handleDriveUploadFilesJob(freshRow);
-    } else if (type === 'deployed_backup_create') {
-      result = await handleDeployedBackupCreateJob(freshRow);
-    } else if (type === 'deployed_backup_restore') {
-      result = await handleDeployedBackupRestoreJob(freshRow);
-    } else {
-      throw new Error('storage_job_type_not_supported');
-    }
-    markStorageJobCompleted(safeJobId, result, { stage: 'completed' }, 'Job completado');
-  } catch (error) {
-    const reason = truncateForNotify(error && error.message ? error.message : 'storage_job_failed', 900);
-    markStorageJobError(safeJobId, reason, { stage: 'error' });
-  }
-}
-
-function scheduleStorageJob(jobId) {
-  const safeJobId = String(jobId || '').trim();
-  if (!safeJobId || activeStorageJobWorkers.has(safeJobId)) return;
-  activeStorageJobWorkers.add(safeJobId);
-  setTimeout(() => {
-    void runStorageJobById(safeJobId).finally(() => {
-      activeStorageJobWorkers.delete(safeJobId);
-    });
-  }, 15);
-}
-
-function resumePendingStorageJobs() {
-  const rows = listPendingToolsBackgroundJobsStmt.all(storageJobPollMaxItems);
-  rows.forEach((row) => {
-    const jobId = String(row && row.id ? row.id : '').trim();
-    if (!jobId) return;
-    scheduleStorageJob(jobId);
-  });
 }
 
 
@@ -5236,26 +7299,183 @@ function normalizeGitRemoteName(rawValue, fallback = '') {
   return value;
 }
 
-function listGitBranchesForRepo(repoPath) {
-  const result = runGitInRepoSync(repoPath, ['branch', '--list', '--format', '%(refname:short)'], {
+function splitGitRemoteBranchRef(rawBranch) {
+  const safeBranch = normalizeGitBranchName(rawBranch);
+  if (!safeBranch || !safeBranch.includes('/')) return null;
+  const firstSlash = safeBranch.indexOf('/');
+  const remoteName = normalizeGitRemoteName(safeBranch.slice(0, firstSlash));
+  const branchPart = normalizeGitBranchName(safeBranch.slice(firstSlash + 1));
+  if (!remoteName || !branchPart) return null;
+  return {
+    remote: remoteName,
+    branch: branchPart
+  };
+}
+
+function gitRemoteBranchExists(repoPath, remoteName, branchName) {
+  const safeRemote = normalizeGitRemoteName(remoteName);
+  const safeBranch = normalizeGitBranchName(branchName);
+  if (!safeRemote || !safeBranch) return false;
+  const remoteCheck = runGitInRepoSync(repoPath, ['remote', 'get-url', safeRemote], {
     allowNonZero: true
   });
-  if (!result.ok) return [];
-  const branches = String(result.stdout || '')
+  if (Number(remoteCheck.code) !== 0) return false;
+  const result = runGitInRepoSync(repoPath, ['rev-parse', '--verify', '--quiet', `refs/remotes/${safeRemote}/${safeBranch}`], {
+    allowNonZero: true
+  });
+  return Number(result.code) === 0;
+}
+
+function listGitRemotes(repoPath) {
+  const result = runGitInRepoSync(repoPath, ['remote'], {
+    allowNonZero: true
+  });
+  if (Number(result.code) !== 0) return [];
+  return String(result.stdout || '')
     .replace(/\r/g, '')
     .split('\n')
-    .map((entry) => normalizeGitBranchName(entry))
+    .map((entry) => normalizeGitRemoteName(entry))
     .filter(Boolean);
-  return Array.from(new Set(branches)).sort((a, b) => a.localeCompare(b));
+}
+
+function refreshGitRemoteRefs(repoPath, preferredRemote = 'origin') {
+  const remotes = listGitRemotes(repoPath);
+  if (remotes.length === 0) {
+    return {
+      fetched: false,
+      errors: []
+    };
+  }
+  const preferred = normalizeGitRemoteName(preferredRemote);
+  const ordered = preferred
+    ? [preferred, ...remotes.filter((entry) => entry !== preferred)]
+    : remotes.slice();
+  const uniqueOrdered = Array.from(new Set(ordered));
+  const errors = [];
+  let fetched = false;
+  uniqueOrdered.forEach((remoteName) => {
+    const fetchResult = runGitInRepoSync(repoPath, ['fetch', remoteName, '--prune'], {
+      allowNonZero: true,
+      timeoutMs: Math.max(gitToolsCommandTimeoutMs, 1000 * 45)
+    });
+    if (Number(fetchResult.code) === 0) {
+      fetched = true;
+      return;
+    }
+    errors.push(
+      truncateForNotify(
+        fetchResult.stderr || fetchResult.stdout || `git_fetch_${remoteName}_failed`,
+        180
+      )
+    );
+  });
+  return {
+    fetched,
+    errors
+  };
+}
+
+function resolveGitRemoteBranchRef(repoPath, rawBranch) {
+  const split = splitGitRemoteBranchRef(rawBranch);
+  if (!split) return null;
+  if (!gitRemoteBranchExists(repoPath, split.remote, split.branch)) return null;
+  return split;
+}
+
+function listGitBranchesForRepo(repoPath) {
+  const result = runGitInRepoSync(
+    repoPath,
+    ['for-each-ref', '--format', '%(refname:short)', 'refs/heads', 'refs/remotes'],
+    {
+      allowNonZero: true
+    }
+  );
+  if (Number(result.code) !== 0) return [];
+  const localBranches = [];
+  const remoteBranches = [];
+  String(result.stdout || '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .forEach((entry) => {
+      const normalized = normalizeGitBranchName(entry);
+      if (!normalized) return;
+      if (normalized.startsWith('refs/')) return;
+      if (normalized.includes('/HEAD')) return;
+      const split = splitGitRemoteBranchRef(normalized);
+      if (split && gitRemoteBranchExists(repoPath, split.remote, split.branch)) {
+        remoteBranches.push(`${split.remote}/${split.branch}`);
+        return;
+      }
+      localBranches.push(normalized);
+    });
+  const localSet = new Set(localBranches);
+  const merged = [
+    ...Array.from(localSet.values()),
+    ...remoteBranches.filter((entry) => {
+      const split = splitGitRemoteBranchRef(entry);
+      if (!split) return false;
+      return !localSet.has(split.branch);
+    })
+  ];
+  return Array.from(new Set(merged)).sort((a, b) => a.localeCompare(b));
 }
 
 function gitBranchExists(repoPath, branchName) {
   const safeName = normalizeGitBranchName(branchName);
   if (!safeName) return false;
-  const result = runGitInRepoSync(repoPath, ['show-ref', '--verify', `refs/heads/${safeName}`], {
+  const result = runGitInRepoSync(repoPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${safeName}`], {
     allowNonZero: true
   });
   return Number(result.code) === 0;
+}
+
+function gitBranchRefExists(repoPath, branchName) {
+  const safeBranch = normalizeGitBranchName(branchName);
+  if (!safeBranch) return false;
+  if (gitBranchExists(repoPath, safeBranch)) return true;
+  const split = splitGitRemoteBranchRef(safeBranch);
+  if (split) {
+    return gitRemoteBranchExists(repoPath, split.remote, split.branch);
+  }
+  return gitRemoteBranchExists(repoPath, 'origin', safeBranch);
+}
+
+function resolveCurrentGitBranchName(repoPath) {
+  const result = runGitInRepoSync(repoPath, ['rev-parse', '--abbrev-ref', 'HEAD'], {
+    allowNonZero: true
+  });
+  if (Number(result.code) !== 0) return '';
+  const current = normalizeGitBranchName(String(result.stdout || '').trim());
+  if (!current || current === 'HEAD') return '';
+  return current;
+}
+
+function normalizeGitCheckoutError(rawText, branchName = '') {
+  const source = String(rawText || '').trim();
+  const lower = source.toLowerCase();
+  if (!source) {
+    return branchName
+      ? `No se pudo hacer checkout a ${branchName}.`
+      : 'No se pudo hacer checkout de rama.';
+  }
+  if (
+    lower.includes('would be overwritten by checkout') ||
+    lower.includes('please commit your changes or stash them before you switch branches')
+  ) {
+    return 'Hay cambios locales que bloquean el checkout. Haz commit, stash o descártalos y vuelve a intentar.';
+  }
+  if (lower.includes('untracked working tree files would be overwritten')) {
+    return 'Hay archivos sin seguimiento que serían sobreescritos por el checkout. Muévelos o elimínalos antes.';
+  }
+  if (lower.includes('did not match any file(s) known to git')) {
+    return branchName
+      ? `La rama no existe en local/remoto: ${branchName}.`
+      : 'La rama solicitada no existe en local/remoto.';
+  }
+  if (lower.includes('you are in the middle of a merge')) {
+    return 'El repositorio está en medio de un merge. Resuélvelo antes de cambiar de rama.';
+  }
+  return truncateForNotify(source, 220);
 }
 
 function listGitRepositoriesUnderRoots(baseDirs) {
@@ -5977,6 +8197,7 @@ function buildObservabilitySnapshot() {
   const freeMemBytes = os.freemem();
   const usedMemBytes = Math.max(0, totalMemBytes - freeMemBytes);
   const usedMemPercent = totalMemBytes > 0 ? (usedMemBytes / totalMemBytes) * 100 : 0;
+  const disk = getDiskUsageSnapshotForPath(repoRootDir) || getDiskUsageSnapshotForPath(storageJobsRootDir);
   const cpuUsage = sampleProcessCpuUsagePercent();
   const endpointStats = Array.from(observabilityState.endpointStats.values()).map((entry) => {
     const latency = summarizeLatencySamples(entry.recentDurationsMs);
@@ -6030,7 +8251,17 @@ function buildObservabilitySnapshot() {
       totalMemBytes,
       freeMemBytes,
       usedMemBytes,
-      usedMemPercent: Number(usedMemPercent.toFixed(1))
+      usedMemPercent: Number(usedMemPercent.toFixed(1)),
+      disk: disk
+        ? {
+            path: disk.path,
+            mountPoint: disk.mountPoint,
+            totalBytes: disk.totalBytes,
+            usedBytes: disk.usedBytes,
+            availableBytes: disk.availableBytes,
+            usedPercent: disk.usagePercent
+          }
+        : null
     },
     api: {
       totalRequests,
@@ -7038,17 +9269,19 @@ ON user_agent_integrations(user_id, agent_id ASC);
 CREATE TABLE IF NOT EXISTS user_agent_permissions (
   user_id INTEGER NOT NULL,
   agent_id TEXT NOT NULL,
+  access_mode TEXT NOT NULL DEFAULT 'full_access',
   allow_root INTEGER NOT NULL DEFAULT 1,
   run_as_user TEXT NOT NULL DEFAULT '',
   allowed_paths_json TEXT NOT NULL DEFAULT '["/"]',
   denied_paths_json TEXT NOT NULL DEFAULT '[]',
+  can_write_files INTEGER NOT NULL DEFAULT 1,
   read_only INTEGER NOT NULL DEFAULT 0,
   allow_shell INTEGER NOT NULL DEFAULT 1,
   allow_sensitive_tools INTEGER NOT NULL DEFAULT 1,
   allow_network INTEGER NOT NULL DEFAULT 1,
   allow_git INTEGER NOT NULL DEFAULT 1,
   allow_backup_restore INTEGER NOT NULL DEFAULT 1,
-  allowed_tools_json TEXT NOT NULL DEFAULT '["chat","git","storage","dropbox","backups","deployments","shell"]',
+  allowed_tools_json TEXT NOT NULL DEFAULT '["chat","git","storage","drive","backups","deployments","shell"]',
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (user_id, agent_id),
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -7057,9 +9290,29 @@ CREATE TABLE IF NOT EXISTS user_agent_permissions (
 CREATE INDEX IF NOT EXISTS idx_user_agent_permissions_user
 ON user_agent_permissions(user_id, agent_id ASC);
 
+CREATE TABLE IF NOT EXISTS chat_projects (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  context_mode TEXT NOT NULL DEFAULT 'mixed',
+  auto_context_enabled INTEGER NOT NULL DEFAULT 1,
+  manual_context TEXT NOT NULL DEFAULT '',
+  auto_context TEXT NOT NULL DEFAULT '',
+  auto_context_meta_json TEXT NOT NULL DEFAULT '{}',
+  auto_last_message_id INTEGER NOT NULL DEFAULT 0,
+  auto_updated_at TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_projects_user_updated
+ON chat_projects(user_id, updated_at DESC, id DESC);
+
 CREATE TABLE IF NOT EXISTS conversations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
+  project_id INTEGER,
   title TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -7284,8 +9537,18 @@ function hasConversationColumn(columnName) {
   return columns.some((column) => String(column && column.name) === columnName);
 }
 
+function hasChatProjectColumn(columnName) {
+  const columns = db.prepare('PRAGMA table_info(chat_projects)').all();
+  return columns.some((column) => String(column && column.name) === columnName);
+}
+
 function hasUserColumn(columnName) {
   const columns = db.prepare('PRAGMA table_info(users)').all();
+  return columns.some((column) => String(column && column.name) === columnName);
+}
+
+function hasUserAgentPermissionsColumn(columnName) {
+  const columns = db.prepare('PRAGMA table_info(user_agent_permissions)').all();
   return columns.some((column) => String(column && column.name) === columnName);
 }
 
@@ -7298,6 +9561,14 @@ if (!hasConversationColumn('reasoning_effort')) {
     `ALTER TABLE conversations ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT '${DEFAULT_REASONING_EFFORT}'`
   );
 }
+
+if (!hasConversationColumn('project_id')) {
+  db.exec('ALTER TABLE conversations ADD COLUMN project_id INTEGER');
+}
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_conversations_user_project
+ON conversations(user_id, project_id, created_at DESC)
+`);
 
 if (!hasUserColumn('discord_webhook_url')) {
   db.exec("ALTER TABLE users ADD COLUMN discord_webhook_url TEXT NOT NULL DEFAULT ''");
@@ -7313,6 +9584,26 @@ if (!hasUserColumn('discord_include_result')) {
 
 if (!hasUserColumn('active_ai_agent_id')) {
   db.exec("ALTER TABLE users ADD COLUMN active_ai_agent_id TEXT NOT NULL DEFAULT ''");
+}
+
+if (!hasUserAgentPermissionsColumn('access_mode')) {
+  db.exec("ALTER TABLE user_agent_permissions ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'full_access'");
+}
+
+if (!hasUserAgentPermissionsColumn('can_write_files')) {
+  db.exec('ALTER TABLE user_agent_permissions ADD COLUMN can_write_files INTEGER NOT NULL DEFAULT 1');
+}
+
+if (!hasChatProjectColumn('auto_context_meta_json')) {
+  db.exec("ALTER TABLE chat_projects ADD COLUMN auto_context_meta_json TEXT NOT NULL DEFAULT '{}'");
+}
+
+if (!hasChatProjectColumn('auto_last_message_id')) {
+  db.exec('ALTER TABLE chat_projects ADD COLUMN auto_last_message_id INTEGER NOT NULL DEFAULT 0');
+}
+
+if (!hasChatProjectColumn('auto_updated_at')) {
+  db.exec("ALTER TABLE chat_projects ADD COLUMN auto_updated_at TEXT NOT NULL DEFAULT ''");
 }
 
 db.exec(`
@@ -7342,24 +9633,77 @@ SET
 `);
 db.exec(`
 UPDATE user_agent_permissions
-SET allowed_tools_json = REPLACE(allowed_tools_json, '"drive"', '"dropbox"')
-WHERE allowed_tools_json LIKE '%"drive"%'
+SET allowed_tools_json = REPLACE(allowed_tools_json, '"dropbox"', '"drive"')
+WHERE allowed_tools_json LIKE '%"dropbox"%'
+`);
+db.exec(`
+UPDATE user_agent_permissions
+SET
+  can_write_files = CASE
+    WHEN read_only = 1 THEN 0
+    WHEN can_write_files IN (0, 1) THEN can_write_files
+    ELSE 1
+  END,
+  access_mode = CASE
+    WHEN read_only = 1 OR can_write_files = 0 THEN 'read_only'
+    WHEN allow_root = 1
+      AND COALESCE(allowed_paths_json, '[]') IN ('["/"]', '["/","${repoRootDir}"]', '["${repoRootDir}","/"]')
+      AND COALESCE(denied_paths_json, '[]') = '[]' THEN 'full_access'
+    WHEN COALESCE(allowed_paths_json, '[]') = '["${repoRootDir}"]'
+      AND COALESCE(denied_paths_json, '[]') = '[]' THEN 'workspace_only'
+    ELSE 'restricted_paths'
+  END
 `);
 db.exec(`
 UPDATE drive_accounts
 SET
   auth_mode = CASE
-    WHEN auth_mode IN ('oauth_client', 'oauth_app', 'oauth') THEN 'oauth_app'
-    ELSE 'token'
+    WHEN auth_mode = 'rclone' THEN 'rclone'
+    ELSE 'legacy_remote'
   END,
   root_folder_id = CASE
     WHEN root_folder_id = 'root' THEN ''
     ELSE COALESCE(root_folder_id, '')
   END
 `);
+db.exec(`
+UPDATE chat_projects
+SET
+  name = TRIM(COALESCE(name, '')),
+  context_mode = CASE
+    WHEN LOWER(COALESCE(context_mode, '')) IN ('manual', 'automatic', 'mixed') THEN LOWER(COALESCE(context_mode, ''))
+    ELSE 'mixed'
+  END,
+  auto_context_enabled = CASE
+    WHEN auto_context_enabled IN (0, 1) THEN auto_context_enabled
+    ELSE 1
+  END,
+  manual_context = COALESCE(manual_context, ''),
+  auto_context = COALESCE(auto_context, ''),
+  auto_context_meta_json = CASE
+    WHEN TRIM(COALESCE(auto_context_meta_json, '')) = '' THEN '{}'
+    ELSE auto_context_meta_json
+  END,
+  auto_last_message_id = CASE
+    WHEN auto_last_message_id >= 0 THEN auto_last_message_id
+    ELSE 0
+  END,
+  auto_updated_at = COALESCE(auto_updated_at, '')
+`);
+db.exec(`
+UPDATE conversations
+SET project_id = NULL
+WHERE project_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM chat_projects p
+    WHERE p.id = conversations.project_id
+      AND p.user_id = conversations.user_id
+  )
+`);
 
 const createConversationStmt = db.prepare(
-  'INSERT INTO conversations (user_id, title, model, reasoning_effort) VALUES (?, ?, ?, ?)'
+  'INSERT INTO conversations (user_id, project_id, title, model, reasoning_effort) VALUES (?, ?, ?, ?, ?)'
 );
 const insertMessageStmt = db.prepare(
   'INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)'
@@ -7367,22 +9711,47 @@ const insertMessageStmt = db.prepare(
 const updateMessageContentStmt = db.prepare(
   'UPDATE messages SET content = ? WHERE id = ?'
 );
-const getConversationStmt = db.prepare(
-  'SELECT id, user_id, title, model, reasoning_effort, created_at FROM conversations WHERE id = ?'
-);
+const getConversationStmt = db.prepare(`
+  SELECT
+    c.id,
+    c.user_id,
+    c.project_id,
+    c.title,
+    c.model,
+    c.reasoning_effort,
+    c.created_at,
+    p.name AS project_name,
+    p.context_mode AS project_context_mode,
+    p.auto_context_enabled AS project_auto_context_enabled
+  FROM conversations c
+  LEFT JOIN chat_projects p
+    ON p.id = c.project_id
+   AND p.user_id = c.user_id
+  WHERE c.id = ?
+`);
 const updateConversationTitleStmt = db.prepare(
   "UPDATE conversations SET title = ? WHERE id = ? AND (title = 'Nuevo chat' OR title = '')"
 );
 const renameConversationTitleStmt = db.prepare(
   'UPDATE conversations SET title = ? WHERE id = ?'
 );
+const assignConversationProjectStmt = db.prepare(`
+  UPDATE conversations
+  SET project_id = ?
+  WHERE id = ?
+    AND user_id = ?
+`);
 const listConversationsStmt = db.prepare(`
   SELECT
     c.id,
+    c.project_id,
     c.title,
     c.model,
     c.reasoning_effort,
     c.created_at,
+    p.name AS project_name,
+    p.context_mode AS project_context_mode,
+    p.auto_context_enabled AS project_auto_context_enabled,
     (
       SELECT MAX(d.updated_at)
       FROM chat_live_drafts d
@@ -7403,12 +9772,150 @@ const listConversationsStmt = db.prepare(`
       WHERE m.conversation_id = c.id
     ) AS last_message_at
   FROM conversations c
+  LEFT JOIN chat_projects p
+    ON p.id = c.project_id
+   AND p.user_id = c.user_id
   WHERE c.user_id = ?
   ORDER BY COALESCE(last_message_at, c.created_at) DESC
 `);
 const updateConversationSettingsStmt = db.prepare(
   'UPDATE conversations SET model = ?, reasoning_effort = ? WHERE id = ?'
 );
+const listChatProjectsForUserStmt = db.prepare(`
+  SELECT
+    p.id,
+    p.user_id,
+    p.name,
+    p.context_mode,
+    p.auto_context_enabled,
+    p.manual_context,
+    p.auto_context,
+    p.auto_context_meta_json,
+    p.auto_last_message_id,
+    p.auto_updated_at,
+    p.created_at,
+    p.updated_at,
+    (
+      SELECT COUNT(1)
+      FROM conversations c
+      WHERE c.user_id = p.user_id
+        AND c.project_id = p.id
+    ) AS chat_count,
+    (
+      SELECT MAX(COALESCE(
+        (
+          SELECT MAX(m.created_at)
+          FROM messages m
+          WHERE m.conversation_id = c.id
+        ),
+        c.created_at
+      ))
+      FROM conversations c
+      WHERE c.user_id = p.user_id
+        AND c.project_id = p.id
+    ) AS last_message_at
+  FROM chat_projects p
+  WHERE p.user_id = ?
+  ORDER BY p.updated_at DESC, p.id DESC
+`);
+const getChatProjectByIdForUserStmt = db.prepare(`
+  SELECT
+    p.id,
+    p.user_id,
+    p.name,
+    p.context_mode,
+    p.auto_context_enabled,
+    p.manual_context,
+    p.auto_context,
+    p.auto_context_meta_json,
+    p.auto_last_message_id,
+    p.auto_updated_at,
+    p.created_at,
+    p.updated_at
+  FROM chat_projects p
+  WHERE p.id = ?
+    AND p.user_id = ?
+  LIMIT 1
+`);
+const createChatProjectStmt = db.prepare(`
+  INSERT INTO chat_projects (
+    user_id,
+    name,
+    context_mode,
+    auto_context_enabled,
+    manual_context,
+    auto_context,
+    auto_context_meta_json,
+    auto_last_message_id,
+    auto_updated_at,
+    created_at,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, '{}', 0, '', ?, ?)
+`);
+const updateChatProjectMetaStmt = db.prepare(`
+  UPDATE chat_projects
+  SET
+    name = ?,
+    context_mode = ?,
+    auto_context_enabled = ?,
+    manual_context = ?,
+    updated_at = ?
+  WHERE id = ?
+    AND user_id = ?
+`);
+const updateChatProjectAutoContextStmt = db.prepare(`
+  UPDATE chat_projects
+  SET
+    auto_context = ?,
+    auto_context_meta_json = ?,
+    auto_last_message_id = ?,
+    auto_updated_at = ?,
+    updated_at = ?
+  WHERE id = ?
+    AND user_id = ?
+`);
+const deleteChatProjectForUserStmt = db.prepare(`
+  DELETE FROM chat_projects
+  WHERE id = ?
+    AND user_id = ?
+`);
+const clearProjectIdFromConversationsStmt = db.prepare(`
+  UPDATE conversations
+  SET project_id = NULL
+  WHERE user_id = ?
+    AND project_id = ?
+`);
+const listRecentProjectMessagesForSummaryStmt = db.prepare(`
+  SELECT
+    m.id,
+    m.role,
+    m.content,
+    m.created_at,
+    c.id AS conversation_id,
+    c.title AS conversation_title
+  FROM messages m
+  INNER JOIN conversations c
+    ON c.id = m.conversation_id
+  WHERE c.user_id = ?
+    AND c.project_id = ?
+  ORDER BY m.id DESC
+  LIMIT ?
+`);
+const getProjectMessageMaxIdStmt = db.prepare(`
+  SELECT MAX(m.id) AS max_message_id
+  FROM messages m
+  INNER JOIN conversations c
+    ON c.id = m.conversation_id
+  WHERE c.user_id = ?
+    AND c.project_id = ?
+`);
+const countUnassignedConversationsForUserStmt = db.prepare(`
+  SELECT COUNT(1) AS total
+  FROM conversations
+  WHERE user_id = ?
+    AND project_id IS NULL
+`);
 const getUserNotificationSettingsStmt = db.prepare(`
   SELECT
     discord_webhook_url,
@@ -7481,10 +9988,12 @@ const getUserAgentPermissionStmt = db.prepare(`
   SELECT
     user_id,
     agent_id,
+    access_mode,
     allow_root,
     run_as_user,
     allowed_paths_json,
     denied_paths_json,
+    can_write_files,
     read_only,
     allow_shell,
     allow_sensitive_tools,
@@ -7502,10 +10011,12 @@ const listUserAgentPermissionsStmt = db.prepare(`
   SELECT
     user_id,
     agent_id,
+    access_mode,
     allow_root,
     run_as_user,
     allowed_paths_json,
     denied_paths_json,
+    can_write_files,
     read_only,
     allow_shell,
     allow_sensitive_tools,
@@ -7522,10 +10033,12 @@ const upsertUserAgentPermissionStmt = db.prepare(`
   INSERT INTO user_agent_permissions (
     user_id,
     agent_id,
+    access_mode,
     allow_root,
     run_as_user,
     allowed_paths_json,
     denied_paths_json,
+    can_write_files,
     read_only,
     allow_shell,
     allow_sensitive_tools,
@@ -7535,12 +10048,14 @@ const upsertUserAgentPermissionStmt = db.prepare(`
     allowed_tools_json,
     updated_at
   )
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   ON CONFLICT(user_id, agent_id) DO UPDATE SET
+    access_mode = excluded.access_mode,
     allow_root = excluded.allow_root,
     run_as_user = excluded.run_as_user,
     allowed_paths_json = excluded.allowed_paths_json,
     denied_paths_json = excluded.denied_paths_json,
+    can_write_files = excluded.can_write_files,
     read_only = excluded.read_only,
     allow_shell = excluded.allow_shell,
     allow_sensitive_tools = excluded.allow_sensitive_tools,
@@ -7705,6 +10220,7 @@ const listDriveAccountsForUserStmt = db.prepare(`
     user_id,
     alias,
     auth_mode,
+    token_cipher,
     root_folder_id,
     status,
     last_error,
@@ -8524,7 +11040,7 @@ app.use(
   })
 );
 
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(staticAssetsDir));
 
 app.use((req, res, next) => {
   const pathName = String(req.path || '');
@@ -9133,10 +11649,9 @@ function normalizeAiPermissionAllowedTools(rawValue) {
   source.forEach((entry) => {
     const rawTool = String(entry || '').trim().toLowerCase();
     if (!rawTool) return;
-    const value = rawTool === 'drive' ? 'dropbox' : rawTool;
-    if (!aiPermissionToolCatalog.includes(value) || seen.has(value)) return;
-    seen.add(value);
-    normalized.push(value);
+    if (!aiPermissionToolCatalog.includes(rawTool) || seen.has(rawTool)) return;
+    seen.add(rawTool);
+    normalized.push(rawTool);
   });
   if (normalized.length > 0) {
     return normalized;
@@ -9144,9 +11659,109 @@ function normalizeAiPermissionAllowedTools(rawValue) {
   return [...aiPermissionDefaultAllowedTools];
 }
 
+function normalizeAiPermissionAccessMode(rawValue, fallback = aiProviderPermissionProfileDefaults.accessMode) {
+  const normalized = String(rawValue || '')
+    .trim()
+    .toLowerCase();
+  if (aiPermissionAccessModes.has(normalized)) {
+    return normalized;
+  }
+  return fallback;
+}
+
+function inferAiPermissionAccessMode(rawValue) {
+  const source = rawValue && typeof rawValue === 'object' ? rawValue : {};
+  const readOnly = parseBooleanSetting(source.readOnly, false);
+  const canWriteFiles = parseBooleanSetting(source.canWriteFiles, !readOnly);
+  if (readOnly || !canWriteFiles) {
+    return 'read_only';
+  }
+  const allowedPaths = normalizeAiPermissionPathList(source.allowedPaths, aiProviderPermissionProfileDefaults.allowedPaths);
+  const deniedPaths = normalizeAiPermissionPathList(source.deniedPaths, [], { allowEmpty: true });
+  const hasRootScope = allowedPaths.some((entry) => normalizeAbsoluteStoragePath(entry) === '/');
+  if (parseBooleanSetting(source.allowRoot, false) && hasRootScope && deniedPaths.length === 0) {
+    return 'full_access';
+  }
+  const workspaceOnly =
+    allowedPaths.length > 0 &&
+    allowedPaths.every((entry) => {
+      const normalized = normalizeAbsoluteStoragePath(entry);
+      return Boolean(normalized) && (normalized === repoRootDir || isPathWithin(repoRootDir, normalized));
+    }) &&
+    deniedPaths.length === 0;
+  if (workspaceOnly) {
+    return 'workspace_only';
+  }
+  return 'restricted_paths';
+}
+
+function buildAiPermissionPresetForMode(accessMode, currentProfile = null) {
+  const normalizedMode = normalizeAiPermissionAccessMode(accessMode);
+  const current = currentProfile && typeof currentProfile === 'object' ? currentProfile : {};
+  const common = {
+    accessMode: normalizedMode,
+    runAsUser: '',
+    allowShell: true,
+    allowSensitiveTools: true,
+    allowNetwork: true,
+    allowGit: true,
+    allowBackupRestore: true,
+    allowedTools: [...aiPermissionToolCatalog]
+  };
+  if (normalizedMode === 'full_access') {
+    return {
+      ...common,
+      allowRoot: true,
+      allowedPaths: ['/'],
+      deniedPaths: [],
+      canWriteFiles: true,
+      readOnly: false
+    };
+  }
+  if (normalizedMode === 'workspace_only') {
+    return {
+      ...common,
+      allowRoot: false,
+      allowedPaths: [repoRootDir],
+      deniedPaths: [],
+      canWriteFiles: true,
+      readOnly: false
+    };
+  }
+  if (normalizedMode === 'read_only') {
+    const currentAllowedPaths = normalizeAiPermissionPathList(
+      current.allowedPaths,
+      [repoRootDir]
+    );
+    return {
+      ...common,
+      allowRoot: false,
+      allowedPaths: currentAllowedPaths,
+      deniedPaths: normalizeAiPermissionPathList(current.deniedPaths, [], { allowEmpty: true }),
+      canWriteFiles: false,
+      readOnly: true
+    };
+  }
+  return {
+    ...common,
+    allowRoot: false,
+    allowedPaths: normalizeAiPermissionPathList(current.allowedPaths, [repoRootDir]),
+    deniedPaths: normalizeAiPermissionPathList(current.deniedPaths, [], { allowEmpty: true }),
+    canWriteFiles: true,
+    readOnly: false
+  };
+}
+
 function normalizeAiAgentPermissionProfile(rawValue) {
   const source = rawValue && typeof rawValue === 'object' ? rawValue : {};
+  const inferredAccessMode = inferAiPermissionAccessMode(source);
+  const readOnly = parseBooleanSetting(source.readOnly, aiProviderPermissionProfileDefaults.readOnly);
+  const canWriteFiles = parseBooleanSetting(
+    source.canWriteFiles,
+    readOnly ? false : aiProviderPermissionProfileDefaults.canWriteFiles
+  );
   return {
+    accessMode: normalizeAiPermissionAccessMode(source.accessMode, inferredAccessMode),
     allowRoot: parseBooleanSetting(source.allowRoot, aiProviderPermissionProfileDefaults.allowRoot),
     runAsUser: String(source.runAsUser || '').trim().slice(0, 60),
     allowedPaths: normalizeAiPermissionPathList(
@@ -9154,7 +11769,8 @@ function normalizeAiAgentPermissionProfile(rawValue) {
       aiProviderPermissionProfileDefaults.allowedPaths
     ),
     deniedPaths: normalizeAiPermissionPathList(source.deniedPaths, [], { allowEmpty: true }),
-    readOnly: parseBooleanSetting(source.readOnly, aiProviderPermissionProfileDefaults.readOnly),
+    canWriteFiles: canWriteFiles && !readOnly,
+    readOnly: readOnly || !canWriteFiles,
     allowShell: parseBooleanSetting(source.allowShell, aiProviderPermissionProfileDefaults.allowShell),
     allowSensitiveTools: parseBooleanSetting(
       source.allowSensitiveTools,
@@ -9177,10 +11793,12 @@ function normalizeAiAgentPermissionRow(rawValue) {
   const parsedDeniedPaths = safeParseJsonArray(row.denied_paths_json ?? row.deniedPathsJson);
   const parsedAllowedTools = safeParseJsonArray(row.allowed_tools_json ?? row.allowedToolsJson);
   const normalized = normalizeAiAgentPermissionProfile({
+    accessMode: row.access_mode ?? row.accessMode,
     allowRoot: Number(row.allow_root) === 1,
     runAsUser: row.run_as_user,
     allowedPaths: parsedAllowedPaths,
     deniedPaths: parsedDeniedPaths,
+    canWriteFiles: Number(row.can_write_files) === 1,
     readOnly: Number(row.read_only) === 1,
     allowShell: Number(row.allow_shell) === 1,
     allowSensitiveTools: Number(row.allow_sensitive_tools) === 1,
@@ -9224,18 +11842,46 @@ function upsertAiAgentPermissionProfileForUser(userId, agentId, profilePatch = {
     throw createClientRequestError('Agente inválido', 400);
   }
   const current = getAiAgentPermissionProfileForUser(safeUserId, safeAgentId);
-  const next = normalizeAiAgentPermissionProfile({
+  const safePatch = profilePatch && typeof profilePatch === 'object' ? profilePatch : {};
+  const requestedMode = normalizeAiPermissionAccessMode(safePatch.accessMode, '');
+  let nextSource = {
     ...current,
-    ...(profilePatch && typeof profilePatch === 'object' ? profilePatch : {})
-  });
+    ...safePatch
+  };
+  if (requestedMode) {
+    nextSource = {
+      ...current,
+      ...buildAiPermissionPresetForMode(requestedMode, current),
+      ...safePatch,
+      accessMode: requestedMode
+    };
+    if (requestedMode === 'full_access') {
+      nextSource.allowRoot = true;
+      nextSource.allowedPaths = ['/'];
+      nextSource.deniedPaths = [];
+      nextSource.canWriteFiles = true;
+      nextSource.readOnly = false;
+    } else if (requestedMode === 'workspace_only') {
+      nextSource.allowRoot = false;
+      nextSource.allowedPaths = [repoRootDir];
+      nextSource.deniedPaths = [];
+    } else if (requestedMode === 'read_only') {
+      nextSource.allowRoot = false;
+      nextSource.canWriteFiles = false;
+      nextSource.readOnly = true;
+    }
+  }
+  const next = normalizeAiAgentPermissionProfile(nextSource);
   const updatedAt = nowIso();
   upsertUserAgentPermissionStmt.run(
     safeUserId,
     safeAgentId,
+    next.accessMode,
     next.allowRoot ? 1 : 0,
     next.runAsUser,
     JSON.stringify(next.allowedPaths),
     JSON.stringify(next.deniedPaths),
+    next.canWriteFiles ? 1 : 0,
     next.readOnly ? 1 : 0,
     next.allowShell ? 1 : 0,
     next.allowSensitiveTools ? 1 : 0,
@@ -9254,10 +11900,12 @@ function upsertAiAgentPermissionProfileForUser(userId, agentId, profilePatch = {
 
 function buildAiPermissionFullAccessPatch() {
   return {
+    accessMode: 'full_access',
     allowRoot: true,
     runAsUser: '',
     allowedPaths: ['/'],
     deniedPaths: [],
+    canWriteFiles: true,
     readOnly: false,
     allowShell: true,
     allowSensitiveTools: true,
@@ -9352,10 +12000,7 @@ function assertAiPermissionForAction(profile, action, options = {}) {
   const requiresNetwork = Boolean(options && options.requiresNetwork);
 
   if (safeProfile.allowedTools && Array.isArray(safeProfile.allowedTools)) {
-    const actionAliases = new Set([safeAction]);
-    if (safeAction === 'dropbox') actionAliases.add('drive');
-    if (safeAction === 'drive') actionAliases.add('dropbox');
-    const allowed = Array.from(actionAliases.values()).some((item) => safeProfile.allowedTools.includes(item));
+    const allowed = safeAction ? safeProfile.allowedTools.includes(safeAction) : true;
     if (safeAction && !allowed) {
       throw createClientRequestError(`Acción bloqueada por permisos (${safeAction})`, 403);
     }
@@ -9375,8 +12020,8 @@ function assertAiPermissionForAction(profile, action, options = {}) {
   if (requiresBackupRestore && !safeProfile.allowBackupRestore) {
     throw createClientRequestError('El perfil actual no permite backup/restauración', 403);
   }
-  if (readOnlyWriteIntent && safeProfile.readOnly) {
-    throw createClientRequestError('El perfil actual es de solo lectura', 403);
+  if (readOnlyWriteIntent && (safeProfile.readOnly || !safeProfile.canWriteFiles)) {
+    throw createClientRequestError('El perfil actual no permite escribir archivos', 403);
   }
   if (targetPath) {
     const normalizedTarget = normalizeAbsoluteStoragePath(targetPath);
@@ -9901,9 +12546,63 @@ function resolveUnixUserIdentity(username) {
   }
 }
 
+function getModeMaskForIdentity(stats, identity) {
+  if (!stats || !identity) return 0;
+  if (identity.uid === 0) {
+    return 0o7;
+  }
+  if (Number(stats.uid) === Number(identity.uid)) {
+    return (stats.mode >> 6) & 0o7;
+  }
+  if (Number(stats.gid) === Number(identity.gid)) {
+    return (stats.mode >> 3) & 0o7;
+  }
+  return stats.mode & 0o7;
+}
+
+function hasDirectoryAccessForIdentity(directoryPath, identity, writeRequired = false) {
+  if (!identity || identity.uid === 0) return true;
+  try {
+    const stats = fs.statSync(directoryPath);
+    if (!stats.isDirectory()) {
+      return false;
+    }
+    const mask = getModeMaskForIdentity(stats, identity);
+    const requiredBits = writeRequired ? 0o7 : 0o5;
+    return (mask & requiredBits) === requiredBits;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function isPathAccessibleForIdentity(targetPath, identity, options = {}) {
+  if (!identity || identity.uid === 0) return true;
+  const normalized = normalizeAbsoluteStoragePath(targetPath);
+  if (!normalized) return false;
+  const writeRequired = Boolean(options.writeRequired);
+  const segments = [];
+  let cursor = normalized;
+  while (cursor) {
+    segments.push(cursor);
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  segments.reverse();
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    const isFinal = index === segments.length - 1;
+    if (!hasDirectoryAccessForIdentity(segment, identity, isFinal && writeRequired)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function resolveChatRuntimeExecutionPolicy(userId, chatRuntime) {
   const providerId = normalizeSupportedAiAgentId(chatRuntime && chatRuntime.activeAgentId);
   const profile = getAiAgentPermissionProfileForUser(userId, providerId);
+  const accessMode = normalizeAiPermissionAccessMode(profile.accessMode, inferAiPermissionAccessMode(profile));
   const allowedPaths = normalizeAiPermissionPathList(
     profile.allowedPaths,
     aiProviderPermissionProfileDefaults.allowedPaths
@@ -9922,9 +12621,10 @@ function resolveChatRuntimeExecutionPolicy(userId, chatRuntime) {
       return false;
     }
   });
-  const cwd = firstAllowed || repoRootDir;
+  const cwd = accessMode === 'full_access' ? process.cwd() : firstAllowed || repoRootDir;
 
   let runAsIdentity = null;
+  let identityFallbackReason = '';
   const canSwitchUser = typeof process.getuid === 'function' && process.getuid() === 0;
   if (canSwitchUser) {
     if (profile.runAsUser) {
@@ -9939,21 +12639,38 @@ function resolveChatRuntimeExecutionPolicy(userId, chatRuntime) {
       runAsIdentity = resolveUnixUserIdentity('nobody') || { user: 'nobody', uid: 65534, gid: 65534 };
     }
   }
+  if (runAsIdentity) {
+    const writeRequired = Boolean(profile.canWriteFiles) && !profile.readOnly;
+    const inaccessiblePaths = safeAllowedPaths.filter(
+      (entry) => !isPathAccessibleForIdentity(entry, runAsIdentity, { writeRequired })
+    );
+    if (!isPathAccessibleForIdentity(cwd, runAsIdentity, { writeRequired })) {
+      inaccessiblePaths.unshift(cwd);
+    }
+    if (inaccessiblePaths.length > 0) {
+      const samplePath = normalizeAbsoluteStoragePath(inaccessiblePaths[0]) || inaccessiblePaths[0];
+      identityFallbackReason = `runAsUser=${runAsIdentity.user} sin acceso a ${samplePath}`;
+      console.warn(`Codex runtime fallback a root: ${identityFallbackReason}`);
+      runAsIdentity = null;
+    }
+  }
 
   const hasRootScope = safeAllowedPaths.some((entry) => normalizeAbsoluteStoragePath(entry) === '/');
-  const codexSandbox = profile.readOnly
+  const codexSandbox = profile.readOnly || !profile.canWriteFiles
     ? 'read-only'
-    : profile.allowRoot && hasRootScope && deniedPaths.length === 0
+    : accessMode === 'full_access' && profile.allowRoot && hasRootScope && deniedPaths.length === 0
       ? 'danger-full-access'
       : 'workspace-write';
 
   return {
     providerId,
+    accessMode,
     profile,
     cwd,
     allowedPaths: safeAllowedPaths,
     deniedPaths,
     runAsIdentity,
+    identityFallbackReason,
     codexSandbox
   };
 }
@@ -9964,6 +12681,141 @@ function getOwnedConversationOrNull(conversationId, userId) {
     return null;
   }
   return conversation;
+}
+
+function getOwnedProjectOrNull(projectId, userId) {
+  const parsedProjectId = Number(projectId);
+  if (!Number.isInteger(parsedProjectId) || parsedProjectId <= 0) {
+    return null;
+  }
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) return null;
+  const row = getChatProjectByIdForUserStmt.get(parsedProjectId, safeUserId);
+  return row || null;
+}
+
+function parseProjectIdInput(rawValue) {
+  if (rawValue === null || rawValue === undefined || rawValue === '') return null;
+  if (rawValue === 'null') return null;
+  const parsed = Number(rawValue);
+  if (!Number.isInteger(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+function serializeChatProjectRow(row, options = {}) {
+  if (!row || typeof row !== 'object') return null;
+  const includeContext = Boolean(options.includeContext);
+  const includePreview = Boolean(options.includePreview);
+  const autoMeta = safeParseJsonObject(row.auto_context_meta_json);
+  const manualContext = normalizeProjectContextText(row.manual_context, projectContextManualMaxChars);
+  const autoContext = normalizeProjectContextText(row.auto_context, projectContextAutoMaxChars);
+  const payload = {
+    id: Number(row.id),
+    name: sanitizeProjectName(row.name) || 'Proyecto',
+    contextMode: normalizeProjectContextMode(row.context_mode, 'mixed'),
+    autoContextEnabled: normalizeProjectAutoEnabled(row.auto_context_enabled, true),
+    autoUpdatedAt: String(row.auto_updated_at || '').trim(),
+    createdAt: String(row.created_at || '').trim(),
+    updatedAt: String(row.updated_at || '').trim(),
+    autoLastMessageId: Math.max(0, Number(row.auto_last_message_id) || 0),
+    autoMeta: autoMeta && typeof autoMeta === 'object' ? autoMeta : {},
+    stats: {
+      chatCount: Math.max(0, Number(row.chat_count) || 0),
+      lastMessageAt: String(row.last_message_at || '').trim()
+    }
+  };
+  if (includeContext) {
+    payload.manualContext = manualContext;
+    payload.autoContext = autoContext;
+  } else if (includePreview) {
+    payload.manualContextPreview = manualContext ? normalizeProjectContextText(manualContext, 240) : '';
+    payload.autoContextPreview = autoContext ? normalizeProjectContextText(autoContext, 240) : '';
+  }
+  return payload;
+}
+
+function buildEffectiveProjectContext(projectRow) {
+  if (!projectRow || typeof projectRow !== 'object') {
+    return {
+      used: false,
+      mode: 'mixed',
+      manualUsed: false,
+      autoUsed: false,
+      text: '',
+      sections: []
+    };
+  }
+  const mode = normalizeProjectContextMode(projectRow.context_mode, 'mixed');
+  const autoEnabled = normalizeProjectAutoEnabled(projectRow.auto_context_enabled, true);
+  const manualContext = normalizeProjectContextText(projectRow.manual_context, projectContextManualMaxChars);
+  const autoContext = normalizeProjectContextText(projectRow.auto_context, projectContextAutoMaxChars);
+  const useManual = (mode === 'manual' || mode === 'mixed') && Boolean(manualContext);
+  const useAuto = autoEnabled && (mode === 'automatic' || mode === 'mixed') && Boolean(autoContext);
+  const sections = [];
+  if (useManual) {
+    sections.push({
+      source: 'manual',
+      title: 'Contexto manual del proyecto',
+      text: manualContext
+    });
+  }
+  if (useAuto) {
+    sections.push({
+      source: 'automatic',
+      title: 'Memoria automática del proyecto',
+      text: autoContext
+    });
+  }
+  const combinedText = sections
+    .map((entry) => `${entry.title}:\n${entry.text}`)
+    .join('\n\n')
+    .trim();
+  return {
+    used: combinedText.length > 0,
+    mode,
+    manualUsed: useManual,
+    autoUsed: useAuto,
+    autoEnabled,
+    text: combinedText,
+    sections
+  };
+}
+
+function buildPromptWithProjectContext(currentPrompt, projectRow) {
+  const projectName = sanitizeProjectName(projectRow && projectRow.name ? projectRow.name : '');
+  const context = buildEffectiveProjectContext(projectRow);
+  if (!context.used) {
+    return currentPrompt;
+  }
+  const lines = [
+    'Contexto compartido del proyecto activo. Debes respetarlo en toda la respuesta.',
+    projectName ? `Proyecto: ${projectName}` : '',
+    ...context.sections.map((entry) => `${entry.title}:\n${entry.text}`),
+    '',
+    'Responde manteniendo coherencia con este contexto de proyecto.',
+    '',
+    currentPrompt
+  ].filter(Boolean);
+  return lines.join('\n');
+}
+
+function serializeConversationProjectRef(conversationRow) {
+  const projectId = Number(conversationRow && conversationRow.project_id);
+  if (!Number.isInteger(projectId) || projectId <= 0) {
+    return null;
+  }
+  return {
+    id: projectId,
+    name: sanitizeProjectName(conversationRow && conversationRow.project_name ? conversationRow.project_name : '') || '',
+    contextMode: normalizeProjectContextMode(
+      conversationRow && conversationRow.project_context_mode ? conversationRow.project_context_mode : 'mixed',
+      'mixed'
+    ),
+    autoContextEnabled: normalizeProjectAutoEnabled(
+      conversationRow && conversationRow.project_auto_context_enabled,
+      true
+    )
+  };
 }
 
 function isAdmin(req) {
@@ -10758,12 +13610,212 @@ app.post('/api/restart', requireAuth, (req, res) => {
   }
 });
 
+app.get('/api/projects', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const rows = listChatProjectsForUserStmt.all(safeUserId);
+  const unassignedRow = countUnassignedConversationsForUserStmt.get(safeUserId);
+  return res.json({
+    ok: true,
+    projects: rows
+      .map((row) => serializeChatProjectRow(row, { includeContext: true }))
+      .filter(Boolean),
+    unassignedCount: Math.max(0, Number(unassignedRow && unassignedRow.total) || 0)
+  });
+});
+
+app.post('/api/projects', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const name = sanitizeProjectName(req.body && req.body.name);
+  if (!name) {
+    return res.status(400).json({ error: 'Nombre de proyecto inválido' });
+  }
+  const contextMode = normalizeProjectContextMode(req.body && req.body.contextMode, 'mixed');
+  const autoContextEnabled = normalizeProjectAutoEnabled(
+    req.body && req.body.autoContextEnabled,
+    contextMode !== 'manual'
+  );
+  const manualContext = normalizeProjectContextText(
+    req.body && req.body.manualContext,
+    projectContextManualMaxChars
+  );
+  const autoContext = normalizeProjectContextText(req.body && req.body.autoContext, projectContextAutoMaxChars);
+  const createdAt = nowIso();
+  const insertResult = createChatProjectStmt.run(
+    safeUserId,
+    name,
+    contextMode,
+    autoContextEnabled ? 1 : 0,
+    manualContext,
+    autoContext,
+    createdAt,
+    createdAt
+  );
+  const projectId = Number(insertResult && insertResult.lastInsertRowid);
+  const project = getOwnedProjectOrNull(projectId, safeUserId);
+  return res.json({
+    ok: true,
+    project: serializeChatProjectRow(project, { includeContext: true })
+  });
+});
+
+app.patch('/api/projects/:id', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const projectId = Number(req.params.id);
+  if (!Number.isInteger(projectId) || projectId <= 0) {
+    return res.status(400).json({ error: 'project_id inválido' });
+  }
+  const project = getOwnedProjectOrNull(projectId, safeUserId);
+  if (!project) {
+    return res.status(404).json({ error: 'Proyecto no encontrado' });
+  }
+
+  const nameProvided = req.body && Object.prototype.hasOwnProperty.call(req.body, 'name');
+  const modeProvided = req.body && Object.prototype.hasOwnProperty.call(req.body, 'contextMode');
+  const autoEnabledProvided =
+    req.body && Object.prototype.hasOwnProperty.call(req.body, 'autoContextEnabled');
+  const manualContextProvided =
+    req.body && Object.prototype.hasOwnProperty.call(req.body, 'manualContext');
+
+  const nextName = nameProvided ? sanitizeProjectName(req.body && req.body.name) : sanitizeProjectName(project.name);
+  if (!nextName) {
+    return res.status(400).json({ error: 'Nombre de proyecto inválido' });
+  }
+  const nextMode = modeProvided
+    ? normalizeProjectContextMode(req.body && req.body.contextMode, project.context_mode)
+    : normalizeProjectContextMode(project.context_mode, 'mixed');
+  const nextAutoEnabled = autoEnabledProvided
+    ? normalizeProjectAutoEnabled(req.body && req.body.autoContextEnabled, project.auto_context_enabled !== 0)
+    : normalizeProjectAutoEnabled(project.auto_context_enabled, true);
+  const nextManualContext = manualContextProvided
+    ? normalizeProjectContextText(req.body && req.body.manualContext, projectContextManualMaxChars)
+    : normalizeProjectContextText(project.manual_context, projectContextManualMaxChars);
+  updateChatProjectMetaStmt.run(
+    nextName,
+    nextMode,
+    nextAutoEnabled ? 1 : 0,
+    nextManualContext,
+    nowIso(),
+    projectId,
+    safeUserId
+  );
+  const refreshed = getOwnedProjectOrNull(projectId, safeUserId);
+  return res.json({
+    ok: true,
+    project: serializeChatProjectRow(refreshed, { includeContext: true })
+  });
+});
+
+app.post('/api/projects/:id/regenerate-context', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const projectId = Number(req.params.id);
+  if (!Number.isInteger(projectId) || projectId <= 0) {
+    return res.status(400).json({ error: 'project_id inválido' });
+  }
+  const project = getOwnedProjectOrNull(projectId, safeUserId);
+  if (!project) {
+    return res.status(404).json({ error: 'Proyecto no encontrado' });
+  }
+  const job = enqueueProjectContextRefreshJob(safeUserId, projectId, {
+    immediate: true,
+    force: true,
+    trigger: 'manual'
+  });
+  const refreshed = getOwnedProjectOrNull(projectId, safeUserId);
+  return res.json({
+    ok: true,
+    project: serializeChatProjectRow(refreshed, { includeContext: true }),
+    job
+  });
+});
+
+app.delete('/api/projects/:id', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const projectId = Number(req.params.id);
+  if (!Number.isInteger(projectId) || projectId <= 0) {
+    return res.status(400).json({ error: 'project_id inválido' });
+  }
+  const project = getOwnedProjectOrNull(projectId, safeUserId);
+  if (!project) {
+    return res.status(404).json({ error: 'Proyecto no encontrado' });
+  }
+  clearQueuedProjectContextRefreshTimer(safeUserId, projectId);
+  const detached = clearProjectIdFromConversationsStmt.run(safeUserId, projectId);
+  deleteChatProjectForUserStmt.run(projectId, safeUserId);
+  return res.json({
+    ok: true,
+    deleted: {
+      projectId,
+      detachedChats: Number(detached && detached.changes) || 0
+    }
+  });
+});
+
+app.patch('/api/conversations/:id/project', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const conversationId = Number(req.params.id);
+  if (!Number.isInteger(conversationId) || conversationId <= 0) {
+    return res.status(400).json({ error: 'conversation_id inválido' });
+  }
+  const conversation = getOwnedConversationOrNull(conversationId, safeUserId);
+  if (!conversation) {
+    return res.status(404).json({ error: 'Conversación no encontrada' });
+  }
+  const requestedProjectId = parseProjectIdInput(req.body && req.body.projectId);
+  let project = null;
+  if (requestedProjectId !== null) {
+    project = getOwnedProjectOrNull(requestedProjectId, safeUserId);
+    if (!project) {
+      return res.status(404).json({ error: 'Proyecto no encontrado para mover el chat.' });
+    }
+  }
+  assignConversationProjectStmt.run(requestedProjectId, conversationId, safeUserId);
+  if (project && normalizeProjectAutoEnabled(project.auto_context_enabled, true)) {
+    enqueueProjectContextRefreshJob(safeUserId, Number(project.id), {
+      immediate: false,
+      force: false,
+      trigger: 'conversation_moved'
+    });
+  }
+  const updatedConversation = getOwnedConversationOrNull(conversationId, safeUserId);
+  return res.json({
+    ok: true,
+    conversation: {
+      id: Number(updatedConversation.id),
+      projectId:
+        Number.isInteger(Number(updatedConversation.project_id)) && Number(updatedConversation.project_id) > 0
+          ? Number(updatedConversation.project_id)
+          : null,
+      project: serializeConversationProjectRef(updatedConversation)
+    }
+  });
+});
+
 app.get('/api/conversations', requireAuth, (req, res) => {
   const conversations = listConversationsStmt.all(req.session.userId);
   return res.json({
     ok: true,
     conversations: conversations.map((conversation) => ({
       id: conversation.id,
+      projectId: Number.isInteger(Number(conversation.project_id)) ? Number(conversation.project_id) : null,
+      project: serializeConversationProjectRef(conversation),
       title: conversation.title,
       model: conversation.model || '',
       reasoningEffort: sanitizeReasoningEffort(conversation.reasoning_effort, DEFAULT_REASONING_EFFORT),
@@ -10781,15 +13833,31 @@ app.post('/api/conversations', requireAuth, (req, res) => {
   const rawTitle = req.body && typeof req.body.title === 'string' ? req.body.title : '';
   const title = buildConversationTitle(rawTitle);
   const selectedModel = sanitizeConversationModel(req.body && req.body.model);
+  const requestedProjectId = parseProjectIdInput(req.body && req.body.projectId);
+  let projectRow = null;
+  if (requestedProjectId !== null) {
+    projectRow = getOwnedProjectOrNull(requestedProjectId, req.session.userId);
+    if (!projectRow) {
+      return res.status(404).json({ error: 'Proyecto no encontrado para crear el chat.' });
+    }
+  }
   const selectedReasoningEffort = sanitizeReasoningEffort(
     req.body && req.body.reasoningEffort,
     DEFAULT_REASONING_EFFORT
   );
-  const result = createConversationStmt.run(req.session.userId, title, selectedModel, selectedReasoningEffort);
+  const result = createConversationStmt.run(
+    req.session.userId,
+    requestedProjectId,
+    title,
+    selectedModel,
+    selectedReasoningEffort
+  );
   return res.json({
     ok: true,
     conversation: {
       id: result.lastInsertRowid,
+      projectId: requestedProjectId,
+      project: projectRow ? serializeChatProjectRow(projectRow, { includePreview: true }) : null,
       title,
       model: selectedModel,
       reasoningEffort: selectedReasoningEffort
@@ -10940,14 +14008,37 @@ app.get('/api/conversations/:id/messages', requireAuth, (req, res) => {
       ? serializeTaskRecovery(latestTaskRun, latestTaskCommands, serializeReasoningMapToText(parsedReasoning))
       : null;
   }
+  const projectRow =
+    Number.isInteger(Number(conversation.project_id)) && Number(conversation.project_id) > 0
+      ? getOwnedProjectOrNull(Number(conversation.project_id), req.session.userId)
+      : null;
+  const effectiveProjectContext = buildEffectiveProjectContext(projectRow);
+  const projectAutoMeta = projectRow ? safeParseJsonObject(projectRow.auto_context_meta_json) : {};
   return res.json({
     ok: true,
     conversation: {
       id: conversation.id,
+      projectId: projectRow ? Number(projectRow.id) : null,
+      project: projectRow ? serializeChatProjectRow(projectRow, { includePreview: true }) : null,
       title: conversation.title,
       model: conversation.model || '',
       reasoningEffort: sanitizeReasoningEffort(conversation.reasoning_effort, DEFAULT_REASONING_EFFORT)
     },
+    projectContext: projectRow
+      ? {
+          projectId: Number(projectRow.id),
+          projectName: sanitizeProjectName(projectRow.name),
+          mode: normalizeProjectContextMode(projectRow.context_mode, 'mixed'),
+          autoEnabled: normalizeProjectAutoEnabled(projectRow.auto_context_enabled, true),
+          manualContext: normalizeProjectContextText(projectRow.manual_context, projectContextManualMaxChars),
+          autoContext: normalizeProjectContextText(projectRow.auto_context, projectContextAutoMaxChars),
+          effectiveContext: effectiveProjectContext.text,
+          manualUsed: effectiveProjectContext.manualUsed,
+          autoUsed: effectiveProjectContext.autoUsed,
+          autoUpdatedAt: String(projectRow.auto_updated_at || ''),
+          autoMeta: projectAutoMeta
+        }
+      : null,
     messages,
     pagination,
     liveDraft: liveDraft
@@ -11797,6 +14888,120 @@ app.post('/api/tools/storage/local/compress', requireAuth, (req, res) => {
   }
 });
 
+app.post('/api/tools/storage/local/delete', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const sourcePaths = parseStoragePathList(req.body && req.body.paths, 160);
+  const confirmation = String(req.body && req.body.confirmText ? req.body.confirmText : '').trim().toUpperCase();
+  if (sourcePaths.length === 0) {
+    return res.status(400).json({ error: 'Selecciona al menos una ruta para borrar.' });
+  }
+  if (confirmation !== 'ELIMINAR') {
+    return res.status(400).json({ error: 'Confirmación inválida. Escribe ELIMINAR para continuar.' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'storage', {
+    requiresSensitiveTool: true,
+    writeIntent: true,
+    targetPath: sourcePaths[0]
+  });
+  if (!permission) return;
+  try {
+    sourcePaths.forEach((entryPath) => {
+      assertAiPermissionForAction(permission.profile, 'storage', {
+        requiresSensitiveTool: true,
+        writeIntent: true,
+        targetPath: entryPath
+      });
+      assertStorageMutationPathAllowed(entryPath);
+    });
+    const job = createStorageJob(safeUserId, 'local_delete_paths', {
+      paths: sourcePaths,
+      requestedAt: nowIso(),
+      requestedBy: String((req.session && req.session.username) || '')
+    });
+    return res.json({
+      ok: true,
+      job
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo iniciar borrado local: ${truncateForNotify(error && error.message ? error.message : 'storage_local_delete_failed', 220)}`
+    });
+  }
+});
+
+app.post('/api/tools/storage/cleanup/analyze', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'storage', {
+    requiresSensitiveTool: false
+  });
+  if (!permission) return;
+  try {
+    const requestPayload = req.body && typeof req.body === 'object' ? req.body : {};
+    const job = createStorageJob(safeUserId, 'cleanup_residual_analyze', requestPayload);
+    return res.json({
+      ok: true,
+      job
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo analizar residuos: ${truncateForNotify(
+              error && error.message ? error.message : 'storage_cleanup_analyze_failed',
+              220
+            )}`
+    });
+  }
+});
+
+app.post('/api/tools/storage/cleanup/delete', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'storage', {
+    requiresSensitiveTool: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  const confirmDelete = String(req.body && req.body.confirm ? req.body.confirm : '')
+    .trim()
+    .toUpperCase() === 'DELETE';
+  if (!confirmDelete) {
+    return res.status(400).json({ error: 'Confirmación requerida. Envía confirm=DELETE.' });
+  }
+  try {
+    const result = deleteStorageResidualPaths(req.body && typeof req.body === 'object' ? req.body : {});
+    return res.json({
+      ok: true,
+      ...result
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo borrar residuales: ${truncateForNotify(
+              error && error.message ? error.message : 'storage_cleanup_delete_failed',
+              220
+            )}`
+    });
+  }
+});
+
 app.get('/api/tools/storage/overview', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
@@ -11853,7 +15058,7 @@ app.get('/api/tools/storage/overview', requireAuth, async (req, res) => {
       cloud = {
         accountId,
         available: false,
-        error: truncateForNotify(error && error.message ? error.message : 'dropbox_quota_unavailable', 220),
+        error: truncateForNotify(error && error.message ? error.message : 'drive_quota_unavailable', 220),
         quota: {
           limit: null,
           usage: null,
@@ -11915,67 +15120,195 @@ app.get('/api/tools/storage/jobs/:jobId', requireAuth, (req, res) => {
   });
 });
 
-app.get('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts', requireAuth, (req, res) => {
+app.get('/api/tools/storage/:cloudProvider(drive)/rclone/status', requireAuth, (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
     requiresSensitiveTool: false
   });
   if (!permission) return;
-  const rows = listDriveAccountsForUserStmt.all(safeUserId);
+  try {
+    const status = getRcloneStatusPayload(String(req.query.configPath || '').trim());
+    return res.json({
+      ok: true,
+      rclone: status
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo leer estado de rclone: ${truncateForNotify(error && error.message ? error.message : 'rclone_status_failed', 220)}`
+    });
+  }
+});
+
+app.post('/api/tools/storage/:cloudProvider(drive)/rclone/remotes', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+    requiresSensitiveTool: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  try {
+    const remote = createOrUpdateRcloneDriveRemote(safeUserId, req.body && typeof req.body === 'object' ? req.body : {});
+    return res.json({
+      ok: true,
+      remote
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo guardar remote rclone: ${truncateForNotify(error && error.message ? error.message : 'rclone_remote_create_failed', 220)}`
+    });
+  }
+});
+
+app.post('/api/tools/storage/:cloudProvider(drive)/rclone/remotes/:remoteName/validate', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+    requiresSensitiveTool: false
+  });
+  if (!permission) return;
+  const remoteName = normalizeDriveRemoteName(req.params.remoteName);
+  if (!remoteName) {
+    return res.status(400).json({ error: 'remoteName inválido' });
+  }
+  try {
+    const validation = validateRcloneRemote(remoteName, String(req.query.configPath || '').trim());
+    return res.json({
+      ok: true,
+      validation
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo validar remote rclone: ${truncateForNotify(error && error.message ? error.message : 'rclone_remote_validate_failed', 220)}`
+    });
+  }
+});
+
+app.delete('/api/tools/storage/:cloudProvider(drive)/rclone/remotes/:remoteName', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+    requiresSensitiveTool: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  const remoteName = normalizeDriveRemoteName(req.params.remoteName);
+  if (!remoteName) {
+    return res.status(400).json({ error: 'remoteName inválido' });
+  }
+  const safeUserRows = listDriveAccountsForUserStmt
+    .all(safeUserId)
+    .map((row) => serializeDriveAccountRow(row))
+    .filter(Boolean);
+  const inUse = safeUserRows.find((entry) => String(entry.details && entry.details.remoteName ? entry.details.remoteName : '') === remoteName);
+  if (inUse) {
+    return res.status(409).json({
+      error: `El remote "${remoteName}" está en uso por la cuenta "${inUse.alias}". Elíminala o cámbiala primero.`
+    });
+  }
+  try {
+    const result = deleteRcloneRemote(remoteName, String(req.query.configPath || '').trim());
+    return res.json({
+      ok: true,
+      deleted: true,
+      remoteName: result.remoteName,
+      rclone: {
+        binary: result.binary,
+        configPath: result.configPath,
+        configExists: result.configExists,
+        remotes: result.remotes,
+        defaultRemote: result.defaultRemote,
+        defaultRootPath: result.defaultRootPath
+      }
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo eliminar remote rclone: ${truncateForNotify(error && error.message ? error.message : 'rclone_remote_delete_failed', 220)}`
+    });
+  }
+});
+
+app.get('/api/tools/storage/:cloudProvider(drive)/accounts', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+    requiresSensitiveTool: false
+  });
+  if (!permission) return;
+  const rows = listDriveAccountsForUserStmt
+    .all(safeUserId)
+    .filter((row) => normalizeDriveAuthMode(row && row.auth_mode) === 'rclone');
   return res.json({
     ok: true,
     accounts: rows.map((row) => serializeDriveAccountRow(row)).filter(Boolean)
   });
 });
 
-app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts', requireAuth, async (req, res) => {
+app.post('/api/tools/storage/:cloudProvider(drive)/accounts', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
     requiresSensitiveTool: true,
     writeIntent: true
   });
   if (!permission) return;
   const alias = sanitizeDriveAccountAlias(req.body && req.body.alias);
-  const rootFolderId = normalizeDropboxPath(String((req.body && req.body.rootFolderId) || '').trim());
   try {
-    const normalizedCredential = normalizeDriveCredentialPayload(req.body && req.body.credentialsJson);
+    const normalizedCredential = normalizeDriveCreateAccountPayload(req.body);
+    const rootFolderId = normalizeDriveRemotePath(normalizedCredential.normalized.root_path || driveDefaultRootPath);
     const accountId = buildDriveAccountId();
     const now = nowIso();
-    const status = normalizedCredential.authMode === 'oauth_app' ? 'needs_oauth' : 'pending';
-    const tokenCipher =
-      normalizedCredential.tokenSeed && Object.keys(normalizedCredential.tokenSeed).length > 0
-        ? encryptSecretText(JSON.stringify(normalizedCredential.tokenSeed))
-        : '';
     insertDriveAccountStmt.run(
       accountId,
       safeUserId,
-      alias || `Dropbox ${accountId.slice(-6)}`,
-      normalizedCredential.authMode,
+      alias || `Drive ${accountId.slice(-6)}`,
+      'rclone',
       encryptSecretText(JSON.stringify(normalizedCredential.normalized)),
-      tokenCipher,
+      '',
       rootFolderId,
-      status,
+      'pending',
       JSON.stringify(normalizedCredential.details),
       now,
       now
     );
-    if (normalizedCredential.authMode === 'token') {
-      try {
-        await validateDriveAccountByIdForUser(safeUserId, accountId);
-      } catch (error) {
-        updateDriveAccountStatusStmt.run(
-          'error',
-          truncateForNotify(error && error.message ? error.message : 'dropbox_validation_failed', 220),
-          nowIso(),
-          accountId
-        );
-      }
+    try {
+      await validateDriveAccountByIdForUser(safeUserId, accountId);
+    } catch (error) {
+      updateDriveAccountStatusStmt.run(
+        'error',
+        truncateForNotify(error && error.message ? error.message : 'drive_validation_failed', 220),
+        nowIso(),
+        accountId
+      );
     }
     const row = getDriveAccountByIdForUserStmt.get(accountId, safeUserId);
     return res.json({
@@ -11987,17 +15320,20 @@ app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts', requireAut
     const message =
       error && error.exposeToClient
         ? error.message
-        : `No se pudo guardar cuenta de Dropbox: ${truncateForNotify(error && error.message ? error.message : 'dropbox_account_create_failed', 220)}`;
+        : `No se pudo guardar cuenta de Google Drive (rclone): ${truncateForNotify(
+            error && error.message ? error.message : 'drive_account_create_failed',
+            220
+          )}`;
     return res.status(statusCode).json({ error: message });
   }
 });
 
-app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts/:accountId/validate', requireAuth, async (req, res) => {
+app.post('/api/tools/storage/:cloudProvider(drive)/accounts/:accountId/validate', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
     requiresSensitiveTool: false
   });
   if (!permission) return;
@@ -12014,7 +15350,7 @@ app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts/:accountId/v
   } catch (error) {
     updateDriveAccountStatusStmt.run(
       'error',
-      truncateForNotify(error && error.message ? error.message : 'dropbox_validation_failed', 220),
+      truncateForNotify(error && error.message ? error.message : 'drive_validation_failed', 220),
       nowIso(),
       accountId
     );
@@ -12023,146 +15359,20 @@ app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts/:accountId/v
       error:
         error && error.exposeToClient
           ? error.message
-          : `No se pudo validar cuenta de Dropbox: ${truncateForNotify(error && error.message ? error.message : 'dropbox_validation_failed', 220)}`
+          : `No se pudo validar cuenta de Google Drive (rclone): ${truncateForNotify(
+              error && error.message ? error.message : 'drive_validation_failed',
+              220
+            )}`
     });
   }
 });
 
-app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts/:accountId/oauth/start', requireAuth, (req, res) => {
+app.delete('/api/tools/storage/:cloudProvider(drive)/accounts/:accountId', requireAuth, (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
-    requiresSensitiveTool: true
-  });
-  if (!permission) return;
-  const accountId = String(req.params.accountId || '').trim();
-  if (!accountId) {
-    return res.status(400).json({ error: 'account_id inválido' });
-  }
-  try {
-    const row = getDriveAccountByIdForUserStmt.get(accountId, safeUserId);
-    if (!row) {
-      return res.status(404).json({ error: 'Cuenta de Dropbox no encontrada.' });
-    }
-    if (normalizeDriveAuthMode(row.auth_mode) !== 'oauth_app') {
-      return res.status(409).json({ error: 'La cuenta indicada no usa modo OAuth app.' });
-    }
-    const credentials = parseDriveAccountCredentials(row);
-    const { oauthClient, oauthConfig } = buildOAuth2ClientFromDriveAccount(
-      row,
-      credentials,
-      String(req.body && req.body.redirectUri ? req.body.redirectUri : '').trim()
-    );
-    const authUrl = oauthClient.generateAuthUrl();
-    return res.json({
-      ok: true,
-      account: serializeDriveAccountRow(row),
-      oauth: {
-        authUrl,
-        redirectUri: oauthConfig.redirectUri || dropboxOauthFallbackRedirectUri,
-        instructions:
-          'Abre la URL, autoriza con Dropbox, copia el code y pégalo en "Completar OAuth" en CodexWeb.'
-      }
-    });
-  } catch (error) {
-    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
-    return res.status(statusCode).json({
-      error:
-        error && error.exposeToClient
-          ? error.message
-          : `No se pudo iniciar OAuth de Dropbox: ${truncateForNotify(error && error.message ? error.message : 'dropbox_oauth_start_failed', 220)}`
-    });
-  }
-});
-
-app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts/:accountId/oauth/complete', requireAuth, async (req, res) => {
-  const safeUserId = getSafeUserId(req.session.userId);
-  if (!safeUserId) {
-    return res.status(400).json({ error: 'user_id inválido' });
-  }
-  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
-    requiresSensitiveTool: true
-  });
-  if (!permission) return;
-  const accountId = String(req.params.accountId || '').trim();
-  const code = String(req.body && req.body.code ? req.body.code : '').trim();
-  const redirectUri = String(req.body && req.body.redirectUri ? req.body.redirectUri : '').trim();
-  if (!accountId || !code) {
-    return res.status(400).json({ error: 'Faltan accountId o code OAuth.' });
-  }
-  try {
-    const row = getDriveAccountByIdForUserStmt.get(accountId, safeUserId);
-    if (!row) {
-      return res.status(404).json({ error: 'Cuenta de Dropbox no encontrada.' });
-    }
-    if (normalizeDriveAuthMode(row.auth_mode) !== 'oauth_app') {
-      return res.status(409).json({ error: 'La cuenta indicada no es OAuth app.' });
-    }
-    const credentials = parseDriveAccountCredentials(row);
-    const { oauthClient } = buildOAuth2ClientFromDriveAccount(row, credentials, redirectUri);
-    const tokenResponse = await oauthClient.getToken(code);
-    const tokens = tokenResponse && tokenResponse.tokens ? tokenResponse.tokens : {};
-    const currentTokens = parseDriveAccountTokens(row);
-    const mergedTokens = {
-      ...currentTokens,
-      ...(tokens && typeof tokens === 'object' ? tokens : {})
-    };
-    const expiresInSec = Number(mergedTokens.expires_in || mergedTokens.expiresIn);
-    if (Number.isFinite(expiresInSec) && expiresInSec > 0) {
-      mergedTokens.expires_at = new Date(Date.now() + expiresInSec * 1000).toISOString();
-    }
-    if (!mergedTokens.refresh_token && currentTokens.refresh_token) {
-      mergedTokens.refresh_token = currentTokens.refresh_token;
-    }
-    if (!mergedTokens.access_token) {
-      return res.status(400).json({
-        error: 'Dropbox no devolvió access_token válido. Repite autorización o reconfigura la cuenta.'
-      });
-    }
-    updateDriveAccountTokenStmt.run(
-      encryptSecretText(JSON.stringify(mergedTokens)),
-      'active',
-      '',
-      nowIso(),
-      accountId
-    );
-    let validation = null;
-    try {
-      validation = await validateDriveAccountByIdForUser(safeUserId, accountId);
-    } catch (_error) {
-      // keep account linked even if immediate validation fails.
-    }
-    const refreshed = getDriveAccountByIdForUserStmt.get(accountId, safeUserId);
-    return res.json({
-      ok: true,
-      account: serializeDriveAccountRow(refreshed),
-      validation
-    });
-  } catch (error) {
-    updateDriveAccountStatusStmt.run(
-      'error',
-      truncateForNotify(error && error.message ? error.message : 'dropbox_oauth_complete_failed', 220),
-      nowIso(),
-      accountId
-    );
-    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
-    return res.status(statusCode).json({
-      error:
-        error && error.exposeToClient
-          ? error.message
-          : `No se pudo completar OAuth de Dropbox: ${truncateForNotify(error && error.message ? error.message : 'dropbox_oauth_complete_failed', 220)}`
-    });
-  }
-});
-
-app.delete('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts/:accountId', requireAuth, (req, res) => {
-  const safeUserId = getSafeUserId(req.session.userId);
-  if (!safeUserId) {
-    return res.status(400).json({ error: 'user_id inválido' });
-  }
-  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
     requiresSensitiveTool: true,
     writeIntent: true
   });
@@ -12173,7 +15383,7 @@ app.delete('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts/:accountId
   }
   const row = getDriveAccountByIdForUserStmt.get(accountId, safeUserId);
   if (!row) {
-    return res.status(404).json({ error: 'Cuenta de Dropbox no encontrada.' });
+    return res.status(404).json({ error: 'Cuenta de Google Drive no encontrada.' });
   }
   deleteDriveAccountForUserStmt.run(accountId, safeUserId);
   return res.json({
@@ -12183,18 +15393,18 @@ app.delete('/api/tools/storage/:cloudProvider(drive|dropbox)/accounts/:accountId
   });
 });
 
-app.get('/api/tools/storage/:cloudProvider(drive|dropbox)/files', requireAuth, async (req, res) => {
+app.get('/api/tools/storage/:cloudProvider(drive)/files', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
     requiresSensitiveTool: false
   });
   if (!permission) return;
   const accountId = String(req.query.accountId || '').trim();
   if (!accountId) {
-    return res.status(400).json({ error: 'Selecciona una cuenta de Dropbox.' });
+    return res.status(400).json({ error: 'Selecciona una cuenta de Google Drive.' });
   }
   try {
     const payload = await listDriveFilesForAccount(safeUserId, accountId, {
@@ -12213,17 +15423,83 @@ app.get('/api/tools/storage/:cloudProvider(drive|dropbox)/files', requireAuth, a
       error:
         error && error.exposeToClient
           ? error.message
-          : `No se pudieron listar archivos de Dropbox: ${truncateForNotify(error && error.message ? error.message : 'dropbox_files_list_failed', 220)}`
+          : `No se pudieron listar archivos de Google Drive (rclone): ${truncateForNotify(
+              error && error.message ? error.message : 'drive_files_list_failed',
+              220
+            )}`
     });
   }
 });
 
-app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/upload', requireAuth, (req, res) => {
+app.get('/api/tools/storage/:cloudProvider(drive)/files/:fileId/download', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
+    requiresSensitiveTool: false
+  });
+  if (!permission) return;
+  const accountId = String(req.query.accountId || '').trim();
+  const fileId = String(req.params.fileId || '').trim();
+  if (!accountId || !fileId) {
+    return res.status(400).json({ error: 'Indica accountId y fileId para descargar desde Google Drive.' });
+  }
+  let tmpFilePath = '';
+  try {
+    const context = await getDriveContextForUser(safeUserId, accountId);
+    tmpFilePath = path.join(storageJobsRootDir, `${buildStorageJobId('drive_dl')}.bin`);
+    const downloaded = await downloadDriveFileToPath(context, fileId, tmpFilePath);
+    const resolvedName = sanitizeDriveFileName(
+      downloaded &&
+        downloaded.metadata &&
+        downloaded.metadata.name
+        ? downloaded.metadata.name
+        : path.posix.basename(String(fileId || '').replace(/%2F/gi, '/')),
+      'drive-file'
+    );
+    const stats = fs.statSync(tmpFilePath);
+    const sizeHeader = Number.isFinite(Number(stats.size)) ? Number(stats.size) : null;
+    const contentType = inferMimeTypeFromFilename(resolvedName) || 'application/octet-stream';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', buildAttachmentContentDisposition(resolvedName, 'drive-file'));
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'no-store');
+    if (Number.isFinite(Number(sizeHeader)) && Number(sizeHeader) >= 0) {
+      res.setHeader('Content-Length', String(sizeHeader));
+    }
+    await pipelineAsync(fs.createReadStream(tmpFilePath), res);
+  } catch (error) {
+    if (res.headersSent) {
+      return res.end();
+    }
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo descargar archivo de Google Drive (rclone): ${truncateForNotify(
+              error && error.message ? error.message : 'drive_download_failed',
+              220
+            )}`
+    });
+  } finally {
+    try {
+      if (tmpFilePath && fs.existsSync(tmpFilePath)) {
+        fs.unlinkSync(tmpFilePath);
+      }
+    } catch (_error) {
+      // ignore tmp cleanup failures.
+    }
+  }
+});
+
+app.post('/api/tools/storage/:cloudProvider(drive)/upload', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
     requiresSensitiveTool: true,
     writeIntent: true
   });
@@ -12232,17 +15508,18 @@ app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/upload', requireAuth,
   const paths = parseStoragePathList(req.body && req.body.paths, storageUploadJobMaxFiles);
   const parentId = String(req.body && req.body.parentId ? req.body.parentId : '').trim();
   if (!accountId || paths.length === 0) {
-    return res.status(400).json({ error: 'Selecciona cuenta de Dropbox y archivos locales para subir.' });
+    return res.status(400).json({ error: 'Selecciona cuenta de Google Drive y archivos locales para subir.' });
   }
   try {
+    await getDriveContextForUser(safeUserId, accountId);
     paths.forEach((sourcePath) => {
-      assertAiPermissionForAction(permission.profile, 'dropbox', {
+      assertAiPermissionForAction(permission.profile, 'drive', {
         requiresSensitiveTool: true,
         writeIntent: true,
         targetPath: sourcePath
       });
     });
-    const job = createStorageJob(safeUserId, 'dropbox_upload_files', {
+    const job = createStorageJob(safeUserId, 'drive_upload_files', {
       accountId,
       paths,
       parentId
@@ -12257,17 +15534,20 @@ app.post('/api/tools/storage/:cloudProvider(drive|dropbox)/upload', requireAuth,
       error:
         error && error.exposeToClient
           ? error.message
-          : `No se pudo crear job de subida a Dropbox: ${truncateForNotify(error && error.message ? error.message : 'dropbox_upload_job_create_failed', 220)}`
+          : `No se pudo crear job de subida a Google Drive: ${truncateForNotify(
+              error && error.message ? error.message : 'drive_upload_job_create_failed',
+              220
+            )}`
     });
   }
 });
 
-app.delete('/api/tools/storage/:cloudProvider(drive|dropbox)/files/:fileId', requireAuth, async (req, res) => {
+app.delete('/api/tools/storage/:cloudProvider(drive)/files/:fileId', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
   }
-  const permission = guardRequestPermissionOrRespond(req, res, 'dropbox', {
+  const permission = guardRequestPermissionOrRespond(req, res, 'drive', {
     requiresSensitiveTool: true,
     writeIntent: true
   });
@@ -12276,7 +15556,7 @@ app.delete('/api/tools/storage/:cloudProvider(drive|dropbox)/files/:fileId', req
   const fileId = String(req.params.fileId || '').trim();
   const confirmDelete = String(req.query.confirm || req.body && req.body.confirm || '').trim().toUpperCase() === 'DELETE';
   if (!accountId || !fileId) {
-    return res.status(400).json({ error: 'Indica accountId y fileId para borrar en Dropbox.' });
+    return res.status(400).json({ error: 'Indica accountId y fileId para borrar en Google Drive.' });
   }
   if (!confirmDelete) {
     return res.status(400).json({ error: 'Confirmación requerida. Envía confirm=DELETE.' });
@@ -12293,7 +15573,10 @@ app.delete('/api/tools/storage/:cloudProvider(drive|dropbox)/files/:fileId', req
       error:
         error && error.exposeToClient
           ? error.message
-          : `No se pudo borrar archivo de Dropbox: ${truncateForNotify(error && error.message ? error.message : 'dropbox_delete_failed', 220)}`
+          : `No se pudo borrar archivo de Google Drive: ${truncateForNotify(
+              error && error.message ? error.message : 'drive_delete_failed',
+              220
+            )}`
     });
   }
 });
@@ -12343,7 +15626,7 @@ app.get('/api/tools/deployed-apps/:appId/backups', requireAuth, async (req, res)
         accountId,
         retentionDays: storageBackupRetentionDays,
         backups: cached,
-        warning: 'Se devolvió caché local porque Dropbox no respondió correctamente.'
+        warning: 'Se devolvió caché local porque Google Drive (rclone) no respondió correctamente.'
       });
     }
     const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
@@ -12356,7 +15639,7 @@ app.get('/api/tools/deployed-apps/:appId/backups', requireAuth, async (req, res)
   }
 });
 
-app.post('/api/tools/deployed-apps/:appId/backups', requireAuth, (req, res) => {
+app.post('/api/tools/deployed-apps/:appId/backups', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
@@ -12386,6 +15669,7 @@ app.post('/api/tools/deployed-apps/:appId/backups', requireAuth, (req, res) => {
     });
   }
   try {
+    await getDriveContextForUser(safeUserId, accountId);
     assertAiPermissionForAction(permission.profile, 'backups', {
       requiresBackupRestore: true,
       requiresSensitiveTool: true,
@@ -12415,7 +15699,7 @@ app.post('/api/tools/deployed-apps/:appId/backups', requireAuth, (req, res) => {
   }
 });
 
-app.post('/api/tools/deployed-apps/:appId/restore', requireAuth, (req, res) => {
+app.post('/api/tools/deployed-apps/:appId/restore', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
@@ -12451,6 +15735,7 @@ app.post('/api/tools/deployed-apps/:appId/restore', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'No se pudo inferir targetPath. Envíalo manualmente.' });
   }
   try {
+    await getDriveContextForUser(safeUserId, accountId);
     assertAiPermissionForAction(permission.profile, 'backups', {
       requiresBackupRestore: true,
       requiresSensitiveTool: true,
@@ -12552,7 +15837,7 @@ app.post('/api/tools/git/repos/:repoId/branches/checkout', requireAuth, (req, re
   });
 });
 
-app.post('/api/tools/git/repos/:repoId/merge', requireAuth, async (req, res) => {
+app.post('/api/tools/git/repos/:repoId/merge', requireAuth, (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
     return res.status(400).json({ error: 'user_id inválido' });
@@ -12575,64 +15860,36 @@ app.post('/api/tools/git/repos/:repoId/merge', requireAuth, async (req, res) => 
   if (sourceBranch === targetBranch) {
     return res.status(400).json({ error: 'sourceBranch y targetBranch deben ser diferentes.' });
   }
-  if (!gitBranchExists(repo.absolutePath, sourceBranch)) {
+  if (!gitBranchRefExists(repo.absolutePath, sourceBranch)) {
     return res.status(404).json({ error: `La rama origen no existe: ${sourceBranch}` });
   }
-  if (!gitBranchExists(repo.absolutePath, targetBranch)) {
+  if (!gitBranchRefExists(repo.absolutePath, targetBranch)) {
     return res.status(404).json({ error: `La rama destino no existe: ${targetBranch}` });
   }
-
+  if (repo.hasConflicts) {
+    return res.status(409).json({
+      error: 'El repositorio tiene conflictos pendientes. Resuélvelos antes de lanzar un merge.'
+    });
+  }
   const gitIdentity = buildGitIdentityFromRequest(req);
-  const ensuredIdentity = ensureGitIdentityForRepo(repo.absolutePath, gitIdentity);
-  if (!ensuredIdentity.ok) {
-    return res.status(500).json({
-      error: `No se pudo preparar identidad Git del repo: ${ensuredIdentity.error || 'git_identity_failed'}`
-    });
-  }
-  const gitIdentityEnv = buildGitIdentityEnv(ensuredIdentity.identity);
-
-  const checkoutTarget = ensureGitBranchForRepo(repo.absolutePath, targetBranch, { createIfMissing: false });
-  if (!checkoutTarget.ok) {
-    return res.status(400).json({ error: `No se pudo cambiar a rama destino: ${checkoutTarget.error}` });
-  }
-
-  const mergeArgs = ['merge', '--no-ff', sourceBranch];
-  const mergeResult = await runGitInRepoAsync(repo.absolutePath, mergeArgs, {
-    allowNonZero: true,
-    env: gitIdentityEnv,
-    timeoutMs: gitToolsCommandTimeoutMs
+  const job = createStorageJob(safeUserId, 'git_merge_branches', {
+    repoId: repo.id,
+    repoPath: repo.absolutePath,
+    sourceBranch,
+    targetBranch,
+    gitIdentity,
+    requestedAt: nowIso(),
+    requestedBy: String((req.session && req.session.username) || '')
   });
-  const refreshed = collectGitRepoSummary(repo.absolutePath, nowIso(), repo.scanRoot);
-  const output = truncateForNotify(
-    [checkoutTarget.output, mergeResult.stdout, mergeResult.stderr].filter(Boolean).join('\n'),
-    2200
-  );
-
-  if (!mergeResult.ok || Number(mergeResult.code) !== 0) {
-    const hasConflicts = refreshed ? refreshed.hasConflicts : false;
-    return res.status(hasConflicts ? 409 : 500).json({
-      error: hasConflicts
-        ? 'Merge con conflictos. Resuélvelos antes de continuar.'
-        : `Merge fallido: ${truncateForNotify(mergeResult.stderr || mergeResult.stdout || 'git_merge_failed', 260)}`,
-      merge: {
-        sourceBranch,
-        targetBranch,
-        hasConflicts: Boolean(hasConflicts),
-        output,
-        conflictFiles: refreshed && Array.isArray(refreshed.conflictFiles) ? refreshed.conflictFiles : []
-      },
-      repo: refreshed || repo
-    });
-  }
-
   return res.json({
     ok: true,
+    repo,
+    job,
     merge: {
       sourceBranch,
       targetBranch,
-      output
-    },
-    repo: refreshed || repo
+      status: 'queued'
+    }
   });
 });
 
@@ -12851,6 +16108,7 @@ app.post('/api/tools/git/repos/:repoId/resolve-conflicts', requireAuth, (req, re
   const title = buildConversationTitle(`Resolver conflictos ${repo.name || 'repo'}`);
   const created = createConversationStmt.run(
     safeUserId,
+    null,
     title,
     DEFAULT_CHAT_MODEL,
     DEFAULT_REASONING_EFFORT
@@ -13241,6 +16499,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       ? req.body.reasoningEffort.trim().toLowerCase()
       : '';
   const requestedConversationId = req.body && req.body.conversationId ? Number(req.body.conversationId) : null;
+  const requestedProjectId = parseProjectIdInput(req.body && req.body.projectId);
   const rawAttachments = req.body && Array.isArray(req.body.attachments) ? req.body.attachments : [];
   const username = truncateForNotify(req.session && req.session.username ? req.session.username : 'anon');
   const userNotificationSettings = getUserNotificationSettings(req.session.userId);
@@ -13288,6 +16547,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   let persistedAttachments = [];
   let userMessageId = null;
   let assistantMessageId = null;
+  let conversationProjectId = null;
+  let conversationProjectRow = null;
   let liveDraftId = null;
   const liveDraftRequestId = `${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
   let taskRunId = null;
@@ -13296,6 +16557,19 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   const taskCommandStateByItem = new Map();
   const taskTestCommands = new Set();
   let taskCompletionWritten = false;
+
+  const scheduleProjectContextRefreshAfterChat = (trigger, force = false) => {
+    if (!conversationProjectId) return;
+    const project =
+      conversationProjectRow || getOwnedProjectOrNull(conversationProjectId, req.session.userId);
+    if (!project) return;
+    if (!force && !normalizeProjectAutoEnabled(project.auto_context_enabled, true)) return;
+    enqueueProjectContextRefreshJob(req.session.userId, conversationProjectId, {
+      immediate: false,
+      force,
+      trigger: normalizeProjectContextText(trigger || 'chat', 64) || 'chat'
+    });
+  };
 
   const finalizeTaskRun = (payload = {}) => {
     if (!taskRunId || taskCompletionWritten) return;
@@ -13368,6 +16642,13 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Conversación no encontrada' });
     }
     conversationId = requestedConversationId;
+    conversationProjectId =
+      Number.isInteger(Number(ownedConversation.project_id)) && Number(ownedConversation.project_id) > 0
+        ? Number(ownedConversation.project_id)
+        : null;
+    conversationProjectRow = conversationProjectId
+      ? getOwnedProjectOrNull(conversationProjectId, req.session.userId)
+      : null;
     const storedConversationModel = String(
       ownedConversation.model || chatRuntime.defaults.model || DEFAULT_CHAT_MODEL
     );
@@ -13394,8 +16675,21 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       updateConversationSettingsStmt.run(selectedModel, selectedReasoningEffort, conversationId);
     }
   } else {
+    if (requestedProjectId !== null) {
+      conversationProjectRow = getOwnedProjectOrNull(requestedProjectId, req.session.userId);
+      if (!conversationProjectRow) {
+        return res.status(404).json({ error: 'Proyecto no encontrado para iniciar chat.' });
+      }
+      conversationProjectId = Number(conversationProjectRow.id);
+    }
     const title = buildConversationTitle(prompt);
-    const created = createConversationStmt.run(req.session.userId, title, selectedModel, selectedReasoningEffort);
+    const created = createConversationStmt.run(
+      req.session.userId,
+      conversationProjectId,
+      title,
+      selectedModel,
+      selectedReasoningEffort
+    );
     conversationId = Number(created.lastInsertRowid);
   }
 
@@ -13463,7 +16757,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     }
     const conversationMessages = listMessagesStmt.all(conversationId);
     const promptWithHistory = buildPromptWithConversationHistory(prompt, conversationMessages);
-    const promptWithRepoContext = buildPromptWithRepoContext(promptWithHistory, prompt);
+    const promptWithProjectContext = buildPromptWithProjectContext(promptWithHistory, conversationProjectRow);
+    const promptWithRepoContext = buildPromptWithRepoContext(promptWithProjectContext, prompt);
     const executionPrompt = buildPromptWithAttachments(promptWithRepoContext, persistedAttachments);
     const httpProviderAdapter = getAiHttpProviderAdapter(chatRuntime.activeAgentId);
     if (httpProviderAdapter && typeof httpProviderAdapter.buildChatRequest === 'function') {
@@ -13555,11 +16850,16 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           runtimePolicy.profile.allowShell ? 'si' : 'no'
         }, red=${runtimePolicy.profile.allowNetwork ? 'si' : 'no'}, git=${
           runtimePolicy.profile.allowGit ? 'si' : 'no'
-        }, modo=${runtimePolicy.profile.readOnly ? 'solo-lectura' : 'lectura/escritura'}`
+        }, escritura=${runtimePolicy.profile.canWriteFiles ? 'si' : 'no'}, modo=${runtimePolicy.accessMode}`
       });
+      if (runtimePolicy.identityFallbackReason) {
+        sendSse(res, 'system_notice', {
+          text: `Ejecucion forzada como root para evitar fallo de permisos: ${runtimePolicy.identityFallbackReason}`
+        });
+      }
 
       const permissionHints = [];
-      if (runtimePolicy.profile.readOnly) {
+      if (runtimePolicy.profile.readOnly || !runtimePolicy.profile.canWriteFiles) {
         permissionHints.push('Perfil activo: solo lectura. No modifiques archivos.');
       }
       if (!runtimePolicy.profile.allowNetwork) {
@@ -13666,6 +16966,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           structured: structuredOutput,
           clientDisconnected
         });
+        scheduleProjectContextRefreshAfterChat(success ? 'chat_completed' : 'chat_failed');
         if (userNotificationSettings.notifyOnFinish) {
           const message = buildChatCompletionDiscordMessage({
             status: success ? 'ok' : 'error',
@@ -14038,11 +17339,11 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           runtimePolicy.profile.allowShell ? 'si' : 'no'
         }, red=${runtimePolicy.profile.allowNetwork ? 'si' : 'no'}, git=${
           runtimePolicy.profile.allowGit ? 'si' : 'no'
-        }, modo=${runtimePolicy.profile.readOnly ? 'solo-lectura' : 'lectura/escritura'}`
+        }, escritura=${runtimePolicy.profile.canWriteFiles ? 'si' : 'no'}, modo=${runtimePolicy.accessMode}`
       });
 
       const permissionHints = [];
-      if (runtimePolicy.profile.readOnly) {
+      if (runtimePolicy.profile.readOnly || !runtimePolicy.profile.canWriteFiles) {
         permissionHints.push('Perfil activo: solo lectura. No modifiques archivos.');
       }
       if (!runtimePolicy.profile.allowNetwork) {
@@ -14076,7 +17377,9 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         CODEXWEB_ACTIVE_PROVIDER: chatRuntime.providerId,
         CODEXWEB_PERMISSION_PROFILE: JSON.stringify({
           agentId: chatRuntime.providerId,
+          accessMode: runtimePolicy.accessMode,
           allowRoot: runtimePolicy.profile.allowRoot,
+          canWriteFiles: runtimePolicy.profile.canWriteFiles,
           readOnly: runtimePolicy.profile.readOnly,
           allowNetwork: runtimePolicy.profile.allowNetwork,
           allowGit: runtimePolicy.profile.allowGit,
@@ -14223,6 +17526,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           structured: false,
           clientDisconnected
         });
+        scheduleProjectContextRefreshAfterChat(success ? 'chat_completed' : 'chat_failed');
         if (userNotificationSettings.notifyOnFinish) {
           const message = buildChatCompletionDiscordMessage({
             status: success ? 'ok' : 'error',
@@ -14388,7 +17692,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       args.push('-c', `model_reasoning_effort="${selectedReasoningEffort}"`);
     }
     const codexPermissionHints = [];
-    if (runtimePolicy.profile.readOnly) {
+    if (runtimePolicy.profile.readOnly || !runtimePolicy.profile.canWriteFiles) {
       codexPermissionHints.push('Perfil activo: solo lectura. No escribas archivos.');
     }
     if (!runtimePolicy.profile.allowNetwork) {
@@ -14566,8 +17870,13 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         runtimePolicy.profile.allowShell ? 'si' : 'no'
       }, red=${runtimePolicy.profile.allowNetwork ? 'si' : 'no'}, git=${
         runtimePolicy.profile.allowGit ? 'si' : 'no'
-      }, modo=${runtimePolicy.profile.readOnly ? 'solo-lectura' : 'lectura/escritura'}`
+      }, escritura=${runtimePolicy.profile.canWriteFiles ? 'si' : 'no'}, modo=${runtimePolicy.accessMode}`
     });
+    if (runtimePolicy.identityFallbackReason) {
+      sendSseSafe('system_notice', {
+        text: `Ejecucion forzada como root para evitar fallo de permisos: ${runtimePolicy.identityFallbackReason}`
+      });
+    }
     let heartbeatTimer = null;
     const stopHeartbeat = () => {
       if (heartbeatTimer !== null) {
@@ -15175,7 +18484,9 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     const codexExecOptions = {
       env: {
         ...getCodexEnvForUser(req.session.userId, {
-          username: req.session && typeof req.session.username === 'string' ? req.session.username : ''
+          username: req.session && typeof req.session.username === 'string' ? req.session.username : '',
+          ownerUid: runtimePolicy.runAsIdentity ? runtimePolicy.runAsIdentity.uid : undefined,
+          ownerGid: runtimePolicy.runAsIdentity ? runtimePolicy.runAsIdentity.gid : undefined
         }),
         CODEXWEB_ACTIVE_PROVIDER: chatRuntime.providerId,
         CODEXWEB_PERMISSION_PROFILE: JSON.stringify({
@@ -15269,6 +18580,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         structured: sawStructuredEvents,
         clientDisconnected
       });
+      scheduleProjectContextRefreshAfterChat(exitCode === 0 ? 'chat_completed' : 'chat_failed');
       if (userNotificationSettings.notifyOnFinish) {
         const message = buildChatCompletionDiscordMessage({
           status: exitCode === 0 ? 'ok' : 'error',
@@ -15414,6 +18726,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         structured: false,
         clientDisconnected: false
       });
+      scheduleProjectContextRefreshAfterChat('chat_client_error');
       if (userNotificationSettings.notifyOnFinish) {
         const message = buildChatCompletionDiscordMessage({
           status: 'error',
@@ -15489,6 +18802,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       structured: false,
       clientDisconnected: false
     });
+    scheduleProjectContextRefreshAfterChat('chat_exec_error');
     if (userNotificationSettings.notifyOnFinish) {
       const message = buildChatCompletionDiscordMessage({
         status: 'error',
@@ -15569,6 +18883,7 @@ if (process.env.CODEXWEB_NO_LISTEN === '1') {
     app,
     db,
     assertAiPermissionForAction,
+    buildAiPermissionPresetForMode,
     buildAiPermissionFullAccessPatch,
     buildAbortableRunHandle,
     getAiAgentPermissionProfileForUser,
@@ -15604,6 +18919,10 @@ if (process.env.CODEXWEB_NO_LISTEN === '1') {
         const reason = truncateForNotify(error && error.message ? error.message : 'GEMINI_NOT_FOUND', 120);
         console.warn(`No se pudo precargar ruta de gemini: ${reason}`);
       });
+    notifyMilestone('codex_permissions_root_default_started', 'codex_permissions_root_default_started');
+    notifyMilestone('codex_permissions_migration_done', 'codex_permissions_migration_done');
+    notifyMilestone('codex_permissions_backend_done', 'codex_permissions_backend_done');
+    notifyMilestone('codex_permissions_ui_done', 'codex_permissions_ui_done');
     notifyMilestone('history_persistent', 'Historial persistente implementado');
     notifyMilestone('codex_full_access', 'CodexWeb ejecuta Codex CLI con acceso total');
     notifyMilestone('streaming_realtime', 'Streaming en tiempo real implementado');

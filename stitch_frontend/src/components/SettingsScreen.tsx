@@ -76,11 +76,45 @@ const providerPermissionToolCatalog = [
   'chat',
   'git',
   'storage',
-  'dropbox',
+  'drive',
   'backups',
   'deployments',
   'shell'
 ];
+
+const providerAccessModeOptions: Array<{
+  id: AiProviderPermissionProfile['accessMode'];
+  label: string;
+  description: string;
+}> = [
+  {
+    id: 'full_access',
+    label: 'Full access',
+    description: 'Acceso root / total al sistema. Equivale al arranque por defecto de Codex.'
+  },
+  {
+    id: 'workspace_only',
+    label: 'Workspace only',
+    description: 'Limita a la carpeta de trabajo de CodexWeb con lectura/escritura.'
+  },
+  {
+    id: 'restricted_paths',
+    label: 'Restricted paths',
+    description: 'Permite solo las rutas que indiques manualmente.'
+  },
+  {
+    id: 'read_only',
+    label: 'Read only',
+    description: 'Bloquea escrituras y deja lectura dentro del alcance permitido.'
+  }
+];
+
+function parsePathListInput(rawValue: string): string[] {
+  return String(rawValue || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
 
 export default function SettingsScreen({
   options,
@@ -89,7 +123,6 @@ export default function SettingsScreen({
   caps,
   onModelChange,
   onReasoningChange,
-  onCapsChange,
   onNavigate
 }: {
   options: ChatOptions;
@@ -98,7 +131,6 @@ export default function SettingsScreen({
   caps: Capabilities;
   onModelChange: (value: string) => void;
   onReasoningChange: (value: string) => void;
-  onCapsChange: (value: Capabilities) => void;
   onNavigate: (screen: Screen) => void;
 }) {
   const [activeView, setActiveView] = useState<SettingsView>('menu');
@@ -281,6 +313,30 @@ export default function SettingsScreen({
     };
   }, [auth?.loginInProgress, loadAuth]);
 
+  const buildPermissionPayload = useCallback((draft: AiProviderPermissionProfile): AiProviderPermissionProfile => {
+    const accessMode = draft.accessMode || 'full_access';
+    const allowedPaths =
+      accessMode === 'full_access'
+        ? ['/']
+        : accessMode === 'workspace_only'
+          ? ['/root/CodexWeb']
+          : draft.allowedPaths.length > 0
+            ? draft.allowedPaths
+            : ['/root/CodexWeb'];
+    const deniedPaths = accessMode === 'full_access' ? [] : draft.deniedPaths;
+    const canWriteFiles = accessMode === 'read_only' ? false : Boolean(draft.canWriteFiles);
+    const readOnly = accessMode === 'read_only' ? true : !canWriteFiles ? true : Boolean(draft.readOnly);
+    return {
+      ...draft,
+      accessMode,
+      allowRoot: accessMode === 'full_access' ? true : Boolean(draft.allowRoot),
+      allowedPaths,
+      deniedPaths,
+      canWriteFiles,
+      readOnly
+    };
+  }, []);
+
   const saveNotifications = useCallback(
     async (patch: Partial<NotificationSettings>) => {
       setNotificationsSaving(true);
@@ -377,7 +433,7 @@ export default function SettingsScreen({
     setSavingPermissionProviderId(providerId);
     setProvidersError('');
     try {
-      const saved = await updateAiProviderPermissions(providerId, draft);
+      const saved = await updateAiProviderPermissions(providerId, buildPermissionPayload(draft));
       setPermissionDrafts((prev) => ({
         ...prev,
         [providerId]: saved
@@ -392,7 +448,7 @@ export default function SettingsScreen({
     } finally {
       setSavingPermissionProviderId('');
     }
-  }, [permissionDrafts]);
+  }, [buildPermissionPayload, permissionDrafts]);
 
   const grantFullPermissions = useCallback(async (providerId: string) => {
     setGrantingPermissionProviderId(providerId);
@@ -760,7 +816,7 @@ export default function SettingsScreen({
                   <div className="min-w-0">
                     <p className="text-sm text-zinc-100">Permisos por IA</p>
                     <p className="text-xs text-zinc-500 truncate">
-                      Control granular de root, rutas, shell, red, git y backups.
+                      Modos `full_access`, `workspace_only`, `restricted_paths` y `read_only`.
                     </p>
                   </div>
                   <ChevronRight size={16} className="text-zinc-600" />
@@ -825,31 +881,40 @@ export default function SettingsScreen({
             </div>
 
             <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-3 space-y-3">
-              <p className="text-xs uppercase text-zinc-500">Capabilities</p>
+              <p className="text-xs uppercase text-zinc-500">Capabilities reales del runtime</p>
+              <p className="text-[11px] text-zinc-500">
+                Se muestran como estado real (no decorativo). Se derivan del agente activo y su perfil de permisos.
+              </p>
 
-              <div className="flex items-center justify-between text-sm">
-                <span>Web Browsing</span>
-                <ToggleSwitch
-                  checked={caps.web}
-                  onChange={(nextValue) => onCapsChange({ ...caps, web: nextValue })}
-                />
-              </div>
+              <article className="rounded-lg border border-zinc-800 bg-black/40 p-2.5">
+                <p className="text-xs text-zinc-100">Web Browsing</p>
+                <p className={`text-[11px] mt-1 ${caps.web ? 'text-emerald-300' : 'text-red-300'}`}>
+                  {caps.web ? 'Disponible' : 'No disponible'}
+                </p>
+                <p className="text-[10px] text-zinc-500 mt-1">
+                  Requiere red permitida en el perfil actual.
+                </p>
+              </article>
 
-              <div className="flex items-center justify-between text-sm">
-                <span>Code Interpreter</span>
-                <ToggleSwitch
-                  checked={caps.code}
-                  onChange={(nextValue) => onCapsChange({ ...caps, code: nextValue })}
-                />
-              </div>
+              <article className="rounded-lg border border-zinc-800 bg-black/40 p-2.5">
+                <p className="text-xs text-zinc-100">Interpreter</p>
+                <p className={`text-[11px] mt-1 ${caps.code ? 'text-emerald-300' : 'text-red-300'}`}>
+                  {caps.code ? 'Disponible' : 'No disponible'}
+                </p>
+                <p className="text-[10px] text-zinc-500 mt-1">
+                  Requiere shell habilitada en el perfil del agente.
+                </p>
+              </article>
 
-              <div className="flex items-center justify-between text-sm">
-                <span>Long Term Memory</span>
-                <ToggleSwitch
-                  checked={caps.memory}
-                  onChange={(nextValue) => onCapsChange({ ...caps, memory: nextValue })}
-                />
-              </div>
+              <article className="rounded-lg border border-zinc-800 bg-black/40 p-2.5">
+                <p className="text-xs text-zinc-100">Long-term memory</p>
+                <p className={`text-[11px] mt-1 ${caps.memory ? 'text-emerald-300' : 'text-red-300'}`}>
+                  {caps.memory ? 'Disponible' : 'No disponible'}
+                </p>
+                <p className="text-[10px] text-zinc-500 mt-1">
+                  Persistencia de historial y contexto en base de datos.
+                </p>
+              </article>
             </div>
           </section>
         ) : null}
@@ -1416,7 +1481,7 @@ export default function SettingsScreen({
               <div>
                 <h2 className="text-sm font-semibold text-zinc-100">Permisos granulares por provider</h2>
                 <p className="text-xs text-zinc-500">
-                  Enforcement real en backend para shell, git, backups, rutas y modo solo lectura.
+                  El modo por defecto es `full_access` y luego puedes caparlo por IA sin romper el arranque root inicial.
                 </p>
               </div>
               <button
@@ -1444,27 +1509,107 @@ export default function SettingsScreen({
                 const draft = permissionDrafts[provider.id] || provider.permissions;
                 const saving = savingPermissionProviderId === provider.id;
                 const granting = grantingPermissionProviderId === provider.id;
+                const normalizedDraft = buildPermissionPayload(draft);
+                const selectedAccessMode = normalizedDraft.accessMode || 'full_access';
                 const allowedTools = new Set(
-                  (draft.allowedTools || [])
+                  (normalizedDraft.allowedTools || [])
                     .map((entry) => String(entry || '').trim().toLowerCase())
                     .filter(Boolean)
                 );
                 return (
                   <article key={provider.id} className="rounded-xl border border-zinc-800 bg-zinc-950/70 p-3 space-y-3">
                     <div className="flex items-center justify-between gap-2">
-                      <p className="text-sm text-zinc-100">{provider.name}</p>
-                      <span className="text-[11px] text-zinc-500">{provider.id}</span>
+                      <div>
+                        <p className="text-sm text-zinc-100">{provider.name}</p>
+                        <p className="text-[11px] text-zinc-500">{provider.id}</p>
+                      </div>
+                      <span
+                        className={`rounded-full border px-2 py-1 text-[11px] ${
+                          selectedAccessMode === 'full_access'
+                            ? 'border-amber-500/40 bg-amber-500/10 text-amber-200'
+                            : 'border-zinc-700 text-zinc-400'
+                        }`}
+                      >
+                        {selectedAccessMode}
+                      </span>
+                    </div>
+
+                    {selectedAccessMode === 'full_access' ? (
+                      <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+                        `full_access` = acceso root / total al sistema. Codex arranca así por defecto.
+                      </div>
+                    ) : null}
+
+                    <div className="grid gap-2 md:grid-cols-2">
+                      {providerAccessModeOptions.map((option) => {
+                        const selected = selectedAccessMode === option.id;
+                        return (
+                          <button
+                            key={`${provider.id}:mode:${option.id}`}
+                            type="button"
+                            onClick={() => {
+                              setPermissionDrafts((prev) => ({
+                                ...prev,
+                                [provider.id]: buildPermissionPayload({
+                                  ...normalizedDraft,
+                                  accessMode: option.id
+                                })
+                              }));
+                            }}
+                            className={`rounded-xl border px-3 py-2 text-left transition ${
+                              selected
+                                ? option.id === 'full_access'
+                                  ? 'border-amber-500/60 bg-amber-500/10 text-amber-100'
+                                  : 'border-emerald-600/60 bg-emerald-500/10 text-zinc-100'
+                                : 'border-zinc-800 bg-black/30 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'
+                            }`}
+                          >
+                            <p className="text-xs font-semibold">{option.label}</p>
+                            <p className="mt-1 text-[11px] leading-relaxed">{option.description}</p>
+                          </button>
+                        );
+                      })}
                     </div>
 
                     <div className="grid grid-cols-2 gap-2 text-xs">
                       <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 px-2 py-1.5">
                         root
                         <ToggleSwitch
-                          checked={Boolean(draft.allowRoot)}
+                          checked={Boolean(normalizedDraft.allowRoot)}
+                          disabled={selectedAccessMode === 'full_access'}
                           onChange={(nextValue) => {
                             setPermissionDrafts((prev) => ({
                               ...prev,
-                              [provider.id]: { ...draft, allowRoot: nextValue }
+                              [provider.id]: { ...normalizedDraft, allowRoot: nextValue }
+                            }));
+                          }}
+                        />
+                      </label>
+                      <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 px-2 py-1.5">
+                        escribir archivos
+                        <ToggleSwitch
+                          checked={Boolean(normalizedDraft.canWriteFiles)}
+                          disabled={selectedAccessMode === 'read_only'}
+                          onChange={(nextValue) => {
+                            setPermissionDrafts((prev) => ({
+                              ...prev,
+                              [provider.id]: {
+                                ...normalizedDraft,
+                                canWriteFiles: nextValue,
+                                readOnly: !nextValue
+                              }
+                            }));
+                          }}
+                        />
+                      </label>
+                      <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 px-2 py-1.5">
+                        ejecutar comandos
+                        <ToggleSwitch
+                          checked={Boolean(normalizedDraft.allowShell)}
+                          onChange={(nextValue) => {
+                            setPermissionDrafts((prev) => ({
+                              ...prev,
+                              [provider.id]: { ...normalizedDraft, allowShell: nextValue }
                             }));
                           }}
                         />
@@ -1472,23 +1617,16 @@ export default function SettingsScreen({
                       <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 px-2 py-1.5">
                         solo lectura
                         <ToggleSwitch
-                          checked={Boolean(draft.readOnly)}
+                          checked={Boolean(normalizedDraft.readOnly)}
+                          disabled={selectedAccessMode === 'read_only'}
                           onChange={(nextValue) => {
                             setPermissionDrafts((prev) => ({
                               ...prev,
-                              [provider.id]: { ...draft, readOnly: nextValue }
-                            }));
-                          }}
-                        />
-                      </label>
-                      <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 px-2 py-1.5">
-                        shell
-                        <ToggleSwitch
-                          checked={Boolean(draft.allowShell)}
-                          onChange={(nextValue) => {
-                            setPermissionDrafts((prev) => ({
-                              ...prev,
-                              [provider.id]: { ...draft, allowShell: nextValue }
+                              [provider.id]: {
+                                ...normalizedDraft,
+                                readOnly: nextValue,
+                                canWriteFiles: nextValue ? false : normalizedDraft.canWriteFiles
+                              }
                             }));
                           }}
                         />
@@ -1496,11 +1634,11 @@ export default function SettingsScreen({
                       <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 px-2 py-1.5">
                         red
                         <ToggleSwitch
-                          checked={Boolean(draft.allowNetwork)}
+                          checked={Boolean(normalizedDraft.allowNetwork)}
                           onChange={(nextValue) => {
                             setPermissionDrafts((prev) => ({
                               ...prev,
-                              [provider.id]: { ...draft, allowNetwork: nextValue }
+                              [provider.id]: { ...normalizedDraft, allowNetwork: nextValue }
                             }));
                           }}
                         />
@@ -1508,11 +1646,11 @@ export default function SettingsScreen({
                       <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 px-2 py-1.5">
                         git
                         <ToggleSwitch
-                          checked={Boolean(draft.allowGit)}
+                          checked={Boolean(normalizedDraft.allowGit)}
                           onChange={(nextValue) => {
                             setPermissionDrafts((prev) => ({
                               ...prev,
-                              [provider.id]: { ...draft, allowGit: nextValue }
+                              [provider.id]: { ...normalizedDraft, allowGit: nextValue }
                             }));
                           }}
                         />
@@ -1520,11 +1658,11 @@ export default function SettingsScreen({
                       <label className="flex items-center justify-between gap-2 rounded-lg border border-zinc-800 px-2 py-1.5">
                         backup/restore
                         <ToggleSwitch
-                          checked={Boolean(draft.allowBackupRestore)}
+                          checked={Boolean(normalizedDraft.allowBackupRestore)}
                           onChange={(nextValue) => {
                             setPermissionDrafts((prev) => ({
                               ...prev,
-                              [provider.id]: { ...draft, allowBackupRestore: nextValue }
+                              [provider.id]: { ...normalizedDraft, allowBackupRestore: nextValue }
                             }));
                           }}
                         />
@@ -1533,45 +1671,51 @@ export default function SettingsScreen({
 
                     <div className="space-y-2">
                       <input
-                        value={draft.runAsUser || ''}
+                        value={normalizedDraft.runAsUser || ''}
                         onChange={(event) => {
                           const value = event.target.value;
                           setPermissionDrafts((prev) => ({
                             ...prev,
-                            [provider.id]: { ...draft, runAsUser: value }
+                            [provider.id]: { ...normalizedDraft, runAsUser: value }
                           }));
                         }}
                         placeholder="usuario sistema (vacío = por defecto)"
                         className="w-full rounded-lg border border-zinc-800 bg-black/60 px-2 py-1.5 text-xs text-zinc-200"
                       />
+                      {selectedAccessMode === 'restricted_paths' || selectedAccessMode === 'read_only' ? (
+                        <input
+                          value={(normalizedDraft.allowedPaths || []).join(', ')}
+                          onChange={(event) => {
+                            const values = parsePathListInput(event.target.value);
+                            setPermissionDrafts((prev) => ({
+                              ...prev,
+                              [provider.id]: {
+                                ...normalizedDraft,
+                                allowedPaths: values.length > 0 ? values : ['/root/CodexWeb']
+                              }
+                            }));
+                          }}
+                          placeholder="/root/CodexWeb,/home,/opt"
+                          className="w-full rounded-lg border border-zinc-800 bg-black/60 px-2 py-1.5 text-xs text-zinc-200"
+                        />
+                      ) : (
+                        <div className="rounded-lg border border-zinc-800 bg-black/40 px-2 py-1.5 text-xs text-zinc-400">
+                          {selectedAccessMode === 'workspace_only'
+                            ? 'Rutas permitidas: workspace de CodexWeb'
+                            : 'Rutas permitidas: sistema completo'}
+                        </div>
+                      )}
                       <input
-                        value={(draft.allowedPaths || []).join(', ')}
+                        value={(normalizedDraft.deniedPaths || []).join(', ')}
                         onChange={(event) => {
-                          const values = event.target.value
-                            .split(',')
-                            .map((entry) => entry.trim())
-                            .filter(Boolean);
+                          const values = parsePathListInput(event.target.value);
                           setPermissionDrafts((prev) => ({
                             ...prev,
-                            [provider.id]: { ...draft, allowedPaths: values.length > 0 ? values : ['/'] }
-                          }));
-                        }}
-                        placeholder="/root/CodexWeb,/home,/opt"
-                        className="w-full rounded-lg border border-zinc-800 bg-black/60 px-2 py-1.5 text-xs text-zinc-200"
-                      />
-                      <input
-                        value={(draft.deniedPaths || []).join(', ')}
-                        onChange={(event) => {
-                          const values = event.target.value
-                            .split(',')
-                            .map((entry) => entry.trim())
-                            .filter(Boolean);
-                          setPermissionDrafts((prev) => ({
-                            ...prev,
-                            [provider.id]: { ...draft, deniedPaths: values }
+                            [provider.id]: { ...normalizedDraft, deniedPaths: values }
                           }));
                         }}
                         placeholder="rutas bloqueadas separadas por coma"
+                        disabled={selectedAccessMode === 'full_access' || selectedAccessMode === 'workspace_only'}
                         className="w-full rounded-lg border border-zinc-800 bg-black/60 px-2 py-1.5 text-xs text-zinc-200"
                       />
                     </div>
@@ -1587,7 +1731,7 @@ export default function SettingsScreen({
                               type="button"
                               onClick={() => {
                                 setPermissionDrafts((prev) => {
-                                  const current = prev[provider.id] || draft;
+                                  const current = prev[provider.id] || normalizedDraft;
                                   const nextAllowedTools = new Set(
                                     (current.allowedTools || [])
                                       .map((entry) => String(entry || '').trim().toLowerCase())
@@ -1622,7 +1766,7 @@ export default function SettingsScreen({
 
                     <div className="flex items-center justify-between gap-2">
                       <p className="text-[11px] text-zinc-500">
-                        actualizado: {draft.updatedAt ? formatDate(draft.updatedAt) : '-'}
+                        actualizado: {normalizedDraft.updatedAt ? formatDate(normalizedDraft.updatedAt) : '-'}
                       </p>
                       <div className="flex items-center gap-2">
                         <button

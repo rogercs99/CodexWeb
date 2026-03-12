@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import BottomNav from './BottomNav';
-import type { ChatOptions, Message, Screen, TerminalEntry } from '../lib/types';
+import type { ChatOptions, ChatProject, ConversationProjectContext, Message, Screen, TerminalEntry } from '../lib/types';
 
 const TITLE_MAX_LENGTH = 40;
 const TOP_LOAD_THRESHOLD_PX = 72;
@@ -172,11 +172,15 @@ function CodeBlock({ text, language }: { text: string; language: string }) {
               event.stopPropagation();
               void handleCopy();
             }}
-            className="inline-flex items-center gap-1 rounded-md border border-zinc-700 px-2 py-1 text-[11px] text-zinc-200 hover:bg-zinc-800/90"
-            aria-label="Copiar codigo"
+            className={`inline-flex h-7 w-7 items-center justify-center rounded-full border transition-colors ${
+              copied
+                ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-300'
+                : 'border-zinc-700 text-zinc-300 hover:border-zinc-500 hover:bg-zinc-800/90 hover:text-zinc-100'
+            }`}
+            aria-label={copied ? 'Codigo copiado' : 'Copiar codigo'}
+            title={copied ? 'Copiado' : 'Copiar codigo'}
           >
-            {copied ? <Check size={12} /> : <Copy size={12} />}
-            {copied ? 'Copiado' : 'Copiar'}
+            {copied ? <Check size={13} /> : <Copy size={13} />}
           </button>
         </div>
       </div>
@@ -254,6 +258,8 @@ function MarkdownMessage({ content }: { content: string }) {
 export default function ChatScreen({
   chatTitle,
   conversationId,
+  projectContext,
+  draftProject,
   messages,
   hasMoreMessages,
   loadingMoreMessages,
@@ -282,6 +288,8 @@ export default function ChatScreen({
 }: {
   chatTitle: string;
   conversationId: number | null;
+  projectContext: ConversationProjectContext | null;
+  draftProject: ChatProject | null;
   messages: Message[];
   hasMoreMessages: boolean;
   loadingMoreMessages: boolean;
@@ -320,9 +328,11 @@ export default function ChatScreen({
   const [showTerminal, setShowTerminal] = useState(false);
   const [hasTerminalActivity, setHasTerminalActivity] = useState(false);
   const [showTitleModal, setShowTitleModal] = useState(false);
+  const [copiedMessageId, setCopiedMessageId] = useState<number | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const headerRef = useRef<HTMLElement | null>(null);
   const messagesRef = useRef<HTMLElement | null>(null);
+  const messageCopyTimerRef = useRef<number | null>(null);
   const [headerOffset, setHeaderOffset] = useState(136);
 
   const grouped = useMemo(() => messages, [messages]);
@@ -391,6 +401,14 @@ export default function ChatScreen({
 
     return () => {
       window.removeEventListener('resize', syncHeaderOffset);
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (messageCopyTimerRef.current !== null) {
+        window.clearTimeout(messageCopyTimerRef.current);
+      }
     };
   }, []);
 
@@ -492,6 +510,19 @@ export default function ChatScreen({
     setInput('');
   };
 
+  const handleCopyMessage = async (messageId: number, text: string) => {
+    const ok = await copyTextToClipboard(text);
+    if (!ok) return;
+    setCopiedMessageId(messageId);
+    if (messageCopyTimerRef.current !== null) {
+      window.clearTimeout(messageCopyTimerRef.current);
+    }
+    messageCopyTimerRef.current = window.setTimeout(() => {
+      setCopiedMessageId(null);
+      messageCopyTimerRef.current = null;
+    }, 1600);
+  };
+
   const canSend = input.trim().length > 0 || selectedFiles.length > 0;
   const canStop = sending || isRunning;
   const pendingUploadBytes = selectedFiles.reduce((sum, file) => {
@@ -515,6 +546,11 @@ export default function ChatScreen({
     : sending
     ? `Generando · ${formatElapsed(sendElapsedSeconds)}`
     : status || 'Sesion activa';
+  const projectLabel = projectContext
+    ? `${projectContext.projectName} · ${projectContext.mode}`
+    : draftProject
+    ? `${draftProject.name} · ${draftProject.contextMode}`
+    : '';
 
   return (
     <div className="h-screen bg-black flex flex-col relative overflow-hidden overflow-x-hidden">
@@ -566,6 +602,11 @@ export default function ChatScreen({
                 </div>
               ) : null}
               <p className="text-[11px] text-zinc-400">IA activa: {activeAgentName || 'Codex CLI'}</p>
+              {projectLabel ? (
+                <p className="text-[11px] text-cyan-300/90">
+                  Proyecto: {projectLabel}
+                </p>
+              ) : null}
             </div>
             <div className="flex items-center gap-1 shrink-0">
               <button
@@ -655,6 +696,25 @@ export default function ChatScreen({
                 ) : (
                   <MarkdownMessage content={visibleContent} />
                 )}
+                {!showThinking && hasVisibleContent ? (
+                  <div className="mt-1.5 flex items-center justify-end">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void handleCopyMessage(message.id, rawContent);
+                      }}
+                      className={`inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors ${
+                        copiedMessageId === message.id
+                          ? 'bg-emerald-500/10 text-emerald-300'
+                          : 'text-zinc-500 hover:bg-zinc-800/80 hover:text-zinc-200'
+                      }`}
+                      aria-label={copiedMessageId === message.id ? 'Mensaje copiado' : 'Copiar mensaje'}
+                      title={copiedMessageId === message.id ? 'Copiado' : 'Copiar mensaje'}
+                    >
+                      {copiedMessageId === message.id ? <Check size={12} /> : <Copy size={12} />}
+                    </button>
+                  </div>
+                ) : null}
                 {messageAttachments.length > 0 ? (
                   <div className="mt-2 space-y-1.5">
                     <p className="text-[10px] uppercase tracking-wide text-zinc-400">Adjuntos enviados</p>

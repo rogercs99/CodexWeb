@@ -11,3 +11,4 @@ codexweb_context_pack/
 codexweb_context_pack.zip
 npm-debug.log*
 /tmp/
+/.runtime/

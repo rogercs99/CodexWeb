@@ -16,6 +16,8 @@ export interface User {
 
 export interface Conversation {
   id: number;
+  projectId?: number | null;
+  project?: ChatProjectRef | null;
   title: string;
   model: string;
   reasoningEffort: string;
@@ -23,6 +25,45 @@ export interface Conversation {
   last_message_at: string;
   liveDraftOpen?: boolean;
   liveDraftUpdatedAt?: string;
+}
+
+export type ProjectContextMode = 'manual' | 'automatic' | 'mixed';
+
+export interface ChatProjectRef {
+  id: number;
+  name: string;
+  contextMode: ProjectContextMode;
+  autoContextEnabled: boolean;
+}
+
+export interface ChatProject extends ChatProjectRef {
+  manualContext?: string;
+  autoContext?: string;
+  manualContextPreview?: string;
+  autoContextPreview?: string;
+  autoUpdatedAt: string;
+  createdAt: string;
+  updatedAt: string;
+  autoLastMessageId?: number;
+  autoMeta?: Record<string, any>;
+  stats?: {
+    chatCount: number;
+    lastMessageAt: string;
+  };
+}
+
+export interface ConversationProjectContext {
+  projectId: number;
+  projectName: string;
+  mode: ProjectContextMode;
+  autoEnabled: boolean;
+  manualContext: string;
+  autoContext: string;
+  effectiveContext: string;
+  manualUsed: boolean;
+  autoUsed: boolean;
+  autoUpdatedAt: string;
+  autoMeta?: Record<string, any>;
 }
 
 export interface Message {
@@ -154,10 +195,12 @@ export interface AiProviderQuota {
 
 export interface AiProviderPermissionProfile {
   agentId: string;
+  accessMode: 'full_access' | 'workspace_only' | 'restricted_paths' | 'read_only';
   allowRoot: boolean;
   runAsUser: string;
   allowedPaths: string[];
   deniedPaths: string[];
+  canWriteFiles: boolean;
   readOnly: boolean;
   allowShell: boolean;
   allowSensitiveTools: boolean;
@@ -356,6 +399,14 @@ export interface ObservabilitySnapshot {
     freeMemBytes: number;
     usedMemBytes: number;
     usedMemPercent: number;
+    disk: {
+      path: string;
+      mountPoint: string;
+      totalBytes: number | null;
+      usedBytes: number | null;
+      availableBytes: number | null;
+      usedPercent: number | null;
+    } | null;
   };
   api: {
     totalRequests: number;
@@ -494,16 +545,23 @@ export interface ToolsStorageHeavyPayload {
 export interface ToolsDriveAccount {
   id: string;
   alias: string;
-  authMode: 'token' | 'oauth_app';
+  authMode: 'rclone';
   rootFolderId: string;
-  status: 'pending' | 'active' | 'needs_oauth' | 'error';
+  status: 'pending' | 'active' | 'error';
   lastError: string;
   details: {
-    credentialType: string;
-    projectId: string;
-    clientEmail: string;
-    clientId: string;
-    redirectUris: string[];
+    remoteName: string;
+    configPath: string;
+    rootPath: string;
+    provider: string;
+    connectionState: 'active' | 'invalid' | 'pending' | 'unknown';
+    validatedAt: string;
+    about?: {
+      limit: number | null;
+      usage: number | null;
+      usageInDrive: number | null;
+      free?: number | null;
+    };
   };
   createdAt: string;
   updatedAt: string;
@@ -528,10 +586,13 @@ export interface ToolsDriveFilesPayload {
 }
 
 export type ToolsStorageJobType =
+  | 'cleanup_residual_analyze'
   | 'drive_upload_files'
-  | 'dropbox_upload_files'
   | 'deployed_backup_create'
-  | 'deployed_backup_restore';
+  | 'deployed_backup_restore'
+  | 'git_merge_branches'
+  | 'local_delete_paths'
+  | 'project_context_refresh';
 export type ToolsStorageJobStatus = 'pending' | 'running' | 'completed' | 'error';
 
 export interface ToolsStorageJob {
@@ -583,6 +644,34 @@ export interface ToolsStorageOverview {
     };
   };
   jobs: ToolsStorageJob[];
+}
+
+export interface ToolsStorageResidualCandidate {
+  id: string;
+  path: string;
+  type: 'file' | 'directory' | 'other';
+  sizeBytes: number;
+  modifiedAt: string;
+  reason: string;
+  confidence: 'high' | 'medium' | 'low';
+  risk: 'high' | 'medium' | 'low';
+  score: number;
+}
+
+export interface ToolsStorageResidualAnalysis {
+  scannedAt: string;
+  roots: string[];
+  maxDepth: number;
+  limit: number;
+  candidates: ToolsStorageResidualCandidate[];
+  ai: {
+    requested: boolean;
+    used: boolean;
+    fallbackReason: string;
+    providerId?: string;
+    providerName?: string;
+    attemptedProviders?: string[];
+  };
 }
 
 export interface ToolsGitRepoStatusCounts {
@@ -644,7 +733,10 @@ export interface ToolsGitBranchesPayload {
 export interface ToolsGitMergePayload {
   sourceBranch: string;
   targetBranch: string;
-  output: string;
+  output?: string;
+  status?: 'queued' | 'merged' | 'conflict' | 'failed';
+  hasConflicts?: boolean;
+  conflictFiles?: string[];
 }
 
 export interface Capabilities {

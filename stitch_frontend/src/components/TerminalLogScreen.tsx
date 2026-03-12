@@ -10,7 +10,6 @@ import {
   FolderOpen,
   GitBranch,
   HardDrive,
-  KeyRound,
   LayoutDashboard,
   RefreshCw,
   Search as SearchIcon,
@@ -20,17 +19,25 @@ import {
   Trash2,
   Upload
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   actionToolsDeployedApp,
-  completeToolsDriveOauth,
+  analyzeToolsStorageResidual,
   createToolsDeployedAppBackup,
+  createToolsDriveRcloneRemote,
   createToolsDriveAccount,
+  deleteToolsDriveRcloneRemote,
+  deleteToolsDriveAccount,
   deleteToolsDriveFile,
+  deleteToolsStorageLocalPaths,
+  deleteToolsStorageResidual,
+  downloadToolsDriveFile,
   describeToolsDeployedApps,
   getCodexRuns,
+  getToolsDriveRcloneStatus,
   getToolsStorageHeavy,
   getToolsStorageJob,
+  getToolsStorageJobs,
   getToolsStorageLocalList,
   getToolsDeployedAppDescribeJob,
   getToolsDeployedAppLogs,
@@ -50,10 +57,10 @@ import {
   pushToolsGitRepo,
   resolveToolsGitConflicts,
   rollbackTaskRun,
-  startToolsDriveOauth,
   uploadToolsDriveFiles,
+  validateToolsDriveRcloneRemote,
   validateToolsDriveAccount,
-  deleteToolsDriveAccount
+  normalizeToolsStorageResidualAnalysis
 } from '../lib/api';
 import BottomNav from './BottomNav';
 import type {
@@ -71,6 +78,7 @@ import type {
   ToolsStorageHeavyPayload,
   ToolsStorageJob,
   ToolsStorageLocalListPayload,
+  ToolsStorageResidualAnalysis,
   UnifiedSearchPayload
 } from '../lib/types';
 
@@ -84,6 +92,15 @@ type ToolsView =
   | 'git'
   | 'storage'
   | 'deployments';
+
+type ResidualCleanupHistoryItem = {
+  id: string;
+  kind: 'analysis' | 'delete';
+  status: 'completed' | 'error' | 'info';
+  createdAt: string;
+  summary: string;
+  details: string;
+};
 
 function formatTime(value: string) {
   const date = value ? new Date(value) : null;
@@ -117,6 +134,16 @@ function formatElapsed(startedAt: string) {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function formatEtaSeconds(value: unknown) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return '--';
+  const total = Math.max(1, Math.round(seconds));
+  if (total < 60) return `${total}s`;
+  const mins = Math.floor(total / 60);
+  const remain = total % 60;
+  return `${mins}m ${String(remain).padStart(2, '0')}s`;
 }
 
 function toTimestamp(value: string): number {
@@ -260,6 +287,7 @@ export default function TerminalLogScreen({
   const [pushingGitRepoId, setPushingGitRepoId] = useState<string | null>(null);
   const [checkingOutGitRepoId, setCheckingOutGitRepoId] = useState<string | null>(null);
   const [mergingGitRepoId, setMergingGitRepoId] = useState<string | null>(null);
+  const [gitMergeJobByRepo, setGitMergeJobByRepo] = useState<Record<string, ToolsStorageJob>>({});
   const [resolvingGitRepoId, setResolvingGitRepoId] = useState<string | null>(null);
   const [gitNotice, setGitNotice] = useState('');
   const [gitBranchTargetByRepo, setGitBranchTargetByRepo] = useState<Record<string, string>>({});
@@ -289,13 +317,16 @@ export default function TerminalLogScreen({
   const [storageLocalPath, setStorageLocalPath] = useState('/root');
   const [storageSortBy, setStorageSortBy] = useState<'name' | 'size' | 'mtime'>('size');
   const [storageSortOrder, setStorageSortOrder] = useState<'asc' | 'desc'>('desc');
+  const [storagePanelView, setStoragePanelView] = useState<'local' | 'drive' | 'backups' | 'cleanup'>('local');
   const [storageLocalData, setStorageLocalData] = useState<ToolsStorageLocalListPayload | null>(null);
   const [storageLocalLoading, setStorageLocalLoading] = useState(false);
   const [storageLocalError, setStorageLocalError] = useState('');
   const [storageHeavyData, setStorageHeavyData] = useState<ToolsStorageHeavyPayload | null>(null);
   const [storageHeavyLoading, setStorageHeavyLoading] = useState(false);
   const [storageHeavyError, setStorageHeavyError] = useState('');
+  const [storageLocalNotice, setStorageLocalNotice] = useState('');
   const [storageSelectedLocalPaths, setStorageSelectedLocalPaths] = useState<Record<string, true>>({});
+  const [localDeleteJob, setLocalDeleteJob] = useState<ToolsStorageJob | null>(null);
   const [driveAccounts, setDriveAccounts] = useState<ToolsDriveAccount[]>([]);
   const [driveAccountsLoading, setDriveAccountsLoading] = useState(false);
   const [driveAccountsError, setDriveAccountsError] = useState('');
@@ -304,16 +335,42 @@ export default function TerminalLogScreen({
   const [driveFiles, setDriveFiles] = useState<ToolsDriveFileItem[]>([]);
   const [driveFilesLoading, setDriveFilesLoading] = useState(false);
   const [driveFilesError, setDriveFilesError] = useState('');
+  const [downloadingDriveFileId, setDownloadingDriveFileId] = useState<string | null>(null);
   const [driveUploadJob, setDriveUploadJob] = useState<ToolsStorageJob | null>(null);
-  const [driveCredentialAlias, setDriveCredentialAlias] = useState('');
-  const [driveCredentialText, setDriveCredentialText] = useState('');
-  const [driveOauthCode, setDriveOauthCode] = useState('');
-  const [driveOauthUrl, setDriveOauthUrl] = useState('');
+  const [driveAccountAlias, setDriveAccountAlias] = useState('');
+  const [driveRemoteName, setDriveRemoteName] = useState('');
+  const [driveConfigPath, setDriveConfigPath] = useState('');
+  const [driveRootFolderId, setDriveRootFolderId] = useState('');
+  const [driveRcloneStatus, setDriveRcloneStatus] = useState<{
+    binary: string;
+    configPath: string;
+    configExists: boolean;
+    remotes: string[];
+    defaultRemote: string;
+    defaultRootPath: string;
+  } | null>(null);
+  const [driveRcloneAuthMode, setDriveRcloneAuthMode] = useState<'none' | 'service_account' | 'oauth_token'>('oauth_token');
+  const [driveRcloneScope, setDriveRcloneScope] = useState('drive');
+  const [driveRcloneTokenJson, setDriveRcloneTokenJson] = useState('');
+  const [driveRcloneServiceAccountJson, setDriveRcloneServiceAccountJson] = useState('');
+  const [driveRcloneTeamDrive, setDriveRcloneTeamDrive] = useState('');
+  const [loadingDriveRcloneStatus, setLoadingDriveRcloneStatus] = useState(false);
+  const [creatingDriveRemote, setCreatingDriveRemote] = useState(false);
+  const [validatingDriveRemoteName, setValidatingDriveRemoteName] = useState<string | null>(null);
+  const [deletingDriveRemoteName, setDeletingDriveRemoteName] = useState<string | null>(null);
   const [creatingDriveAccount, setCreatingDriveAccount] = useState(false);
   const [validatingDriveAccountId, setValidatingDriveAccountId] = useState<string | null>(null);
-  const [startingOauthAccountId, setStartingOauthAccountId] = useState<string | null>(null);
-  const [completingOauthAccountId, setCompletingOauthAccountId] = useState<string | null>(null);
   const [deletingDriveAccountId, setDeletingDriveAccountId] = useState<string | null>(null);
+  const [residualData, setResidualData] = useState<ToolsStorageResidualAnalysis | null>(null);
+  const [residualLoading, setResidualLoading] = useState(false);
+  const [residualAnalyzeJob, setResidualAnalyzeJob] = useState<ToolsStorageJob | null>(null);
+  const [residualError, setResidualError] = useState('');
+  const [residualNotice, setResidualNotice] = useState('');
+  const [residualLatestSummary, setResidualLatestSummary] = useState('');
+  const [residualHistory, setResidualHistory] = useState<ResidualCleanupHistoryItem[]>([]);
+  const [residualHistoryLoading, setResidualHistoryLoading] = useState(false);
+  const [residualSelectedPaths, setResidualSelectedPaths] = useState<Record<string, true>>({});
+  const [residualDeleting, setResidualDeleting] = useState(false);
   const [backupsByAppId, setBackupsByAppId] = useState<Record<string, ToolsDeployedAppBackupItem[]>>({});
   const [loadingBackupsAppId, setLoadingBackupsAppId] = useState<string | null>(null);
   const [selectedBackupFileIdByAppId, setSelectedBackupFileIdByAppId] = useState<Record<string, string>>({});
@@ -321,6 +378,7 @@ export default function TerminalLogScreen({
   const [creatingBackupAppId, setCreatingBackupAppId] = useState<string | null>(null);
   const [restoringBackupAppId, setRestoringBackupAppId] = useState<string | null>(null);
   const [restoreJobByAppId, setRestoreJobByAppId] = useState<Record<string, ToolsStorageJob>>({});
+  const handledMergeFinalJobIdsRef = useRef<Record<string, true>>({});
 
   const loadRuns = useCallback(async (silent = false) => {
     if (!silent) {
@@ -1216,14 +1274,40 @@ export default function TerminalLogScreen({
         if (safePrev && accounts.some((entry) => entry.id === safePrev)) return safePrev;
         return accounts[0]?.id || '';
       });
+      if (!driveRemoteName && accounts[0]?.details?.remoteName) {
+        setDriveRemoteName(accounts[0].details.remoteName);
+      }
     } catch (error) {
-      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudieron cargar cuentas de Dropbox');
+      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudieron cargar cuentas de Google Drive');
     } finally {
       if (!silent) {
         setDriveAccountsLoading(false);
       }
     }
-  }, []);
+  }, [driveRemoteName]);
+
+  const loadDriveRcloneStatus = useCallback(async (silent = false) => {
+    if (!silent) {
+      setLoadingDriveRcloneStatus(true);
+    }
+    setDriveAccountsError('');
+    try {
+      const status = await getToolsDriveRcloneStatus(driveConfigPath.trim());
+      setDriveRcloneStatus(status);
+      if (!driveConfigPath && status.configPath) {
+        setDriveConfigPath(status.configPath);
+      }
+      if (!driveRemoteName && status.defaultRemote) {
+        setDriveRemoteName(status.defaultRemote);
+      }
+    } catch (error) {
+      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo leer estado rclone');
+    } finally {
+      if (!silent) {
+        setLoadingDriveRcloneStatus(false);
+      }
+    }
+  }, [driveConfigPath, driveRemoteName]);
 
   const loadDriveFiles = useCallback(async () => {
     const accountId = String(activeDriveAccountId || '').trim();
@@ -1239,7 +1323,7 @@ export default function TerminalLogScreen({
       });
       setDriveFiles(payload.files);
     } catch (error) {
-      setDriveFilesError(error instanceof Error ? error.message : 'No se pudieron listar archivos de Dropbox');
+      setDriveFilesError(error instanceof Error ? error.message : 'No se pudieron listar archivos de Google Drive');
     } finally {
       setDriveFilesLoading(false);
     }
@@ -1287,44 +1371,140 @@ export default function TerminalLogScreen({
     });
   };
 
-  const handleDriveCredentialsFile = async (file: File | null) => {
-    if (!file) return;
-    const text = await file.text();
-    setDriveCredentialText(text);
-    if (!driveCredentialAlias.trim()) {
-      const rawName = String(file.name || '').replace(/\.[^.]+$/, '');
-      setDriveCredentialAlias(rawName.slice(0, 60));
-    }
+  const selectAllVisibleLocalEntries = () => {
+    const entries = Array.isArray(storageLocalData?.entries) ? storageLocalData.entries : [];
+    if (entries.length === 0) return;
+    setStorageSelectedLocalPaths((prev) => {
+      const next = { ...prev };
+      entries.forEach((entry) => {
+        const target = String(entry.path || '').trim();
+        if (!target) return;
+        next[target] = true;
+      });
+      return next;
+    });
   };
 
-  const createDriveAccountFromCredentialText = async () => {
-    const alias = driveCredentialAlias.trim();
-    const rawText = driveCredentialText.trim();
-    if (!rawText) {
-      setDriveAccountsError('Pega o sube el JSON de credenciales antes de guardar la cuenta.');
-      return;
-    }
+  const clearLocalSelection = () => {
+    setStorageSelectedLocalPaths({});
+  };
+
+  const createDriveAccount = async () => {
+    const alias = driveAccountAlias.trim();
+    const remoteName = driveRemoteName.trim();
+    const configPath = driveConfigPath.trim();
+    const rootFolderId = driveRootFolderId.trim();
     setCreatingDriveAccount(true);
     setDriveNotice('');
     setDriveAccountsError('');
     try {
-      const credentialsJson = JSON.parse(rawText);
-      const account = await createToolsDriveAccount({
-        alias: alias || `Dropbox ${Date.now().toString().slice(-5)}`,
-        credentialsJson
-      });
+      if (!remoteName) {
+        setDriveAccountsError('Indica el nombre del remote de rclone (ej: codexwebdev-gdrive).');
+        return;
+      }
+      const payload: Parameters<typeof createToolsDriveAccount>[0] = {
+        alias: alias || `Drive ${Date.now().toString().slice(-5)}`,
+        remoteName,
+        configPath,
+        rootPath: rootFolderId
+      };
+      const account = await createToolsDriveAccount(payload);
       setDriveNotice(`Cuenta ${account.alias} guardada.`);
-      setDriveCredentialText('');
-      setDriveOauthCode('');
-      setDriveOauthUrl('');
       await loadDriveAccounts(true);
+      await loadDriveRcloneStatus(true);
       if (account.id) {
         setActiveDriveAccountId(account.id);
       }
     } catch (error) {
-      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo guardar cuenta de Dropbox');
+      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo guardar cuenta de Google Drive');
     } finally {
       setCreatingDriveAccount(false);
+    }
+  };
+
+  const createOrUpdateDriveRemote = async () => {
+    const remoteName = driveRemoteName.trim();
+    if (!remoteName) {
+      setDriveAccountsError('Indica un remoteName para crear/actualizar en rclone.');
+      return;
+    }
+    setCreatingDriveRemote(true);
+    setDriveNotice('');
+    setDriveAccountsError('');
+    try {
+      const payload: Parameters<typeof createToolsDriveRcloneRemote>[0] = {
+        remoteName,
+        configPath: driveConfigPath.trim(),
+        scope: driveRcloneScope.trim() || 'drive',
+        authMode: driveRcloneAuthMode,
+        rootFolderId: driveRootFolderId.trim(),
+        teamDrive: driveRcloneTeamDrive.trim(),
+        clientId: '',
+        clientSecret: ''
+      };
+      if (driveRcloneAuthMode === 'service_account') {
+        payload.serviceAccountJson = driveRcloneServiceAccountJson.trim();
+      }
+      if (driveRcloneAuthMode === 'oauth_token') {
+        payload.tokenJson = driveRcloneTokenJson.trim();
+      }
+      const response = await createToolsDriveRcloneRemote(payload);
+      setDriveNotice(`Remote ${response.remote.remoteName} configurado en rclone.`);
+      setDriveRcloneTokenJson('');
+      if (driveRcloneAuthMode === 'service_account') {
+        setDriveRcloneServiceAccountJson('');
+      }
+      await loadDriveRcloneStatus(true);
+    } catch (error) {
+      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo crear/actualizar remote rclone');
+    } finally {
+      setCreatingDriveRemote(false);
+    }
+  };
+
+  const removeDriveRemote = async (remoteName: string) => {
+    const safeRemoteName = String(remoteName || '').trim();
+    if (!safeRemoteName) return;
+    const confirmed = window.prompt(
+      `Se eliminará el remote "${safeRemoteName}" de rclone. Escribe ELIMINAR para confirmar.`
+    );
+    if (confirmed !== 'ELIMINAR') return;
+    setDeletingDriveRemoteName(safeRemoteName);
+    setDriveNotice('');
+    setDriveAccountsError('');
+    try {
+      await deleteToolsDriveRcloneRemote(safeRemoteName, driveConfigPath.trim());
+      setDriveNotice(`Remote ${safeRemoteName} eliminado.`);
+      await loadDriveRcloneStatus(true);
+    } catch (error) {
+      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo eliminar remote rclone');
+    } finally {
+      setDeletingDriveRemoteName(null);
+    }
+  };
+
+  const validateDriveRemote = async (remoteName: string) => {
+    const safeRemoteName = String(remoteName || '').trim();
+    if (!safeRemoteName) {
+      setDriveAccountsError('Selecciona un remote válido para validar.');
+      return;
+    }
+    setValidatingDriveRemoteName(safeRemoteName);
+    setDriveNotice('');
+    setDriveAccountsError('');
+    try {
+      const response = await validateToolsDriveRcloneRemote(safeRemoteName, driveConfigPath.trim());
+      const aboutKeys = Object.keys(response.about || {});
+      setDriveNotice(
+        aboutKeys.length > 0
+          ? `Remote ${safeRemoteName} validado (${aboutKeys.length} campo(s) de cuota/estado).`
+          : `Remote ${safeRemoteName} validado correctamente.`
+      );
+      await loadDriveRcloneStatus(true);
+    } catch (error) {
+      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo validar remote rclone');
+    } finally {
+      setValidatingDriveRemoteName(null);
     }
   };
 
@@ -1334,59 +1514,21 @@ export default function TerminalLogScreen({
     setDriveAccountsError('');
     try {
       const response = await validateToolsDriveAccount(accountId);
-      const email = response.about?.email ? ` (${response.about.email})` : '';
-      setDriveNotice(`Cuenta validada${email}`);
+      const used = response.about?.quota?.usage !== null && response.about?.quota?.usage !== undefined
+        ? ` · uso ${formatBytes(Number(response.about.quota.usage || 0))}`
+        : '';
+      setDriveNotice(`Cuenta validada${used}`);
       await loadDriveAccounts(true);
       await loadDriveFiles();
     } catch (error) {
-      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo validar cuenta de Dropbox');
+      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo validar cuenta de Google Drive');
     } finally {
       setValidatingDriveAccountId(null);
     }
   };
 
-  const beginDriveOauth = async (accountId: string) => {
-    setStartingOauthAccountId(accountId);
-    setDriveNotice('');
-    setDriveAccountsError('');
-    try {
-      const payload = await startToolsDriveOauth(accountId);
-      setDriveOauthUrl(payload.oauth.authUrl);
-      setDriveNotice('URL OAuth generada. Ábrela, autoriza y pega el code en la caja inferior.');
-    } catch (error) {
-      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo iniciar OAuth');
-    } finally {
-      setStartingOauthAccountId(null);
-    }
-  };
-
-  const completeDriveOauth = async (accountId: string) => {
-    const code = driveOauthCode.trim();
-    if (!code) {
-      setDriveAccountsError('Pega el code OAuth antes de completar.');
-      return;
-    }
-    setCompletingOauthAccountId(accountId);
-    setDriveNotice('');
-    setDriveAccountsError('');
-    try {
-      await completeToolsDriveOauth({
-        accountId,
-        code
-      });
-      setDriveNotice('OAuth completado. Cuenta lista para operar.');
-      setDriveOauthCode('');
-      await loadDriveAccounts(true);
-      await loadDriveFiles();
-    } catch (error) {
-      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo completar OAuth');
-    } finally {
-      setCompletingOauthAccountId(null);
-    }
-  };
-
   const removeDriveAccount = async (accountId: string) => {
-    if (!window.confirm('Se eliminará la cuenta de Dropbox de CodexWeb. ¿Continuar?')) {
+    if (!window.confirm('Se eliminará la cuenta de Google Drive (rclone) de CodexWeb. ¿Continuar?')) {
       return;
     }
     setDeletingDriveAccountId(accountId);
@@ -1398,7 +1540,7 @@ export default function TerminalLogScreen({
       await loadDriveAccounts(true);
       await loadDriveFiles();
     } catch (error) {
-      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo eliminar cuenta de Dropbox');
+      setDriveAccountsError(error instanceof Error ? error.message : 'No se pudo eliminar cuenta de Google Drive');
     } finally {
       setDeletingDriveAccountId(null);
     }
@@ -1408,7 +1550,7 @@ export default function TerminalLogScreen({
     const accountId = String(activeDriveAccountId || '').trim();
     const paths = Object.keys(storageSelectedLocalPaths);
     if (!accountId) {
-      setDriveAccountsError('Selecciona una cuenta de Dropbox para subir archivos.');
+      setDriveAccountsError('Selecciona una cuenta de Google Drive para subir archivos.');
       return;
     }
     if (paths.length === 0) {
@@ -1429,13 +1571,41 @@ export default function TerminalLogScreen({
       });
       setDriveUploadJob(job);
       if (job.status === 'error') {
-        throw new Error(job.error || 'La subida a Dropbox terminó con error.');
+        throw new Error(job.error || 'La subida a Google Drive terminó con error.');
       }
       setStorageSelectedLocalPaths({});
       setDriveNotice('Subida completada.');
       await loadDriveFiles();
     } catch (error) {
-      setDriveFilesError(error instanceof Error ? error.message : 'No se pudo completar la subida a Dropbox');
+      setDriveFilesError(error instanceof Error ? error.message : 'No se pudo completar la subida a Google Drive');
+    }
+  };
+
+  const deleteSelectedLocalPaths = async () => {
+    const paths = Object.keys(storageSelectedLocalPaths).filter(Boolean);
+    if (paths.length === 0) {
+      setStorageLocalError('Selecciona al menos una ruta local para borrar.');
+      return;
+    }
+    const confirmation = window.prompt(
+      `Se eliminarán ${paths.length} ruta(s) local(es). Escribe ELIMINAR para confirmar.`
+    );
+    if (confirmation !== 'ELIMINAR') {
+      setStorageLocalNotice('Borrado local cancelado.');
+      return;
+    }
+    setStorageLocalError('');
+    setStorageLocalNotice('');
+    try {
+      const payload = await deleteToolsStorageLocalPaths({
+        paths,
+        confirmText: 'ELIMINAR'
+      });
+      setLocalDeleteJob(payload.job);
+      setStorageLocalNotice(`Job de borrado local iniciado (${payload.job.id}).`);
+      setStorageSelectedLocalPaths({});
+    } catch (error) {
+      setStorageLocalError(error instanceof Error ? error.message : 'No se pudo iniciar borrado local');
     }
   };
 
@@ -1443,7 +1613,7 @@ export default function TerminalLogScreen({
     const accountId = String(activeDriveAccountId || '').trim();
     const safeFileId = String(fileId || '').trim();
     if (!accountId || !safeFileId) return;
-    const confirmed = window.confirm('Se eliminará el archivo seleccionado de Dropbox. ¿Continuar?');
+    const confirmed = window.confirm('Se eliminará el archivo seleccionado de Google Drive. ¿Continuar?');
     if (!confirmed) return;
     setDriveFilesError('');
     setDriveNotice('');
@@ -1452,10 +1622,38 @@ export default function TerminalLogScreen({
         accountId,
         fileId: safeFileId
       });
-      setDriveNotice('Archivo borrado en Dropbox.');
+      setDriveNotice('Archivo borrado en Google Drive.');
       await loadDriveFiles();
     } catch (error) {
-      setDriveFilesError(error instanceof Error ? error.message : 'No se pudo borrar archivo de Dropbox');
+      setDriveFilesError(error instanceof Error ? error.message : 'No se pudo borrar archivo de Google Drive');
+    }
+  };
+
+  const downloadDriveFile = async (file: ToolsDriveFileItem) => {
+    const accountId = String(activeDriveAccountId || '').trim();
+    const safeFileId = String(file.id || '').trim();
+    if (!accountId || !safeFileId) return;
+    setDownloadingDriveFileId(safeFileId);
+    setDriveNotice('');
+    setDriveFilesError('');
+    try {
+      const payload = await downloadToolsDriveFile({
+        accountId,
+        fileId: safeFileId
+      });
+      const url = window.URL.createObjectURL(payload.blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = payload.fileName || file.name || 'drive-file';
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(url);
+      setDriveNotice(`Descarga iniciada: ${payload.fileName || file.name}`);
+    } catch (error) {
+      setDriveFilesError(error instanceof Error ? error.message : 'No se pudo descargar archivo de Google Drive');
+    } finally {
+      setDownloadingDriveFileId(null);
     }
   };
 
@@ -1492,7 +1690,7 @@ export default function TerminalLogScreen({
       String(backupAccountByAppId[safeAppId] || '').trim() ||
       String(activeDriveAccountId || '').trim();
     if (!safeAppId || !accountId) {
-      setDeployedAppsError('Selecciona cuenta de Dropbox para crear backup.');
+      setDeployedAppsError('Selecciona cuenta de Google Drive para crear backup.');
       return;
     }
     setCreatingBackupAppId(safeAppId);
@@ -1570,16 +1768,224 @@ export default function TerminalLogScreen({
     }
   };
 
+  const parseResidualTimeMs = (rawValue: string): number => {
+    const parsed = Date.parse(String(rawValue || '').trim());
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  };
+
+  const parseResidualAnalysisFromJob = useCallback((job: ToolsStorageJob | null): ToolsStorageResidualAnalysis | null => {
+    if (!job || !job.result || typeof job.result !== 'object') return null;
+    const normalized = normalizeToolsStorageResidualAnalysis(job.result);
+    if (!normalized.scannedAt && normalized.candidates.length === 0 && normalized.roots.length === 0) {
+      return null;
+    }
+    return normalized;
+  }, []);
+
+  const buildResidualHistoryItemFromJob = useCallback(
+    (job: ToolsStorageJob): ResidualCleanupHistoryItem | null => {
+      if (!job || job.type !== 'cleanup_residual_analyze') return null;
+      if (job.status !== 'completed' && job.status !== 'error') return null;
+      const createdAt = String(job.finishedAt || job.updatedAt || job.createdAt || '').trim() || new Date().toISOString();
+      if (job.status === 'error') {
+        return {
+          id: `analysis:${job.id}`,
+          kind: 'analysis',
+          status: 'error',
+          createdAt,
+          summary: 'Análisis IA fallido',
+          details: String(job.error || 'Error no especificado')
+        };
+      }
+      const analysis = parseResidualAnalysisFromJob(job);
+      if (!analysis) return null;
+      const summary = `Análisis IA completado · ${analysis.candidates.length} candidato(s)`;
+      const detailChunks: string[] = [];
+      detailChunks.push(analysis.ai.used ? 'Clasificación IA activa' : 'Clasificación heurística');
+      if (!analysis.ai.used && analysis.ai.fallbackReason) {
+        detailChunks.push(`fallback: ${analysis.ai.fallbackReason}`);
+      }
+      if (analysis.roots.length > 0) {
+        detailChunks.push(`rutas: ${analysis.roots.join(', ')}`);
+      }
+      return {
+        id: `analysis:${job.id}`,
+        kind: 'analysis',
+        status: 'completed',
+        createdAt,
+        summary,
+        details: detailChunks.join(' · ')
+      };
+    },
+    [parseResidualAnalysisFromJob]
+  );
+
+  const loadResidualHistory = useCallback(
+    async (silent = false) => {
+      if (!silent) setResidualHistoryLoading(true);
+      try {
+        const jobs = await getToolsStorageJobs(90);
+        const analysisItems = (Array.isArray(jobs) ? jobs : [])
+          .filter((entry) => entry.type === 'cleanup_residual_analyze')
+          .map((entry) => buildResidualHistoryItemFromJob(entry))
+          .filter((entry): entry is ResidualCleanupHistoryItem => Boolean(entry));
+        setResidualHistory((prev) => {
+          const manualDeleteEntries = prev.filter((entry) => entry.kind === 'delete');
+          const unique = new Map<string, ResidualCleanupHistoryItem>();
+          [...analysisItems, ...manualDeleteEntries].forEach((entry) => {
+            unique.set(entry.id, entry);
+          });
+          return Array.from(unique.values())
+            .sort((a, b) => parseResidualTimeMs(b.createdAt) - parseResidualTimeMs(a.createdAt))
+            .slice(0, 18);
+        });
+      } catch (error) {
+        if (!silent) {
+          setResidualError(error instanceof Error ? error.message : 'No se pudo cargar historial de limpiezas');
+        }
+      } finally {
+        if (!silent) setResidualHistoryLoading(false);
+      }
+    },
+    [buildResidualHistoryItemFromJob]
+  );
+
+  const runResidualAnalysis = async () => {
+    setResidualLoading(true);
+    setResidualAnalyzeJob(null);
+    setResidualError('');
+    setResidualNotice('');
+    try {
+      const payload = await analyzeToolsStorageResidual({
+        useAi: true
+      });
+      setResidualAnalyzeJob(payload.job);
+      setResidualNotice(`Job ${payload.job.id} iniciado. Analizando en segundo plano...`);
+      const finalJob = await waitForStorageJob(payload.job.id, (jobUpdate) => {
+        setResidualAnalyzeJob(jobUpdate);
+      });
+      setResidualAnalyzeJob(finalJob);
+      if (finalJob.status === 'error') {
+        throw new Error(finalJob.error || 'El análisis residual terminó con error.');
+      }
+      const nextAnalysis = parseResidualAnalysisFromJob(finalJob);
+      if (!nextAnalysis) {
+        throw new Error('El job terminó sin resultados de análisis.');
+      }
+      setResidualData(nextAnalysis);
+      setResidualSelectedPaths({});
+      const aiProvider = String(nextAnalysis.ai.providerName || nextAnalysis.ai.providerId || '').trim();
+      const summary = `Análisis completado: ${nextAnalysis.candidates.length} candidato(s). ${
+        nextAnalysis.ai.used
+          ? `Clasificación IA aplicada${aiProvider ? ` (${aiProvider})` : ''}.`
+          : `Fallback heurístico aplicado${nextAnalysis.ai.fallbackReason ? ` (${nextAnalysis.ai.fallbackReason})` : ''}.`
+      }`;
+      setResidualNotice(summary);
+      setResidualLatestSummary(summary);
+      await loadResidualHistory(true);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'No se pudo analizar residuales con IA';
+      setResidualError(message);
+      setResidualLatestSummary(`Análisis fallido: ${message}`);
+      await loadResidualHistory(true);
+    } finally {
+      setResidualLoading(false);
+    }
+  };
+
+  const deleteSelectedResidualCandidates = async () => {
+    const selectedPaths = Object.keys(residualSelectedPaths).filter(Boolean);
+    if (selectedPaths.length === 0) {
+      setResidualError('Selecciona al menos un candidato para borrar.');
+      return;
+    }
+    const confirmation = window.prompt(
+      `Se van a borrar ${selectedPaths.length} ruta(s). Escribe ELIMINAR para confirmar.`
+    );
+    if (confirmation !== 'ELIMINAR') {
+      setResidualNotice('Borrado cancelado.');
+      return;
+    }
+    setResidualDeleting(true);
+    setResidualError('');
+    setResidualNotice('');
+    try {
+      const payload = await deleteToolsStorageResidual({
+        paths: selectedPaths
+      });
+      const deletedCount = payload.deleted.length;
+      const failedCount = payload.failed.length;
+      const deleteSummary =
+        failedCount > 0
+          ? `Borrado parcial: ${deletedCount} eliminado(s), ${failedCount} con error.`
+          : `Borrado completado: ${deletedCount} eliminado(s).`;
+      setResidualNotice(deleteSummary);
+      setResidualLatestSummary(deleteSummary);
+      const deletedPreview = payload.deleted.slice(0, 3).join(', ');
+      const failurePreview = payload.failed.slice(0, 2).map((entry) => `${entry.path}: ${entry.error}`).join(' | ');
+      setResidualHistory((prev) =>
+        [
+          {
+            id: `delete:${Date.now()}:${Math.random().toString(16).slice(2, 8)}`,
+            kind: 'delete',
+            status: failedCount > 0 ? 'error' : 'completed',
+            createdAt: new Date().toISOString(),
+            summary: deleteSummary,
+            details: [
+              deletedPreview ? `eliminados: ${deletedPreview}` : '',
+              failurePreview ? `errores: ${failurePreview}` : ''
+            ]
+              .filter(Boolean)
+              .join(' · ')
+          },
+          ...prev
+        ]
+          .sort((a, b) => parseResidualTimeMs(b.createdAt) - parseResidualTimeMs(a.createdAt))
+          .slice(0, 18)
+      );
+      if (failedCount > 0) {
+        const firstFailure = payload.failed[0];
+        if (firstFailure?.error) {
+          setResidualError(`Error en algunos elementos: ${firstFailure.error}`);
+        }
+      }
+      await runResidualAnalysis();
+      await loadResidualHistory(true);
+      setResidualSelectedPaths({});
+    } catch (error) {
+      setResidualError(error instanceof Error ? error.message : 'No se pudieron borrar rutas residuales');
+    } finally {
+      setResidualDeleting(false);
+    }
+  };
+
   useEffect(() => {
     void loadDriveAccounts(true);
-  }, [loadDriveAccounts]);
+    void loadDriveRcloneStatus(true);
+  }, [loadDriveAccounts, loadDriveRcloneStatus]);
 
   useEffect(() => {
     if (activeView !== 'storage') return;
     void loadStorageLocal();
     void loadStorageHeavy();
     void loadDriveAccounts(true);
-  }, [activeView, loadStorageLocal, loadStorageHeavy, loadDriveAccounts]);
+    void loadDriveRcloneStatus(true);
+  }, [activeView, loadStorageLocal, loadStorageHeavy, loadDriveAccounts, loadDriveRcloneStatus]);
+
+  useEffect(() => {
+    if (activeView !== 'storage' || storagePanelView !== 'cleanup') return;
+    void loadResidualHistory();
+  }, [activeView, storagePanelView, loadResidualHistory]);
+
+  useEffect(() => {
+    if (activeView !== 'storage' || storagePanelView !== 'cleanup') return;
+    const pollId = window.setInterval(() => {
+      void loadResidualHistory(true);
+    }, 6500);
+    return () => {
+      window.clearInterval(pollId);
+    };
+  }, [activeView, storagePanelView, loadResidualHistory]);
 
   useEffect(() => {
     if (activeView !== 'storage') return;
@@ -1595,11 +2001,24 @@ export default function TerminalLogScreen({
         runningRestoreJobIds.push(job.id);
       }
     });
+    const runningMergeJobIds: string[] = [];
+    Object.keys(gitMergeJobByRepo).forEach((repoId) => {
+      const job = gitMergeJobByRepo[repoId];
+      if (!job) return;
+      if (job.status === 'running' || job.status === 'pending') {
+        runningMergeJobIds.push(job.id);
+      }
+    });
     const runningIds = [
       driveUploadJob && (driveUploadJob.status === 'running' || driveUploadJob.status === 'pending')
         ? driveUploadJob.id
         : '',
+      localDeleteJob && (localDeleteJob.status === 'running' || localDeleteJob.status === 'pending')
+        ? localDeleteJob.id
+        : '',
       ...runningRestoreJobIds
+      ,
+      ...runningMergeJobIds
     ]
       .map((entry) => String(entry || '').trim())
       .filter(Boolean);
@@ -1611,11 +2030,23 @@ export default function TerminalLogScreen({
             if (driveUploadJob && driveUploadJob.id === job.id) {
               setDriveUploadJob(job);
             }
+            if (localDeleteJob && localDeleteJob.id === job.id) {
+              setLocalDeleteJob(job);
+            }
             setRestoreJobByAppId((prev) => {
               const next = { ...prev };
               Object.keys(next).forEach((appId) => {
                 if (next[appId] && next[appId].id === job.id) {
                   next[appId] = job;
+                }
+              });
+              return next;
+            });
+            setGitMergeJobByRepo((prev) => {
+              const next = { ...prev };
+              Object.keys(next).forEach((repoId) => {
+                if (next[repoId] && next[repoId].id === job.id) {
+                  next[repoId] = job;
                 }
               });
               return next;
@@ -1629,7 +2060,54 @@ export default function TerminalLogScreen({
     return () => {
       window.clearInterval(pollId);
     };
-  }, [driveUploadJob, restoreJobByAppId]);
+  }, [driveUploadJob, localDeleteJob, restoreJobByAppId, gitMergeJobByRepo]);
+
+  useEffect(() => {
+    if (!localDeleteJob) return;
+    if (localDeleteJob.status === 'pending' || localDeleteJob.status === 'running') return;
+    if (localDeleteJob.status === 'error') {
+      setStorageLocalError(localDeleteJob.error || 'El borrado local terminó con error.');
+      return;
+    }
+    const deletedCount = Number(localDeleteJob.result?.deletedCount) || 0;
+    const failedCount = Number(localDeleteJob.result?.failedCount) || 0;
+    const summary =
+      failedCount > 0
+        ? `Borrado local parcial: ${deletedCount} eliminado(s), ${failedCount} con error.`
+        : `Borrado local completado: ${deletedCount} eliminado(s).`;
+    setStorageLocalNotice(summary);
+    void loadStorageLocal();
+    void loadStorageHeavy();
+  }, [localDeleteJob, loadStorageLocal, loadStorageHeavy]);
+
+  useEffect(() => {
+    Object.keys(gitMergeJobByRepo).forEach((repoId) => {
+      const job = gitMergeJobByRepo[repoId];
+      if (!job) return;
+      if (job.status === 'pending' || job.status === 'running') return;
+      if (handledMergeFinalJobIdsRef.current[job.id]) return;
+      handledMergeFinalJobIdsRef.current[job.id] = true;
+      if (job.status === 'error') {
+        setGitReposError(job.error || 'El merge en background terminó con error.');
+      } else if (job.result?.merge?.status === 'conflict') {
+        const conflictCount = Array.isArray(job.result?.merge?.conflictFiles)
+          ? job.result.merge.conflictFiles.length
+          : 0;
+        setGitReposError(
+          conflictCount > 0
+            ? `Merge con conflictos (${conflictCount} archivo(s)). Usa "Resolver conflictos".`
+            : 'Merge con conflictos. Usa "Resolver conflictos".'
+        );
+      } else {
+        setGitNotice(
+          `Merge completado: ${String(job.result?.merge?.sourceBranch || '')} -> ${String(
+            job.result?.merge?.targetBranch || ''
+          )}.`
+        );
+      }
+      void loadGitRepoView(true, true);
+    });
+  }, [gitMergeJobByRepo, loadGitRepoView]);
 
   const pushGitRepo = async (repoId: string) => {
     setGitReposError('');
@@ -1671,10 +2149,13 @@ export default function TerminalLogScreen({
         branch,
         create: Boolean(gitCreateBranchByRepo[repoId])
       });
+      const activeBranch = String(payload.repo?.branch || payload.branch || branch).trim();
+      setGitBranchTargetByRepo((prev) => ({ ...prev, [repoId]: activeBranch }));
+      setGitMergeTargetByRepo((prev) => ({ ...prev, [repoId]: activeBranch }));
       setGitNotice(
         payload.created
-          ? `Rama ${payload.branch} creada y seleccionada.`
-          : `Rama ${payload.branch} seleccionada.`
+          ? `Checkout realizado. Rama actual: ${activeBranch} (creada).`
+          : `Checkout realizado. Rama actual: ${activeBranch}.`
       );
       await loadGitRepoView(true, true);
     } catch (error) {
@@ -1704,11 +2185,16 @@ export default function TerminalLogScreen({
     setMergingGitRepoId(repoId);
     try {
       const payload = await mergeToolsGitBranches(repoId, { sourceBranch, targetBranch });
-      setGitNotice(`Merge completado: ${sourceBranch} -> ${targetBranch}.`);
-      await loadGitRepoView(true, true);
-      if (payload.repo?.hasConflicts) {
-        setGitReposError('El merge terminó con conflictos. Revisa el repo y usa "Resolver conflictos".');
+      if (payload.job) {
+        setGitMergeJobByRepo((prev) => ({
+          ...prev,
+          [repoId]: payload.job as ToolsStorageJob
+        }));
+        setGitNotice(`Merge en segundo plano iniciado: ${sourceBranch} -> ${targetBranch}.`);
+      } else {
+        setGitNotice(`Merge encolado: ${sourceBranch} -> ${targetBranch}.`);
       }
+      await loadGitRepoView(true, true);
     } catch (error) {
       setGitReposError(error instanceof Error ? error.message : 'No se pudo ejecutar merge de ramas');
       await loadGitRepoView(true, true);
@@ -1758,8 +2244,20 @@ export default function TerminalLogScreen({
               : activeView === 'git'
                 ? 'Tools · Git'
                 : activeView === 'storage'
-                  ? 'Tools · Storage local + nube'
+                  ? 'Tools · Copias y espacio'
                   : 'Tools · Apps desplegadas';
+
+  const residualJobStage = String(
+    residualAnalyzeJob?.progress?.stageLabel || residualAnalyzeJob?.progress?.stage || ''
+  ).trim();
+  const residualJobPercentRaw = Number(residualAnalyzeJob?.progress?.percent);
+  const residualJobPercent = Number.isFinite(residualJobPercentRaw)
+    ? Math.max(0, Math.min(100, Math.round(residualJobPercentRaw)))
+    : null;
+  const residualJobEtaRaw = Number(residualAnalyzeJob?.progress?.etaSeconds);
+  const residualJobEtaSeconds = Number.isFinite(residualJobEtaRaw) ? Math.max(0, Math.round(residualJobEtaRaw)) : null;
+  const residualJobRunning =
+    residualAnalyzeJob?.status === 'pending' || residualAnalyzeJob?.status === 'running';
 
   const handleBack = () => {
     if (activeView === 'menu') {
@@ -1950,7 +2448,7 @@ export default function TerminalLogScreen({
                     <div className="min-w-0">
                       <p className="text-sm text-zinc-100">Storage local + nube</p>
                       <p className="text-xs text-zinc-500 truncate">
-                        {storageLocalData?.entries?.length || 0} item(s) locales · {driveAccounts.length} cuenta(s) Dropbox
+                        {storageLocalData?.entries?.length || 0} item(s) locales · {driveAccounts.length} cuenta(s) Google Drive
                       </p>
                     </div>
                   </div>
@@ -2479,6 +2977,7 @@ export default function TerminalLogScreen({
                 const pushBranch = String(gitBranchTargetByRepo[repo.id] || repo.branch || '').trim();
                 const mergeSource = String(gitMergeSourceByRepo[repo.id] || '').trim();
                 const mergeTarget = String(gitMergeTargetByRepo[repo.id] || repo.branch || '').trim();
+                const mergeJob = gitMergeJobByRepo[repo.id] || null;
                 const canMerge =
                   !repo.detached &&
                   !repo.hasConflicts &&
@@ -2499,7 +2998,7 @@ export default function TerminalLogScreen({
                       <div className="min-w-0">
                         <p className="text-sm text-zinc-100 truncate" title={repo.absolutePath}>{repo.name}</p>
                         <p className="text-xs text-zinc-500 mt-1 truncate">
-                          {repo.relativePath} · rama {repo.branch}
+                          {repo.relativePath} · rama actual {repo.branch}
                           {repo.ahead > 0 ? ` · ahead ${repo.ahead}` : ''}
                           {repo.behind > 0 ? ` · behind ${repo.behind}` : ''} · cambios {repo.status.total}
                           {repo.hasConflicts ? ` · conflictos ${repo.status.conflicted}` : ''}
@@ -2562,7 +3061,7 @@ export default function TerminalLogScreen({
                               <option value="">Rama actual ({repo.branch})</option>
                               {branches.map((branch) => (
                                 <option key={`${repo.id}:pushbranch:${branch}`} value={branch}>
-                                  {branch}
+                                  {branch === repo.branch ? `${branch} (actual)` : branch}
                                 </option>
                               ))}
                             </select>
@@ -2640,6 +3139,40 @@ export default function TerminalLogScreen({
                           </div>
                         </article>
 
+                        {mergeJob ? (
+                          <article
+                            className={`rounded-lg border p-2.5 ${
+                              mergeJob.status === 'error' || mergeJob.result?.merge?.status === 'conflict'
+                                ? 'border-red-500/30 bg-red-500/5'
+                                : mergeJob.status === 'completed'
+                                  ? 'border-emerald-500/30 bg-emerald-500/5'
+                                  : 'border-cyan-500/30 bg-cyan-500/5'
+                            }`}
+                          >
+                            <p className="text-[11px] uppercase text-zinc-300">
+                              merge job · {mergeJob.status}
+                              {mergeJob.result?.merge?.sourceBranch && mergeJob.result?.merge?.targetBranch
+                                ? ` · ${mergeJob.result.merge.sourceBranch} -> ${mergeJob.result.merge.targetBranch}`
+                                : ''}
+                            </p>
+                            <p className="mt-1 text-xs text-zinc-300 whitespace-pre-wrap break-all">
+                              {String(
+                                mergeJob.log ||
+                                  mergeJob.error ||
+                                  mergeJob.result?.merge?.output ||
+                                  mergeJob.progress?.stageLabel ||
+                                  '-'
+                              )}
+                            </p>
+                            {Array.isArray(mergeJob.result?.merge?.conflictFiles) &&
+                            mergeJob.result.merge.conflictFiles.length > 0 ? (
+                              <p className="mt-1 text-[11px] text-red-200">
+                                Conflictos detectados: {mergeJob.result.merge.conflictFiles.length}
+                              </p>
+                            ) : null}
+                          </article>
+                        ) : null}
+
                         <div className="flex items-center gap-2 flex-wrap">
                           <button
                             type="button"
@@ -2679,269 +3212,482 @@ export default function TerminalLogScreen({
         {activeView === 'storage' ? (
           <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 space-y-4">
             <div>
-              <h2 className="text-sm font-semibold text-zinc-100">Storage local + Dropbox</h2>
-              <p className="text-xs text-zinc-500">
-                Explora rutas del servidor, detecta peso, sube a nube y gestiona cuentas de Dropbox.
-              </p>
+              <h2 className="text-sm font-semibold text-zinc-100">Copias en la nube y liberación de espacio</h2>
+              <p className="text-xs text-zinc-500">Vistas separadas para archivos locales, Google Drive, backups y limpieza IA.</p>
             </div>
 
-            <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-3">
-              <div className="flex items-center justify-between gap-2">
-                <p className="text-xs text-zinc-300 uppercase">Explorador local</p>
+            <div className="flex items-center gap-2 flex-wrap">
+              {(['local', 'drive', 'backups', 'cleanup'] as const).map((viewId) => (
                 <button
+                  key={viewId}
                   type="button"
-                  onClick={() => {
-                    void loadStorageLocal();
-                    void loadStorageHeavy();
-                  }}
-                  className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-200 hover:text-white hover:border-zinc-500"
-                >
-                  Refrescar
-                </button>
-              </div>
-
-              <div className="flex items-center gap-2">
-                <input
-                  value={storageLocalPath}
-                  onChange={(event) => setStorageLocalPath(event.target.value)}
-                  placeholder="/var, /opt, /root, /home..."
-                  className="flex-1 rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-100"
-                />
-                <button
-                  type="button"
-                  onClick={() => {
-                    void loadStorageLocal();
-                    void loadStorageHeavy();
-                  }}
-                  className="text-xs px-3 py-2 rounded-lg border border-zinc-700 text-zinc-200 hover:text-white hover:border-zinc-500"
-                >
-                  Abrir
-                </button>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                <label className="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-300">
-                  <span className="block text-[10px] uppercase text-zinc-500 mb-1">Ordenar</span>
-                  <select
-                    value={storageSortBy}
-                    onChange={(event) =>
-                      setStorageSortBy(
-                        event.target.value === 'name' || event.target.value === 'mtime'
-                          ? event.target.value
-                          : 'size'
-                      )
-                    }
-                    className="w-full bg-transparent text-xs text-zinc-100 outline-none"
-                  >
-                    <option value="size">Tamano</option>
-                    <option value="mtime">Fecha</option>
-                    <option value="name">Nombre</option>
-                  </select>
-                </label>
-                <label className="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-300">
-                  <span className="block text-[10px] uppercase text-zinc-500 mb-1">Direccion</span>
-                  <select
-                    value={storageSortOrder}
-                    onChange={(event) =>
-                      setStorageSortOrder(event.target.value === 'asc' ? 'asc' : 'desc')
-                    }
-                    className="w-full bg-transparent text-xs text-zinc-100 outline-none"
-                  >
-                    <option value="desc">Desc</option>
-                    <option value="asc">Asc</option>
-                  </select>
-                </label>
-                <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-300">
-                  <p className="text-[10px] uppercase text-zinc-500">Seleccion</p>
-                  <p className="mt-1 text-zinc-100">
-                    {selectedLocalPaths.length} item(s) · {formatBytes(selectedLocalTotalBytes)}
-                  </p>
-                </div>
-              </div>
-
-              {storageLocalError ? <p className="text-xs text-red-300">{storageLocalError}</p> : null}
-              {storageHeavyError ? <p className="text-xs text-red-300">{storageHeavyError}</p> : null}
-
-              {storageLocalLoading ? <p className="text-xs text-zinc-500">Cargando ruta local...</p> : null}
-              {!storageLocalLoading && storageLocalData ? (
-                <div className="space-y-2">
-                  <div className="flex items-center gap-2">
-                    {storageLocalData.parentPath ? (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setStorageLocalPath(storageLocalData.parentPath);
-                        }}
-                        className="text-xs px-2.5 py-1 rounded border border-zinc-700 text-zinc-300"
-                      >
-                        Subir nivel
-                      </button>
-                    ) : null}
-                    <p className="text-[11px] text-zinc-500 break-all">
-                      {storageLocalData.path} · {storageLocalData.totalEntries} item(s)
-                    </p>
-                  </div>
-
-                  <div className="max-h-80 overflow-auto space-y-1">
-                    {storageLocalData.entries.map((entry) => {
-                      const isSelected = Boolean(storageSelectedLocalPaths[entry.path]);
-                      return (
-                        <article
-                          key={entry.path}
-                          className={`rounded-lg border p-2 ${
-                            isSelected ? 'border-cyan-500/50 bg-cyan-500/10' : 'border-zinc-800 bg-zinc-950/70'
-                          }`}
-                        >
-                          <div className="flex items-center gap-2">
-                            <input
-                              type="checkbox"
-                              checked={isSelected}
-                              onChange={() => {
-                                toggleStorageLocalSelection(entry.path);
-                              }}
-                              className="h-4 w-4 accent-cyan-400"
-                            />
-                            <div className="min-w-0 flex-1">
-                              <p className="text-xs text-zinc-100 truncate" title={entry.path}>
-                                {entry.name}
-                              </p>
-                              <p className="text-[10px] text-zinc-500 truncate">
-                                {entry.type} · {entry.sizeBytes !== null ? formatBytes(entry.sizeBytes) : 'n/a'} ·{' '}
-                                {formatDateTime(entry.modifiedAt)}
-                              </p>
-                            </div>
-                            {entry.type === 'directory' ? (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setStorageLocalPath(entry.path);
-                                }}
-                                className="text-xs px-2 py-1 rounded border border-zinc-700 text-zinc-300"
-                              >
-                                <span className="inline-flex items-center gap-1">
-                                  <FolderOpen size={12} />
-                                  Abrir
-                                </span>
-                              </button>
-                            ) : null}
-                          </div>
-                        </article>
-                      );
-                    })}
-                  </div>
-                </div>
-              ) : null}
-
-              <div className="flex items-center gap-2 flex-wrap">
-                <button
-                  type="button"
-                  onClick={() => {
-                    void uploadSelectedLocalPathsToDrive();
-                  }}
-                  disabled={selectedLocalPaths.length === 0 || !activeDriveAccountId}
+                  onClick={() => setStoragePanelView(viewId)}
                   className={`text-xs px-2.5 py-1.5 rounded-lg border ${
-                    selectedLocalPaths.length > 0 && activeDriveAccountId
-                      ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-200'
-                      : 'border-zinc-700 text-zinc-500'
-                  } disabled:opacity-50`}
+                    storagePanelView === viewId
+                      ? 'border-cyan-500/40 bg-cyan-500/10 text-cyan-200'
+                      : 'border-zinc-700 text-zinc-300'
+                  }`}
                 >
-                  <span className="inline-flex items-center gap-1">
-                    <Upload size={12} />
-                    Subir seleccion a Dropbox
-                  </span>
+                  {viewId === 'local'
+                    ? 'Archivos locales'
+                    : viewId === 'drive'
+                      ? 'Google Drive'
+                      : viewId === 'backups'
+                        ? 'Backups'
+                        : 'Limpieza IA'}
                 </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    void loadStorageHeavy();
-                  }}
-                  className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-300"
-                >
-                  Analizar peso
-                </button>
-              </div>
+              ))}
+            </div>
 
-              {driveUploadJob ? (
-                <article className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5">
-                  <p className="text-[11px] text-zinc-400 uppercase">
-                    job subida · {driveUploadJob.status}
-                  </p>
-                  <p className="text-xs text-zinc-300 mt-1 break-all">{driveUploadJob.log || driveUploadJob.error || '-'}</p>
-                </article>
-              ) : null}
-
-              {storageHeavyLoading ? <p className="text-xs text-zinc-500">Escaneando peso...</p> : null}
-              {storageHeavyData ? (
-                <article className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5 space-y-1">
-                  <p className="text-[11px] uppercase text-zinc-500">
-                    Top pesado · {storageHeavyData.path} · total {formatBytes(storageHeavyData.totalBytes)}
-                  </p>
-                  <div className="space-y-1 max-h-44 overflow-auto">
-                    {storageHeavyData.entries.map((entry) => (
-                      <div key={entry.path} className="text-xs text-zinc-300 flex items-center justify-between gap-2">
-                        <span className="truncate" title={entry.path}>{entry.path}</span>
-                        <span className="shrink-0 text-zinc-500">{formatBytes(entry.sizeBytes)}</span>
-                      </div>
-                    ))}
-                  </div>
-                </article>
-              ) : null}
-            </article>
-
-            <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-3">
-              <div className="flex items-center justify-between gap-2">
-                <p className="text-xs text-zinc-300 uppercase">Dropbox</p>
-                <button
-                  type="button"
-                  onClick={() => {
-                    void loadDriveAccounts();
-                  }}
-                  className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-200"
-                >
-                  Refrescar cuentas
-                </button>
-              </div>
-
-              <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-3 space-y-2">
-                <p className="text-[11px] uppercase text-zinc-500">Subir credenciales JSON</p>
-                <p className="text-[11px] text-zinc-500">
-                  Soporta `token` y `oauth_app`. Las credenciales se guardan cifradas en servidor y no se exponen al cliente.
-                </p>
-                <p className="text-[11px] text-zinc-500">
-                  Pasos: crea app en Dropbox Developers → genera token o credenciales OAuth app → descarga/arma JSON → súbelo aquí.
-                </p>
-                <input
-                  value={driveCredentialAlias}
-                  onChange={(event) => setDriveCredentialAlias(event.target.value)}
-                  placeholder="Alias de cuenta (ej. Dropbox Produccion)"
-                  className="w-full rounded-lg border border-zinc-800 bg-black/50 px-3 py-2 text-xs text-zinc-100"
-                />
-                <textarea
-                  value={driveCredentialText}
-                  onChange={(event) => setDriveCredentialText(event.target.value)}
-                  placeholder="Pega el JSON de credenciales..."
-                  className="w-full min-h-24 rounded-lg border border-zinc-800 bg-black/50 px-3 py-2 text-xs text-zinc-100 font-mono"
-                />
-                <div className="flex items-center gap-2 flex-wrap">
-                  <label className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-200 cursor-pointer">
-                    <span className="inline-flex items-center gap-1">
-                      <KeyRound size={12} />
-                      Seleccionar JSON
-                    </span>
-                    <input
-                      type="file"
-                      accept="application/json,.json"
-                      className="hidden"
-                      onChange={(event) => {
-                        const file = event.target.files && event.target.files[0] ? event.target.files[0] : null;
-                        void handleDriveCredentialsFile(file);
-                      }}
-                    />
-                  </label>
+            {storagePanelView === 'local' ? (
+              <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs text-zinc-300 uppercase">Explorador local</p>
                   <button
                     type="button"
                     onClick={() => {
-                      void createDriveAccountFromCredentialText();
+                      void loadStorageLocal();
+                      void loadStorageHeavy();
+                    }}
+                    className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-200"
+                  >
+                    Refrescar
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <input
+                    value={storageLocalPath}
+                    onChange={(event) => setStorageLocalPath(event.target.value)}
+                    placeholder="/var, /opt, /root, /home..."
+                    className="flex-1 rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-100"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void loadStorageLocal();
+                      void loadStorageHeavy();
+                    }}
+                    className="text-xs px-3 py-2 rounded-lg border border-zinc-700 text-zinc-200"
+                  >
+                    Abrir
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <label className="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-300">
+                    <span className="block text-[10px] uppercase text-zinc-500 mb-1">Ordenar</span>
+                    <select
+                      value={storageSortBy}
+                      onChange={(event) =>
+                        setStorageSortBy(
+                          event.target.value === 'name' || event.target.value === 'mtime'
+                            ? event.target.value
+                            : 'size'
+                        )
+                      }
+                      className="w-full bg-transparent text-xs text-zinc-100 outline-none"
+                    >
+                      <option value="size">Tamano</option>
+                      <option value="mtime">Fecha</option>
+                      <option value="name">Nombre</option>
+                    </select>
+                  </label>
+                  <label className="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-300">
+                    <span className="block text-[10px] uppercase text-zinc-500 mb-1">Direccion</span>
+                    <select
+                      value={storageSortOrder}
+                      onChange={(event) => setStorageSortOrder(event.target.value === 'asc' ? 'asc' : 'desc')}
+                      className="w-full bg-transparent text-xs text-zinc-100 outline-none"
+                    >
+                      <option value="desc">Desc</option>
+                      <option value="asc">Asc</option>
+                    </select>
+                  </label>
+                  <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-xs text-zinc-300">
+                    <p className="text-[10px] uppercase text-zinc-500">Seleccion</p>
+                    <p className="mt-1 text-zinc-100">
+                      {selectedLocalPaths.length} item(s) · {formatBytes(selectedLocalTotalBytes)}
+                    </p>
+                    <div className="mt-2 flex items-center gap-2 flex-wrap">
+                      <button
+                        type="button"
+                        onClick={selectAllVisibleLocalEntries}
+                        disabled={!storageLocalData?.entries?.length}
+                        className="text-[10px] px-2 py-1 rounded border border-zinc-700 text-zinc-300 disabled:opacity-50"
+                      >
+                        Seleccionar visibles
+                      </button>
+                      <button
+                        type="button"
+                        onClick={clearLocalSelection}
+                        disabled={selectedLocalPaths.length === 0}
+                        className="text-[10px] px-2 py-1 rounded border border-zinc-700 text-zinc-300 disabled:opacity-50"
+                      >
+                        Limpiar selección
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {storageLocalError ? <p className="text-xs text-red-300">{storageLocalError}</p> : null}
+                {storageLocalNotice ? <p className="text-xs text-emerald-300">{storageLocalNotice}</p> : null}
+                {storageHeavyError ? <p className="text-xs text-red-300">{storageHeavyError}</p> : null}
+                {storageLocalLoading ? <p className="text-xs text-zinc-500">Cargando ruta local...</p> : null}
+
+                {!storageLocalLoading && storageLocalData ? (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      {storageLocalData.parentPath ? (
+                        <button
+                          type="button"
+                          onClick={() => setStorageLocalPath(storageLocalData.parentPath)}
+                          className="text-xs px-2.5 py-1 rounded border border-zinc-700 text-zinc-300"
+                        >
+                          Subir nivel
+                        </button>
+                      ) : null}
+                      <p className="text-[11px] text-zinc-500 break-all">
+                        {storageLocalData.path} · {storageLocalData.totalEntries} item(s)
+                      </p>
+                    </div>
+
+                    <div className="max-h-80 overflow-auto space-y-1">
+                      {storageLocalData.entries.map((entry) => {
+                        const isSelected = Boolean(storageSelectedLocalPaths[entry.path]);
+                        return (
+                          <article
+                            key={entry.path}
+                            className={`rounded-lg border p-3.5 min-h-[74px] ${
+                              isSelected ? 'border-cyan-500/50 bg-cyan-500/10' : 'border-zinc-800 bg-zinc-950/70'
+                            }`}
+                          >
+                            <div className="flex items-center gap-2">
+                              <input
+                                type="checkbox"
+                                checked={isSelected}
+                                onChange={() => toggleStorageLocalSelection(entry.path)}
+                                className="h-6 w-6 accent-cyan-400"
+                              />
+                              <div className="min-w-0 flex-1">
+                                <p className="text-sm text-zinc-100 truncate" title={entry.path}>{entry.name}</p>
+                                <p className="text-xs text-zinc-500 truncate">
+                                  {entry.type} · {entry.sizeBytes !== null ? formatBytes(entry.sizeBytes) : 'n/a'} ·{' '}
+                                  {formatDateTime(entry.modifiedAt)}
+                                </p>
+                              </div>
+                              {entry.type === 'directory' ? (
+                                <button
+                                  type="button"
+                                  onClick={() => setStorageLocalPath(entry.path)}
+                                  className="text-xs px-2 py-1 rounded border border-zinc-700 text-zinc-300"
+                                >
+                                  <span className="inline-flex items-center gap-1">
+                                    <FolderOpen size={12} />
+                                    Abrir
+                                  </span>
+                                </button>
+                              ) : null}
+                            </div>
+                          </article>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : null}
+
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void uploadSelectedLocalPathsToDrive();
+                    }}
+                    disabled={selectedLocalPaths.length === 0 || !activeDriveAccountId}
+                    className={`text-xs px-2.5 py-1.5 rounded-lg border ${
+                      selectedLocalPaths.length > 0 && activeDriveAccountId
+                        ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-200'
+                        : 'border-zinc-700 text-zinc-500'
+                    } disabled:opacity-50`}
+                  >
+                    <span className="inline-flex items-center gap-1">
+                      <Upload size={12} />
+                      Subir seleccion a Google Drive
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void deleteSelectedLocalPaths();
+                    }}
+                    disabled={selectedLocalPaths.length === 0}
+                    className={`text-xs px-2.5 py-1.5 rounded-lg border ${
+                      selectedLocalPaths.length > 0
+                        ? 'border-red-500/40 bg-red-500/10 text-red-200'
+                        : 'border-zinc-700 text-zinc-500'
+                    } disabled:opacity-50`}
+                  >
+                    <span className="inline-flex items-center gap-1">
+                      <Trash2 size={12} />
+                      Borrar selección local
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void loadStorageHeavy();
+                    }}
+                    className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-300"
+                  >
+                    Analizar peso
+                  </button>
+                </div>
+
+                {driveUploadJob ? (
+                  <article className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5">
+                    <p className="text-[11px] text-zinc-400 uppercase">job subida · {driveUploadJob.status}</p>
+                    <p className="text-xs text-zinc-300 mt-1 break-all">{driveUploadJob.log || driveUploadJob.error || '-'}</p>
+                  </article>
+                ) : null}
+                {localDeleteJob ? (
+                  <article className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5">
+                    <p className="text-[11px] text-zinc-400 uppercase">job borrado local · {localDeleteJob.status}</p>
+                    <p className="text-xs text-zinc-300 mt-1 break-all">{localDeleteJob.log || localDeleteJob.error || '-'}</p>
+                  </article>
+                ) : null}
+
+                {storageHeavyLoading ? <p className="text-xs text-zinc-500">Escaneando peso...</p> : null}
+                {storageHeavyData ? (
+                  <article className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5 space-y-1">
+                    <p className="text-[11px] uppercase text-zinc-500">
+                      Top pesado · {storageHeavyData.path} · total {formatBytes(storageHeavyData.totalBytes)}
+                    </p>
+                    <div className="space-y-1 max-h-44 overflow-auto">
+                      {storageHeavyData.entries.map((entry) => (
+                        <div key={entry.path} className="text-xs text-zinc-300 flex items-center justify-between gap-2">
+                          <span className="truncate" title={entry.path}>{entry.path}</span>
+                          <span className="shrink-0 text-zinc-500">{formatBytes(entry.sizeBytes)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </article>
+                ) : null}
+              </article>
+            ) : null}
+
+            {storagePanelView === 'drive' ? (
+              <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs text-zinc-300 uppercase">Google Drive (rclone)</p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void loadDriveAccounts();
+                    }}
+                    className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-200"
+                  >
+                    Refrescar cuentas
+                  </button>
+                </div>
+
+                <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-3 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[11px] uppercase text-zinc-500">Estado rclone (gestionado desde CodexWeb)</p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void loadDriveRcloneStatus();
+                      }}
+                      disabled={loadingDriveRcloneStatus}
+                      className="text-[10px] px-2 py-1 rounded border border-zinc-700 text-zinc-300 disabled:opacity-50"
+                    >
+                      {loadingDriveRcloneStatus ? 'Cargando...' : 'Refrescar estado'}
+                    </button>
+                  </div>
+                  <p className="text-[11px] text-zinc-400">
+                    binario: <span className="font-mono">{driveRcloneStatus?.binary || 'rclone'}</span> · config:{' '}
+                    <span className="font-mono break-all">{driveRcloneStatus?.configPath || driveConfigPath || '(auto)'}</span>
+                  </p>
+                  <p className="text-[11px] text-zinc-400">
+                    config existe: {driveRcloneStatus?.configExists ? 'sí' : 'no'} · remotes detectados:{' '}
+                    {driveRcloneStatus?.remotes?.length || 0}
+                  </p>
+                  {driveRcloneStatus?.remotes?.length ? (
+                    <div className="space-y-1">
+                      {driveRcloneStatus.remotes.map((remote) => (
+                        <div key={`rclone-remote:${remote}`} className="flex items-center justify-between gap-2 rounded border border-zinc-800 bg-black/40 px-2 py-1.5">
+                          <span className="text-xs text-zinc-200 font-mono">{remote}</span>
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void validateDriveRemote(remote);
+                              }}
+                              disabled={validatingDriveRemoteName === remote}
+                              className="text-[10px] px-2 py-1 rounded border border-zinc-700 text-zinc-200 disabled:opacity-50"
+                            >
+                              {validatingDriveRemoteName === remote ? 'Validando...' : 'Validar'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void removeDriveRemote(remote);
+                              }}
+                              disabled={deletingDriveRemoteName === remote}
+                              className="text-[10px] px-2 py-1 rounded border border-red-500/40 bg-red-500/10 text-red-200 disabled:opacity-50"
+                            >
+                              {deletingDriveRemoteName === remote ? 'Eliminando...' : 'Eliminar'}
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-zinc-500">Aún no hay remotes rclone configurados en este entorno.</p>
+                  )}
+                </div>
+
+                <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-3 space-y-2">
+                  <p className="text-[11px] uppercase text-zinc-500">Asistente remote rclone (desde CodexWeb)</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <input
+                      value={driveRemoteName}
+                      onChange={(event) => setDriveRemoteName(event.target.value)}
+                      placeholder="remoteName (ej. codexwebdev-gdrive)"
+                      className="w-full rounded-lg border border-zinc-800 bg-black/50 px-3 py-2 text-xs text-zinc-100 font-mono"
+                    />
+                    <input
+                      value={driveConfigPath}
+                      onChange={(event) => setDriveConfigPath(event.target.value)}
+                      placeholder="configPath opcional"
+                      className="w-full rounded-lg border border-zinc-800 bg-black/50 px-3 py-2 text-xs text-zinc-100 font-mono"
+                    />
+                    <label className="rounded-lg border border-zinc-800 bg-black/40 px-3 py-2 text-xs text-zinc-300">
+                      <span className="block text-[10px] uppercase text-zinc-500 mb-1">Scope</span>
+                      <select
+                        value={driveRcloneScope}
+                        onChange={(event) => setDriveRcloneScope(event.target.value || 'drive')}
+                        className="w-full bg-transparent text-xs text-zinc-100 outline-none"
+                      >
+                        <option value="drive">drive (completo)</option>
+                        <option value="drive.file">drive.file</option>
+                        <option value="drive.readonly">drive.readonly</option>
+                        <option value="metadata.readonly">metadata.readonly</option>
+                      </select>
+                    </label>
+                    <label className="rounded-lg border border-zinc-800 bg-black/40 px-3 py-2 text-xs text-zinc-300">
+                      <span className="block text-[10px] uppercase text-zinc-500 mb-1">Auth mode</span>
+                      <select
+                        value={driveRcloneAuthMode}
+                        onChange={(event) =>
+                          setDriveRcloneAuthMode(
+                            event.target.value === 'service_account'
+                              ? 'service_account'
+                              : event.target.value === 'oauth_token'
+                                ? 'oauth_token'
+                                : 'none'
+                          )
+                        }
+                        className="w-full bg-transparent text-xs text-zinc-100 outline-none"
+                      >
+                        <option value="none">none (usa credencial existente en rclone)</option>
+                        <option value="oauth_token">oauth_token (JSON token)</option>
+                        <option value="service_account">service_account (JSON SA)</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <input
+                      value={driveRootFolderId}
+                      onChange={(event) => setDriveRootFolderId(event.target.value)}
+                      placeholder="rootFolderId / rootPath opcional"
+                      className="w-full rounded-lg border border-zinc-800 bg-black/50 px-3 py-2 text-xs text-zinc-100 font-mono"
+                    />
+                    <input
+                      value={driveRcloneTeamDrive}
+                      onChange={(event) => setDriveRcloneTeamDrive(event.target.value)}
+                      placeholder="teamDrive opcional"
+                      className="w-full rounded-lg border border-zinc-800 bg-black/50 px-3 py-2 text-xs text-zinc-100 font-mono"
+                    />
+                  </div>
+
+                  {driveRcloneAuthMode === 'oauth_token' ? (
+                    <textarea
+                      value={driveRcloneTokenJson}
+                      onChange={(event) => setDriveRcloneTokenJson(event.target.value)}
+                      placeholder='Pega token JSON OAuth (ej. {"access_token":"...","refresh_token":"..."})'
+                      className="w-full min-h-[96px] rounded-lg border border-zinc-800 bg-black/50 px-3 py-2 text-xs text-zinc-100 font-mono"
+                    />
+                  ) : null}
+                  {driveRcloneAuthMode === 'service_account' ? (
+                    <textarea
+                      value={driveRcloneServiceAccountJson}
+                      onChange={(event) => setDriveRcloneServiceAccountJson(event.target.value)}
+                      placeholder='Pega JSON de service account de Google Cloud'
+                      className="w-full min-h-[96px] rounded-lg border border-zinc-800 bg-black/50 px-3 py-2 text-xs text-zinc-100 font-mono"
+                    />
+                  ) : null}
+
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void createOrUpdateDriveRemote();
+                      }}
+                      disabled={creatingDriveRemote}
+                      className="text-xs px-2.5 py-1.5 rounded-lg border border-emerald-500/50 bg-emerald-500/10 text-emerald-200 disabled:opacity-50"
+                    >
+                      {creatingDriveRemote ? 'Guardando remote...' : 'Crear/actualizar remote'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void validateDriveRemote(driveRemoteName);
+                      }}
+                      disabled={validatingDriveRemoteName === driveRemoteName || !driveRemoteName.trim()}
+                      className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-200 disabled:opacity-50"
+                    >
+                      {validatingDriveRemoteName === driveRemoteName ? 'Validando...' : 'Validar remote'}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-3 space-y-2">
+                  <p className="text-[11px] uppercase text-zinc-500">Nueva cuenta Google Drive</p>
+                  <input
+                    value={driveAccountAlias}
+                    onChange={(event) => setDriveAccountAlias(event.target.value)}
+                    placeholder="Alias de cuenta (ej. Drive DEV)"
+                    className="w-full rounded-lg border border-zinc-800 bg-black/50 px-3 py-2 text-xs text-zinc-100"
+                  />
+                  <label className="rounded-lg border border-zinc-800 bg-black/40 px-3 py-2 text-xs text-zinc-300">
+                    <span className="block text-[10px] uppercase text-zinc-500 mb-1">Remote rclone</span>
+                    <select
+                      value={driveRemoteName}
+                      onChange={(event) => setDriveRemoteName(event.target.value)}
+                      className="w-full bg-transparent text-xs text-zinc-100 outline-none"
+                    >
+                      <option value="">Selecciona remote</option>
+                      {(driveRcloneStatus?.remotes || []).map((remote) => (
+                        <option key={`new-account-remote:${remote}`} value={remote}>
+                          {remote}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <input
+                    value={driveRootFolderId}
+                    onChange={(event) => setDriveRootFolderId(event.target.value)}
+                    placeholder="Ruta raíz opcional (ej. CodexWeb)"
+                    className="w-full rounded-lg border border-zinc-800 bg-black/50 px-3 py-2 text-xs text-zinc-100 font-mono"
+                  />
+                  <p className="text-[11px] text-zinc-500">
+                    Config actual: <span className="font-mono break-all">{driveConfigPath || '(auto)'}</span>
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void createDriveAccount();
                     }}
                     disabled={creatingDriveAccount}
                     className="text-xs px-2.5 py-1.5 rounded-lg border border-emerald-500/50 bg-emerald-500/10 text-emerald-200 disabled:opacity-50"
@@ -2949,144 +3695,412 @@ export default function TerminalLogScreen({
                     {creatingDriveAccount ? 'Guardando...' : 'Guardar cuenta'}
                   </button>
                 </div>
-              </div>
 
-              {driveNotice ? <p className="text-xs text-emerald-300">{driveNotice}</p> : null}
-              {driveAccountsError ? <p className="text-xs text-red-300">{driveAccountsError}</p> : null}
-              {driveFilesError ? <p className="text-xs text-red-300">{driveFilesError}</p> : null}
-
-              {driveAccountsLoading ? <p className="text-xs text-zinc-500">Cargando cuentas...</p> : null}
-              {!driveAccountsLoading && driveAccounts.length === 0 ? (
-                <p className="text-xs text-zinc-500">No hay cuentas de Dropbox configuradas todavía.</p>
-              ) : null}
-
-              <div className="space-y-2">
-                {driveAccounts.map((account) => {
-                  const isActive = activeDriveAccountId === account.id;
-                  const oauthBusy = startingOauthAccountId === account.id || completingOauthAccountId === account.id;
-                  return (
-                    <article
-                      key={account.id}
-                      className={`rounded-lg border p-2.5 ${
-                        isActive ? 'border-cyan-500/40 bg-cyan-500/10' : 'border-zinc-800 bg-zinc-950/70'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="min-w-0">
-                          <p className="text-xs text-zinc-100 truncate">{account.alias}</p>
-                          <p className="text-[10px] text-zinc-500 truncate">
-                            {account.authMode} · {account.status}
-                            {account.lastError ? ` · ${account.lastError}` : ''}
-                          </p>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setActiveDriveAccountId(account.id)}
-                          className="text-xs px-2 py-1 rounded border border-zinc-700 text-zinc-200"
-                        >
-                          {isActive ? 'Activa' : 'Usar'}
-                        </button>
-                      </div>
-                      <div className="mt-2 flex items-center gap-2 flex-wrap">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            void validateDriveAccount(account.id);
-                          }}
-                          disabled={validatingDriveAccountId === account.id}
-                          className="text-xs px-2 py-1 rounded border border-zinc-700 text-zinc-300 disabled:opacity-50"
-                        >
-                          {validatingDriveAccountId === account.id ? 'Validando...' : 'Validar'}
-                        </button>
-                        {account.authMode === 'oauth_app' ? (
-                          <>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                void beginDriveOauth(account.id);
-                              }}
-                              disabled={oauthBusy}
-                              className="text-xs px-2 py-1 rounded border border-amber-500/40 bg-amber-500/10 text-amber-200 disabled:opacity-50"
-                            >
-                              {startingOauthAccountId === account.id ? 'Generando...' : 'Iniciar OAuth'}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                void completeDriveOauth(account.id);
-                              }}
-                              disabled={oauthBusy}
-                              className="text-xs px-2 py-1 rounded border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 disabled:opacity-50"
-                            >
-                              {completingOauthAccountId === account.id ? 'Completando...' : 'Completar OAuth'}
-                            </button>
-                          </>
-                        ) : null}
-                        <button
-                          type="button"
-                          onClick={() => {
-                            void removeDriveAccount(account.id);
-                          }}
-                          disabled={deletingDriveAccountId === account.id}
-                          className="text-xs px-2 py-1 rounded border border-red-500/40 bg-red-500/10 text-red-200 disabled:opacity-50"
-                        >
-                          {deletingDriveAccountId === account.id ? 'Eliminando...' : 'Eliminar'}
-                        </button>
-                      </div>
-                    </article>
-                  );
-                })}
-              </div>
-
-              {driveOauthUrl ? (
-                <article className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-2.5 space-y-2">
-                  <p className="text-[11px] uppercase text-amber-300">OAuth URL</p>
-                  <a href={driveOauthUrl} target="_blank" rel="noreferrer" className="text-xs text-cyan-300 break-all">
-                    {driveOauthUrl}
-                  </a>
-                  <input
-                    value={driveOauthCode}
-                    onChange={(event) => setDriveOauthCode(event.target.value)}
-                    placeholder="Pega aquí el code de Dropbox"
-                    className="w-full rounded-lg border border-zinc-800 bg-black/40 px-3 py-2 text-xs text-zinc-100"
-                  />
-                </article>
-              ) : null}
-
-              <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5 space-y-2">
-                <p className="text-[11px] uppercase text-zinc-500">
-                  Archivos en Dropbox {activeDriveAccountId ? `· cuenta ${activeDriveAccountId}` : ''}
-                </p>
-                {driveFilesLoading ? <p className="text-xs text-zinc-500">Cargando archivos...</p> : null}
-                {!driveFilesLoading && driveFiles.length === 0 ? (
-                  <p className="text-xs text-zinc-500">Sin archivos visibles en la carpeta seleccionada.</p>
+                {driveNotice ? <p className="text-xs text-emerald-300">{driveNotice}</p> : null}
+                {driveAccountsError ? <p className="text-xs text-red-300">{driveAccountsError}</p> : null}
+                {driveFilesError ? <p className="text-xs text-red-300">{driveFilesError}</p> : null}
+                {driveAccountsLoading ? <p className="text-xs text-zinc-500">Cargando cuentas...</p> : null}
+                {!driveAccountsLoading && driveAccounts.length === 0 ? (
+                  <p className="text-xs text-zinc-500">No hay cuentas de Google Drive configuradas todavía.</p>
                 ) : null}
-                <div className="max-h-72 overflow-auto space-y-1">
-                  {driveFiles.map((file) => (
-                    <div key={file.id} className="rounded border border-zinc-800 bg-black/30 p-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="min-w-0">
-                          <p className="text-xs text-zinc-100 truncate" title={file.name}>{file.name}</p>
-                          <p className="text-[10px] text-zinc-500 truncate">
-                            {file.mimeType} · {file.sizeBytes !== null ? formatBytes(file.sizeBytes) : 'n/a'} ·{' '}
-                            {formatDateTime(file.createdAt)}
-                          </p>
+
+                <div className="space-y-2">
+                  {driveAccounts.map((account) => {
+                    const isActive = activeDriveAccountId === account.id;
+                    return (
+                      <article
+                        key={account.id}
+                        className={`rounded-lg border p-2.5 ${
+                          isActive ? 'border-cyan-500/40 bg-cyan-500/10' : 'border-zinc-800 bg-zinc-950/70'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="min-w-0">
+                            <p className="text-xs text-zinc-100 truncate">{account.alias}</p>
+                            <p className="text-[10px] text-zinc-500 truncate">
+                              remote {account.details.remoteName || '-'} · {account.status}
+                              {account.lastError ? ` · ${account.lastError}` : ''}
+                            </p>
+                            <p className="text-[10px] text-zinc-500 truncate">
+                              raíz {account.details.rootPath || '/'} · validado {account.details.validatedAt ? formatDateTime(account.details.validatedAt) : 'no'}
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setActiveDriveAccountId(account.id)}
+                            className="text-xs px-2 py-1 rounded border border-zinc-700 text-zinc-200"
+                          >
+                            {isActive ? 'Activa' : 'Usar'}
+                          </button>
                         </div>
+                        <div className="mt-2 flex items-center gap-2 flex-wrap">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void validateDriveAccount(account.id);
+                            }}
+                            disabled={validatingDriveAccountId === account.id}
+                            className="text-xs px-2 py-1 rounded border border-zinc-700 text-zinc-300 disabled:opacity-50"
+                          >
+                            {validatingDriveAccountId === account.id ? 'Validando...' : 'Validar'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void removeDriveAccount(account.id);
+                            }}
+                            disabled={deletingDriveAccountId === account.id}
+                            className="text-xs px-2 py-1 rounded border border-red-500/40 bg-red-500/10 text-red-200 disabled:opacity-50"
+                          >
+                            {deletingDriveAccountId === account.id ? 'Eliminando...' : 'Eliminar'}
+                          </button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+
+                <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5 space-y-2">
+                  <p className="text-[11px] uppercase text-zinc-500">
+                    Archivos en Google Drive {activeDriveAccountId ? `· cuenta ${activeDriveAccountId}` : ''}
+                  </p>
+                  {driveFilesLoading ? <p className="text-xs text-zinc-500">Cargando archivos...</p> : null}
+                  {!driveFilesLoading && driveFiles.length === 0 ? (
+                    <p className="text-xs text-zinc-500">Sin archivos visibles en la carpeta seleccionada.</p>
+                  ) : null}
+                  <div className="max-h-72 overflow-auto space-y-1">
+                    {driveFiles.map((file) => (
+                      <div key={file.id} className="rounded border border-zinc-800 bg-black/30 p-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="min-w-0">
+                            <p className="text-xs text-zinc-100 truncate" title={file.name}>{file.name}</p>
+                            <p className="text-[10px] text-zinc-500 truncate">
+                              {file.mimeType} · {file.sizeBytes !== null ? formatBytes(file.sizeBytes) : 'n/a'} ·{' '}
+                              {formatDateTime(file.createdAt)}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void downloadDriveFile(file);
+                              }}
+                              disabled={downloadingDriveFileId === file.id}
+                              className={`text-xs px-2 py-1 rounded border ${
+                                downloadingDriveFileId === file.id
+                                  ? 'border-zinc-700 text-zinc-500'
+                                  : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                              }`}
+                            >
+                              {downloadingDriveFileId === file.id ? 'Descargando...' : 'Descargar'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void removeDriveFile(file.id);
+                              }}
+                              className="text-xs px-2 py-1 rounded border border-red-500/40 bg-red-500/10 text-red-200"
+                            >
+                              Borrar
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </article>
+            ) : null}
+
+            {storagePanelView === 'backups' ? (
+              <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs text-zinc-300 uppercase">Backups en Google Drive</p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void loadDeployedAppsView(false, true);
+                    }}
+                    className="text-xs px-2.5 py-1.5 rounded-lg border border-zinc-700 text-zinc-200"
+                  >
+                    Refrescar apps
+                  </button>
+                </div>
+                {deployedAppsError ? <p className="text-xs text-red-300">{deployedAppsError}</p> : null}
+                {deployedAppsLoading && deployedApps.length === 0 ? (
+                  <p className="text-xs text-zinc-500">Cargando apps desplegadas...</p>
+                ) : null}
+                {!deployedAppsLoading && deployedApps.length === 0 ? (
+                  <p className="text-xs text-zinc-500">No hay apps desplegadas detectadas.</p>
+                ) : null}
+                <div className="space-y-2 max-h-[36rem] overflow-auto">
+                  {deployedApps.map((app) => {
+                    const backupAccountId =
+                      String(backupAccountByAppId[app.id] || '').trim() ||
+                      String(activeDriveAccountId || '').trim();
+                    const appBackups = backupsByAppId[app.id] || [];
+                    const selectedBackupFileId = String(selectedBackupFileIdByAppId[app.id] || '').trim();
+                    const backupJob = restoreJobByAppId[app.id] || null;
+                    return (
+                      <article key={`storage-backup:${app.id}`} className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5 space-y-2">
+                        <p className="text-xs text-zinc-100 truncate">{app.name || app.id}</p>
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                          <label className="rounded-lg border border-zinc-800 bg-black/30 px-2.5 py-2 text-xs text-zinc-300">
+                            <span className="block text-[10px] uppercase text-zinc-500 mb-1">Cuenta Drive</span>
+                            <select
+                              value={backupAccountId}
+                              onChange={(event) =>
+                                setBackupAccountByAppId((prev) => ({
+                                  ...prev,
+                                  [app.id]: event.target.value
+                                }))
+                              }
+                              className="w-full bg-transparent text-xs text-zinc-100 outline-none"
+                            >
+                              <option value="">Seleccionar</option>
+                              {driveAccounts.map((account) => (
+                                <option key={`${app.id}:acc:${account.id}`} value={account.id}>
+                                  {account.alias} ({account.status})
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void loadBackupsForApp(app.id, backupAccountId);
+                            }}
+                            disabled={!backupAccountId || loadingBackupsAppId === app.id}
+                            className={`text-xs px-2.5 py-2 rounded-lg border ${
+                              backupAccountId ? 'border-zinc-700 text-zinc-200' : 'border-zinc-700 text-zinc-500'
+                            } disabled:opacity-50`}
+                          >
+                            {loadingBackupsAppId === app.id ? 'Cargando backups...' : 'Listar backups'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void createBackupForApp(app.id);
+                            }}
+                            disabled={!backupAccountId || creatingBackupAppId === app.id}
+                            className={`text-xs px-2.5 py-2 rounded-lg border ${
+                              backupAccountId
+                                ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                                : 'border-zinc-700 text-zinc-500'
+                            } disabled:opacity-50`}
+                          >
+                            {creatingBackupAppId === app.id ? 'Creando backup...' : 'Crear backup'}
+                          </button>
+                        </div>
+                        <label className="rounded-lg border border-zinc-800 bg-black/30 px-2.5 py-2 text-xs text-zinc-300 block">
+                          <span className="block text-[10px] uppercase text-zinc-500 mb-1">Backup disponible</span>
+                          <select
+                            value={selectedBackupFileId}
+                            onChange={(event) =>
+                              setSelectedBackupFileIdByAppId((prev) => ({
+                                ...prev,
+                                [app.id]: event.target.value
+                              }))
+                            }
+                            className="w-full bg-transparent text-xs text-zinc-100 outline-none"
+                          >
+                            <option value="">Seleccionar backup</option>
+                            {appBackups.map((backup) => (
+                              <option key={`${app.id}:backup:${backup.id}`} value={backup.driveFileId}>
+                                {backup.name} · {backup.sizeBytes !== null ? formatBytes(backup.sizeBytes) : 'n/a'} ·{' '}
+                                {formatDateTime(backup.createdAt)}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
                         <button
                           type="button"
                           onClick={() => {
-                            void removeDriveFile(file.id);
+                            void restoreBackupForApp(app.id);
                           }}
-                          className="text-xs px-2 py-1 rounded border border-red-500/40 bg-red-500/10 text-red-200"
+                          disabled={!backupAccountId || !selectedBackupFileId || restoringBackupAppId === app.id}
+                          className={`text-xs px-2.5 py-1.5 rounded-lg border ${
+                            backupAccountId && selectedBackupFileId
+                              ? 'border-red-500/40 bg-red-500/10 text-red-200'
+                              : 'border-zinc-700 text-zinc-500'
+                          } disabled:opacity-50`}
                         >
-                          Borrar
+                          <span className="inline-flex items-center gap-1">
+                            <Download size={12} />
+                            {restoringBackupAppId === app.id ? 'Restaurando...' : 'Restaurar backup'}
+                          </span>
                         </button>
-                      </div>
-                    </div>
-                  ))}
+                        {backupJob ? (
+                          <article className="rounded border border-zinc-800 bg-black/30 p-2">
+                            <p className="text-[10px] uppercase text-zinc-500">
+                              job {backupJob.type} · {backupJob.status}
+                            </p>
+                            <p className="text-xs text-zinc-300 mt-1 whitespace-pre-wrap break-all">
+                              {backupJob.log || backupJob.error || '-'}
+                            </p>
+                          </article>
+                        ) : null}
+                      </article>
+                    );
+                  })}
                 </div>
-              </div>
-            </article>
+              </article>
+            ) : null}
+
+            {storagePanelView === 'cleanup' ? (
+              <article className="rounded-xl border border-zinc-800 bg-black/40 p-3 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs text-zinc-300 uppercase">Limpieza residual asistida por IA</p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void runResidualAnalysis();
+                      }}
+                      disabled={residualLoading || residualJobRunning}
+                      className="text-xs px-2.5 py-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 disabled:opacity-50"
+                    >
+                      {residualLoading || residualJobRunning
+                        ? 'Analizando...'
+                        : 'Analizar residuales con IA'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void deleteSelectedResidualCandidates();
+                      }}
+                      disabled={residualDeleting || Object.keys(residualSelectedPaths).length === 0}
+                      className={`text-xs px-2.5 py-1.5 rounded-lg border ${
+                        Object.keys(residualSelectedPaths).length > 0
+                          ? 'border-red-500/40 bg-red-500/10 text-red-200'
+                          : 'border-zinc-700 text-zinc-500'
+                      } disabled:opacity-50`}
+                    >
+                      {residualDeleting ? 'Borrando...' : `Borrar seleccionados (${Object.keys(residualSelectedPaths).length})`}
+                    </button>
+                  </div>
+                </div>
+                <p className="text-[11px] text-zinc-500">
+                  Rutas permitidas: {(residualData?.roots || []).join(', ') || 'sin datos aún'}.
+                </p>
+                {residualError ? <p className="text-xs text-red-300">{residualError}</p> : null}
+                {residualNotice ? <p className="text-xs text-emerald-300">{residualNotice}</p> : null}
+                {residualLatestSummary ? (
+                  <article className="rounded border border-emerald-500/20 bg-emerald-500/5 px-2.5 py-2">
+                    <p className="text-[10px] uppercase text-emerald-300/90">Resumen última limpieza</p>
+                    <p className="mt-1 text-xs text-emerald-100 whitespace-pre-wrap break-words">{residualLatestSummary}</p>
+                  </article>
+                ) : null}
+                {residualJobRunning ? (
+                  <article className="rounded border border-cyan-500/20 bg-cyan-500/5 p-2">
+                    <div className="flex items-center justify-between gap-2 text-xs text-cyan-100">
+                      <span className="inline-flex items-center gap-2">
+                        <span className="h-3 w-3 rounded-full border-2 border-cyan-300 border-t-transparent animate-spin" />
+                        {residualJobStage || 'Analizando residuos'}
+                      </span>
+                      <span>
+                        {residualJobPercent !== null ? `${residualJobPercent}%` : '--'}
+                        {residualJobEtaSeconds !== null && residualJobEtaSeconds > 0
+                          ? ` · quedan ~${formatEtaSeconds(residualJobEtaSeconds)}`
+                          : ''}
+                      </span>
+                    </div>
+                    <div className="mt-2 h-1.5 w-full rounded-full bg-zinc-900 overflow-hidden">
+                      <div
+                        className="h-full rounded-full bg-cyan-400 transition-[width] duration-300 ease-out"
+                        style={{ width: `${residualJobPercent !== null ? residualJobPercent : 8}%` }}
+                      />
+                    </div>
+                  </article>
+                ) : null}
+                {residualData ? (
+                  <p className="text-[11px] text-zinc-500">
+                    IA {residualData.ai.used ? 'activa' : 'fallback heurístico'}
+                    {residualData.ai.fallbackReason ? ` · ${residualData.ai.fallbackReason}` : ''}
+                  </p>
+                ) : null}
+                {residualData && residualData.candidates.length === 0 ? (
+                  <p className="text-xs text-zinc-500">No se detectaron candidatos residuales en este análisis.</p>
+                ) : null}
+                <article className="rounded border border-zinc-800 bg-zinc-950/60 p-2 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[10px] uppercase text-zinc-400">Historial de limpiezas</p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void loadResidualHistory();
+                      }}
+                      className="text-[10px] px-2 py-1 rounded border border-zinc-700 text-zinc-300 hover:text-zinc-100"
+                    >
+                      Refrescar
+                    </button>
+                  </div>
+                  {residualHistoryLoading ? (
+                    <p className="text-[11px] text-zinc-500">Cargando historial...</p>
+                  ) : residualHistory.length === 0 ? (
+                    <p className="text-[11px] text-zinc-500">Aún no hay limpiezas registradas.</p>
+                  ) : (
+                    <div className="space-y-1.5 max-h-40 overflow-auto pr-1">
+                      {residualHistory.map((item) => (
+                        <article
+                          key={item.id}
+                          className={`rounded border px-2 py-1.5 ${
+                            item.status === 'error'
+                              ? 'border-red-500/30 bg-red-500/5'
+                              : item.kind === 'delete'
+                                ? 'border-amber-500/30 bg-amber-500/5'
+                                : 'border-zinc-700 bg-black/40'
+                          }`}
+                        >
+                          <p className="text-[11px] text-zinc-200">{item.summary}</p>
+                          <p className="text-[10px] text-zinc-500">{formatDateTime(item.createdAt)}</p>
+                          {item.details ? (
+                            <p className="mt-0.5 text-[10px] text-zinc-400 whitespace-pre-wrap break-words">{item.details}</p>
+                          ) : null}
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                </article>
+                <div className="max-h-[30rem] overflow-auto space-y-1">
+                  {(residualData?.candidates || []).map((candidate) => {
+                    const checked = Boolean(residualSelectedPaths[candidate.path]);
+                    return (
+                      <label
+                        key={`residual:${candidate.path}`}
+                        className={`flex items-start gap-2 rounded border p-2 cursor-pointer ${
+                          checked ? 'border-red-500/40 bg-red-500/5' : 'border-zinc-800 bg-zinc-950/70'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() =>
+                            setResidualSelectedPaths((prev) => {
+                              const next = { ...prev };
+                              if (next[candidate.path]) {
+                                delete next[candidate.path];
+                              } else {
+                                next[candidate.path] = true;
+                              }
+                              return next;
+                            })
+                          }
+                          className="mt-0.5 h-4 w-4 accent-red-400"
+                        />
+                        <div className="min-w-0">
+                          <p className="text-xs text-zinc-100 break-all">{candidate.path}</p>
+                          <p className="text-[10px] text-zinc-500">
+                            {candidate.type} · {formatBytes(candidate.sizeBytes)} · {formatDateTime(candidate.modifiedAt)} · conf {candidate.confidence} · riesgo {candidate.risk}
+                          </p>
+                          <p className="text-[10px] text-zinc-400 break-all">{candidate.reason}</p>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              </article>
+            ) : null}
           </section>
         ) : null}
 
@@ -3262,13 +4276,6 @@ export default function TerminalLogScreen({
                   describingDeployedAppId === app.id ||
                   app.descriptionJobStatus === 'pending' ||
                   app.descriptionJobStatus === 'running';
-                const backupAccountId =
-                  String(backupAccountByAppId[app.id] || '').trim() ||
-                  String(activeDriveAccountId || '').trim() ||
-                  String(driveAccounts[0]?.id || '').trim();
-                const appBackups = backupsByAppId[app.id] || [];
-                const selectedBackupFileId = String(selectedBackupFileIdByAppId[app.id] || '').trim();
-                const backupJob = restoreJobByAppId[app.id];
                 const cardClass = isFailing
                   ? 'rounded-xl border border-red-500/40 bg-red-500/5 p-3'
                   : 'rounded-xl border border-zinc-800 bg-black/40 p-3';
@@ -3441,111 +4448,6 @@ export default function TerminalLogScreen({
                           ) : null}
                         </div>
 
-                        <article className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5 space-y-2">
-                          <p className="text-[11px] uppercase text-zinc-500">backup nube / restauracion</p>
-                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                            <label className="rounded-lg border border-zinc-800 bg-black/30 px-2.5 py-2 text-xs text-zinc-300">
-                              <span className="block text-[10px] uppercase text-zinc-500 mb-1">Cuenta Dropbox</span>
-                              <select
-                                value={backupAccountId}
-                                onChange={(event) =>
-                                  setBackupAccountByAppId((prev) => ({
-                                    ...prev,
-                                    [app.id]: event.target.value
-                                  }))
-                                }
-                                className="w-full bg-transparent text-xs text-zinc-100 outline-none"
-                              >
-                                <option value="">Seleccionar</option>
-                                {driveAccounts.map((account) => (
-                                  <option key={`${app.id}:acc:${account.id}`} value={account.id}>
-                                    {account.alias} ({account.status})
-                                  </option>
-                                ))}
-                              </select>
-                            </label>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                void loadBackupsForApp(app.id, backupAccountId);
-                              }}
-                              disabled={!backupAccountId || loadingBackupsAppId === app.id}
-                              className={`text-xs px-2.5 py-2 rounded-lg border ${
-                                backupAccountId
-                                  ? 'border-zinc-700 text-zinc-200'
-                                  : 'border-zinc-700 text-zinc-500'
-                              } disabled:opacity-50`}
-                            >
-                              {loadingBackupsAppId === app.id ? 'Cargando backups...' : 'Listar backups'}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                void createBackupForApp(app.id);
-                              }}
-                              disabled={!backupAccountId || creatingBackupAppId === app.id}
-                              className={`text-xs px-2.5 py-2 rounded-lg border ${
-                                backupAccountId
-                                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
-                                  : 'border-zinc-700 text-zinc-500'
-                              } disabled:opacity-50`}
-                            >
-                              {creatingBackupAppId === app.id ? 'Creando backup...' : 'Crear backup en nube'}
-                            </button>
-                          </div>
-
-                          <label className="rounded-lg border border-zinc-800 bg-black/30 px-2.5 py-2 text-xs text-zinc-300 block">
-                            <span className="block text-[10px] uppercase text-zinc-500 mb-1">Backup disponible</span>
-                            <select
-                              value={selectedBackupFileId}
-                              onChange={(event) =>
-                                setSelectedBackupFileIdByAppId((prev) => ({
-                                  ...prev,
-                                  [app.id]: event.target.value
-                                }))
-                              }
-                              className="w-full bg-transparent text-xs text-zinc-100 outline-none"
-                            >
-                              <option value="">Seleccionar backup</option>
-                              {appBackups.map((backup) => (
-                                <option key={`${app.id}:backup:${backup.id}`} value={backup.driveFileId}>
-                                  {backup.name} · {backup.sizeBytes !== null ? formatBytes(backup.sizeBytes) : 'n/a'} ·{' '}
-                                  {formatDateTime(backup.createdAt)} · {backup.accountAlias || backup.accountId}
-                                </option>
-                              ))}
-                            </select>
-                          </label>
-
-                          <button
-                            type="button"
-                            onClick={() => {
-                              void restoreBackupForApp(app.id);
-                            }}
-                            disabled={!backupAccountId || !selectedBackupFileId || restoringBackupAppId === app.id}
-                            className={`text-xs px-2.5 py-1.5 rounded-lg border ${
-                              backupAccountId && selectedBackupFileId
-                                ? 'border-red-500/40 bg-red-500/10 text-red-200'
-                                : 'border-zinc-700 text-zinc-500'
-                            } disabled:opacity-50`}
-                          >
-                            <span className="inline-flex items-center gap-1">
-                              <Download size={12} />
-                              {restoringBackupAppId === app.id ? 'Restaurando...' : 'Restaurar desde backup'}
-                            </span>
-                          </button>
-
-                          {backupJob ? (
-                            <article className="rounded border border-zinc-800 bg-black/30 p-2">
-                              <p className="text-[10px] uppercase text-zinc-500">
-                                job {backupJob.type} · {backupJob.status}
-                              </p>
-                              <p className="text-xs text-zinc-300 mt-1 whitespace-pre-wrap break-all">
-                                {backupJob.log || backupJob.error || '-'}
-                              </p>
-                            </article>
-                          ) : null}
-                        </article>
-
                         {logsState?.visible ? (
                           <article className="rounded-lg border border-zinc-800 bg-zinc-950/70 p-2.5 space-y-2">
                             <p className="text-[11px] uppercase text-zinc-500">
@@ -3605,6 +4507,24 @@ export default function TerminalLogScreen({
                     </p>
                   </article>
                 </div>
+
+                {observability.system.disk ? (
+                  <article className="rounded-xl border border-zinc-800 bg-black/40 p-3">
+                    <p className="text-[11px] uppercase text-zinc-500">espacio en disco</p>
+                    <p className="text-sm text-zinc-100 mt-1">
+                      libre {formatBytes(Number(observability.system.disk.availableBytes || 0))}
+                    </p>
+                    <p className="text-[10px] text-zinc-600 mt-1">
+                      total {formatBytes(Number(observability.system.disk.totalBytes || 0))} · usado{' '}
+                      {formatBytes(Number(observability.system.disk.usedBytes || 0))} ({formatPercent(
+                        Number(observability.system.disk.usedPercent || 0)
+                      )})
+                    </p>
+                    <p className="text-[10px] text-zinc-600 mt-1">
+                      mount {observability.system.disk.mountPoint} · ruta {observability.system.disk.path}
+                    </p>
+                  </article>
+                ) : null}
 
                 <article className="rounded-xl border border-zinc-800 bg-black/40 p-3">
                   <p className="text-[11px] uppercase text-zinc-500">latencia api</p>

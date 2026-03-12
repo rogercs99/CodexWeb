@@ -5,6 +5,8 @@ import type {
   AiAgentSettingsItem,
   AiAgentSettingsPayload,
   AttachmentItem,
+  ChatProject,
+  ChatProjectRef,
   CodexBackgroundRun,
   CodexAuthStatus,
   ChatOptions,
@@ -14,6 +16,7 @@ import type {
   MessagesPagination,
   MessageAttachment,
   Message,
+  ConversationProjectContext,
   ToolsDeployedAppActionResponse,
   ToolsDeployedAppDescribeJob,
   ToolsDeployedAppDescribeResponse,
@@ -32,6 +35,8 @@ import type {
   ToolsStorageJob,
   ToolsStorageLocalListPayload,
   ToolsStorageOverview,
+  ToolsStorageResidualAnalysis,
+  ToolsStorageResidualCandidate,
   RestartState,
   TaskRecovery,
   TaskRunDashboardItem,
@@ -50,6 +55,22 @@ async function parseJsonSafe(response: Response): Promise<any> {
   } catch (_error) {
     return {};
   }
+}
+
+function parseContentDispositionFileName(rawValue: string): string {
+  const value = String(rawValue || '').trim();
+  if (!value) return '';
+  const utf8Match = value.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+  if (utf8Match && utf8Match[1]) {
+    try {
+      return decodeURIComponent(String(utf8Match[1]).trim().replace(/^"|"$/g, ''));
+    } catch (_error) {
+      // ignore malformed filename*
+    }
+  }
+  const basicMatch = value.match(/filename\s*=\s*"([^"]+)"/i) || value.match(/filename\s*=\s*([^;]+)/i);
+  if (!basicMatch || !basicMatch[1]) return '';
+  return String(basicMatch[1]).trim().replace(/^"|"$/g, '');
 }
 
 export async function api<T = any>(url: string, init?: RequestInit): Promise<T> {
@@ -82,8 +103,21 @@ function normalizeAiProviderQuota(rawValue: any): AiProviderQuota {
 }
 
 function normalizeAiProviderPermissionProfile(rawValue: any): AiProviderPermissionProfile {
+  const accessModeRaw = String(rawValue?.accessMode || '').trim().toLowerCase();
+  const normalizedAccessMode =
+    accessModeRaw === 'full_access' ||
+    accessModeRaw === 'workspace_only' ||
+    accessModeRaw === 'restricted_paths' ||
+    accessModeRaw === 'read_only'
+      ? (accessModeRaw as AiProviderPermissionProfile['accessMode'])
+      : Boolean(rawValue?.readOnly)
+        ? 'read_only'
+        : Boolean(rawValue?.allowRoot) && Array.isArray(rawValue?.allowedPaths) && rawValue.allowedPaths.includes('/')
+          ? 'full_access'
+          : 'restricted_paths';
   return {
     agentId: String(rawValue?.agentId || ''),
+    accessMode: normalizedAccessMode,
     allowRoot: Boolean(rawValue?.allowRoot),
     runAsUser: String(rawValue?.runAsUser || ''),
     allowedPaths: Array.isArray(rawValue?.allowedPaths)
@@ -92,6 +126,9 @@ function normalizeAiProviderPermissionProfile(rawValue: any): AiProviderPermissi
     deniedPaths: Array.isArray(rawValue?.deniedPaths)
       ? rawValue.deniedPaths.map((entry: any) => String(entry || '')).filter(Boolean)
       : [],
+    canWriteFiles: Boolean(
+      rawValue?.canWriteFiles ?? (rawValue?.readOnly ? false : true)
+    ),
     readOnly: Boolean(rawValue?.readOnly),
     allowShell: Boolean(rawValue?.allowShell),
     allowSensitiveTools: Boolean(rawValue?.allowSensitiveTools),
@@ -100,7 +137,7 @@ function normalizeAiProviderPermissionProfile(rawValue: any): AiProviderPermissi
     allowBackupRestore: Boolean(rawValue?.allowBackupRestore),
     allowedTools: Array.isArray(rawValue?.allowedTools)
       ? rawValue.allowedTools.map((entry: any) => String(entry || '').trim().toLowerCase()).filter(Boolean)
-      : ['chat', 'git', 'storage', 'dropbox', 'backups', 'deployments', 'shell'],
+      : ['chat', 'git', 'storage', 'drive', 'backups', 'deployments', 'shell'],
     updatedAt: String(rawValue?.updatedAt || '')
   };
 }
@@ -153,6 +190,46 @@ function normalizeAiProviderInfo(rawValue: any): AiProviderInfo {
   };
 }
 
+function normalizeProjectContextMode(rawValue: any): 'manual' | 'automatic' | 'mixed' {
+  const value = String(rawValue || '').trim().toLowerCase();
+  if (value === 'manual' || value === 'automatic') return value;
+  return 'mixed';
+}
+
+function normalizeChatProjectRef(rawValue: any): ChatProjectRef | null {
+  const id = Number(rawValue?.id);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  return {
+    id,
+    name: String(rawValue?.name || '').trim() || `Proyecto ${id}`,
+    contextMode: normalizeProjectContextMode(rawValue?.contextMode),
+    autoContextEnabled: Boolean(rawValue?.autoContextEnabled)
+  };
+}
+
+function normalizeChatProject(rawValue: any): ChatProject | null {
+  const base = normalizeChatProjectRef(rawValue);
+  if (!base) return null;
+  return {
+    ...base,
+    manualContext: String(rawValue?.manualContext || ''),
+    autoContext: String(rawValue?.autoContext || ''),
+    manualContextPreview: String(rawValue?.manualContextPreview || ''),
+    autoContextPreview: String(rawValue?.autoContextPreview || ''),
+    autoUpdatedAt: String(rawValue?.autoUpdatedAt || ''),
+    createdAt: String(rawValue?.createdAt || ''),
+    updatedAt: String(rawValue?.updatedAt || ''),
+    autoLastMessageId: Number.isInteger(Number(rawValue?.autoLastMessageId))
+      ? Number(rawValue.autoLastMessageId)
+      : 0,
+    autoMeta: rawValue?.autoMeta && typeof rawValue.autoMeta === 'object' ? rawValue.autoMeta : {},
+    stats: {
+      chatCount: Math.max(0, Number(rawValue?.stats?.chatCount) || 0),
+      lastMessageAt: String(rawValue?.stats?.lastMessageAt || '')
+    }
+  };
+}
+
 export async function getMe(): Promise<{ authenticated: boolean; user: User | null }> {
   return api('/api/me');
 }
@@ -170,8 +247,29 @@ export async function logout(): Promise<void> {
 }
 
 export async function listConversations(): Promise<Conversation[]> {
-  const data = await api<{ conversations: Conversation[] }>('/api/conversations');
-  return Array.isArray(data.conversations) ? data.conversations : [];
+  const data = await api<{ conversations: any[] }>('/api/conversations');
+  return Array.isArray(data.conversations)
+    ? data.conversations.map((entry: any) => {
+        const project = normalizeChatProjectRef(entry?.project);
+        return {
+          id: Number(entry?.id) || 0,
+          projectId:
+            Number.isInteger(Number(entry?.projectId)) && Number(entry?.projectId) > 0
+              ? Number(entry.projectId)
+              : project
+                ? project.id
+                : null,
+          project,
+          title: String(entry?.title || ''),
+          model: String(entry?.model || ''),
+          reasoningEffort: String(entry?.reasoningEffort || ''),
+          created_at: String(entry?.created_at || ''),
+          last_message_at: String(entry?.last_message_at || ''),
+          liveDraftOpen: Boolean(entry?.liveDraftOpen),
+          liveDraftUpdatedAt: String(entry?.liveDraftUpdatedAt || '')
+        } as Conversation;
+      })
+    : [];
 }
 
 export async function deleteConversation(conversationId: number): Promise<void> {
@@ -193,6 +291,101 @@ export async function updateConversationTitle(
   return data.conversation;
 }
 
+export async function listProjects(): Promise<{ projects: ChatProject[]; unassignedCount: number }> {
+  const data = await api<{ projects?: any[]; unassignedCount?: number }>('/api/projects');
+  return {
+    projects: Array.isArray(data?.projects)
+      ? data.projects
+          .map((entry: any) => normalizeChatProject(entry))
+          .filter((entry): entry is ChatProject => Boolean(entry))
+      : [],
+    unassignedCount: Math.max(0, Number(data?.unassignedCount) || 0)
+  };
+}
+
+export async function createProject(payload: {
+  name: string;
+  contextMode: 'manual' | 'automatic' | 'mixed';
+  autoContextEnabled?: boolean;
+  manualContext?: string;
+}): Promise<ChatProject> {
+  const data = await api<{ project: any }>('/api/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const project = normalizeChatProject(data?.project);
+  if (!project) {
+    throw new Error('Proyecto inválido en respuesta');
+  }
+  return project;
+}
+
+export async function updateProject(
+  projectId: number,
+  payload: {
+    name?: string;
+    contextMode?: 'manual' | 'automatic' | 'mixed';
+    autoContextEnabled?: boolean;
+    manualContext?: string;
+  }
+): Promise<ChatProject> {
+  const data = await api<{ project: any }>(`/api/projects/${projectId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const project = normalizeChatProject(data?.project);
+  if (!project) {
+    throw new Error('Proyecto inválido en respuesta');
+  }
+  return project;
+}
+
+export async function deleteProject(projectId: number): Promise<{ projectId: number; detachedChats: number }> {
+  const data = await api<{ deleted?: { projectId: number; detachedChats: number } }>(`/api/projects/${projectId}`, {
+    method: 'DELETE'
+  });
+  return {
+    projectId: Number(data?.deleted?.projectId) || projectId,
+    detachedChats: Math.max(0, Number(data?.deleted?.detachedChats) || 0)
+  };
+}
+
+export async function regenerateProjectContext(projectId: number): Promise<{ project: ChatProject; jobId: string }> {
+  const data = await api<{ project: any; job?: { id?: string } | null }>(`/api/projects/${projectId}/regenerate-context`, {
+    method: 'POST'
+  });
+  const project = normalizeChatProject(data?.project);
+  if (!project) {
+    throw new Error('Proyecto inválido en respuesta');
+  }
+  return {
+    project,
+    jobId: String(data?.job?.id || '')
+  };
+}
+
+export async function moveConversationToProject(
+  conversationId: number,
+  projectId: number | null
+): Promise<{ id: number; projectId: number | null; project: ChatProjectRef | null }> {
+  const data = await api<{ conversation?: any }>(`/api/conversations/${conversationId}/project`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ projectId })
+  });
+  const project = normalizeChatProjectRef(data?.conversation?.project);
+  return {
+    id: Number(data?.conversation?.id) || conversationId,
+    projectId:
+      Number.isInteger(Number(data?.conversation?.projectId)) && Number(data?.conversation?.projectId) > 0
+        ? Number(data?.conversation?.projectId)
+        : null,
+    project
+  };
+}
+
 export async function killConversationSession(
   conversationId: number
 ): Promise<{ ok: true; killed: boolean; reason?: string }> {
@@ -206,7 +399,15 @@ interface ListMessagesOptions {
 }
 
 export async function listMessages(conversationId: number, options?: ListMessagesOptions): Promise<{
-  conversation: { id: number; title: string; model: string; reasoningEffort: string };
+  conversation: {
+    id: number;
+    title: string;
+    model: string;
+    reasoningEffort: string;
+    projectId: number | null;
+    project: ChatProjectRef | null;
+  };
+  projectContext: ConversationProjectContext | null;
   messages: Message[];
   pagination: MessagesPagination;
   liveDraft?: any;
@@ -227,7 +428,15 @@ export async function listMessages(conversationId: number, options?: ListMessage
   const querySuffix = queryParams.toString() ? `?${queryParams.toString()}` : '';
 
   const data = await api<{
-    conversation: { id: number; title: string; model: string; reasoningEffort: string };
+    conversation: {
+      id: number;
+      title: string;
+      model: string;
+      reasoningEffort: string;
+      projectId?: number | null;
+      project?: any;
+    };
+    projectContext?: any;
     messages: Message[];
     pagination?: Partial<MessagesPagination> | null;
     liveDraft?: any;
@@ -250,8 +459,43 @@ export async function listMessages(conversationId: number, options?: ListMessage
       : null
   };
 
+  const projectRef = normalizeChatProjectRef(data?.conversation?.project);
+  const projectContextRaw = data?.projectContext;
+  const projectContext: ConversationProjectContext | null =
+    projectContextRaw && typeof projectContextRaw === 'object'
+      ? {
+          projectId: Number(projectContextRaw.projectId) || 0,
+          projectName: String(projectContextRaw.projectName || ''),
+          mode: normalizeProjectContextMode(projectContextRaw.mode),
+          autoEnabled: Boolean(projectContextRaw.autoEnabled),
+          manualContext: String(projectContextRaw.manualContext || ''),
+          autoContext: String(projectContextRaw.autoContext || ''),
+          effectiveContext: String(projectContextRaw.effectiveContext || ''),
+          manualUsed: Boolean(projectContextRaw.manualUsed),
+          autoUsed: Boolean(projectContextRaw.autoUsed),
+          autoUpdatedAt: String(projectContextRaw.autoUpdatedAt || ''),
+          autoMeta:
+            projectContextRaw.autoMeta && typeof projectContextRaw.autoMeta === 'object'
+              ? projectContextRaw.autoMeta
+              : {}
+        }
+      : null;
+
   return {
-    conversation: data.conversation,
+    conversation: {
+      id: Number(data?.conversation?.id) || conversationId,
+      title: String(data?.conversation?.title || ''),
+      model: String(data?.conversation?.model || ''),
+      reasoningEffort: String(data?.conversation?.reasoningEffort || ''),
+      projectId:
+        Number.isInteger(Number(data?.conversation?.projectId)) && Number(data?.conversation?.projectId) > 0
+          ? Number(data?.conversation?.projectId)
+          : projectRef
+            ? projectRef.id
+            : null,
+      project: projectRef
+    },
+    projectContext,
     messages: Array.isArray(data.messages)
       ? data.messages.map((entry: any) => {
           const attachments: MessageAttachment[] = Array.isArray(entry?.attachments)
@@ -639,12 +883,15 @@ function normalizeToolsStorageJob(rawValue: any): ToolsStorageJob {
   return {
     id: String(rawValue?.id || ''),
     type:
+      rawValue?.type === 'cleanup_residual_analyze' ||
       rawValue?.type === 'drive_upload_files' ||
-      rawValue?.type === 'dropbox_upload_files' ||
       rawValue?.type === 'deployed_backup_create' ||
-      rawValue?.type === 'deployed_backup_restore'
+      rawValue?.type === 'deployed_backup_restore' ||
+      rawValue?.type === 'git_merge_branches' ||
+      rawValue?.type === 'local_delete_paths' ||
+      rawValue?.type === 'project_context_refresh'
         ? rawValue.type
-        : 'dropbox_upload_files',
+      : 'drive_upload_files',
     status:
       rawValue?.status === 'running' ||
       rawValue?.status === 'completed' ||
@@ -667,23 +914,34 @@ function normalizeToolsDriveAccount(rawValue: any): ToolsDriveAccount {
   return {
     id: String(rawValue?.id || ''),
     alias: String(rawValue?.alias || ''),
-    authMode: rawValue?.authMode === 'oauth_app' ? 'oauth_app' : 'token',
+    authMode: 'rclone',
     rootFolderId: String(rawValue?.rootFolderId || 'root'),
     status:
       rawValue?.status === 'active' ||
-      rawValue?.status === 'needs_oauth' ||
       rawValue?.status === 'error'
         ? rawValue.status
         : 'pending',
     lastError: String(rawValue?.lastError || ''),
     details: {
-      credentialType: String(rawValue?.details?.credentialType || ''),
-      projectId: String(rawValue?.details?.projectId || ''),
-      clientEmail: String(rawValue?.details?.clientEmail || ''),
-      clientId: String(rawValue?.details?.clientId || ''),
-      redirectUris: Array.isArray(rawValue?.details?.redirectUris)
-        ? rawValue.details.redirectUris.map((entry: any) => String(entry || '')).filter(Boolean)
-        : []
+      remoteName: String(rawValue?.details?.remoteName || ''),
+      configPath: String(rawValue?.details?.configPath || ''),
+      rootPath: String(rawValue?.details?.rootPath || ''),
+      provider: String(rawValue?.details?.provider || 'rclone'),
+      connectionState:
+        rawValue?.details?.connectionState === 'active' ||
+        rawValue?.details?.connectionState === 'invalid' ||
+        rawValue?.details?.connectionState === 'pending'
+          ? rawValue.details.connectionState
+          : 'unknown',
+      validatedAt: String(rawValue?.details?.validatedAt || ''),
+      about: {
+        limit: Number.isFinite(Number(rawValue?.details?.about?.limit)) ? Number(rawValue.details.about.limit) : null,
+        usage: Number.isFinite(Number(rawValue?.details?.about?.usage)) ? Number(rawValue.details.about.usage) : null,
+        usageInDrive: Number.isFinite(Number(rawValue?.details?.about?.usageInDrive))
+          ? Number(rawValue.details.about.usageInDrive)
+          : null,
+        free: Number.isFinite(Number(rawValue?.details?.about?.free)) ? Number(rawValue.details.about.free) : null
+      }
     },
     createdAt: String(rawValue?.createdAt || ''),
     updatedAt: String(rawValue?.updatedAt || '')
@@ -780,6 +1038,20 @@ export async function compressToolsStoragePaths(payload: {
   });
 }
 
+export async function deleteToolsStorageLocalPaths(payload: {
+  paths: string[];
+  confirmText: string;
+}): Promise<{ job: ToolsStorageJob }> {
+  const data = await api<{ job: ToolsStorageJob }>('/api/tools/storage/local/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  return {
+    job: normalizeToolsStorageJob(data?.job)
+  };
+}
+
 export async function getToolsStorageOverview(
   accountId = '',
   pathValue = ''
@@ -824,17 +1096,179 @@ export async function getToolsStorageJob(jobId: string): Promise<ToolsStorageJob
   return normalizeToolsStorageJob(data?.job);
 }
 
+export async function getToolsDriveRcloneStatus(configPath = ''): Promise<{
+  binary: string;
+  configPath: string;
+  configExists: boolean;
+  remotes: string[];
+  defaultRemote: string;
+  defaultRootPath: string;
+}> {
+  const params = new URLSearchParams();
+  if (configPath) params.set('configPath', String(configPath));
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const data = await api<{
+    rclone: {
+      binary: string;
+      configPath: string;
+      configExists: boolean;
+      remotes: string[];
+      defaultRemote: string;
+      defaultRootPath: string;
+    };
+  }>(`/api/tools/storage/drive/rclone/status${suffix}`);
+  return {
+    binary: String(data?.rclone?.binary || 'rclone'),
+    configPath: String(data?.rclone?.configPath || ''),
+    configExists: Boolean(data?.rclone?.configExists),
+    remotes: Array.isArray(data?.rclone?.remotes)
+      ? data.rclone.remotes.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+      : [],
+    defaultRemote: String(data?.rclone?.defaultRemote || ''),
+    defaultRootPath: String(data?.rclone?.defaultRootPath || '')
+  };
+}
+
+export async function createToolsDriveRcloneRemote(payload: {
+  remoteName: string;
+  configPath?: string;
+  scope?: string;
+  authMode?: 'none' | 'service_account' | 'oauth_token';
+  clientId?: string;
+  clientSecret?: string;
+  tokenJson?: string;
+  serviceAccountJson?: string;
+  rootFolderId?: string;
+  teamDrive?: string;
+}): Promise<{
+  remote: {
+    remoteName: string;
+    configPath: string;
+    authMode: string;
+    scope: string;
+    rootFolderId: string;
+    teamDrive: string;
+    remotes: string[];
+  };
+}> {
+  const data = await api<{
+    remote: {
+      remoteName: string;
+      configPath: string;
+      authMode: string;
+      scope: string;
+      rootFolderId: string;
+      teamDrive: string;
+      remotes: string[];
+    };
+  }>('/api/tools/storage/drive/rclone/remotes', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  return {
+    remote: {
+      remoteName: String(data?.remote?.remoteName || ''),
+      configPath: String(data?.remote?.configPath || ''),
+      authMode: String(data?.remote?.authMode || 'none'),
+      scope: String(data?.remote?.scope || 'drive'),
+      rootFolderId: String(data?.remote?.rootFolderId || ''),
+      teamDrive: String(data?.remote?.teamDrive || ''),
+      remotes: Array.isArray(data?.remote?.remotes)
+        ? data.remote.remotes.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+        : []
+    }
+  };
+}
+
+export async function deleteToolsDriveRcloneRemote(remoteName: string, configPath = ''): Promise<{
+  deleted: boolean;
+  remoteName: string;
+  rclone: {
+    binary: string;
+    configPath: string;
+    configExists: boolean;
+    remotes: string[];
+    defaultRemote: string;
+    defaultRootPath: string;
+  };
+}> {
+  const params = new URLSearchParams();
+  if (configPath) params.set('configPath', configPath);
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const data = await api<{
+    deleted: boolean;
+    remoteName: string;
+    rclone: {
+      binary: string;
+      configPath: string;
+      configExists: boolean;
+      remotes: string[];
+      defaultRemote: string;
+      defaultRootPath: string;
+    };
+  }>(`/api/tools/storage/drive/rclone/remotes/${encodeURIComponent(String(remoteName || '').trim())}${suffix}`, {
+    method: 'DELETE'
+  });
+  return {
+    deleted: Boolean(data?.deleted),
+    remoteName: String(data?.remoteName || ''),
+    rclone: {
+      binary: String(data?.rclone?.binary || ''),
+      configPath: String(data?.rclone?.configPath || ''),
+      configExists: Boolean(data?.rclone?.configExists),
+      remotes: Array.isArray(data?.rclone?.remotes)
+        ? data.rclone.remotes.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+        : [],
+      defaultRemote: String(data?.rclone?.defaultRemote || ''),
+      defaultRootPath: String(data?.rclone?.defaultRootPath || '')
+    }
+  };
+}
+
+export async function validateToolsDriveRcloneRemote(remoteName: string, configPath = ''): Promise<{
+  remoteName: string;
+  configPath: string;
+  about: Record<string, any>;
+}> {
+  const params = new URLSearchParams();
+  if (configPath) params.set('configPath', configPath);
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const data = await api<{
+    validation: {
+      remoteName: string;
+      configPath: string;
+      about: Record<string, any>;
+    };
+  }>(
+    `/api/tools/storage/drive/rclone/remotes/${encodeURIComponent(String(remoteName || '').trim())}/validate${suffix}`,
+    {
+      method: 'POST'
+    }
+  );
+  return {
+    remoteName: String(data?.validation?.remoteName || ''),
+    configPath: String(data?.validation?.configPath || ''),
+    about:
+      data?.validation?.about && typeof data.validation.about === 'object'
+        ? data.validation.about
+        : {}
+  };
+}
+
 export async function listToolsDriveAccounts(): Promise<ToolsDriveAccount[]> {
-  const data = await api<{ accounts: ToolsDriveAccount[] }>('/api/tools/storage/dropbox/accounts');
+  const data = await api<{ accounts: ToolsDriveAccount[] }>('/api/tools/storage/drive/accounts');
   return Array.isArray(data?.accounts) ? data.accounts.map((row: any) => normalizeToolsDriveAccount(row)) : [];
 }
 
 export async function createToolsDriveAccount(payload: {
   alias: string;
+  remoteName: string;
+  configPath?: string;
+  rootPath?: string;
   rootFolderId?: string;
-  credentialsJson: Record<string, any> | string;
 }): Promise<ToolsDriveAccount> {
-  const data = await api<{ account: ToolsDriveAccount }>('/api/tools/storage/dropbox/accounts', {
+  const data = await api<{ account: ToolsDriveAccount }>('/api/tools/storage/drive/accounts', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
@@ -850,7 +1284,7 @@ export async function validateToolsDriveAccount(accountId: string): Promise<{
     account: ToolsDriveAccount;
     about: { email: string; displayName: string; quota: { limit: number | null; usage: number | null; usageInDrive: number | null } };
   }>(
-    `/api/tools/storage/dropbox/accounts/${encodeURIComponent(String(accountId || '').trim())}/validate`,
+    `/api/tools/storage/drive/accounts/${encodeURIComponent(String(accountId || '').trim())}/validate`,
     { method: 'POST' }
   );
   return {
@@ -859,51 +1293,8 @@ export async function validateToolsDriveAccount(accountId: string): Promise<{
   };
 }
 
-export async function startToolsDriveOauth(accountId: string, redirectUri = ''): Promise<{
-  account: ToolsDriveAccount;
-  oauth: { authUrl: string; redirectUri: string; instructions: string };
-}> {
-  const data = await api<{
-    account: ToolsDriveAccount;
-    oauth: { authUrl: string; redirectUri: string; instructions: string };
-  }>(
-    `/api/tools/storage/dropbox/accounts/${encodeURIComponent(String(accountId || '').trim())}/oauth/start`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ redirectUri })
-    }
-  );
-  return {
-    account: normalizeToolsDriveAccount(data?.account),
-    oauth: {
-      authUrl: String(data?.oauth?.authUrl || ''),
-      redirectUri: String(data?.oauth?.redirectUri || ''),
-      instructions: String(data?.oauth?.instructions || '')
-    }
-  };
-}
-
-export async function completeToolsDriveOauth(payload: {
-  accountId: string;
-  code: string;
-  redirectUri?: string;
-}): Promise<{ account: ToolsDriveAccount }> {
-  const data = await api<{ account: ToolsDriveAccount }>(
-    `/api/tools/storage/dropbox/accounts/${encodeURIComponent(String(payload.accountId || '').trim())}/oauth/complete`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code: payload.code, redirectUri: payload.redirectUri || '' })
-    }
-  );
-  return {
-    account: normalizeToolsDriveAccount(data?.account)
-  };
-}
-
 export async function deleteToolsDriveAccount(accountId: string): Promise<{ deleted: boolean; accountId: string }> {
-  return api(`/api/tools/storage/dropbox/accounts/${encodeURIComponent(String(accountId || '').trim())}`, {
+  return api(`/api/tools/storage/drive/accounts/${encodeURIComponent(String(accountId || '').trim())}`, {
     method: 'DELETE'
   });
 }
@@ -919,7 +1310,7 @@ export async function listToolsDriveFiles(payload: {
   if (payload.folderId) params.set('folderId', String(payload.folderId));
   if (payload.pageToken) params.set('pageToken', String(payload.pageToken));
   if (payload.query) params.set('query', String(payload.query));
-  const data = await api<ToolsDriveFilesPayload>(`/api/tools/storage/dropbox/files?${params.toString()}`);
+  const data = await api<ToolsDriveFilesPayload>(`/api/tools/storage/drive/files?${params.toString()}`);
   return {
     account: normalizeToolsDriveAccount(data?.account),
     folderId: String(data?.folderId || ''),
@@ -947,7 +1338,7 @@ export async function uploadToolsDriveFiles(payload: {
   paths: string[];
   parentId?: string;
 }): Promise<{ job: ToolsStorageJob }> {
-  const data = await api<{ job: ToolsStorageJob }>('/api/tools/storage/dropbox/upload', {
+  const data = await api<{ job: ToolsStorageJob }>('/api/tools/storage/drive/upload', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
@@ -962,7 +1353,7 @@ export async function deleteToolsDriveFile(payload: {
   fileId: string;
 }): Promise<{ deleted: boolean; fileId: string; account: ToolsDriveAccount }> {
   const data = await api<{ deleted: boolean; fileId: string; account: ToolsDriveAccount }>(
-    `/api/tools/storage/dropbox/files/${encodeURIComponent(String(payload.fileId || '').trim())}?accountId=${encodeURIComponent(String(payload.accountId || '').trim())}&confirm=DELETE`,
+    `/api/tools/storage/drive/files/${encodeURIComponent(String(payload.fileId || '').trim())}?accountId=${encodeURIComponent(String(payload.accountId || '').trim())}&confirm=DELETE`,
     {
       method: 'DELETE'
     }
@@ -971,6 +1362,114 @@ export async function deleteToolsDriveFile(payload: {
     deleted: Boolean(data?.deleted),
     fileId: String(data?.fileId || ''),
     account: normalizeToolsDriveAccount(data?.account)
+  };
+}
+
+export async function downloadToolsDriveFile(payload: {
+  accountId: string;
+  fileId: string;
+}): Promise<{ blob: Blob; fileName: string; mimeType: string }> {
+  const fileId = String(payload.fileId || '').trim();
+  const accountId = String(payload.accountId || '').trim();
+  const response = await fetch(
+    `/api/tools/storage/drive/files/${encodeURIComponent(fileId)}/download?accountId=${encodeURIComponent(accountId)}`,
+    {
+      method: 'GET',
+      credentials: 'include'
+    }
+  );
+  if (!response.ok) {
+    const data = await parseJsonSafe(response);
+    const err = new Error(data?.error || `Request failed (${response.status})`) as ApiError;
+    err.status = response.status;
+    throw err;
+  }
+  const blob = await response.blob();
+  const headerName = parseContentDispositionFileName(String(response.headers.get('content-disposition') || ''));
+  const fallbackName = fileId ? String(fileId).split('/').filter(Boolean).pop() || 'drive-file' : 'drive-file';
+  const fileName = headerName || fallbackName;
+  return {
+    blob,
+    fileName,
+    mimeType: String(blob.type || response.headers.get('content-type') || '').trim() || 'application/octet-stream'
+  };
+}
+
+function normalizeToolsStorageResidualCandidate(rawValue: any): ToolsStorageResidualCandidate {
+  return {
+    id: String(rawValue?.id || rawValue?.path || ''),
+    path: String(rawValue?.path || ''),
+    type: rawValue?.type === 'directory' || rawValue?.type === 'other' ? rawValue.type : 'file',
+    sizeBytes: Number.isFinite(Number(rawValue?.sizeBytes)) ? Number(rawValue.sizeBytes) : 0,
+    modifiedAt: String(rawValue?.modifiedAt || ''),
+    reason: String(rawValue?.reason || ''),
+    confidence:
+      rawValue?.confidence === 'high' || rawValue?.confidence === 'medium' ? rawValue.confidence : 'low',
+    risk: rawValue?.risk === 'high' || rawValue?.risk === 'medium' ? rawValue.risk : 'low',
+    score: Number.isFinite(Number(rawValue?.score)) ? Number(rawValue.score) : 0
+  };
+}
+
+export function normalizeToolsStorageResidualAnalysis(rawValue: any): ToolsStorageResidualAnalysis {
+  return {
+    scannedAt: String(rawValue?.scannedAt || ''),
+    roots: Array.isArray(rawValue?.roots) ? rawValue.roots.map((entry: any) => String(entry || '')).filter(Boolean) : [],
+    maxDepth: Number(rawValue?.maxDepth) || 0,
+    limit: Number(rawValue?.limit) || 0,
+    candidates: Array.isArray(rawValue?.candidates)
+      ? rawValue.candidates.map((entry: any) => normalizeToolsStorageResidualCandidate(entry))
+      : [],
+    ai: {
+      requested: Boolean(rawValue?.ai?.requested),
+      used: Boolean(rawValue?.ai?.used),
+      fallbackReason: String(rawValue?.ai?.fallbackReason || ''),
+      providerId: String(rawValue?.ai?.providerId || ''),
+      providerName: String(rawValue?.ai?.providerName || ''),
+      attemptedProviders: Array.isArray(rawValue?.ai?.attemptedProviders)
+        ? rawValue.ai.attemptedProviders.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+        : []
+    }
+  };
+}
+
+export async function analyzeToolsStorageResidual(payload?: {
+  roots?: string[];
+  limit?: number;
+  maxDepth?: number;
+  useAi?: boolean;
+}): Promise<{ job: ToolsStorageJob }> {
+  const data = await api<{ job: ToolsStorageJob }>('/api/tools/storage/cleanup/analyze', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {})
+  });
+  return {
+    job: normalizeToolsStorageJob(data?.job)
+  };
+}
+
+export async function deleteToolsStorageResidual(payload: {
+  paths: string[];
+}): Promise<{ deleted: string[]; failed: Array<{ path: string; error: string }> }> {
+  const data = await api<{ deleted: string[]; failed: Array<{ path: string; error: string }> }>(
+    '/api/tools/storage/cleanup/delete',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        paths: Array.isArray(payload?.paths) ? payload.paths : [],
+        confirm: 'DELETE'
+      })
+    }
+  );
+  return {
+    deleted: Array.isArray(data?.deleted) ? data.deleted.map((entry: any) => String(entry || '')).filter(Boolean) : [],
+    failed: Array.isArray(data?.failed)
+      ? data.failed.map((entry: any) => ({
+          path: String(entry?.path || ''),
+          error: String(entry?.error || '')
+        }))
+      : []
   };
 }
 
@@ -1126,12 +1625,42 @@ export async function checkoutToolsGitBranch(
 export async function mergeToolsGitBranches(
   repoId: string,
   payload: { sourceBranch: string; targetBranch: string }
-): Promise<{ repo: ToolsGitRepoSummary; merge?: ToolsGitMergePayload }> {
-  return api(`/api/tools/git/repos/${encodeURIComponent(String(repoId || ''))}/merge`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
+): Promise<{ repo: ToolsGitRepoSummary; merge?: ToolsGitMergePayload; job?: ToolsStorageJob }> {
+  const data = await api<{ repo: ToolsGitRepoSummary; merge?: ToolsGitMergePayload; job?: ToolsStorageJob }>(
+    `/api/tools/git/repos/${encodeURIComponent(String(repoId || ''))}/merge`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }
+  );
+  return {
+    repo: {
+      ...data.repo,
+      branches: Array.isArray(data?.repo?.branches)
+        ? data.repo.branches.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+        : []
+    },
+    merge: data.merge
+      ? {
+          sourceBranch: String(data.merge.sourceBranch || ''),
+          targetBranch: String(data.merge.targetBranch || ''),
+          output: String(data.merge.output || ''),
+          status:
+            data.merge.status === 'queued' ||
+            data.merge.status === 'merged' ||
+            data.merge.status === 'conflict' ||
+            data.merge.status === 'failed'
+              ? data.merge.status
+              : undefined,
+          hasConflicts: Boolean(data.merge.hasConflicts),
+          conflictFiles: Array.isArray(data.merge.conflictFiles)
+            ? data.merge.conflictFiles.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+            : []
+        }
+      : undefined,
+    job: data?.job ? normalizeToolsStorageJob(data.job) : undefined
+  };
 }
 
 export async function resolveToolsGitConflicts(
@@ -1296,6 +1825,7 @@ export async function startChatStream(payload: {
   model: string;
   reasoningEffort: string;
   conversationId: number | null;
+  projectId?: number | null;
   attachments: Array<{ uploadId: string }>;
   signal: AbortSignal;
 }): Promise<Response> {
@@ -1308,6 +1838,10 @@ export async function startChatStream(payload: {
       model: payload.model,
       reasoningEffort: payload.reasoningEffort,
       conversationId: payload.conversationId,
+      projectId:
+        Number.isInteger(Number(payload.projectId)) && Number(payload.projectId) > 0
+          ? Number(payload.projectId)
+          : null,
       attachments: payload.attachments
     }),
     signal: payload.signal

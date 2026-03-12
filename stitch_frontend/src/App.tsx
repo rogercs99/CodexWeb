@@ -9,20 +9,27 @@ import SettingsScreen from './components/SettingsScreen';
 import SystemRebootScreen from './components/SystemRebootScreen';
 import OfflineErrorScreen from './components/OfflineErrorScreen';
 import {
+  createProject,
   deleteAttachment,
+  deleteProject,
   deleteConversation,
   getChatOptions,
   getCodexRuns,
   getMe,
   getRestartStatus,
+  getToolsStorageJobs,
   killConversationSession,
   listAttachments,
   listConversations,
+  listProjects,
   listMessages,
   login,
   logout,
+  moveConversationToProject,
+  regenerateProjectContext,
   restartServer,
   startChatStream,
+  updateProject,
   updateConversationSettings,
   updateConversationTitle,
   uploadAttachment
@@ -31,21 +38,23 @@ import { consumeSse } from './lib/sse';
 import type {
   AttachmentItem,
   Capabilities,
+  ChatProject,
   ChatOptions,
   CodexBackgroundRun,
   Conversation,
+  ConversationProjectContext,
   MessageAttachment,
   Message,
   RestartState,
   Screen,
   TaskRecovery,
+  ToolsStorageJob,
   TerminalEntry,
   User
 } from './lib/types';
 
 const DEFAULT_MODEL_KEY = 'codexweb_model';
 const DEFAULT_REASONING_KEY = 'codexweb_reasoning_effort';
-const CAPS_KEY = 'codexweb_caps';
 const TERMINAL_KEY = 'codexweb_terminal_entries_v1';
 const LIVE_DRAFT_PREFIX = 'codexweb_live_draft_v1';
 const DRAFT_PERSIST_THROTTLE_MS = 150;
@@ -131,6 +140,184 @@ function normalizeReasoningForOptions(value: string, opts: ChatOptions): string 
     return defaultEffort;
   }
   return efforts.length > 0 ? String(efforts[0] || '').trim().toLowerCase() : DEFAULT_REASONING_EFFORT;
+}
+
+function formatEtaShort(seconds: number | null): string {
+  if (!Number.isFinite(Number(seconds)) || Number(seconds) <= 0) return '--';
+  const total = Math.max(1, Math.round(Number(seconds)));
+  if (total < 60) return `${total}s`;
+  const mins = Math.floor(total / 60);
+  const remain = total % 60;
+  return `${mins}m ${String(remain).padStart(2, '0')}s`;
+}
+
+interface HubBackgroundNotice {
+  jobId: string;
+  text: string;
+  details?: string;
+  tone: 'info' | 'success' | 'error';
+  loading: boolean;
+  canDismiss: boolean;
+  updatedAtMs: number;
+}
+
+const HUB_NOTICE_LOOKBACK_MS = 1000 * 60 * 45;
+const HUB_NOTICE_MAX_ITEMS = 5;
+
+function parseIsoMs(value: string): number {
+  const parsed = Date.parse(String(value || '').trim());
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function truncateHubNoticeText(value: string, maxLen = 260): string {
+  const text = String(value || '').trim();
+  if (text.length <= maxLen) return text;
+  return `${text.slice(0, Math.max(0, maxLen - 1)).trimEnd()}…`;
+}
+
+function buildHubJobProgressDetails(job: ToolsStorageJob): string {
+  const stageLabel = String(job.progress?.stageLabel || job.progress?.stage || '').trim();
+  const percentRaw = Number(job.progress?.percent);
+  const percent = Number.isFinite(percentRaw) ? Math.max(0, Math.min(100, Math.round(percentRaw))) : null;
+  const etaRaw = Number(job.progress?.etaSeconds);
+  const eta = Number.isFinite(etaRaw) && etaRaw > 0 ? formatEtaShort(Math.round(etaRaw)) : '';
+  const chunks: string[] = [];
+  if (stageLabel) chunks.push(`Etapa: ${stageLabel}`);
+  if (percent !== null) chunks.push(`Progreso: ${percent}%`);
+  if (eta) chunks.push(`ETA aprox: ${eta}`);
+  return chunks.join(' · ');
+}
+
+function buildHubNoticeFromStorageJob(job: ToolsStorageJob): HubBackgroundNotice | null {
+  if (!job || !job.id) return null;
+  const updatedAtMs = parseIsoMs(String(job.updatedAt || job.finishedAt || job.createdAt || ''));
+  const status = String(job.status || '').trim().toLowerCase();
+  const isRunning = status === 'running' || status === 'pending';
+  const isError = status === 'error';
+  const isCompleted = status === 'completed';
+  let text = '';
+  let details = '';
+  let tone: HubBackgroundNotice['tone'] = isRunning ? 'info' : isError ? 'error' : 'success';
+
+  if (job.type === 'cleanup_residual_analyze') {
+    if (isRunning) {
+      text = 'Analizando residuos con IA';
+      details = buildHubJobProgressDetails(job) || 'Escaneando y clasificando residuales.';
+    } else if (isCompleted) {
+      const candidateCount = Array.isArray(job.result?.candidates) ? job.result.candidates.length : 0;
+      const aiUsed = Boolean(job.result?.ai?.used);
+      const providerName = String(job.result?.ai?.providerName || job.result?.ai?.providerId || '').trim();
+      const fallbackReason = String(job.result?.ai?.fallbackReason || '').trim();
+      text = aiUsed ? 'Limpieza IA completada' : 'Limpieza completada con fallback heurístico';
+      details = [
+        `${candidateCount} candidato(s)`,
+        aiUsed ? `Proveedor: ${providerName || 'IA'}` : `Motivo fallback: ${fallbackReason || 'IA no disponible'}`
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      tone = aiUsed ? 'success' : 'error';
+    } else if (isError) {
+      text = 'Limpieza IA falló';
+      details = truncateHubNoticeText(String(job.error || 'error no especificado'));
+      tone = 'error';
+    }
+  } else if (job.type === 'git_merge_branches') {
+    const source = String(job.payload?.sourceBranch || job.result?.merge?.sourceBranch || '').trim();
+    const target = String(job.payload?.targetBranch || job.result?.merge?.targetBranch || '').trim();
+    const pair = source && target ? `${source} -> ${target}` : 'ramas';
+    if (isRunning) {
+      text = `Mergeando ${pair}`;
+      details = buildHubJobProgressDetails(job) || 'Merge en segundo plano en curso.';
+    } else if (isCompleted) {
+      const mergeStatus = String(job.result?.merge?.status || '').trim().toLowerCase();
+      if (mergeStatus === 'conflict') {
+        const conflictCount = Array.isArray(job.result?.merge?.conflictFiles)
+          ? job.result.merge.conflictFiles.length
+          : 0;
+        text = `Merge con conflictos: ${pair}`;
+        details = conflictCount > 0 ? `${conflictCount} archivo(s) en conflicto.` : 'Requiere resolución manual.';
+        tone = 'error';
+      } else {
+        text = `Merge completado: ${pair}`;
+        details = truncateHubNoticeText(String(job.result?.merge?.output || job.log || ''), 240) || 'Sin conflictos.';
+        tone = 'success';
+      }
+    } else if (isError) {
+      text = `Merge falló: ${pair}`;
+      details = truncateHubNoticeText(String(job.error || 'error no especificado'));
+      tone = 'error';
+    }
+  } else if (job.type === 'local_delete_paths') {
+    if (isRunning) {
+      text = 'Borrando rutas locales';
+      details = buildHubJobProgressDetails(job) || 'Borrado local en curso.';
+    } else if (isCompleted) {
+      text = 'Borrado local completado';
+      details = truncateHubNoticeText(String(job.result?.summary || job.log || 'Operación finalizada.'));
+      tone = 'success';
+    } else if (isError) {
+      text = 'Borrado local falló';
+      details = truncateHubNoticeText(String(job.error || 'error no especificado'));
+      tone = 'error';
+    }
+  } else if (job.type === 'drive_upload_files') {
+    if (isRunning) {
+      text = 'Subiendo archivos a Google Drive';
+      details = buildHubJobProgressDetails(job) || 'Subida en curso.';
+    } else if (isCompleted) {
+      text = 'Subida a Google Drive completada';
+      details = truncateHubNoticeText(String(job.log || 'Operación finalizada.'));
+      tone = 'success';
+    } else if (isError) {
+      text = 'Subida a Google Drive falló';
+      details = truncateHubNoticeText(String(job.error || 'error no especificado'));
+      tone = 'error';
+    }
+  } else if (job.type === 'deployed_backup_create' || job.type === 'deployed_backup_restore') {
+    const isRestore = job.type === 'deployed_backup_restore';
+    if (isRunning) {
+      text = isRestore ? 'Restaurando backup de app' : 'Creando backup de app';
+      details = buildHubJobProgressDetails(job) || (isRestore ? 'Restauración en curso.' : 'Backup en curso.');
+    } else if (isCompleted) {
+      text = isRestore ? 'Restauración completada' : 'Backup completado';
+      details = truncateHubNoticeText(String(job.log || 'Operación finalizada.'));
+      tone = 'success';
+    } else if (isError) {
+      text = isRestore ? 'Restauración falló' : 'Backup falló';
+      details = truncateHubNoticeText(String(job.error || 'error no especificado'));
+      tone = 'error';
+    }
+  } else if (job.type === 'project_context_refresh') {
+    const projectName = String(job.payload?.projectName || job.progress?.projectName || job.result?.project?.name || 'proyecto').trim();
+    if (isRunning) {
+      text = `Actualizando contexto de ${projectName}`;
+      details = buildHubJobProgressDetails(job) || 'Sintetizando memoria automática del proyecto.';
+    } else if (isCompleted) {
+      const aiUsed = Boolean(job.result?.ai?.used);
+      const providerName = String(job.result?.ai?.providerName || job.result?.ai?.providerId || '').trim();
+      const fallbackReason = String(job.result?.ai?.fallbackReason || '').trim();
+      text = aiUsed ? `Contexto de ${projectName} actualizado` : `Contexto de ${projectName} (fallback heurístico)`;
+      details = aiUsed
+        ? `Proveedor: ${providerName || 'IA'}`
+        : `Fallback: ${fallbackReason || 'IA no disponible'}`;
+      tone = aiUsed ? 'success' : 'error';
+    } else if (isError) {
+      text = `Falló actualización de ${projectName}`;
+      details = truncateHubNoticeText(String(job.error || 'error no especificado'));
+      tone = 'error';
+    }
+  }
+
+  if (!text) return null;
+  return {
+    jobId: job.id,
+    text,
+    details,
+    tone,
+    loading: isRunning,
+    canDismiss: !isRunning,
+    updatedAtMs
+  };
 }
 
 interface LiveChatDraft {
@@ -352,6 +539,12 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [status, setStatus] = useState('');
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [projects, setProjects] = useState<ChatProject[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null);
+  const [unassignedConversationCount, setUnassignedConversationCount] = useState(0);
+  const [draftProjectId, setDraftProjectId] = useState<number | null>(null);
+  const [activeConversationProjectContext, setActiveConversationProjectContext] =
+    useState<ConversationProjectContext | null>(null);
   const [activeConversationId, setActiveConversationId] = useState<number | null>(null);
   const [runningConversationIds, setRunningConversationIds] = useState<number[]>([]);
   const [chatTitle, setChatTitle] = useState('Nuevo chat');
@@ -377,9 +570,10 @@ export default function App() {
   const [defaultReasoningEffort, setDefaultReasoningEffort] = useState(DEFAULT_REASONING_EFFORT);
   const [chatModel, setChatModel] = useState(DEFAULT_MODEL);
   const [chatReasoningEffort, setChatReasoningEffort] = useState(DEFAULT_REASONING_EFFORT);
-  const [caps, setCaps] = useState<Capabilities>({ web: true, code: true, memory: false });
+  const [caps, setCaps] = useState<Capabilities>({ web: true, code: true, memory: true });
   const [terminalEntries, setTerminalEntries] = useState<TerminalEntry[]>([]);
   const [offlineMessage, setOfflineMessage] = useState('No se pudo contactar al servidor.');
+  const [hubBackgroundNotices, setHubBackgroundNotices] = useState<HubBackgroundNotice[]>([]);
   const [restartState, setRestartState] = useState<RestartState | null>(null);
   const [restartBusy, setRestartBusy] = useState(false);
   const [liveReasoning, setLiveReasoning] = useState('');
@@ -399,6 +593,7 @@ export default function App() {
   const activeDraftStorageKeyRef = useRef<string | null>(null);
   const activeRequestIdRef = useRef<string>('');
   const draftPersistTimerRef = useRef<number | null>(null);
+  const dismissedHubNoticeIdsRef = useRef<Record<string, true>>({});
   const previousScreenRef = useRef<Screen>('hub');
   const hydrateInFlightRef = useRef<Promise<void> | null>(null);
   const activeConversationIdRef = useRef<number | null>(null);
@@ -433,6 +628,63 @@ export default function App() {
   useEffect(() => {
     messagesNextBeforeIdRef.current = messagesNextBeforeId;
   }, [messagesNextBeforeId]);
+
+  useEffect(() => {
+    if (!user || screen === 'login' || screen === 'offline' || screen === 'reboot') {
+      setHubBackgroundNotices((prev) => prev.filter((entry) => !entry.loading));
+      return;
+    }
+    let cancelled = false;
+    const pollBackgroundJobs = async () => {
+      try {
+        const jobs = await getToolsStorageJobs(90);
+        if (cancelled) return;
+        const allowedTypes = new Set([
+          'cleanup_residual_analyze',
+          'git_merge_branches',
+          'local_delete_paths',
+          'drive_upload_files',
+          'deployed_backup_create',
+          'deployed_backup_restore',
+          'project_context_refresh'
+        ]);
+        const nowMs = Date.now();
+        const nextNotices = (Array.isArray(jobs) ? jobs : [])
+          .filter((entry) => allowedTypes.has(String(entry.type || '')))
+          .sort((a, b) => {
+            const aTs = parseIsoMs(String(a.updatedAt || a.finishedAt || a.createdAt || ''));
+            const bTs = parseIsoMs(String(b.updatedAt || b.finishedAt || b.createdAt || ''));
+            return bTs - aTs;
+          })
+          .map((entry) => buildHubNoticeFromStorageJob(entry))
+          .filter((entry): entry is HubBackgroundNotice => Boolean(entry))
+          .filter((entry) => {
+            if (entry.loading) return true;
+            if (dismissedHubNoticeIdsRef.current[entry.jobId]) return false;
+            return entry.updatedAtMs >= nowMs - HUB_NOTICE_LOOKBACK_MS;
+          })
+          .slice(0, HUB_NOTICE_MAX_ITEMS);
+        setHubBackgroundNotices(nextNotices);
+      } catch (_error) {
+        // polling best-effort only.
+      }
+    };
+    void pollBackgroundJobs();
+    const timer = window.setInterval(() => {
+      void pollBackgroundJobs();
+    }, 4000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [screen, user]);
+
+  const handleDismissHubBackgroundNotice = useCallback((jobId: string) => {
+    const safeJobId = String(jobId || '').trim();
+    if (!safeJobId) return;
+    dismissedHubNoticeIdsRef.current[safeJobId] = true;
+    setHubBackgroundNotices((prev) => prev.filter((entry) => entry.loading || entry.jobId !== safeJobId));
+  }, []);
 
   const resetTransientStreamState = useCallback(() => {
     if (draftPersistTimerRef.current !== null) {
@@ -830,12 +1082,23 @@ export default function App() {
     async (preferredId?: number | null, usernameOverride?: string | null) => {
       messagesPaginationRequestSeqRef.current += 1;
       setMessagesLoadingMore(false);
-      const [rows, runningIds]: [Conversation[], number[]] = await Promise.all([
+      const [rows, runningIds, projectsPayload]: [
+        Conversation[],
+        number[],
+        { projects: ChatProject[]; unassignedCount: number }
+      ] = await Promise.all([
         listConversations(),
-        refreshRunningConversationIds()
+        refreshRunningConversationIds(),
+        listProjects().catch(() => ({ projects: [], unassignedCount: 0 }))
       ]);
       const sorted = byDateDesc(rows);
       setConversations(sorted);
+      setProjects(projectsPayload.projects);
+      setUnassignedConversationCount(projectsPayload.unassignedCount);
+      setSelectedProjectId((current) => {
+        if (current === null) return null;
+        return projectsPayload.projects.some((project) => project.id === current) ? current : null;
+      });
       clearTerminalForMissingChats(sorted.map((item) => item.id));
 
       const chosenId =
@@ -848,6 +1111,7 @@ export default function App() {
       if (!chosenId) {
         const draftOnly = getLiveDraftForConversation(null, usernameOverride);
         setActiveConversationId(null);
+        setActiveConversationProjectContext(null);
         setChatTitle('Nuevo chat');
         setMessages(
           draftOnly
@@ -863,6 +1127,7 @@ export default function App() {
         setMessagesNextBeforeId(null);
         setChatModel(normalizeModelForOptions(defaultModel, options));
         setChatReasoningEffort(normalizeReasoningForOptions(defaultReasoningEffort, options));
+        setDraftProjectId(null);
         return;
       }
 
@@ -884,6 +1149,12 @@ export default function App() {
           : '';
       setActiveConversationId(chosenId);
       setChatTitle(detail.conversation.title || 'Chat');
+      setDraftProjectId(
+        Number.isInteger(Number(detail.conversation.projectId)) && Number(detail.conversation.projectId) > 0
+          ? Number(detail.conversation.projectId)
+          : null
+      );
+      setActiveConversationProjectContext(detail.projectContext || null);
       setMessages(
         mergeMessagesWithDraft(detail.messages || [], liveDraft ? liveDraft.draft : null, {
           hideAssistantContentWhileRunning: hideAssistantWhileRunning
@@ -948,17 +1219,17 @@ export default function App() {
             localStorage.getItem(DEFAULT_REASONING_KEY) ||
             opts.defaults.reasoningEffort ||
             DEFAULT_REASONING_EFFORT;
-          const rawCaps = localStorage.getItem(CAPS_KEY);
           const normalizedModel = normalizeModelForOptions(savedModel, opts);
           const normalizedReasoning = normalizeReasoningForOptions(savedReasoning, opts);
           setDefaultModel(normalizedModel);
           setDefaultReasoningEffort(normalizedReasoning);
           setChatModel(normalizedModel);
           setChatReasoningEffort(normalizedReasoning);
-          if (rawCaps) {
-            const parsed = JSON.parse(rawCaps);
-            setCaps({ web: Boolean(parsed.web), code: Boolean(parsed.code), memory: Boolean(parsed.memory) });
-          }
+          setCaps({
+            web: Boolean(opts.permissions?.allowNetwork),
+            code: Boolean(opts.permissions?.allowShell),
+            memory: true
+          });
         } catch (_error) {
           // ignore storage parsing
         }
@@ -1017,11 +1288,10 @@ export default function App() {
         DEFAULT_REASONING_KEY,
         defaultReasoningEffort || DEFAULT_REASONING_EFFORT
       );
-      localStorage.setItem(CAPS_KEY, JSON.stringify(caps));
     } catch (_error) {
       // ignore
     }
-  }, [caps, defaultModel, defaultReasoningEffort]);
+  }, [defaultModel, defaultReasoningEffort]);
 
   useEffect(() => {
     if (screen !== 'chat') return;
@@ -1037,6 +1307,11 @@ export default function App() {
         );
         setChatModel((prev) => normalizeModelForOptions(prev, latestOptions));
         setChatReasoningEffort((prev) => normalizeReasoningForOptions(prev, latestOptions));
+        setCaps({
+          web: Boolean(latestOptions.permissions?.allowNetwork),
+          code: Boolean(latestOptions.permissions?.allowShell),
+          memory: true
+        });
       } catch (_error) {
         // ignore refresh errors when opening chat
       }
@@ -1193,6 +1468,12 @@ export default function App() {
                 : '';
             setActiveConversationId(targetChatId);
             setChatTitle(detail.conversation.title || 'Chat');
+            setActiveConversationProjectContext(detail.projectContext || null);
+            setDraftProjectId(
+              Number.isInteger(Number(detail.conversation.projectId)) && Number(detail.conversation.projectId) > 0
+                ? Number(detail.conversation.projectId)
+                : null
+            );
             setMessages(
               mergeMessagesWithDraft(detail.messages || [], liveDraft ? liveDraft.draft : null, {
                 hideAssistantContentWhileRunning: hideAssistantWhileRunning
@@ -1238,6 +1519,9 @@ export default function App() {
       if (next !== 'chat') {
         setPendingChatDraft(null);
       }
+      if (next !== 'chat') {
+        setActiveConversationProjectContext(null);
+      }
       setScreen(next);
     },
     [
@@ -1280,12 +1564,17 @@ export default function App() {
     setMessagesNextBeforeId(null);
     setMessagesLoadingMore(false);
     setConversations([]);
+    setProjects([]);
+    setSelectedProjectId(null);
+    setUnassignedConversationCount(0);
+    setDraftProjectId(null);
+    setActiveConversationProjectContext(null);
     setRunningConversationIds([]);
     setActiveConversationId(null);
     setScreen('login');
   }, [cancelActiveStream]);
 
-  const handleCreateChat = useCallback(async () => {
+  const handleCreateChat = useCallback(async (projectId?: number | null) => {
     if (sending) {
       detachActiveStream('Ejecución en segundo plano para el chat anterior.');
     }
@@ -1303,6 +1592,10 @@ export default function App() {
     setMessagesHasMore(false);
     setMessagesNextBeforeId(null);
     setMessagesLoadingMore(false);
+    setActiveConversationProjectContext(null);
+    setDraftProjectId(
+      Number.isInteger(Number(projectId)) && Number(projectId) > 0 ? Number(projectId) : null
+    );
     setChatModel(normalizeModelForOptions(defaultModel, effectiveOptions));
     setChatReasoningEffort(normalizeReasoningForOptions(defaultReasoningEffort, effectiveOptions));
     setScreen('chat');
@@ -1436,6 +1729,158 @@ export default function App() {
       }
     },
     [activeConversationId]
+  );
+
+  const handleCreateProject = useCallback(
+    async (payload: {
+      name: string;
+      contextMode: 'manual' | 'automatic' | 'mixed';
+      autoContextEnabled?: boolean;
+      manualContext?: string;
+    }) => {
+      const created = await createProject(payload);
+      setProjects((prev) =>
+        [...prev, created].sort((a, b) => Date.parse(b.updatedAt || '') - Date.parse(a.updatedAt || ''))
+      );
+      setSelectedProjectId(created.id);
+      setStatus(`Proyecto creado: ${created.name}`);
+      return created;
+    },
+    []
+  );
+
+  const handleUpdateProject = useCallback(
+    async (
+      projectId: number,
+      payload: {
+        name?: string;
+        contextMode?: 'manual' | 'automatic' | 'mixed';
+        autoContextEnabled?: boolean;
+        manualContext?: string;
+      }
+    ) => {
+      const updated = await updateProject(projectId, payload);
+      setProjects((prev) => prev.map((item) => (item.id === projectId ? updated : item)));
+      if (
+        activeConversationProjectContext &&
+        Number(activeConversationProjectContext.projectId) === Number(projectId)
+      ) {
+        setActiveConversationProjectContext((prev) =>
+          prev
+            ? {
+                ...prev,
+                projectName: updated.name,
+                mode: updated.contextMode,
+                autoEnabled: updated.autoContextEnabled,
+                manualContext: String(updated.manualContext || ''),
+                autoContext: String(updated.autoContext || ''),
+                autoUpdatedAt: updated.autoUpdatedAt
+              }
+            : prev
+        );
+      }
+      setStatus(`Proyecto actualizado: ${updated.name}`);
+      return updated;
+    },
+    [activeConversationProjectContext]
+  );
+
+  const handleDeleteProjectById = useCallback(
+    async (projectId: number) => {
+      const deleted = await deleteProject(projectId);
+      setProjects((prev) => prev.filter((item) => item.id !== projectId));
+      setConversations((prev) =>
+        prev.map((item) =>
+          Number(item.projectId) === Number(projectId)
+            ? { ...item, projectId: null, project: null }
+            : item
+        )
+      );
+      if (selectedProjectId === projectId) {
+        setSelectedProjectId(null);
+      }
+      if (
+        activeConversationProjectContext &&
+        Number(activeConversationProjectContext.projectId) === Number(projectId)
+      ) {
+        setActiveConversationProjectContext(null);
+      }
+      setUnassignedConversationCount((prev) => Math.max(0, prev + Math.max(0, deleted.detachedChats)));
+      setStatus(`Proyecto eliminado. Chats desvinculados: ${deleted.detachedChats}`);
+      await loadConversationsAndPick(activeConversationIdRef.current);
+    },
+    [activeConversationProjectContext, loadConversationsAndPick, selectedProjectId]
+  );
+
+  const handleRegenerateProjectContextById = useCallback(async (projectId: number) => {
+    const result = await regenerateProjectContext(projectId);
+    setProjects((prev) => prev.map((item) => (item.id === projectId ? result.project : item)));
+    if (
+      activeConversationProjectContext &&
+      Number(activeConversationProjectContext.projectId) === Number(projectId)
+    ) {
+      setActiveConversationProjectContext((prev) =>
+        prev
+          ? {
+              ...prev,
+              autoContext: String(result.project.autoContext || ''),
+              autoUpdatedAt: result.project.autoUpdatedAt
+            }
+          : prev
+      );
+    }
+    setStatus(
+      result.jobId
+        ? 'Regeneración de contexto en segundo plano iniciada.'
+        : 'Regeneración de contexto solicitada.'
+    );
+  }, [activeConversationProjectContext]);
+
+  const handleMoveConversationProject = useCallback(
+    async (conversationId: number, projectId: number | null) => {
+      const moved = await moveConversationToProject(conversationId, projectId);
+      setConversations((prev) =>
+        prev.map((item) =>
+          item.id === conversationId
+            ? {
+                ...item,
+                projectId: moved.projectId,
+                project: moved.project
+              }
+            : item
+        )
+      );
+      if (activeConversationIdRef.current === conversationId) {
+        if (!moved.projectId) {
+          setActiveConversationProjectContext(null);
+        } else {
+          const nextProject = projects.find((project) => project.id === moved.projectId) || null;
+          if (nextProject) {
+            setActiveConversationProjectContext((prev) =>
+              prev
+                ? { ...prev, projectId: nextProject.id, projectName: nextProject.name }
+                : {
+                    projectId: nextProject.id,
+                    projectName: nextProject.name,
+                    mode: nextProject.contextMode,
+                    autoEnabled: nextProject.autoContextEnabled,
+                    manualContext: String(nextProject.manualContext || ''),
+                    autoContext: String(nextProject.autoContext || ''),
+                    effectiveContext: '',
+                    manualUsed: false,
+                    autoUsed: false,
+                    autoUpdatedAt: nextProject.autoUpdatedAt,
+                    autoMeta: nextProject.autoMeta || {}
+                  }
+            );
+          }
+        }
+      }
+      await loadConversationsAndPick(activeConversationIdRef.current);
+      setStatus(moved.projectId ? 'Chat movido al proyecto.' : 'Chat movido fuera del proyecto.');
+      return moved;
+    },
+    [loadConversationsAndPick, projects]
   );
 
   const handleDeleteAttachments = useCallback(async (attachmentIds: string[]) => {
@@ -1774,6 +2219,12 @@ export default function App() {
           model: requestModel,
           reasoningEffort: requestReasoning,
           conversationId: activeConversationId,
+          projectId:
+            activeConversationId && activeConversationId > 0
+              ? null
+              : Number.isInteger(Number(draftProjectId)) && Number(draftProjectId) > 0
+                ? Number(draftProjectId)
+                : null,
           attachments: uploaded,
           signal: controller.signal
         });
@@ -2052,6 +2503,7 @@ export default function App() {
       scheduleDraftPersist,
       selectedFiles,
       sending,
+      draftProjectId,
       clearTerminalForConversation,
       updateActiveDraft,
       upsertTerminal
@@ -2146,10 +2598,21 @@ export default function App() {
         <ChatHubScreen
           user={user}
           conversations={filteredConversations}
+          projects={projects}
+          selectedProjectId={selectedProjectId}
+          unassignedCount={unassignedConversationCount}
           activeConversationId={activeConversationId}
           runningConversationIds={runningConversationIds}
+          backgroundNotices={hubBackgroundNotices}
+          onDismissBackgroundNotice={handleDismissHubBackgroundNotice}
           onOpenChat={(id) => navigate('chat', { chatId: id })}
           onCreateChat={handleCreateChat}
+          onSelectProject={setSelectedProjectId}
+          onCreateProject={handleCreateProject}
+          onUpdateProject={handleUpdateProject}
+          onDeleteProject={handleDeleteProjectById}
+          onRegenerateProjectContext={handleRegenerateProjectContextById}
+          onMoveChatToProject={handleMoveConversationProject}
           onDeleteChat={handleDeleteConversation}
           onRenameChat={handleRenameConversation}
           onDeleteChats={handleDeleteConversations}
@@ -2164,6 +2627,12 @@ export default function App() {
         <ChatScreen
           chatTitle={chatTitle}
           conversationId={activeConversationId}
+          projectContext={activeConversationProjectContext}
+          draftProject={
+            Number.isInteger(Number(draftProjectId)) && Number(draftProjectId) > 0
+              ? projects.find((project) => project.id === Number(draftProjectId)) || null
+              : null
+          }
           messages={messages}
           hasMoreMessages={messagesHasMore}
           loadingMoreMessages={messagesLoadingMore}
@@ -2253,7 +2722,6 @@ export default function App() {
           caps={caps}
           onModelChange={setDefaultModel}
           onReasoningChange={setDefaultReasoningEffort}
-          onCapsChange={setCaps}
           onNavigate={navigate}
         />
       )}

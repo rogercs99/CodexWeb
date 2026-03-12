@@ -1,0 +1,36 @@
+# Validaciones ejecutadas
+
+## 1) Calidad frontend
+Comando:
+- `cd /root/CodexWeb/DIXIT/client && npm run lint`
+Resultado:
+- FAIL
+- 15 errores + 1 warning en `src/App.jsx`
+- Principales tipos: `react-hooks/purity`, `react-hooks/set-state-in-effect`, `no-unused-vars`, `exhaustive-deps`
+
+Comando:
+- `cd /root/CodexWeb/DIXIT/client && npm run build`
+Resultado:
+- OK (vite build exitoso)
+
+## 2) Tests backend relacionados (solo referencia de integracion)
+Comando:
+- `cd /root/CodexWeb/DIXIT && npm test`
+Resultado:
+- FAIL en sandbox (no detalla casos por bloqueo de runtime de red)
+
+Comando:
+- `cd /root/CodexWeb/DIXIT && npm run test:e2e`
+Resultado:
+- FAIL por `listen EPERM` al intentar levantar servidor de pruebas en `0.0.0.0:3000`
+
+## 3) Intento de arranque local de servidor para prueba manual
+Comando:
+- `PORT=4501 node server.js`
+Resultado:
+- FAIL por sandbox: `listen EPERM: operation not permitted 0.0.0.0:4501`
+
+## 4) Evidencia de procesos activos detectados
+- `/usr/bin/node /opt/dixit/server.js`
+- `node /root/CodexWeb/EclipseGame/node_modules/.bin/tsx server/src/index.ts`
+- `/usr/bin/node /root/CodexWeb/server.js`

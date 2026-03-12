@@ -48,3 +48,26 @@ GEMINI_INCLUDE_DIRECTORIES=/
 - `GEMINI_CMD`: comando/ruta del CLI de Gemini (por defecto `gemini`).
 - `GEMINI_INCLUDE_DIRECTORIES`: rutas extra disponibles para Gemini (usa `/` para acceso total).
 - `NODE_ENV`: `development` o `production`.
+- `DB_PATH`: ruta de DB SQLite (admite absoluta o relativa al repo).
+- `UPLOADS_DIR`: ruta de adjuntos/subidas.
+- `TASK_SNAPSHOTS_DIR`: ruta de snapshots de tareas.
+- `STORAGE_JOBS_DIR`: ruta de jobs temporales de almacenamiento.
+- `RESTART_STATE_PATH`: ruta del estado de reinicio.
+- `STATIC_ASSETS_DIR`: ruta de estáticos servidos por Express.
+- `RCLONE_BIN`: binario de rclone (por defecto `rclone`).
+- `RCLONE_CONFIG_PATH`: ruta del `rclone.conf` usado por CodexWeb.
+- `RCLONE_DRIVE_DEFAULT_REMOTE`: remote por defecto de Google Drive.
+- `RCLONE_DRIVE_DEFAULT_ROOT`: carpeta raíz remota por defecto (ej. `CodexWebDEV`).
+- `STORAGE_RESIDUAL_SCAN_ROOTS`: raíces permitidas para análisis/borrado de residuales.
+
+## Despliegue aislado dev/prod
+
+Para levantar `codexwebdev.gamemodai.pro` sin tocar `codexweb.gamemodai.pro`, revisa:
+
+- `docs/deployment-codexwebdev-isolation-2026-03-11.md`
+
+## Google Drive con rclone (DEV)
+
+Guía de integración real (rclone + Google Drive) para CodexWebDEV:
+
+- `docs/google-drive-rclone-codexwebdev-2026-03-11.md`

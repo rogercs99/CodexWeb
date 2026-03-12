@@ -1,0 +1,36 @@
+{
+  "attemptId": "1773231109202-88cb4f29",
+  "active": false,
+  "phase": "completed",
+  "requestedBy": "roger",
+  "notifyWebhookUrl": "https://discord.com/api/webhooks/1386130341357424801/4UKIDRm_ldPvCLTTdPJ9ZEbXCVKo234_l49TV8oAr04CzVvvUIAQLcO-Ru-7VUvyTtuW",
+  "startedAt": "2026-03-11T12:11:49.202Z",
+  "finishedAt": "2026-03-11T12:11:52.167Z",
+  "updatedAt": "2026-03-11T12:11:52.167Z",
+  "logs": [
+    {
+      "at": "2026-03-11T12:11:49.202Z",
+      "message": "Reinicio solicitado por roger"
+    },
+    {
+      "at": "2026-03-11T12:11:49.205Z",
+      "message": "Preparando helper de reinicio"
+    },
+    {
+      "at": "2026-03-11T12:11:49.209Z",
+      "message": "Helper de reinicio lanzado"
+    },
+    {
+      "at": "2026-03-11T12:11:49.221Z",
+      "message": "Respuesta enviada. Cerrando proceso actual"
+    },
+    {
+      "at": "2026-03-11T12:11:49.278Z",
+      "message": "Helper de reinicio iniciado"
+    },
+    {
+      "at": "2026-03-11T12:11:52.167Z",
+      "message": "Nuevo proceso iniciado (pid 777591)"
+    }
+  ]
+}
