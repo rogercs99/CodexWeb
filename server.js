@@ -475,6 +475,19 @@ const frontendDiagReportsPath = path.join(path.dirname(staticAssetsDir), 'diag-r
 const frontendDiagReportsLimit = 50;
 const frontendDiagReports = [];
 const frontendBuildStartedAtIso = new Date().toISOString();
+const frontendGitCommit = (() => {
+  try {
+    return String(
+      execFileSync('git', ['rev-parse', '--short=12', 'HEAD'], {
+        cwd: __dirname,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore']
+      }) || ''
+    ).trim();
+  } catch (_error) {
+    return '';
+  }
+})();
 const frontendEntrypointAssetCache = {
   indexMtimeMs: 0,
   checkedAtMs: 0,
@@ -13764,6 +13777,7 @@ app.get('/api/version', (_req, res) => {
     ok: true,
     service: 'codexweb',
     environment: isDevDeployment ? 'dev' : 'prod',
+    gitCommit: frontendGitCommit || null,
     nodeVersion: process.version,
     startedAt: frontendBuildStartedAtIso,
     staticAssetsDir: compactDiagValue(staticAssetsDirNormalized, 220),

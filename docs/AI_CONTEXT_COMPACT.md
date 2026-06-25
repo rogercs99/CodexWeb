@@ -1,5 +1,40 @@
 # AI_CONTEXT_COMPACT.md
 
+## Actualizacion 2026-06-25D
+
+- **Puertos reales**:
+  - Prod: `codexweb.service` -> `127.0.0.1:3050` -> `staticAssetsDir=/root/CodexWeb/public`
+  - Dev: `codexwebdev.service` -> `127.0.0.1:3060` -> `staticAssetsDir=/root/CodexWeb/.runtime/dev/public`
+  - Tunnel activo esperado: `cloudflared-codexweb.service`
+- **Procesos/servicios detectados**:
+  - `codexweb.service`, `codexwebdev.service`, `cloudflared-codexweb.service`, `nginx.service`
+  - Ambos Node arrancan el mismo backend: `/usr/bin/node /root/CodexWeb/server.js`
+- **Build/start**:
+  - Frontend build: `cd /root/CodexWeb/stitch_frontend && npm run build`
+  - Prod sirve `public/`
+  - Dev sirve `.runtime/dev/public/`
+  - Ambos se reinician con `systemctl restart codexweb.service codexwebdev.service`
+- **Estructura relevante**:
+  - Backend monolito: `/root/CodexWeb/server.js`
+  - Frontend React/Vite: `/root/CodexWeb/stitch_frontend/src`
+  - PWA/static source: `/root/CodexWeb/stitch_frontend/public`
+  - Build output: `/root/CodexWeb/stitch_frontend/dist`
+- **Validacion prod/dev**:
+  - Local: `curl -fsS http://127.0.0.1:3050/api/version` y `curl -fsS http://127.0.0.1:3060/api/version`
+  - Publico: `curl -vkL https://codexweb.gamemodai.pro/` y `curl -vkL https://codexwebdev.gamemodai.pro/`
+  - Verificacion esperada actual: ambos devuelven el mismo `gitCommit=273b3f562747` y el mismo bundle `index-Be24ctB6.js`
+- **Token Saver**:
+  - Causa raiz del auto-open: `App.tsx` montaba `TokenSaverPanel` siempre al abrir chat y no pasaba `onClose`
+  - Fix aplicado: panel cerrado por defecto, solo abre desde boton explicito o preferencia persistida valida
+  - Persistencia UI: `localStorage` por usuario con schema minimo `{ version: 1, open: boolean }`
+  - Preferencia corrupta o legacy invalida => fallback cerrado y limpieza segura
+- **Cache/service worker**:
+  - `sw.js` ahora sale del source del frontend (`stitch_frontend/public/sw.js`) y versiona cache con `codexweb-v2-20260625`
+  - Objetivo: invalidar caches viejas sin tocar datos de usuario
+- **Build info visible**:
+  - `GET /api/version` expone `environment`, `gitCommit`, `staticAssetsDir` y entrypoints JS/CSS reales
+
+
 ## Actualizacion 2026-06-25C
 
 - **Parseo Claude/Codex**: Ya está implementado y operativo tanto en backend como frontend. No se requiere agregar nada nuevo.

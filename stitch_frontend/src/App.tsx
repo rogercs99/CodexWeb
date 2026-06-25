@@ -62,6 +62,7 @@ import type {
 const DEFAULT_MODEL_KEY = 'codexweb_model';
 const DEFAULT_REASONING_KEY = 'codexweb_reasoning_effort';
 const TERMINAL_KEY = 'codexweb_terminal_entries_v1';
+const TOKEN_SAVER_UI_KEY_PREFIX = 'codexweb_token_saver_ui_v1';
 const LIVE_DRAFT_PREFIX = 'codexweb_live_draft_v1';
 const DRAFT_PERSIST_THROTTLE_MS = 150;
 const DEFAULT_MODEL = 'gpt-5.3-codex';
@@ -396,6 +397,11 @@ interface AttachmentPipelineState {
   error: string;
 }
 
+interface TokenSaverUiState {
+  version: 1;
+  open: boolean;
+}
+
 function getSafeLocalStorage(): Storage | null {
   if (typeof window === 'undefined') return null;
   try {
@@ -407,6 +413,27 @@ function getSafeLocalStorage(): Storage | null {
 
 function normalizeUsername(value: string): string {
   return String(value || '').trim().toLowerCase();
+}
+
+function buildTokenSaverUiStorageKey(username: string): string {
+  const normalized = normalizeUsername(username) || 'anon';
+  return `${TOKEN_SAVER_UI_KEY_PREFIX}:${normalized}`;
+}
+
+function parseTokenSaverUiState(rawValue: string | null): TokenSaverUiState | null {
+  if (!rawValue) return null;
+  try {
+    const parsed = JSON.parse(rawValue);
+    if (typeof parsed === 'boolean') {
+      return { version: 1, open: parsed };
+    }
+    if (parsed && typeof parsed === 'object' && typeof parsed.open === 'boolean') {
+      return { version: 1, open: parsed.open };
+    }
+  } catch (_error) {
+    return null;
+  }
+  return null;
 }
 
 function draftStorageKey(username: string, conversationId: number | null, messageId: number): string {
@@ -633,6 +660,7 @@ export default function App() {
   const [restartState, setRestartState] = useState<RestartState | null>(null);
   const [restartBusy, setRestartBusy] = useState(false);
   const [liveReasoning, setLiveReasoning] = useState('');
+  const [isTokenSaverOpen, setIsTokenSaverOpen] = useState(false);
   const [pendingChatDraft, setPendingChatDraft] = useState<{
     chatId: number;
     message: string;
@@ -769,6 +797,42 @@ export default function App() {
     (usernameOverride?: string | null) => normalizeUsername(usernameOverride || user?.username || ''),
     [user]
   );
+
+  const persistTokenSaverUiState = useCallback(
+    (open: boolean, usernameOverride?: string | null) => {
+      const storage = getSafeLocalStorage();
+      const normalizedUser = resolveActiveUsername(usernameOverride);
+      if (!storage || !normalizedUser) return;
+      try {
+        const payload: TokenSaverUiState = { version: 1, open };
+        storage.setItem(buildTokenSaverUiStorageKey(normalizedUser), JSON.stringify(payload));
+      } catch (_error) {
+        // ignore storage failures
+      }
+    },
+    [resolveActiveUsername]
+  );
+
+  useEffect(() => {
+    const storage = getSafeLocalStorage();
+    const normalizedUser = resolveActiveUsername();
+    if (!storage || !normalizedUser) {
+      setIsTokenSaverOpen(false);
+      return;
+    }
+    const storageKey = buildTokenSaverUiStorageKey(normalizedUser);
+    const parsed = parseTokenSaverUiState(storage.getItem(storageKey));
+    if (!parsed) {
+      try {
+        storage.removeItem(storageKey);
+      } catch (_error) {
+        // ignore cleanup failures
+      }
+      setIsTokenSaverOpen(false);
+      return;
+    }
+    setIsTokenSaverOpen(parsed.open);
+  }, [resolveActiveUsername, user?.username]);
 
   const saveDraftSnapshot = useCallback(
     (draft: LiveChatDraft, storageKeyOverride?: string | null): string | null => {
@@ -1630,6 +1694,7 @@ export default function App() {
     setActiveConversationProjectContext(null);
     setRunningConversationIds([]);
     setActiveConversationId(null);
+    setIsTokenSaverOpen(false);
     setScreen('login');
   }, [cancelActiveStream]);
 
@@ -2811,6 +2876,11 @@ export default function App() {
           onNavigate={navigate}
           onModelChange={handleChatModelChange}
           onReasoningChange={handleChatReasoningChange}
+          tokenSaverOpen={isTokenSaverOpen}
+          onOpenTokenSaver={() => {
+            setIsTokenSaverOpen(true);
+            persistTokenSaverUiState(true);
+          }}
         />
       )}
 
@@ -2894,8 +2964,14 @@ export default function App() {
       )}
 
       {/* Token Saver Panel - lateral derecho */}
-      {screen === 'chat' && activeConversationId !== null && (
-        <TokenSaverPanel chatId={activeConversationId} />
+      {screen === 'chat' && activeConversationId !== null && isTokenSaverOpen && (
+        <TokenSaverPanel
+          chatId={activeConversationId}
+          onClose={() => {
+            setIsTokenSaverOpen(false);
+            persistTokenSaverUiState(false);
+          }}
+        />
       )}
 
       {/* Terminal Live Panel - lateral derecho inferior */}
