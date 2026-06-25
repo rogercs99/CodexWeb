@@ -1,0 +1,173 @@
+map $http_upgrade $connection_upgrade_stremio_web {
+  default upgrade;
+  '' close;
+}
+
+server {
+  listen 80;
+  listen [::]:80;
+  server_name stremio.gamemodai.pro;
+
+  proxy_buffering off;
+  proxy_request_buffering off;
+  proxy_read_timeout 3600s;
+  proxy_send_timeout 3600s;
+  send_timeout 3600s;
+
+  location = /healthz {
+    add_header Content-Type text/plain;
+    return 200 "ok-stremio-web\n";
+  }
+
+  location /stremio-auth/ {
+    resolver 1.1.1.1 1.0.0.1 valid=300s ipv6=off;
+    set $stremio_auth_origin https://www.strem.io;
+    rewrite ^/stremio-auth/(.*)$ /$1 break;
+
+    proxy_pass $stremio_auth_origin;
+    proxy_http_version 1.1;
+    proxy_set_header Host www.strem.io;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Port 443;
+    proxy_ssl_name www.strem.io;
+    proxy_ssl_server_name on;
+    proxy_intercept_errors on;
+    error_page 301 302 303 307 308 = @stremio_auth_redirect;
+  }
+
+  location @stremio_auth_redirect {
+    if ($upstream_http_location ~* "^(.*)redirect_uri=https%3A%2F%2Fwww\\.strem\\.io%2Fauth%2F(.*)$") {
+      return 302 $1redirect_uri=https%3A%2F%2Fstremio.gamemodai.pro%2Fstremio-auth%2Fauth%2F$2;
+    }
+    if ($upstream_http_location ~* "^https://www\\.strem\\.io/(.*)$") {
+      return 302 https://stremio.gamemodai.pro/stremio-auth/$1;
+    }
+    return 302 $upstream_http_location;
+  }
+
+  location /stremio-server/ {
+    proxy_pass http://127.0.0.1:11472/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Ssl on;
+    proxy_set_header X-Forwarded-Port 443;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade_stremio_web;
+
+    proxy_set_header Accept-Encoding "";
+    sub_filter_types application/json;
+    sub_filter_once off;
+    sub_filter '"baseUrl":"http://127.0.0.1:11472"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+    sub_filter '"baseUrl":"http://85.208.23.189:11472"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+    sub_filter '"baseUrl":"http://172.17.0.1:11472"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+    sub_filter '"baseUrl":"http://10.8.0.1:11472"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+    sub_filter '"baseUrl":"http://127.0.0.1:11470"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+    sub_filter '"baseUrl":"http://172.17.0.1:11470"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+    sub_filter '"baseUrl":"http://172.18.0.2:11470"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+    sub_filter '"baseUrl":"http://10.8.0.1:11470"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+
+    proxy_max_temp_file_size 0;
+    proxy_force_ranges on;
+  }
+
+  # Headless server deployment: no local casting targets are available.
+  # Stremio Web expects a JSON array here; the upstream server returns 404.
+  location = /stremio-server/casting {
+    default_type application/json;
+    add_header Cache-Control "no-store" always;
+    return 200 '[]';
+  }
+
+  # Dedicated same-origin download API with long-lived streaming support.
+  # Use ^~ so this block wins over the generic regex fallback that also matches /api.
+  location ^~ /api/downloads/ {
+    proxy_pass http://127.0.0.1:11474/api/downloads/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Port 443;
+    proxy_set_header Connection "";
+
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_max_temp_file_size 0;
+    proxy_read_timeout 86400s;
+    proxy_send_timeout 86400s;
+    send_timeout 86400s;
+    proxy_force_ranges on;
+    add_header X-Accel-Buffering "no" always;
+  }
+
+  # Stremio web may probe this endpoint without preserving auth proxy state.
+  # Route it through the already whitelisted auth proxy path.
+  location = /get-https {
+    return 302 https://stremio.gamemodai.pro/stremio-auth/get-https$is_args$args;
+  }
+
+  # Compatibility fallback: some clients still request streaming-server
+  # control endpoints at root (without /stremio-server prefix).
+  location ~ ^/(settings|network-info|device-info|casting|configuration|configure|stats|version|health|healthz|api|hlsv2|subtitles|tracks)(/|$) {
+    proxy_pass http://127.0.0.1:11472;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Ssl on;
+    proxy_set_header X-Forwarded-Port 443;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade_stremio_web;
+
+    proxy_set_header Accept-Encoding "";
+    sub_filter_types application/json;
+    sub_filter_once off;
+    sub_filter '"baseUrl":"http://127.0.0.1:11472"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+    sub_filter '"baseUrl":"http://85.208.23.189:11472"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+    sub_filter '"baseUrl":"http://172.17.0.1:11472"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+    sub_filter '"baseUrl":"http://10.8.0.1:11472"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+    sub_filter '"baseUrl":"http://127.0.0.1:11470"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+    sub_filter '"baseUrl":"http://172.17.0.1:11470"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+    sub_filter '"baseUrl":"http://172.18.0.2:11470"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+    sub_filter '"baseUrl":"http://10.8.0.1:11470"' '"baseUrl":"https://stremio.gamemodai.pro/stremio-server"';
+
+    proxy_max_temp_file_size 0;
+    proxy_force_ranges on;
+  }
+
+  location = /casting {
+    default_type application/json;
+    add_header Cache-Control "no-store" always;
+    return 200 '[]';
+  }
+
+  location / {
+    proxy_pass http://127.0.0.1:11473;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Port 443;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade_stremio_web;
+
+    # Avoid stale service-worker/app cache keeping old localhost defaults.
+    proxy_hide_header Cache-Control;
+    add_header Cache-Control "no-store, no-cache, must-revalidate, proxy-revalidate" always;
+    add_header Pragma "no-cache" always;
+    add_header Expires "0" always;
+
+    # Force web client defaults to the public reverse-proxied streaming server.
+    proxy_set_header Accept-Encoding "";
+    sub_filter_types application/javascript text/javascript application/json;
+    sub_filter_once off;
+    sub_filter 'http://127.0.0.1:11470' 'https://stremio.gamemodai.pro/stremio-server';
+    sub_filter 'http://localhost:11470' 'https://stremio.gamemodai.pro/stremio-server';
+    sub_filter 'http%3A%2F%2F127.0.0.1%3A11470' 'https%3A%2F%2Fstremio.gamemodai.pro%2Fstremio-server';
+  }
+}

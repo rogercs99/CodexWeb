@@ -1,0 +1,7 @@
+{
+  "port": 57321,
+  "publicHost": "quetzal.gamemodai.pro",
+  "localTargetHost": "127.0.0.1",
+  "localTargetPort": 57321,
+  "sshUser": "root"
+}

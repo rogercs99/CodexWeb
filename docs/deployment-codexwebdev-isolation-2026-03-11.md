@@ -24,6 +24,15 @@ Además, los endpoints cloud públicos quedaron expuestos como `drive` (rclone):
 - validación/delete para cuentas Google Drive (rclone)
 - limpieza IA: `/api/tools/storage/cleanup/analyze` y `/api/tools/storage/cleanup/delete`
 
+## Static assets de DEV
+
+`codexwebdev` debe servir un build propio desde `.runtime/dev/public`.
+
+- No reutilizar `public/` para DEV.
+- Generar el build con `cd /root/CodexWeb/stitch_frontend && npm run build`.
+- Desplegarlo con `./deploy/deploy-dev-frontend.sh`.
+- El script crea backup con timestamp y copia también `boot-monitor.js`, `diag.html`, `diag.js` y `legacy-bootstrap.js`.
+
 ## Archivos de despliegue añadidos
 
 - `deploy/codexwebdev.env.example`

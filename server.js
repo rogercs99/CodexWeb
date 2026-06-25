@@ -11,6 +11,14 @@ const helmet = require('helmet');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
 const Database = require('better-sqlite3');
+const {
+  collectRelayStatus,
+  getCommandsPayload: getQuetzalRelayCommandsPayload,
+  getDiagnosticsPayload: getQuetzalRelayDiagnosticsPayload,
+  prepareRelay,
+  saveConfig: saveQuetzalRelayConfig
+} = require('./quetzalRelay');
+const tokenSaver = require('./tokenSaver');
 
 const execFileAsync = util.promisify(execFile);
 const pipelineAsync = util.promisify(pipeline);
@@ -20,7 +28,22 @@ const host = process.env.HOST || '127.0.0.1';
 const defaultWebhookUrl = String(process.env.WEBHOOK_URL || '').trim();
 let resolvedCodexPath = null;
 let resolvedGeminiPath = null;
+let resolvedClaudeCodePath = null;
 const sentMilestones = new Set();
+const claudeCodeEnabled = parseEnvBoolean(process.env.CLAUDE_CODE_ENABLED, true);
+const claudeCodeBin = String(process.env.CLAUDE_CODE_BIN || 'claude').trim() || 'claude';
+const claudeCodeDefaultCwd = String(process.env.CLAUDE_CODE_DEFAULT_CWD || '/root/CodexWeb').trim() || '/root/CodexWeb';
+const claudeCodeConfiguredDefaultModel = String(process.env.CLAUDE_CODE_DEFAULT_MODEL || 'claude-sonnet-4-5').trim() || 'claude-sonnet-4-5';
+const claudeCodeConfiguredDefaultReasoningEffort = String(process.env.CLAUDE_CODE_DEFAULT_REASONING_EFFORT || 'low').trim().toLowerCase() || 'low';
+const claudeCodeTimeoutMs = (() => {
+  const parsed = Number.parseInt(String(process.env.CLAUDE_CODE_TIMEOUT_MS || '900000'), 10);
+  return Number.isInteger(parsed) && parsed >= 30000 ? parsed : 900000;
+})();
+const claudeCodeAllowedCwds = (() => {
+  const raw = String(process.env.CLAUDE_CODE_ALLOWED_CWDS || '/root/CodexWeb').trim();
+  const parsed = raw.split(',').map((entry) => entry.trim()).filter(Boolean);
+  return parsed.length > 0 ? parsed : ['/root/CodexWeb'];
+})();
 const DEFAULT_CHAT_MODEL = 'gpt-5.3-codex';
 const DEFAULT_REASONING_EFFORT = 'xhigh';
 const DISCORD_WEBHOOK_PREFIXES = [
@@ -35,9 +58,61 @@ const OPENROUTER_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 const OLLAMA_DEFAULT_BASE_URL = 'http://127.0.0.1:11434';
 const GROQ_DEFAULT_BASE_URL = 'https://api.groq.com/openai/v1';
 const LMSTUDIO_DEFAULT_BASE_URL = 'http://127.0.0.1:1234/v1';
+const claudeCodeModelOptions = Object.freeze(['claude-sonnet-4-5', 'claude-opus-4-5', 'claude-haiku-4-5']);
+
+// Phase 3 — Auto-summarization: in-memory cache to avoid re-summarizing the same context
+// Key: `${conversationId}:${oldMessageCount}:${lastOldMessageFingerprint}`
+const _tsSummaryCache = new Map();
+const TS_SUMMARY_CACHE_MAX = 200;
+const TS_SUMMARIZER_MODEL = 'meta-llama/llama-3.1-8b-instruct';
+const TS_SUMMARIZER_TIMEOUT_MS = 12000;
+
+async function callTsSummarizer(conversationId, oldMessages, apiKey, baseUrl) {
+  if (!apiKey || !baseUrl || !oldMessages || oldMessages.length === 0) return null;
+  const lastMsg = oldMessages[oldMessages.length - 1];
+  const fingerprint = String(lastMsg && lastMsg.content || '').slice(0, 40);
+  const cacheKey = `${conversationId}:${oldMessages.length}:${fingerprint}`;
+  if (_tsSummaryCache.has(cacheKey)) return _tsSummaryCache.get(cacheKey);
+  try {
+    const messages = tokenSaver.buildSummaryRequestMessages(oldMessages);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TS_SUMMARIZER_TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(`${String(baseUrl).replace(/\/+$/, '')}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+          'HTTP-Referer': 'https://codexweb.local',
+          'X-Title': 'CodexWeb'
+        },
+        body: JSON.stringify({ model: TS_SUMMARIZER_MODEL, messages, max_tokens: 300, stream: false }),
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) return null;
+    const data = await res.json();
+    const summary = String(
+      (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || ''
+    ).trim();
+    if (!summary) return null;
+    if (_tsSummaryCache.size >= TS_SUMMARY_CACHE_MAX) {
+      const firstKey = _tsSummaryCache.keys().next().value;
+      _tsSummaryCache.delete(firstKey);
+    }
+    _tsSummaryCache.set(cacheKey, summary);
+    return summary;
+  } catch (_e) {
+    return null;
+  }
+}
 const chatGptModelOptions = [
   DEFAULT_CHAT_MODEL,
   'gpt-5',
+  'gpt-5.5',
   'gpt-5-mini',
   'gpt-5-nano',
   'gpt-4.1',
@@ -166,6 +241,20 @@ const aiProviderDefinitions = [
     runtimeProvider: 'lmstudio',
     capabilities: ['chat', 'streaming', 'reasoning-visibility', 'model-listing'],
     defaultModel: DEFAULT_LMSTUDIO_MODEL
+  },
+  {
+    id: 'claude-code',
+    name: 'Claude Code',
+    vendor: 'Anthropic',
+    description: 'Agente CLI de Anthropic con acceso a archivos, comandos y git. Requiere autenticación claude auth login.',
+    pricing: 'paid',
+    integrationType: 'local_cli',
+    authModes: ['none'],
+    docsUrl: 'https://docs.anthropic.com/claude-code',
+    supportsBaseUrl: false,
+    runtimeProvider: 'claude-code',
+    capabilities: ['chat', 'streaming', 'shell', 'file-ops', 'git', 'background-tasks'],
+    defaultModel: claudeCodeConfiguredDefaultModel
   }
 ];
 const supportedAiAgents = aiProviderDefinitions.map((provider) => ({
@@ -292,6 +381,23 @@ const aiAgentTutorialsById = {
       'Selecciona LM Studio como agente activo y prueba el chat.'
     ],
     notes: ['No requiere API key en entorno local por defecto.']
+  },
+  'claude-code': {
+    title: 'Integración Claude Code CLI',
+    steps: [
+      'Claude Code ya está instalado en el servidor (/usr/bin/claude).',
+      'Autentica con: claude auth login (requiere cuenta Anthropic con acceso API).',
+      'En CodexWeb > Settings > Integraciones IA, activa Claude Code.',
+      'Selecciona Claude Code como agente activo.',
+      'Envía un prompt de prueba para verificar el funcionamiento.'
+    ],
+    notes: [
+      'El binario se configura con CLAUDE_CODE_BIN (por defecto: claude).',
+      'Directorio de trabajo por defecto: CLAUDE_CODE_DEFAULT_CWD=/root/CodexWeb.',
+      'Timeout configurable con CLAUDE_CODE_TIMEOUT_MS (por defecto: 900000ms).',
+      'Claude Code requiere autenticación activa en el servidor; ejecuta claude auth status para verificar.',
+      'Solo se permite ejecución en rutas definidas en CLAUDE_CODE_ALLOWED_CWDS.'
+    ]
   }
 };
 const chatReasoningEffortOptions = ['minimal', 'low', 'medium', 'high', 'xhigh'];
@@ -324,6 +430,16 @@ function resolveConfiguredPath(rawValue, fallbackPath) {
   }
 }
 
+function parseEnvBoolean(rawValue, fallback = false) {
+  const normalized = String(rawValue || '')
+    .trim()
+    .toLowerCase();
+  if (!normalized) return Boolean(fallback);
+  if (normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on') return true;
+  if (normalized === '0' || normalized === 'false' || normalized === 'no' || normalized === 'off') return false;
+  return Boolean(fallback);
+}
+
 const uploadsDir = resolveConfiguredPath(process.env.UPLOADS_DIR, path.join(__dirname, 'uploads'));
 const pendingUploadsDir = path.join(uploadsDir, 'pending');
 const uploadsDirUrlPath = uploadsDir.replace(/\\/g, '/');
@@ -332,6 +448,7 @@ const legacyCodexUsersRootDir = path.join(__dirname, '.codex_users');
 const codexUsersRootDir = path.resolve(
   String(process.env.CODEX_HOME_ROOT || '/var/lib/codexweb/codex_users').trim() || '/var/lib/codexweb/codex_users'
 );
+const codexAuthTemplateDir = String(process.env.CODEX_AUTH_TEMPLATE_DIR || '/root/.codex').trim();
 const restartStatePath = resolveConfiguredPath(
   process.env.RESTART_STATE_PATH,
   path.join(__dirname, 'restart-state.json')
@@ -340,6 +457,32 @@ const staticAssetsDir = resolveConfiguredPath(
   process.env.STATIC_ASSETS_DIR,
   path.join(__dirname, 'public')
 );
+const staticAssetsDirNormalized = String(staticAssetsDir || '').replace(/\\/g, '/');
+const isDevDeployment =
+  ['CODEXWEB_ENV', 'ENVIRONMENT', 'APP_ENV'].some((key) => {
+    const value = String(process.env[key] || '').trim().toLowerCase();
+    return value === 'dev' || value === 'development';
+  }) ||
+  /\/\.runtime\/dev(?:\/|$)/.test(staticAssetsDirNormalized) ||
+  /\/\.runtime\/dev(?:\/|$)/.test(String(process.env.DB_PATH || '').replace(/\\/g, '/')) ||
+  Number.parseInt(String(process.env.PORT || ''), 10) === 3060;
+const frontendIndexHtmlPath = path.join(staticAssetsDir, 'index.html');
+const frontendDiagHtmlPath = path.join(staticAssetsDir, 'diag.html');
+const frontendDiagScriptPath = path.join(staticAssetsDir, 'diag.js');
+const frontendBootMonitorPath = path.join(staticAssetsDir, 'boot-monitor.js');
+const frontendLegacyBootstrapPath = path.join(staticAssetsDir, 'legacy-bootstrap.js');
+const frontendDiagReportsPath = path.join(path.dirname(staticAssetsDir), 'diag-reports.json');
+const frontendDiagReportsLimit = 50;
+const frontendDiagReports = [];
+const frontendBuildStartedAtIso = new Date().toISOString();
+const frontendEntrypointAssetCache = {
+  indexMtimeMs: 0,
+  checkedAtMs: 0,
+  js: '',
+  css: ''
+};
+const frontendBootstrapErrorDedup = new Map();
+const frontendBootstrapErrorDedupMs = 15 * 1000;
 const restartLogLimit = 200;
 const maxAttachments = 5;
 const maxAttachmentSizeBytes = 500 * 1024 * 1024;
@@ -391,6 +534,46 @@ const chatRequestTimeoutMs =
   Number.isInteger(configuredChatRequestTimeoutMs) && configuredChatRequestTimeoutMs >= 60 * 1000
     ? configuredChatRequestTimeoutMs
     : 1000 * 60 * 20;
+const configuredChatInactivityTimeoutMs = Number.parseInt(
+  String(process.env.CHAT_INACTIVITY_TIMEOUT_MS || String(chatRequestTimeoutMs)),
+  10
+);
+const chatInactivityTimeoutMs =
+  Number.isInteger(configuredChatInactivityTimeoutMs) && configuredChatInactivityTimeoutMs >= 60 * 1000
+    ? configuredChatInactivityTimeoutMs
+    : chatRequestTimeoutMs;
+const configuredChatHardTimeoutMs = Number.parseInt(
+  String(process.env.CHAT_HARD_TIMEOUT_MS || String(Math.max(chatRequestTimeoutMs * 4, 1000 * 60 * 90))),
+  10
+);
+const chatHardTimeoutMs =
+  Number.isInteger(configuredChatHardTimeoutMs) && configuredChatHardTimeoutMs >= chatInactivityTimeoutMs
+    ? configuredChatHardTimeoutMs
+    : Math.max(chatInactivityTimeoutMs * 4, 1000 * 60 * 90);
+const configuredChatInactivityNoticeIntervalMs = Number.parseInt(
+  String(process.env.CHAT_INACTIVITY_NOTICE_INTERVAL_MS || String(Math.max(60 * 1000, chatInactivityTimeoutMs / 2))),
+  10
+);
+const chatInactivityNoticeIntervalMs =
+  Number.isInteger(configuredChatInactivityNoticeIntervalMs) && configuredChatInactivityNoticeIntervalMs >= 30 * 1000
+    ? configuredChatInactivityNoticeIntervalMs
+    : Math.max(60 * 1000, Math.floor(chatInactivityTimeoutMs / 2));
+const configuredChatStaleTaskTtlMs = Number.parseInt(
+  String(process.env.CHAT_STALE_TASK_TTL_MS || String(chatInactivityTimeoutMs * 2)),
+  10
+);
+const chatStaleTaskTtlMs =
+  Number.isInteger(configuredChatStaleTaskTtlMs) && configuredChatStaleTaskTtlMs >= chatInactivityTimeoutMs
+    ? configuredChatStaleTaskTtlMs
+    : chatInactivityTimeoutMs * 2;
+const configuredChatStaleSweepIntervalMs = Number.parseInt(
+  String(process.env.CHAT_STALE_SWEEP_INTERVAL_MS || String(45 * 1000)),
+  10
+);
+const chatStaleSweepIntervalMs =
+  Number.isInteger(configuredChatStaleSweepIntervalMs) && configuredChatStaleSweepIntervalMs >= 10 * 1000
+    ? configuredChatStaleSweepIntervalMs
+    : 45 * 1000;
 const geminiIncludeDirectories = (() => {
   const parsed = String(process.env.GEMINI_INCLUDE_DIRECTORIES || '/')
     .split(',')
@@ -555,6 +738,10 @@ const workspaceFileBlockedBaseNames = new Set([
 ]);
 const workspaceFileBlockedExtensions = new Set(['.db', '.sqlite', '.sqlite3', '.pem', '.key']);
 let repoContextIndexCache = null;
+const contextMdCache = new Map(); // absDir → { content, readAtMs }
+const contextMdCacheTtlMs = 60 * 1000;
+const contextMdFileNames = ['PROJECT_CONTEXT.md', 'CLAUDE.md', 'CONTEXT.md', 'README.md'];
+const contextMdMaxChars = 2200;
 const taskSnapshotsRootDir = resolveConfiguredPath(
   process.env.TASK_SNAPSHOTS_DIR,
   path.join(__dirname, 'tmp', 'task-snapshots')
@@ -666,9 +853,120 @@ const rcloneBinary = String(process.env.RCLONE_BIN || 'rclone').trim() || 'rclon
 const rcloneConfigPathDefault = String(process.env.RCLONE_CONFIG_PATH || '').trim();
 const driveDefaultRemoteName = String(process.env.RCLONE_DRIVE_DEFAULT_REMOTE || '').trim();
 const driveDefaultRootPath = String(process.env.RCLONE_DRIVE_DEFAULT_ROOT || 'CodexWeb').trim();
+const steamDeckSshFeatureEnabled = parseEnvBoolean(process.env.STEAMDECK_SSH_ENABLED, false);
+const steamDeckDefaultHost = String(process.env.STEAMDECK_SSH_HOST || '').trim();
+const configuredSteamDeckPort = Number.parseInt(String(process.env.STEAMDECK_SSH_PORT || '22'), 10);
+const steamDeckDefaultPort =
+  Number.isInteger(configuredSteamDeckPort) && configuredSteamDeckPort > 0 && configuredSteamDeckPort <= 65535
+    ? configuredSteamDeckPort
+    : 22;
+const steamDeckDefaultUser = String(process.env.STEAMDECK_SSH_USER || 'deck').trim() || 'deck';
+const steamDeckDefaultWorkdir =
+  String(process.env.STEAMDECK_REMOTE_WORKDIR || '/home/deck').trim() || '/home/deck';
+const steamDeckDefaultCodexBin = String(process.env.STEAMDECK_CODEX_BIN || 'codex').trim() || 'codex';
+const steamDeckSshKeyPathDefault = resolveConfiguredPath(
+  process.env.STEAMDECK_SSH_KEY_PATH,
+  path.join(__dirname, 'data', 'secrets', 'steamdeck_ssh_key')
+);
+const configuredSteamDeckCommandTimeoutMs = Number.parseInt(
+  String(process.env.STEAMDECK_COMMAND_TIMEOUT_MS || '120000'),
+  10
+);
+const steamDeckCommandTimeoutMs =
+  Number.isInteger(configuredSteamDeckCommandTimeoutMs) && configuredSteamDeckCommandTimeoutMs >= 3000
+    ? Math.min(configuredSteamDeckCommandTimeoutMs, 1000 * 60 * 60 * 6)
+    : 120000;
+const steamDeckAllowDangerousCommandsDefault = parseEnvBoolean(
+  process.env.STEAMDECK_ALLOW_DANGEROUS_COMMANDS,
+  false
+);
+const steamDeckJobLogMaxChars = 180000;
+const steamDeckJobOutputMaxChars = 240000;
+const steamDeckJobsMaxItems = 120;
 const storageResidualScanMaxItems = 220;
 const storageResidualScanMaxDepth = 5;
 const storageResidualDeleteMaxItems = 80;
+const storageQuickCleanupScanMaxItems = 240;
+const storageQuickCleanupDefaultDeleteLimit = 40;
+const storageQuickCleanupDefaultMinAgeHours = 12;
+const devStorageQuickCleanupTimeoutMs = 1000 * 60 * 8;
+const devStorageQuickCleanupOutputMaxChars = 32000;
+const devStorageQuickCleanupOutputTailMaxChars = 12000;
+const devStorageQuickCleanupScript = [
+  'set -Eeuo pipefail',
+  '',
+  'echo "===== ESPACIO ANTES ====="',
+  'df -hT /',
+  'echo',
+  '',
+  'echo "===== 1) VER BACKUPS DE APPS ====="',
+  'ls -lh /opt/server_backups/apps 2>/dev/null || true',
+  'echo',
+  '',
+  'echo "===== 2) DEJAR SOLO EL BACKUP MAS RECIENTE EN /opt/server_backups/apps ====="',
+  'if [ -d /opt/server_backups/apps ]; then',
+  '  cd /opt/server_backups/apps',
+  '  latest="$(ls -1t apps-backup-*.tar.zst 2>/dev/null | head -n1 || true)"',
+  '  if [ -n "${latest:-}" ]; then',
+  '    echo "Conservando: $latest"',
+  '    find . -maxdepth 1 -type f -name "apps-backup-*.tar.zst" ! -name "$latest" -print -delete',
+  '  else',
+  '    echo "No se encontraron backups apps-backup-*.tar.zst"',
+  '  fi',
+  'fi',
+  'echo',
+  '',
+  'echo "===== 3) BORRAR CACHE DE STREMIO APP ====="',
+  'if [ -d /root/stremio-app-data/stremio-cache ]; then',
+  '  du -sh /root/stremio-app-data/stremio-cache || true',
+  '  rm -rf /root/stremio-app-data/stremio-cache/*',
+  'fi',
+  'echo',
+  '',
+  'echo "===== 4) BORRAR CACHE DE STREMIO SERVER ====="',
+  'if [ -d /srv/stremio-server/home/.stremio-server/stremio-cache ]; then',
+  '  du -sh /srv/stremio-server/home/.stremio-server/stremio-cache || true',
+  '  rm -rf /srv/stremio-server/home/.stremio-server/stremio-cache/*',
+  'fi',
+  'echo',
+  '',
+  'echo "===== 5) LIMPIAR SNAPS DESHABILITADOS ====="',
+  'if command -v snap >/dev/null 2>&1; then',
+  '  snap list --all | awk "/disabled/{print \\$1, \\$3}" | while read snapname revision; do',
+  '    echo "Eliminando snap deshabilitado: $snapname rev $revision"',
+  '    snap remove "$snapname" --revision="$revision" || true',
+  '  done',
+  'fi',
+  'echo',
+  '',
+  'echo "===== 6) LIMPIEZA EXTRA SEGURA ====="',
+  'apt-get clean || true',
+  'journalctl --vacuum-size=150M || true',
+  'rm -rf /tmp/* /var/tmp/* 2>/dev/null || true',
+  'sync',
+  'echo',
+  '',
+  'echo "===== ESPACIO DESPUES ====="',
+  'df -hT /',
+  'echo',
+  '',
+  'echo "===== TAMANOS CLAVE DESPUES ====="',
+  'du -sh /opt/server_backups 2>/dev/null || true',
+  'du -sh /root/stremio-app-data 2>/dev/null || true',
+  'du -sh /srv/stremio-server 2>/dev/null || true',
+  'du -sh /var/lib/docker 2>/dev/null || true',
+  'du -sh /var/lib/snapd 2>/dev/null || true'
+].join('\n');
+const devStorageQuickCleanupPermissionTargets = [
+  '/',
+  '/opt/server_backups/apps',
+  '/root/stremio-app-data/stremio-cache',
+  '/srv/stremio-server/home/.stremio-server/stremio-cache',
+  '/tmp',
+  '/var/tmp',
+  '/var/lib/snapd',
+  '/var/lib/docker'
+];
 const storageResidualAiMaxCandidates = 80;
 const storageResidualProgressTickMs = 700;
 const storageResidualAiEtaBaseSeconds = 12;
@@ -736,6 +1034,10 @@ let deployedAppsCache = {
 };
 const activeDeployedDescriptionWorkers = new Set();
 const activeStorageJobWorkers = new Set();
+const activeSteamDeckJobWorkers = new Set();
+const activeSteamDeckProcesses = new Map();
+// One-time setup tokens: token -> { userId, publicKey, tunnelPrivKey, tunnelPort, serverBaseUrl, expiresAt }
+const steamDeckSetupTokens = new Map();
 const queuedProjectContextRefreshTimers = new Map();
 
 const sessionSecret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
@@ -1002,6 +1304,17 @@ function isStorageMutationPathProtected(absolutePath) {
   return false;
 }
 
+function isStoragePathUnderSystemProtectedRoot(absolutePath) {
+  const target = normalizeAbsoluteStoragePath(absolutePath, '');
+  if (!target) return true;
+  if (storageProtectedMutationRoots.has(target)) return true;
+  for (const root of storageProtectedMutationRoots) {
+    if (!root || root === '/') continue;
+    if (isPathWithin(root, target)) return true;
+  }
+  return false;
+}
+
 function assertStorageMutationPathAllowed(absolutePath) {
   const target = normalizeAbsoluteStoragePath(absolutePath);
   if (!target) {
@@ -1042,7 +1355,12 @@ function resolveStorageCleanupScanRoots(rawValue, fallback = []) {
     const normalized = normalizeAbsoluteStoragePath(entry, '');
     if (!normalized || seen.has(normalized)) return;
     seen.add(normalized);
-    if (isStorageMutationPathProtected(normalized) && !isPathWithin('/tmp', normalized) && !isPathWithin('/var/tmp', normalized)) {
+    if (normalized === repoRootDir) return;
+    if (
+      isStoragePathUnderSystemProtectedRoot(normalized) &&
+      !isPathWithin('/tmp', normalized) &&
+      !isPathWithin('/var/tmp', normalized)
+    ) {
       return;
     }
     deduped.push(normalized);
@@ -1069,7 +1387,10 @@ function assertStorageCleanupPathAllowed(absolutePath) {
   if (!isPathWithinAny(storageResidualScanRoots, normalized)) {
     throw createClientRequestError('Ruta fuera de las raíces permitidas para limpieza', 403);
   }
-  if (isStorageMutationPathProtected(normalized)) {
+  if (normalized === repoRootDir) {
+    throw createClientRequestError('Ruta protegida: no se permite borrar la raíz del workspace', 403);
+  }
+  if (isStoragePathUnderSystemProtectedRoot(normalized)) {
     throw createClientRequestError('Ruta protegida: no se permite borrar por limpieza', 403);
   }
   return normalized;
@@ -1485,9 +1806,9 @@ function detectResidualCategory(entry) {
   const absolutePath = normalizeAbsoluteStoragePath(entry && entry.path ? entry.path : '', '');
   const lowerPath = String(absolutePath || '').toLowerCase();
   const baseName = path.basename(lowerPath || '');
-  if (/\/(tmp|temp)\//i.test(lowerPath) || /(\.tmp|\.temp)$/i.test(baseName)) return 'temporary';
+  if (/\/(\.?tmp|temp)\//i.test(lowerPath) || /(\.tmp|\.temp)$/i.test(baseName)) return 'temporary';
   if (/\/logs?\//i.test(lowerPath) || /\.log(\.\d+)?$/i.test(baseName)) return 'logs';
-  if (/\/(cache|caches)\//i.test(lowerPath) || /(\.cache|cache\.)/i.test(baseName)) return 'cache';
+  if (/\/(\.?cache|caches)\//i.test(lowerPath) || /(\.cache|cache\.)/i.test(baseName)) return 'cache';
   if (
     /\/(backup|backups|archives?|old)\//i.test(lowerPath) ||
     /(\.bak|\.old|\.orig|\.tar|\.tar\.gz|\.zip|\.7z|\.rar)$/i.test(baseName)
@@ -1546,7 +1867,7 @@ function buildResidualHeuristicForEntry(entry) {
     score += 2;
     reasons.push('extensión típica de archivo residual');
   }
-  if (/\/(tmp|temp|cache|caches|logs?|old|backup|archives?)\//i.test(lowerPath)) {
+  if (/\/(\.?tmp|temp|\.?cache|caches|logs?|old|backup|archives?)\//i.test(lowerPath)) {
     score += 2;
     reasons.push('ubicación típica de residuales');
   }
@@ -1662,7 +1983,7 @@ function scanStorageResidualCandidates(payload = {}, options = {}) {
     visited.add(absolutePath);
     visitedCount += 1;
     if (!isPathWithinAny(storageResidualScanRoots, absolutePath)) continue;
-    if (isStorageMutationPathProtected(absolutePath)) continue;
+    if (isStoragePathUnderSystemProtectedRoot(absolutePath)) continue;
     let stats = null;
     try {
       stats = fs.lstatSync(absolutePath);
@@ -2175,6 +2496,201 @@ async function analyzeStorageResidualFilesForUser(userId, username, payload = {}
     });
   }
   return result;
+}
+
+function buildStorageQuickCleanupRoots(rawRoots) {
+  const requested = Array.isArray(rawRoots) ? rawRoots : [];
+  const normalizedRequested = requested
+    .map((entry) => normalizeAbsoluteStoragePath(entry, ''))
+    .filter((entry) => isPathWithinAny(storageResidualScanRoots, entry));
+  const fallback = [
+    taskSnapshotsRootDir,
+    storageJobsRootDir,
+    pendingUploadsDir,
+    '/tmp',
+    '/var/tmp'
+  ];
+  const roots = [];
+  const seen = new Set();
+  const addRoot = (entry) => {
+    const normalized = normalizeAbsoluteStoragePath(entry, '');
+    if (!normalized || seen.has(normalized)) return;
+    if (!isPathWithinAny(storageResidualScanRoots, normalized)) return;
+    if (isStoragePathUnderSystemProtectedRoot(normalized)) return;
+    seen.add(normalized);
+    roots.push(normalized);
+  };
+  if (normalizedRequested.length > 0) {
+    normalizedRequested.forEach(addRoot);
+  } else {
+    fallback.forEach(addRoot);
+    storageResidualScanRoots.forEach(addRoot);
+  }
+  return roots.slice(0, 20);
+}
+
+function isStorageQuickCleanupCandidate(entry, options = {}) {
+  const absolutePath = normalizeAbsoluteStoragePath(entry && entry.path ? entry.path : '', '');
+  if (!absolutePath) return false;
+  const lowerPath = absolutePath.toLowerCase();
+  const baseName = path.basename(lowerPath);
+  if (!baseName) return false;
+  if (
+    absolutePath === repoRootDir ||
+    absolutePath === uploadsDir ||
+    absolutePath === pendingUploadsDir ||
+    absolutePath === taskSnapshotsRootDir ||
+    absolutePath === storageJobsRootDir
+  ) {
+    return false;
+  }
+  if (workspaceFileBlockedBaseNames.has(baseName)) return false;
+  if (workspaceFileBlockedExtensions.has(path.extname(baseName))) return false;
+  if (baseName.startsWith('.env')) return false;
+  const entryType = String(entry && entry.type ? entry.type : '').trim().toLowerCase();
+  if (entryType !== 'file' && entryType !== 'directory') return false;
+
+  const category = normalizeResidualCandidateCategory(
+    entry && entry.category ? entry.category : '',
+    detectResidualCategory({
+      path: absolutePath,
+      type: entryType
+    })
+  );
+  if (category !== 'temporary' && category !== 'logs' && category !== 'cache' && category !== 'backup' && category !== 'artifact') {
+    return false;
+  }
+
+  const risk = String(entry && entry.risk ? entry.risk : '').trim().toLowerCase();
+  if (risk === 'high') return false;
+  const score = Number(entry && entry.score ? entry.score : 0);
+  const confidence = String(entry && entry.confidence ? entry.confidence : '').trim().toLowerCase();
+  if (confidence === 'low' && score < 5) return false;
+
+  const modifiedAtMs = Date.parse(String(entry && entry.modifiedAt ? entry.modifiedAt : ''));
+  const minAgeHoursRaw = Number(options && options.minAgeHours);
+  const minAgeHours = Number.isFinite(minAgeHoursRaw)
+    ? Math.min(Math.max(Math.round(minAgeHoursRaw), 1), 24 * 365)
+    : storageQuickCleanupDefaultMinAgeHours;
+  const ageHours = Number.isFinite(modifiedAtMs) && modifiedAtMs > 0
+    ? Math.max(0, (Date.now() - modifiedAtMs) / (1000 * 60 * 60))
+    : minAgeHours + 1;
+  const looksEphemeralPath = /\/(\.?tmp|temp|\.?cache|caches|logs?|old|backup|archives?|pending|storage-jobs|task-snapshots)\//i.test(lowerPath);
+  const looksEphemeralName = /(\.log(\.\d+)?|\.tmp|\.temp|\.cache|\.bak|\.old|\.orig|\.gz|\.tar|\.tar\.gz|\.zip)$/i.test(baseName);
+  if (!looksEphemeralPath && !looksEphemeralName && ageHours < minAgeHours) {
+    return false;
+  }
+
+  if (/\/uploads\/\d+\//i.test(lowerPath) && !/\/uploads\/pending\//i.test(lowerPath)) {
+    return false;
+  }
+  return true;
+}
+
+function runStorageQuickCleanup(payload = {}, options = {}) {
+  const rawLimit = Number.parseInt(String(payload && payload.limit ? payload.limit : ''), 10);
+  const deleteLimit = Number.isInteger(rawLimit)
+    ? Math.min(Math.max(rawLimit, 1), storageResidualDeleteMaxItems)
+    : storageQuickCleanupDefaultDeleteLimit;
+  const rawDepth = Number.parseInt(String(payload && payload.maxDepth ? payload.maxDepth : ''), 10);
+  const maxDepth = Number.isInteger(rawDepth)
+    ? Math.min(Math.max(rawDepth, 1), storageResidualScanMaxDepth)
+    : Math.min(3, storageResidualScanMaxDepth);
+  const rawMinAgeHours = Number.parseInt(String(payload && payload.minAgeHours ? payload.minAgeHours : ''), 10);
+  const minAgeHours = Number.isInteger(rawMinAgeHours)
+    ? Math.min(Math.max(rawMinAgeHours, 1), 24 * 365)
+    : storageQuickCleanupDefaultMinAgeHours;
+  const roots = buildStorageQuickCleanupRoots(payload && payload.roots ? payload.roots : []);
+  const scanLimit = Math.min(storageQuickCleanupScanMaxItems, Math.max(deleteLimit * 4, deleteLimit));
+  const scanned = scanStorageResidualCandidates(
+    {
+      roots,
+      limit: scanLimit,
+      maxDepth
+    },
+    {}
+  );
+  const eligible = scanned.candidates.filter((entry) => isStorageQuickCleanupCandidate(entry, { minAgeHours }));
+  const sortedEligible = [...eligible].sort((a, b) => {
+    const scoreDiff = Number(b && b.score ? b.score : 0) - Number(a && a.score ? a.score : 0);
+    if (scoreDiff !== 0) return scoreDiff;
+    const sizeDiff = Number(b && b.sizeBytes ? b.sizeBytes : 0) - Number(a && a.sizeBytes ? a.sizeBytes : 0);
+    if (sizeDiff !== 0) return sizeDiff;
+    const aMs = Date.parse(String(a && a.modifiedAt ? a.modifiedAt : ''));
+    const bMs = Date.parse(String(b && b.modifiedAt ? b.modifiedAt : ''));
+    return (Number.isFinite(aMs) ? aMs : 0) - (Number.isFinite(bMs) ? bMs : 0);
+  });
+  const selectedPaths = [];
+  const skipped = [];
+  const selected = new Set();
+  const protectedRootSet = new Set(
+    roots
+      .map((entry) => normalizeAbsoluteStoragePath(entry, ''))
+      .filter(Boolean)
+  );
+  const permissionProfile = options && options.permissionProfile ? options.permissionProfile : null;
+  sortedEligible.forEach((entry) => {
+    if (selectedPaths.length >= deleteLimit) return;
+    const absolutePath = normalizeAbsoluteStoragePath(entry && entry.path ? entry.path : '', '');
+    if (!absolutePath || selected.has(absolutePath)) return;
+    if (protectedRootSet.has(absolutePath)) {
+      if (skipped.length < 12) {
+        skipped.push({
+          path: absolutePath,
+          error: 'ruta raíz protegida para limpieza rápida'
+        });
+      }
+      return;
+    }
+    try {
+      if (permissionProfile) {
+        assertAiPermissionForAction(permissionProfile, 'storage', {
+          requiresSensitiveTool: true,
+          writeIntent: true,
+          targetPath: absolutePath
+        });
+      }
+      assertStorageCleanupPathAllowed(absolutePath);
+      selected.add(absolutePath);
+      selectedPaths.push(absolutePath);
+    } catch (error) {
+      if (skipped.length < 12) {
+        skipped.push({
+          path: absolutePath,
+          error: truncateForNotify(error && error.message ? error.message : 'cleanup_path_blocked', 200)
+        });
+      }
+    }
+  });
+  const deleteResult = selectedPaths.length > 0
+    ? deleteStorageResidualPaths({ paths: selectedPaths })
+    : {
+        requestedCount: 0,
+        deleted: [],
+        deletedEntries: [],
+        failed: [],
+        deletedCount: 0,
+        failedCount: 0,
+        freedBytes: 0
+      };
+  const summary = deleteResult.deletedCount > 0
+    ? deleteResult.failedCount > 0
+      ? `Limpieza rápida parcial: ${deleteResult.deletedCount} eliminado(s), ${deleteResult.failedCount} con error.`
+      : `Limpieza rápida completada: ${deleteResult.deletedCount} eliminado(s).`
+    : 'Limpieza rápida sin cambios: no se encontraron residuos seguros para borrar.';
+  return {
+    scannedAt: scanned.scannedAt,
+    roots: scanned.roots,
+    maxDepth,
+    minAgeHours,
+    candidateCount: scanned.candidates.length,
+    eligibleCount: eligible.length,
+    selectedCount: selectedPaths.length,
+    selectedPaths,
+    skipped,
+    ...deleteResult,
+    summary
+  };
 }
 
 function deleteStorageResidualPaths(payload = {}) {
@@ -2792,6 +3308,192 @@ function getSafeUserId(value) {
   return parsed;
 }
 
+const steamDeckAuthMethods = new Set(['key', 'password']);
+const steamDeckNetworkModes = new Set(['auto', 'tailscale', 'wireguard', 'lan']);
+const steamDeckDangerousCommandPatterns = [
+  {
+    id: 'rm_root',
+    label: 'Borrado total del sistema',
+    pattern: /\brm\s+-rf\s+\/(\s|$)/i
+  },
+  {
+    id: 'partition_table',
+    label: 'Manipulación de particiones/discos',
+    pattern: /\b(fdisk|parted|mkfs|wipefs|dd)\b/i
+  },
+  {
+    id: 'ssh_config',
+    label: 'Cambios en SSH/firewall del dispositivo',
+    pattern: /\b(ufw|iptables|nft|sshd_config|systemctl\s+(stop|disable)\s+sshd)\b/i
+  },
+  {
+    id: 'steamos_readonly_disable',
+    label: 'Desactivar modo readonly de SteamOS',
+    pattern: /\bsteamos-readonly\s+disable\b/i
+  }
+];
+
+function normalizeSteamDeckAuthMethod(rawValue, fallback = 'key') {
+  const value = String(rawValue || '')
+    .trim()
+    .toLowerCase();
+  if (steamDeckAuthMethods.has(value)) return value;
+  const safeFallback = String(fallback || '')
+    .trim()
+    .toLowerCase();
+  return steamDeckAuthMethods.has(safeFallback) ? safeFallback : 'key';
+}
+
+function normalizeSteamDeckNetworkMode(rawValue, fallback = 'auto') {
+  const value = String(rawValue || '')
+    .trim()
+    .toLowerCase();
+  if (steamDeckNetworkModes.has(value)) return value;
+  const safeFallback = String(fallback || '')
+    .trim()
+    .toLowerCase();
+  return steamDeckNetworkModes.has(safeFallback) ? safeFallback : 'auto';
+}
+
+function sanitizeSteamDeckDeviceName(rawValue) {
+  const compact = String(rawValue || '')
+    .replace(/[\r\n\t]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!compact) return 'Steam Deck';
+  return compact.length <= 80 ? compact : compact.slice(0, 80).trim();
+}
+
+function sanitizeSteamDeckHost(rawValue) {
+  const value = String(rawValue || '')
+    .trim()
+    .replace(/^ssh:\/\//i, '')
+    .replace(/^https?:\/\//i, '')
+    .replace(/\/+$/, '');
+  if (!value) return '';
+  const hostOnly = value.split('/')[0].trim();
+  return hostOnly.length <= 255 ? hostOnly : hostOnly.slice(0, 255);
+}
+
+function sanitizeSteamDeckUser(rawValue, fallback = steamDeckDefaultUser) {
+  const value = String(rawValue || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]/g, '');
+  if (!value) return String(fallback || steamDeckDefaultUser || 'deck').trim() || 'deck';
+  return value.slice(0, 64);
+}
+
+function sanitizeSteamDeckWorkdir(rawValue, fallback = steamDeckDefaultWorkdir) {
+  const value = String(rawValue || '')
+    .trim()
+    .replace(/[\r\n\0]/g, '');
+  if (!value) return String(fallback || steamDeckDefaultWorkdir || '/home/deck').trim() || '/home/deck';
+  return value.slice(0, 280);
+}
+
+function sanitizeSteamDeckCodexBin(rawValue, fallback = steamDeckDefaultCodexBin) {
+  const value = String(rawValue || '')
+    .trim()
+    .replace(/[\r\n\0]/g, '');
+  if (!value) return String(fallback || steamDeckDefaultCodexBin || 'codex').trim() || 'codex';
+  return value.slice(0, 180);
+}
+
+function normalizeSteamDeckPort(rawValue, fallback = steamDeckDefaultPort) {
+  const parsed = Number.parseInt(String(rawValue || ''), 10);
+  if (Number.isInteger(parsed) && parsed > 0 && parsed <= 65535) return parsed;
+  const safeFallback = Number.parseInt(String(fallback || steamDeckDefaultPort), 10);
+  if (Number.isInteger(safeFallback) && safeFallback > 0 && safeFallback <= 65535) return safeFallback;
+  return 22;
+}
+
+function normalizeSteamDeckTimeoutMs(rawValue, fallback = steamDeckCommandTimeoutMs) {
+  const parsed = Number.parseInt(String(rawValue || ''), 10);
+  if (Number.isInteger(parsed) && parsed >= 3000) {
+    return Math.min(parsed, 1000 * 60 * 60 * 6);
+  }
+  const safeFallback = Number.parseInt(String(fallback || steamDeckCommandTimeoutMs), 10);
+  if (Number.isInteger(safeFallback) && safeFallback >= 3000) {
+    return Math.min(safeFallback, 1000 * 60 * 60 * 6);
+  }
+  return 120000;
+}
+
+function truncateSteamDeckOutput(rawValue, maxChars = steamDeckJobOutputMaxChars) {
+  const value = String(rawValue || '');
+  if (!value) return '';
+  if (value.length <= maxChars) return value;
+  return value.slice(value.length - maxChars);
+}
+
+function appendSteamDeckLogText(baseText, message) {
+  const current = String(baseText || '');
+  const line = String(message || '').trim();
+  const stamped = `${nowIso()} ${line || '...'}`;
+  const next = current ? `${current}\n${stamped}` : stamped;
+  return truncateSteamDeckOutput(next, steamDeckJobLogMaxChars);
+}
+
+function shellSingleQuote(rawValue) {
+  return `'${String(rawValue || '').replace(/'/g, `'\\''`)}'`;
+}
+
+function buildSteamDeckJobId(kind = 'ssh') {
+  const suffix = crypto.randomBytes(6).toString('hex');
+  return `steamdeck_${String(kind || 'ssh').trim().toLowerCase()}_${Date.now()}_${suffix}`;
+}
+
+function detectSteamDeckDangerousCommand(rawCommand) {
+  const command = String(rawCommand || '').trim();
+  if (!command) return [];
+  return steamDeckDangerousCommandPatterns
+    .filter((entry) => entry.pattern.test(command))
+    .map((entry) => ({
+      id: entry.id,
+      label: entry.label
+    }));
+}
+
+function looksPublicNetworkHost(rawHost) {
+  const host = sanitizeSteamDeckHost(rawHost).toLowerCase();
+  if (!host) return false;
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return false;
+  if (host.endsWith('.local') || host.endsWith('.lan')) return false;
+  if (host.endsWith('.ts.net')) return false;
+  if (/^(10\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.test(host)) return false;
+  if (/^(192\.168\.\d{1,3}\.\d{1,3})$/.test(host)) return false;
+  if (/^(172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})$/.test(host)) return false;
+  return true;
+}
+
+function resolveSteamDeckKeyPathFromConfig(rawPath) {
+  const source = String(rawPath || '').trim();
+  if (!source) return steamDeckSshKeyPathDefault;
+  try {
+    return path.isAbsolute(source) ? path.resolve(source) : path.resolve(__dirname, source);
+  } catch (_error) {
+    return steamDeckSshKeyPathDefault;
+  }
+}
+
+function ensureSteamDeckSecretFilePermission(targetPath) {
+  const safePath = String(targetPath || '').trim();
+  if (!safePath) return;
+  ensureParentDirForFile(safePath);
+  try {
+    fs.chmodSync(path.dirname(safePath), 0o700);
+  } catch (_error) {
+    // best effort
+  }
+  if (fs.existsSync(safePath)) {
+    try {
+      fs.chmodSync(safePath, 0o600);
+    } catch (_error) {
+      // best effort
+    }
+  }
+}
+
 function isDirectoryEmptySync(targetPath) {
   try {
     return fs.readdirSync(targetPath).length === 0;
@@ -2893,6 +3595,10 @@ function ensureCodexHome(userId, options = {}) {
   if (Number.isInteger(ownerUid) && ownerUid >= 0 && Number.isInteger(ownerGid) && ownerGid >= 0) {
     chownRecursiveSync(target, ownerUid, ownerGid);
   }
+  seedCodexHomeFromTemplateIfNeeded(target, {
+    ownerUid: Number.isInteger(ownerUid) && ownerUid >= 0 ? ownerUid : null,
+    ownerGid: Number.isInteger(ownerGid) && ownerGid >= 0 ? ownerGid : null
+  });
   if (migrated) {
     console.info(`Codex home migrado a ${target} para user_${safeUserId}`);
   }
@@ -2927,6 +3633,47 @@ function getCodexEnvForUser(userId, options = {}) {
     TMPDIR: path.join(codexHome, 'tmp'),
     ...buildGitIdentityEnv(gitIdentity)
   };
+}
+
+function seedCodexHomeFromTemplateIfNeeded(targetCodexHome, options = {}) {
+  const target = String(targetCodexHome || '').trim();
+  if (!target || !codexAuthTemplateDir) return;
+
+  const templateDir = path.resolve(codexAuthTemplateDir);
+  const templateAuthPath = path.join(templateDir, 'auth.json');
+  if (!fs.existsSync(templateAuthPath)) return;
+
+  const filesToSeed = ['auth.json', 'models_cache.json', 'config.toml'];
+  let copiedAny = false;
+  for (const filename of filesToSeed) {
+    const source = path.join(templateDir, filename);
+    const destination = path.join(target, filename);
+    if (!fs.existsSync(source) || fs.existsSync(destination)) {
+      continue;
+    }
+    try {
+      fs.copyFileSync(source, destination);
+      fs.chmodSync(destination, filename === 'config.toml' ? 0o644 : 0o600);
+      copiedAny = true;
+    } catch (_error) {
+      // best-effort only; login flow can still populate the home later.
+    }
+  }
+
+  const ownerUid = Number(options.ownerUid);
+  const ownerGid = Number(options.ownerGid);
+  if (copiedAny && Number.isInteger(ownerUid) && ownerUid >= 0 && Number.isInteger(ownerGid) && ownerGid >= 0) {
+    for (const filename of filesToSeed) {
+      const destination = path.join(target, filename);
+      if (fs.existsSync(destination)) {
+        try {
+          fs.chownSync(destination, ownerUid, ownerGid);
+        } catch (_error) {
+          // ignore ownership best-effort failures
+        }
+      }
+    }
+  }
 }
 
 function getCodexQuotaStateForUser(userId) {
@@ -3118,6 +3865,10 @@ function registerActiveChatRun(userId, conversationId, processHandle) {
     conversationId: Number(conversationId),
     process: processHandle,
     startedAtMs: Date.now(),
+    lastActivityAtMs: Date.now(),
+    phase: 'starting',
+    continuationCount: 0,
+    continuationLimit: chatAutoContinuationLimit,
     killRequested: false,
     killReason: ''
   };
@@ -3771,6 +4522,101 @@ function markStaleTaskRunsOnStartup() {
   }
 }
 
+function parseTaskTimestampMs(value) {
+  const parsed = Date.parse(String(value || '').trim());
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function formatDurationMinutes(durationMs) {
+  const safeMs = Number.isFinite(Number(durationMs)) ? Math.max(0, Number(durationMs)) : 0;
+  const minutes = Math.max(1, Math.round(safeMs / 60000));
+  return `${minutes} min`;
+}
+
+function sweepStaleRunningTaskRuns() {
+  const safeLimit = 220;
+  const nowMs = Date.now();
+  const nowAt = nowIso();
+  let recovered = 0;
+  let timedOutActive = 0;
+
+  try {
+    const rows = listRunningTaskRunsStmt.all(safeLimit);
+    rows.forEach((row) => {
+      const safeTaskId = Number(row && row.id);
+      const safeUserId = Number(row && row.user_id);
+      const safeConversationId = Number(row && row.conversation_id);
+      if (!Number.isInteger(safeTaskId) || safeTaskId <= 0) return;
+      if (!Number.isInteger(safeUserId) || safeUserId <= 0) return;
+
+      const referenceMs = Math.max(
+        parseTaskTimestampMs(row && row.updated_at),
+        parseTaskTimestampMs(row && row.started_at)
+      );
+      if (!referenceMs || nowMs - referenceMs < chatStaleTaskTtlMs) {
+        return;
+      }
+
+      if (Number.isInteger(safeConversationId) && safeConversationId > 0) {
+        const runKey = buildActiveChatRunKey(safeUserId, safeConversationId);
+        const activeRun = activeChatRuns.get(runKey);
+        if (
+          activeRun &&
+          activeRun.process &&
+          activeRun.process.exitCode === null &&
+          !activeRun.process.killed
+        ) {
+          const terminated = terminateActiveChatRun(activeRun, 'timeout');
+          if (terminated) {
+            timedOutActive += 1;
+          }
+          return;
+        }
+      }
+
+      const staleDurationMs = Math.max(0, nowMs - referenceMs);
+      const fallbackMessage = `La ejecución quedó huérfana y se cerró por inactividad (${formatDurationMinutes(
+        staleDurationMs
+      )} sin cierre válido).`;
+      const markResult = markRunningTaskRunFailedStmt.run(
+        'timeout_orphaned',
+        fallbackMessage,
+        nowAt,
+        nowAt,
+        safeTaskId,
+        safeUserId
+      );
+      if (!markResult || Number(markResult.changes) <= 0) {
+        return;
+      }
+
+      const openDraft = getOpenLiveDraftByRequestStmt.get(safeUserId, String((row && row.request_id) || ''));
+      if (openDraft) {
+        const draftAssistantMessageId = Number(openDraft.assistant_message_id);
+        if (Number.isInteger(draftAssistantMessageId) && draftAssistantMessageId > 0) {
+          updateMessageContentStmt.run(fallbackMessage, draftAssistantMessageId);
+        }
+        completeLiveDraftByIdStmt.run(
+          fallbackMessage,
+          nowAt,
+          Number(openDraft.id),
+          safeUserId
+        );
+      }
+      recovered += 1;
+    });
+
+    if (recovered > 0 || timedOutActive > 0) {
+      void notify(
+        `Sweep stale tasks: huérfanas cerradas=${recovered}, activas terminadas por timeout=${timedOutActive}.`
+      );
+    }
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'stale_task_sweep_failed', 180);
+    void notify(`WARN stale_task_sweep_failed reason=${reason}`);
+  }
+}
+
 function sanitizeDiscordWebhookUrl(rawValue, fallback = '') {
   const source = typeof rawValue === 'string' ? rawValue.trim() : '';
   if (!source) return String(fallback || '').trim();
@@ -3896,6 +4742,17 @@ function toBase64Json(value) {
   return Buffer.from(JSON.stringify(value), 'utf8').toString('base64');
 }
 
+function flushSseResponse(res) {
+  if (!res || res.writableEnded || res.destroyed) return;
+  if (typeof res.flush === 'function') {
+    try {
+      res.flush();
+    } catch (_error) {
+      // best-effort flush only
+    }
+  }
+}
+
 function sendSse(res, event, payload) {
   if (!res || res.writableEnded || res.destroyed || (res.socket && res.socket.destroyed)) {
     return false;
@@ -3903,6 +4760,7 @@ function sendSse(res, event, payload) {
   try {
     res.write(`event: ${event}\n`);
     res.write(`data: ${toBase64Json(payload)}\n\n`);
+    flushSseResponse(res);
     return true;
   } catch (_error) {
     return false;
@@ -3915,6 +4773,7 @@ function sendSseComment(res, comment) {
   }
   try {
     res.write(`: ${String(comment || '').trim() || 'ping'}\n\n`);
+    flushSseResponse(res);
     return true;
   } catch (_error) {
     return false;
@@ -4438,6 +5297,100 @@ function commandExistsSync(commandName) {
   const exists = Boolean(result && result.code === 0 && String(result.stdout || '').trim());
   commandExistsCache.set(safeName, exists);
   return exists;
+}
+
+function normalizeHostForDevInstanceCheck(rawHost) {
+  const value = String(rawHost || '').trim().toLowerCase();
+  if (!value) return '';
+  const firstHost = value
+    .replace(/^https?:\/\//, '')
+    .split(',')[0]
+    .trim();
+  return firstHost.replace(/:\d+$/, '');
+}
+
+function isDevHostnameValue(rawHost) {
+  const host = normalizeHostForDevInstanceCheck(rawHost);
+  if (!host) return false;
+  return host.includes('codexwebdev') || host === 'localhost' || host === '127.0.0.1' || host.endsWith('.dev');
+}
+
+function isDevRuntimeInstance() {
+  const currentPort = String(process.env.PORT || '').trim();
+  if (currentPort === '3060') return true;
+  const dbPathLower = String(dbAbsolutePath || '').toLowerCase();
+  const storageJobsLower = String(storageJobsRootDir || '').toLowerCase();
+  return dbPathLower.includes('/.runtime/dev/') || storageJobsLower.includes('/.runtime/dev/');
+}
+
+function assertDevStorageQuickCleanupRequestAllowed(req) {
+  const hostCandidates = [
+    req && req.hostname ? req.hostname : '',
+    req && req.headers ? req.headers.host : '',
+    req && req.headers ? req.headers['x-forwarded-host'] : ''
+  ];
+  const hostAllowed = hostCandidates.some((entry) => isDevHostnameValue(entry));
+  if (!hostAllowed && !isDevRuntimeInstance()) {
+    throw createClientRequestError(
+      'La limpieza rápida de sistema solo está habilitada en la instancia DEV.',
+      403
+    );
+  }
+}
+
+function runDevStorageQuickCleanupCommand() {
+  const runningAsRoot = typeof process.getuid === 'function' ? process.getuid() === 0 : false;
+  const candidates = runningAsRoot
+    ? [
+        {
+          command: 'bash',
+          args: ['-lc', devStorageQuickCleanupScript],
+          label: 'bash'
+        }
+      ]
+    : [
+        {
+          command: 'sudo',
+          args: ['-n', 'bash', '-lc', devStorageQuickCleanupScript],
+          label: 'sudo -n bash'
+        },
+        {
+          command: 'bash',
+          args: ['-lc', devStorageQuickCleanupScript],
+          label: 'bash'
+        }
+      ];
+  let lastResult = null;
+  let usedLabel = '';
+  for (let index = 0; index < candidates.length; index += 1) {
+    const item = candidates[index];
+    const result = runSystemCommandSync(item.command, item.args, {
+      allowNonZero: true,
+      timeoutMs: devStorageQuickCleanupTimeoutMs,
+      maxBuffer: 1024 * 1024 * 24
+    });
+    const combinedOutput = `${String(result.stdout || '')}${String(result.stderr || '')}`;
+    const failedBecauseNoSudo =
+      item.command === 'sudo' &&
+      Number(result.code) !== 0 &&
+      /password is required|a password is required|sudo: a terminal is required/i.test(combinedOutput);
+    if (!failedBecauseNoSudo) {
+      lastResult = result;
+      usedLabel = item.label;
+      break;
+    }
+    lastResult = result;
+  }
+  return {
+    result:
+      lastResult || {
+        ok: false,
+        code: 1,
+        stdout: '',
+        stderr: 'quick_cleanup_command_failed'
+      },
+    ranWith: usedLabel || (runningAsRoot ? 'bash' : 'sudo -n bash')
+  };
 }
 
 function parseKeyValueOutput(rawText) {
@@ -6734,6 +7687,27 @@ async function summarizeProjectContextWithAi(userId, username, projectRow, messa
     }
   }
 
+  // Try all other configured HTTP providers before falling back to codex-cli
+  const serializationOptions = getAiAgentSerializationOptionsForUser(userId);
+  const fallbackHttpProviders = supportedAiAgents
+    .map((a) => a.id)
+    .filter((id) => id !== 'codex-cli' && id !== activeProviderId && getAiHttpProviderAdapter(id));
+  for (const altId of fallbackHttpProviders) {
+    const integration = getUserAiAgentIntegration(userId, altId);
+    if (!isAiAgentConfiguredForUser(altId, integration, serializationOptions)) continue;
+    if (attemptedProviders.includes(altId)) continue;
+    const altDef = getAiProviderDefinition(altId);
+    const altName = String((altDef && altDef.name) || altId).trim();
+    attemptedProviders.push(altId);
+    const altAttempt = await tryHttpProvider(altId, altName);
+    if (altAttempt.used) {
+      return {
+        ...altAttempt,
+        attemptedProviders
+      };
+    }
+  }
+
   attemptedProviders.push('codex-cli');
   const codexAttempt = await tryCodexCli();
   if (codexAttempt.used) {
@@ -8814,11 +9788,25 @@ function serializeTaskRecovery(row, commandRows, fallbackPlanText = '') {
   const task = serializeTaskRow(row);
   const commands = Array.isArray(commandRows) ? commandRows.map(serializeTaskCommandRow) : [];
   const planText = task.planText || normalizeTaskPlanText(fallbackPlanText);
+  const metrics = task && task.metrics && typeof task.metrics === 'object' ? task.metrics : {};
+  const runtimePhase = String(metrics.phase || '').trim().toLowerCase();
   return {
     taskId: task.id,
     status: task.status,
+    phase: runtimePhase || (task.status === 'running' ? 'running' : task.status),
     startedAt: task.startedAt,
     updatedAt: task.updatedAt,
+    finishedAt: task.finishedAt,
+    closeReason: task.closeReason,
+    result: task.result,
+    providerId: String(metrics.providerId || ''),
+    providerName: String(metrics.providerName || ''),
+    continuationCount: Number.isFinite(Number(metrics.continuationCount))
+      ? Math.max(0, Number(metrics.continuationCount))
+      : 0,
+    continuationLimit: Number.isFinite(Number(metrics.continuationLimit))
+      ? Math.max(0, Number(metrics.continuationLimit))
+      : chatAutoContinuationLimit,
     planText,
     commands
   };
@@ -9793,6 +10781,29 @@ function rankRepoFilesForPrompt(promptText) {
   };
 }
 
+function readContextMdForDir(absDir) {
+  const now = Date.now();
+  const cached = contextMdCache.get(absDir);
+  if (cached && now - cached.readAtMs < contextMdCacheTtlMs) {
+    return cached.content;
+  }
+  let content = '';
+  for (const fileName of contextMdFileNames) {
+    const filePath = path.join(absDir, fileName);
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      if (raw && raw.trim()) {
+        content = raw.length > contextMdMaxChars ? raw.slice(0, contextMdMaxChars) + '\n...[truncado]' : raw.trim();
+        break;
+      }
+    } catch (_error) {
+      // file not found or unreadable — try next
+    }
+  }
+  contextMdCache.set(absDir, { content, readAtMs: now });
+  return content;
+}
+
 function buildPromptWithRepoContext(currentPrompt, userPrompt) {
   const context = rankRepoFilesForPrompt(userPrompt);
   const candidates = Array.isArray(context.candidates) ? context.candidates : [];
@@ -9810,6 +10821,36 @@ function buildPromptWithRepoContext(currentPrompt, userPrompt) {
     lines.push(`Top-level: ${context.topLevelEntries.join(', ')}`);
   }
 
+  // Inject context MD files: root dir always, plus unique dirs from top candidates
+  const dirsToCheck = new Set();
+  dirsToCheck.add(context.rootDir);
+  candidates.slice(0, 4).forEach((entry) => {
+    const parentRel = path.dirname(entry.relativePath);
+    if (parentRel && parentRel !== '.') {
+      dirsToCheck.add(path.join(context.rootDir, parentRel));
+    }
+  });
+
+  const injectedContexts = [];
+  dirsToCheck.forEach((absDir) => {
+    if (injectedContexts.length >= 3) return;
+    const mdContent = readContextMdForDir(absDir);
+    if (!mdContent) return;
+    const relDir = path.relative(context.rootDir, absDir) || '.';
+    injectedContexts.push({ relDir, content: mdContent });
+  });
+
+  if (injectedContexts.length > 0) {
+    lines.push('');
+    lines.push('Contexto MD encontrado en el repo (lee esto primero para ahorrar tokens):');
+    injectedContexts.forEach(({ relDir, content }) => {
+      lines.push(`--- ${relDir === '.' ? 'raiz' : relDir} ---`);
+      lines.push(content);
+    });
+    lines.push('--- fin contexto MD ---');
+  }
+
+  lines.push('');
   lines.push('Archivos posiblemente relevantes para esta consulta:');
   candidates.forEach((entry, index) => {
     const matchHint =
@@ -9882,6 +10923,37 @@ async function resolveGeminiPath() {
   }
   resolvedGeminiPath = discovered;
   return resolvedGeminiPath;
+}
+
+async function resolveClaudeCodePath() {
+  if (resolvedClaudeCodePath) {
+    return resolvedClaudeCodePath;
+  }
+  const configuredBin = claudeCodeBin;
+  if (configuredBin && configuredBin !== 'claude') {
+    resolvedClaudeCodePath = configuredBin;
+    return resolvedClaudeCodePath;
+  }
+  let discovered = null;
+  try {
+    discovered = await resolveWhichPath(configuredBin || 'claude');
+  } catch (_error) {
+    discovered = null;
+  }
+  if (!discovered) {
+    throw new Error('CLAUDE_CODE_NOT_FOUND');
+  }
+  resolvedClaudeCodePath = discovered;
+  return resolvedClaudeCodePath;
+}
+
+function isClaudeCodeCwdAllowed(cwd) {
+  if (!cwd) return false;
+  const normalized = path.resolve(String(cwd));
+  return claudeCodeAllowedCwds.some((allowed) => {
+    const normalizedAllowed = path.resolve(allowed);
+    return normalized === normalizedAllowed || normalized.startsWith(normalizedAllowed + '/');
+  });
 }
 
 function scheduleApplicationRestart(attemptId) {
@@ -10266,6 +11338,51 @@ ON deployed_app_cloud_backups(user_id, app_id, created_at DESC, id DESC);
 
 CREATE INDEX IF NOT EXISTS idx_deployed_app_cloud_backups_account_created
 ON deployed_app_cloud_backups(account_id, created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS steamdeck_device_configs (
+  user_id INTEGER PRIMARY KEY,
+  device_name TEXT NOT NULL DEFAULT 'Steam Deck',
+  host TEXT NOT NULL DEFAULT '',
+  ssh_port INTEGER NOT NULL DEFAULT 22,
+  ssh_user TEXT NOT NULL DEFAULT 'deck',
+  auth_method TEXT NOT NULL DEFAULT 'key',
+  password_cipher TEXT NOT NULL DEFAULT '',
+  remote_workdir TEXT NOT NULL DEFAULT '/home/deck',
+  codex_bin TEXT NOT NULL DEFAULT 'codex',
+  network_mode TEXT NOT NULL DEFAULT 'auto',
+  allow_dangerous_commands INTEGER NOT NULL DEFAULT 0,
+  notify_discord INTEGER NOT NULL DEFAULT 0,
+  key_path TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS steamdeck_jobs (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'command',
+  status TEXT NOT NULL DEFAULT 'queued',
+  command_text TEXT NOT NULL DEFAULT '',
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  stdout_text TEXT NOT NULL DEFAULT '',
+  stderr_text TEXT NOT NULL DEFAULT '',
+  log_text TEXT NOT NULL DEFAULT '',
+  exit_code INTEGER,
+  error_text TEXT NOT NULL DEFAULT '',
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  started_at TEXT NOT NULL DEFAULT '',
+  finished_at TEXT NOT NULL DEFAULT '',
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_steamdeck_jobs_user_created
+ON steamdeck_jobs(user_id, created_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_steamdeck_jobs_status
+ON steamdeck_jobs(status, updated_at DESC, id DESC);
 `);
 
 function hasConversationColumn(columnName) {
@@ -10305,6 +11422,10 @@ db.exec(`
 CREATE INDEX IF NOT EXISTS idx_conversations_user_project
 ON conversations(user_id, project_id, created_at DESC)
 `);
+
+if (!hasConversationColumn('deck_chat')) {
+  db.exec('ALTER TABLE conversations ADD COLUMN deck_chat INTEGER NOT NULL DEFAULT 0');
+}
 
 if (!hasUserColumn('discord_webhook_url')) {
   db.exec("ALTER TABLE users ADD COLUMN discord_webhook_url TEXT NOT NULL DEFAULT ''");
@@ -10438,8 +11559,130 @@ WHERE project_id IS NOT NULL
   )
 `);
 
+// ── Token Saver schema + statements ──────────────────────────────────────────
+db.exec(tokenSaver.SCHEMA_SQL);
+const tsStmts = tokenSaver.createSettingsStatementsFor(db);
+
+function getTsGlobalSettings(userId) {
+  const row = tsStmts.getGlobal.get(userId);
+  return tokenSaver.parseSettingsRow(row, tokenSaver.DEFAULT_PRESET) ||
+    { mode: tokenSaver.DEFAULT_PRESET, enabled: true };
+}
+
+function getTsChatSettings(userId, conversationId) {
+  if (!conversationId) return null;
+  const row = tsStmts.getChat.get(userId, conversationId);
+  return tokenSaver.parseSettingsRow(row, null);
+}
+
+function getEffectiveTsSettings(userId, conversationId) {
+  const global = getTsGlobalSettings(userId);
+  const chat = getTsChatSettings(userId, conversationId);
+  return tokenSaver.resolveEffectiveSettings(global, chat);
+}
+
+function saveTsMetric(userId, conversationId, result) {
+  try {
+    tsStmts.insertMetric.run(
+      userId,
+      conversationId || null,
+      result.estimatedTokensBefore || 0,
+      result.estimatedTokensAfter || 0,
+      result.estimatedSavings || 0,
+      JSON.stringify(result.sections || {}),
+      nowIso()
+    );
+  } catch (_e) {
+    // best-effort
+  }
+}
+
+// ── Recent projects prepared statement ───────────────────────────────────────
+const getRecentProjectsStmt = db.prepare(`
+  SELECT
+    p.id AS project_id,
+    p.name AS project_name,
+    p.context_mode,
+    p.created_at AS project_created_at,
+    p.updated_at AS project_updated_at,
+    (
+      SELECT COUNT(1)
+      FROM conversations c2
+      WHERE c2.user_id = p.user_id
+        AND c2.project_id = p.id
+    ) AS chat_count,
+    (
+      SELECT c3.id
+      FROM conversations c3
+      WHERE c3.user_id = p.user_id
+        AND c3.project_id = p.id
+      ORDER BY COALESCE(
+        (SELECT MAX(m2.created_at) FROM messages m2 WHERE m2.conversation_id = c3.id),
+        c3.created_at
+      ) DESC
+      LIMIT 1
+    ) AS last_chat_id,
+    (
+      SELECT c3.title
+      FROM conversations c3
+      WHERE c3.user_id = p.user_id
+        AND c3.project_id = p.id
+      ORDER BY COALESCE(
+        (SELECT MAX(m2.created_at) FROM messages m2 WHERE m2.conversation_id = c3.id),
+        c3.created_at
+      ) DESC
+      LIMIT 1
+    ) AS last_chat_title,
+    (
+      SELECT m_last.content
+      FROM messages m_last
+      WHERE m_last.conversation_id = (
+        SELECT c3.id
+        FROM conversations c3
+        WHERE c3.user_id = p.user_id
+          AND c3.project_id = p.id
+        ORDER BY COALESCE(
+          (SELECT MAX(m2.created_at) FROM messages m2 WHERE m2.conversation_id = c3.id),
+          c3.created_at
+        ) DESC
+        LIMIT 1
+      )
+      ORDER BY m_last.created_at DESC
+      LIMIT 1
+    ) AS last_message_raw,
+    (
+      SELECT MAX(COALESCE(
+        (SELECT MAX(m.created_at) FROM messages m WHERE m.conversation_id = c.id),
+        c.created_at
+      ))
+      FROM conversations c
+      WHERE c.user_id = p.user_id
+        AND c.project_id = p.id
+    ) AS last_activity_at
+  FROM chat_projects p
+  WHERE p.user_id = ?
+  ORDER BY last_activity_at DESC, p.updated_at DESC
+  LIMIT ?
+`);
+
+function sanitizePreview(raw) {
+  if (!raw) return '';
+  let preview = String(raw).trim();
+  preview = preview
+    .replace(/[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g, '[email]')
+    .replace(/https?:\/\/[^\s"'<>]{8,}/g, '[url]')
+    .replace(/\b(sk-[A-Za-z0-9\-_]{20,}|Bearer\s+[A-Za-z0-9\-_]{20,}|token[=:\s]+[A-Za-z0-9\-_]{16,})/gi, '[REDACTED]')
+    .replace(/(<think>|<\/think>|<reasoning>|<\/reasoning>)[^<]*/gi, '')
+    .slice(0, 120)
+    .trim();
+  if (preview.length === 120) preview += '…';
+  return preview;
+}
+
+// ── End Token Saver init ──────────────────────────────────────────────────────
+
 const createConversationStmt = db.prepare(
-  'INSERT INTO conversations (user_id, project_id, title, model, reasoning_effort) VALUES (?, ?, ?, ?, ?)'
+  'INSERT INTO conversations (user_id, project_id, title, model, reasoning_effort, deck_chat) VALUES (?, ?, ?, ?, ?, ?)'
 );
 const insertMessageStmt = db.prepare(
   'INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)'
@@ -10481,6 +11724,7 @@ const listConversationsStmt = db.prepare(`
   SELECT
     c.id,
     c.project_id,
+    c.deck_chat,
     c.title,
     c.model,
     c.reasoning_effort,
@@ -10663,6 +11907,240 @@ const getUserNotificationSettingsStmt = db.prepare(`
 const updateUserNotificationSettingsStmt = db.prepare(
   'UPDATE users SET discord_webhook_url = ?, discord_notify_on_finish = ?, discord_include_result = ? WHERE id = ?'
 );
+const getSteamDeckConfigForUserStmt = db.prepare(`
+  SELECT
+    user_id,
+    device_name,
+    host,
+    ssh_port,
+    ssh_user,
+    auth_method,
+    password_cipher,
+    remote_workdir,
+    codex_bin,
+    network_mode,
+    allow_dangerous_commands,
+    notify_discord,
+    key_path,
+    created_at,
+    updated_at
+  FROM steamdeck_device_configs
+  WHERE user_id = ?
+  LIMIT 1
+`);
+const upsertSteamDeckConfigForUserStmt = db.prepare(`
+  INSERT INTO steamdeck_device_configs (
+    user_id,
+    device_name,
+    host,
+    ssh_port,
+    ssh_user,
+    auth_method,
+    password_cipher,
+    remote_workdir,
+    codex_bin,
+    network_mode,
+    allow_dangerous_commands,
+    notify_discord,
+    key_path,
+    created_at,
+    updated_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(user_id) DO UPDATE SET
+    device_name = excluded.device_name,
+    host = excluded.host,
+    ssh_port = excluded.ssh_port,
+    ssh_user = excluded.ssh_user,
+    auth_method = excluded.auth_method,
+    password_cipher = excluded.password_cipher,
+    remote_workdir = excluded.remote_workdir,
+    codex_bin = excluded.codex_bin,
+    network_mode = excluded.network_mode,
+    allow_dangerous_commands = excluded.allow_dangerous_commands,
+    notify_discord = excluded.notify_discord,
+    key_path = excluded.key_path,
+    updated_at = excluded.updated_at
+`);
+const insertSteamDeckJobStmt = db.prepare(`
+  INSERT INTO steamdeck_jobs (
+    id,
+    user_id,
+    kind,
+    status,
+    command_text,
+    payload_json,
+    stdout_text,
+    stderr_text,
+    log_text,
+    exit_code,
+    error_text,
+    cancel_requested,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  )
+  VALUES (?, ?, ?, ?, ?, ?, '', '', '', NULL, '', 0, ?, ?, '', '')
+`);
+const updateSteamDeckJobRunningStmt = db.prepare(`
+  UPDATE steamdeck_jobs
+  SET
+    status = 'running',
+    started_at = CASE
+      WHEN LENGTH(started_at) > 0 THEN started_at
+      ELSE ?
+    END,
+    updated_at = ?,
+    error_text = ''
+  WHERE id = ?
+`);
+const updateSteamDeckJobProgressStmt = db.prepare(`
+  UPDATE steamdeck_jobs
+  SET
+    stdout_text = ?,
+    stderr_text = ?,
+    log_text = ?,
+    updated_at = ?
+  WHERE id = ?
+`);
+const updateSteamDeckJobSucceededStmt = db.prepare(`
+  UPDATE steamdeck_jobs
+  SET
+    status = 'succeeded',
+    stdout_text = ?,
+    stderr_text = ?,
+    log_text = ?,
+    exit_code = ?,
+    error_text = '',
+    finished_at = ?,
+    updated_at = ?
+  WHERE id = ?
+`);
+const updateSteamDeckJobFailedStmt = db.prepare(`
+  UPDATE steamdeck_jobs
+  SET
+    status = 'failed',
+    stdout_text = ?,
+    stderr_text = ?,
+    log_text = ?,
+    exit_code = ?,
+    error_text = ?,
+    finished_at = ?,
+    updated_at = ?
+  WHERE id = ?
+`);
+const updateSteamDeckJobCancelledStmt = db.prepare(`
+  UPDATE steamdeck_jobs
+  SET
+    status = 'cancelled',
+    stdout_text = ?,
+    stderr_text = ?,
+    log_text = ?,
+    exit_code = ?,
+    error_text = '',
+    finished_at = ?,
+    updated_at = ?
+  WHERE id = ?
+`);
+const requestSteamDeckJobCancelStmt = db.prepare(`
+  UPDATE steamdeck_jobs
+  SET
+    cancel_requested = 1,
+    updated_at = ?
+  WHERE id = ?
+`);
+const getSteamDeckJobByIdStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    kind,
+    status,
+    command_text,
+    payload_json,
+    stdout_text,
+    stderr_text,
+    log_text,
+    exit_code,
+    error_text,
+    cancel_requested,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  FROM steamdeck_jobs
+  WHERE id = ?
+  LIMIT 1
+`);
+const getSteamDeckJobForUserStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    kind,
+    status,
+    command_text,
+    payload_json,
+    stdout_text,
+    stderr_text,
+    log_text,
+    exit_code,
+    error_text,
+    cancel_requested,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  FROM steamdeck_jobs
+  WHERE id = ?
+    AND user_id = ?
+  LIMIT 1
+`);
+const listSteamDeckJobsForUserStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    kind,
+    status,
+    command_text,
+    payload_json,
+    stdout_text,
+    stderr_text,
+    log_text,
+    exit_code,
+    error_text,
+    cancel_requested,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  FROM steamdeck_jobs
+  WHERE user_id = ?
+  ORDER BY created_at DESC, id DESC
+  LIMIT ?
+`);
+const listPendingSteamDeckJobsStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    kind,
+    status,
+    command_text,
+    payload_json,
+    stdout_text,
+    stderr_text,
+    log_text,
+    exit_code,
+    error_text,
+    cancel_requested,
+    created_at,
+    updated_at,
+    started_at,
+    finished_at
+  FROM steamdeck_jobs
+  WHERE status IN ('queued', 'running')
+  ORDER BY created_at ASC, id ASC
+  LIMIT ?
+`);
 const getUsernameByIdStmt = db.prepare(`
   SELECT username
   FROM users
@@ -11672,6 +13150,76 @@ const markStaleRunningTaskRunsStmt = db.prepare(`
     updated_at = ?
   WHERE status = 'running'
 `);
+const touchTaskRunHeartbeatStmt = db.prepare(`
+  UPDATE task_runs
+  SET
+    updated_at = ?
+  WHERE id = ?
+    AND user_id = ?
+    AND status = 'running'
+`);
+const updateRunningTaskRunMetricsStmt = db.prepare(`
+  UPDATE task_runs
+  SET
+    metrics_json = ?,
+    updated_at = ?
+  WHERE id = ?
+    AND user_id = ?
+    AND status = 'running'
+`);
+const listRunningTaskRunsStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    conversation_id,
+    request_id,
+    started_at,
+    updated_at
+  FROM task_runs
+  WHERE status = 'running'
+  ORDER BY COALESCE(updated_at, started_at) ASC, id ASC
+  LIMIT ?
+`);
+const markRunningTaskRunFailedStmt = db.prepare(`
+  UPDATE task_runs
+  SET
+    status = 'failed',
+    close_reason = ?,
+    result_summary = ?,
+    finished_at = ?,
+    rollback_available = CASE
+      WHEN snapshot_ready = 1 THEN rollback_available
+      ELSE 0
+    END,
+    updated_at = ?
+  WHERE id = ?
+    AND user_id = ?
+    AND status = 'running'
+`);
+const getOpenLiveDraftByRequestStmt = db.prepare(`
+  SELECT
+    id,
+    user_id,
+    conversation_id,
+    assistant_message_id,
+    assistant_content,
+    request_id
+  FROM chat_live_drafts
+  WHERE user_id = ?
+    AND request_id = ?
+    AND completed = 0
+  ORDER BY updated_at DESC, id DESC
+  LIMIT 1
+`);
+const completeLiveDraftByIdStmt = db.prepare(`
+  UPDATE chat_live_drafts
+  SET
+    assistant_content = ?,
+    completed = 1,
+    updated_at = ?
+  WHERE id = ?
+    AND user_id = ?
+`);
 
 function resolveTaskDurationMs(startedAt, finishedAt, fallbackDuration = null) {
   if (Number.isFinite(Number(fallbackDuration))) {
@@ -11795,7 +13343,331 @@ app.use(
   })
 );
 
-app.use(express.static(staticAssetsDir));
+function refreshFrontendEntrypointAssetCache() {
+  try {
+    const stat = fs.statSync(frontendIndexHtmlPath);
+    const nowMs = Date.now();
+    const cacheFresh =
+      frontendEntrypointAssetCache.checkedAtMs > 0 &&
+      nowMs - frontendEntrypointAssetCache.checkedAtMs < 15 * 1000 &&
+      frontendEntrypointAssetCache.indexMtimeMs === Number(stat.mtimeMs || 0);
+    if (cacheFresh) return;
+
+    const html = fs.readFileSync(frontendIndexHtmlPath, 'utf8');
+    const scriptMatch = html.match(/<script[^>]+src=["'](\/assets\/index-[^"']+\.js)["']/i);
+    const styleMatch = html.match(/<link[^>]+href=["'](\/assets\/index-[^"']+\.css)["']/i);
+    const resolveAssetPath = (assetUrlPath) => {
+      if (!assetUrlPath || typeof assetUrlPath !== 'string') return '';
+      const relative = assetUrlPath.replace(/^\/+/, '');
+      const absolute = path.resolve(staticAssetsDir, relative);
+      return fs.existsSync(absolute) ? absolute : '';
+    };
+
+    frontendEntrypointAssetCache.indexMtimeMs = Number(stat.mtimeMs || 0);
+    frontendEntrypointAssetCache.checkedAtMs = nowMs;
+    frontendEntrypointAssetCache.js = resolveAssetPath(scriptMatch ? scriptMatch[1] : '');
+    frontendEntrypointAssetCache.css = resolveAssetPath(styleMatch ? styleMatch[1] : '');
+  } catch (_error) {
+    frontendEntrypointAssetCache.checkedAtMs = Date.now();
+    frontendEntrypointAssetCache.js = '';
+    frontendEntrypointAssetCache.css = '';
+  }
+}
+
+function resolveFrontendEntrypointAsset(extension) {
+  const safeExtension = String(extension || '').trim().toLowerCase();
+  if (safeExtension !== 'js' && safeExtension !== 'css') return '';
+  refreshFrontendEntrypointAssetCache();
+  return safeExtension === 'js' ? frontendEntrypointAssetCache.js : frontendEntrypointAssetCache.css;
+}
+
+function compactDiagValue(value, maxLen = 320) {
+  const safeMax = Number.isInteger(maxLen) && maxLen > 0 ? maxLen : 320;
+  const text = String(value === null || value === undefined ? '' : value)
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return '';
+  return text.length <= safeMax ? text : `${text.slice(0, Math.max(0, safeMax - 1)).trimEnd()}…`;
+}
+
+function sanitizeDiagObject(value, maxKeys = 60, maxValueLen = 280) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const output = {};
+  Object.keys(value)
+    .slice(0, maxKeys)
+    .forEach((key) => {
+      const safeKey = compactDiagValue(key, 80);
+      if (!safeKey) return;
+      const raw = value[key];
+      if (typeof raw === 'boolean') {
+        output[safeKey] = raw;
+        return;
+      }
+      if (typeof raw === 'number' && Number.isFinite(raw)) {
+        output[safeKey] = raw;
+        return;
+      }
+      if (raw && typeof raw === 'object') {
+        output[safeKey] = compactDiagValue(JSON.stringify(raw), maxValueLen);
+        return;
+      }
+      output[safeKey] = compactDiagValue(raw, maxValueLen);
+    });
+  return output;
+}
+
+function sanitizeDiagErrors(rawErrors) {
+  if (!Array.isArray(rawErrors)) return [];
+  return rawErrors.slice(0, 30).map((entry) => ({
+    at: compactDiagValue(entry && entry.at, 60),
+    kind: compactDiagValue(entry && entry.kind, 80),
+    message: compactDiagValue(entry && entry.message, 320),
+    detail: compactDiagValue(entry && entry.detail, 900)
+  }));
+}
+
+function sanitizeStoredFrontendDiagReport(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  return {
+    receivedAt: compactDiagValue(entry.receivedAt, 80),
+    source: compactDiagValue(entry.source, 40),
+    ip: compactDiagValue(entry.ip, 120),
+    userAgent: compactDiagValue(entry.userAgent, 320),
+    url: compactDiagValue(entry.url, 420),
+    timestamp: compactDiagValue(entry.timestamp, 80),
+    code: compactDiagValue(entry.code, 80),
+    stage: compactDiagValue(entry.stage, 120),
+    message: compactDiagValue(entry.message, 360),
+    detail: compactDiagValue(entry.detail, 1200),
+    storage: sanitizeDiagObject(entry.storage, 30, 220),
+    featureChecks: sanitizeDiagObject(entry.featureChecks, 80, 220),
+    healthcheck: sanitizeDiagObject(entry.healthcheck, 40, 260),
+    version: sanitizeDiagObject(entry.version, 60, 260),
+    networkChecks: sanitizeDiagObject(entry.networkChecks, 80, 320),
+    assets: sanitizeDiagObject(entry.assets, 20, 260),
+    errors: sanitizeDiagErrors(entry.errors),
+    referrer: compactDiagValue(entry.referrer, 280),
+    username: compactDiagValue(entry.username, 80)
+  };
+}
+
+function normalizeFrontendDiagReportPayload(req) {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  return {
+    receivedAt: new Date().toISOString(),
+    ip: compactDiagValue(req.ip || '', 120),
+    userAgent: compactDiagValue(body.userAgent || req.headers['user-agent'] || '', 320),
+    url: compactDiagValue(body.url || req.headers.referer || '', 420),
+    timestamp: compactDiagValue(body.timestamp || '', 80),
+    code: compactDiagValue(body.code || body.stage || '', 80),
+    stage: compactDiagValue(body.stage || '', 120),
+    message: compactDiagValue(body.message || '', 360),
+    detail: compactDiagValue(body.detail || '', 1200),
+    storage: sanitizeDiagObject(body.storage, 30, 220),
+    featureChecks: sanitizeDiagObject(body.featureChecks || body.features, 80, 220),
+    healthcheck: sanitizeDiagObject(body.healthcheck, 40, 260),
+    version: sanitizeDiagObject(body.version, 60, 260),
+    networkChecks: sanitizeDiagObject(body.networkChecks || body.network, 80, 320),
+    assets: sanitizeDiagObject(body.assets, 20, 260),
+    errors: sanitizeDiagErrors(body.errors || body.lastErrors),
+    referrer: compactDiagValue(body.referrer || req.headers.referer || '', 280)
+  };
+}
+
+function persistFrontendDiagReportsToDisk() {
+  if (!isDevDeployment) return;
+  try {
+    fs.mkdirSync(path.dirname(frontendDiagReportsPath), { recursive: true });
+    fs.writeFileSync(frontendDiagReportsPath, JSON.stringify(frontendDiagReports, null, 2), 'utf8');
+  } catch (_error) {
+    // best effort persistence
+  }
+}
+
+function loadFrontendDiagReportsFromDisk() {
+  if (!isDevDeployment) return;
+  try {
+    if (!fs.existsSync(frontendDiagReportsPath)) return;
+    const raw = fs.readFileSync(frontendDiagReportsPath, 'utf8');
+    if (!raw.trim()) return;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return;
+    const normalized = parsed
+      .slice(Math.max(0, parsed.length - frontendDiagReportsLimit))
+      .map((entry) => sanitizeStoredFrontendDiagReport(entry))
+      .filter(Boolean);
+    frontendDiagReports.splice(0, frontendDiagReports.length, ...normalized);
+  } catch (_error) {
+    // ignore corrupted persisted reports
+  }
+}
+
+function pushFrontendDiagReport(report) {
+  if (!report || typeof report !== 'object') return;
+  frontendDiagReports.push(report);
+  if (frontendDiagReports.length > frontendDiagReportsLimit) {
+    frontendDiagReports.splice(0, frontendDiagReports.length - frontendDiagReportsLimit);
+  }
+  persistFrontendDiagReportsToDisk();
+}
+
+loadFrontendDiagReportsFromDisk();
+
+function setFrontendNoStore(res) {
+  res.set('Cache-Control', 'no-store, no-cache, max-age=0, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Surrogate-Control', 'no-store');
+}
+
+function disableConditionalCacheHeaders(req) {
+  if (!req || !req.headers || typeof req.headers !== 'object') return;
+  delete req.headers['if-none-match'];
+  delete req.headers['if-modified-since'];
+  delete req.headers['if-match'];
+  delete req.headers['if-unmodified-since'];
+}
+
+app.get(['/diag', '/diag.html'], (_req, res, next) => {
+  if (!fs.existsSync(frontendDiagHtmlPath)) {
+    next();
+    return;
+  }
+  disableConditionalCacheHeaders(_req);
+  setFrontendNoStore(res);
+  return res.sendFile(frontendDiagHtmlPath);
+});
+
+app.get('/d', (_req, res) => {
+  setFrontendNoStore(res);
+  return res.redirect(302, `/diag?reload=${Date.now()}`);
+});
+
+app.get('/dbg', (_req, res) => {
+  setFrontendNoStore(res);
+  return res.redirect(302, `/?debug=1&reload=${Date.now()}`);
+});
+
+app.get('/sf', (_req, res) => {
+  setFrontendNoStore(res);
+  return res.redirect(302, `/?safe=1&reload=${Date.now()}`);
+});
+
+app.get('/__clear-site-data', (req, res) => {
+  disableConditionalCacheHeaders(req);
+  setFrontendNoStore(res);
+  res.set('Clear-Site-Data', '"cache", "storage", "executionContexts"');
+  res.type('text/plain; charset=utf-8');
+  return res.status(200).send('client storage cleared\n');
+});
+
+app.get(['/boot-monitor.js', '/diag.js', '/legacy-bootstrap.js'], (req, res, next) => {
+  const map = {
+    '/boot-monitor.js': frontendBootMonitorPath,
+    '/diag.js': frontendDiagScriptPath,
+    '/legacy-bootstrap.js': frontendLegacyBootstrapPath
+  };
+  const target = map[String(req.path || '')];
+  if (!target || !fs.existsSync(target)) {
+    next();
+    return;
+  }
+  disableConditionalCacheHeaders(req);
+  setFrontendNoStore(res);
+  return res.sendFile(target);
+});
+
+app.get('/sw.js', (_req, res) => {
+  const swPath = path.join(staticAssetsDir, 'sw.js');
+  if (!fs.existsSync(swPath)) return res.status(404).send('Not found');
+  res.set('Cache-Control', 'no-store, max-age=0');
+  res.set('Content-Type', 'application/javascript; charset=utf-8');
+  return res.sendFile(swPath);
+});
+
+app.get('/manifest.json', (_req, res) => {
+  const mPath = path.join(staticAssetsDir, 'manifest.json');
+  if (!fs.existsSync(mPath)) return res.status(404).send('Not found');
+  res.set('Cache-Control', 'public, max-age=86400');
+  res.set('Content-Type', 'application/manifest+json; charset=utf-8');
+  return res.sendFile(mPath);
+});
+
+app.get('/icon.svg', (_req, res) => {
+  const iPath = path.join(staticAssetsDir, 'icon.svg');
+  if (!fs.existsSync(iPath)) return res.status(404).send('Not found');
+  res.set('Cache-Control', 'public, max-age=604800');
+  res.set('Content-Type', 'image/svg+xml');
+  return res.sendFile(iPath);
+});
+
+app.get(['/', '/index.html'], (_req, res, next) => {
+  if (!fs.existsSync(frontendIndexHtmlPath)) {
+    next();
+    return;
+  }
+  // Keep HTML always fresh to avoid stale hashes after deploys.
+  disableConditionalCacheHeaders(_req);
+  setFrontendNoStore(res);
+  return res.sendFile(frontendIndexHtmlPath);
+});
+
+app.get(['/quetzal-relay', '/quetzal-relay/'], (_req, res, next) => {
+  if (!fs.existsSync(frontendIndexHtmlPath)) {
+    next();
+    return;
+  }
+  disableConditionalCacheHeaders(_req);
+  setFrontendNoStore(res);
+  return res.sendFile(frontendIndexHtmlPath);
+});
+
+app.get(/^\/assets\/index-[A-Za-z0-9_-]+\.(js|css)$/, (req, res, next) => {
+  const safeRelativePath = String(req.path || '').replace(/^\/+/, '');
+  const requestedPath = path.resolve(staticAssetsDir, safeRelativePath);
+  if (fs.existsSync(requestedPath)) {
+    if (isDevDeployment) {
+      disableConditionalCacheHeaders(req);
+      setFrontendNoStore(res);
+    }
+    return res.sendFile(requestedPath);
+  }
+
+  const extensionMatch = String(req.path || '').match(/\.([a-z0-9]+)$/i);
+  const extension = extensionMatch ? extensionMatch[1].toLowerCase() : '';
+  const fallbackPath = resolveFrontendEntrypointAsset(extension);
+  if (!fallbackPath) {
+    next();
+    return;
+  }
+
+  disableConditionalCacheHeaders(req);
+  setFrontendNoStore(res);
+  res.set('X-CodexWeb-Asset-Fallback', path.basename(fallbackPath));
+  return res.sendFile(fallbackPath);
+});
+
+app.use(
+  express.static(staticAssetsDir, {
+    setHeaders: (res, filePath) => {
+      if (!isDevDeployment) return;
+      const safePath = String(filePath || '').replace(/\\/g, '/');
+      if (
+        safePath === String(frontendIndexHtmlPath).replace(/\\/g, '/') ||
+        safePath === String(frontendDiagHtmlPath).replace(/\\/g, '/') ||
+        safePath === String(frontendBootMonitorPath).replace(/\\/g, '/') ||
+        safePath === String(frontendDiagScriptPath).replace(/\\/g, '/') ||
+        safePath === String(frontendLegacyBootstrapPath).replace(/\\/g, '/')
+      ) {
+        setFrontendNoStore(res);
+        return;
+      }
+      if (/\/assets\/.+\.(?:js|css|map)$/i.test(safePath)) {
+        setFrontendNoStore(res);
+      }
+    }
+  })
+);
 
 app.use((req, res, next) => {
   const pathName = String(req.path || '');
@@ -11831,12 +13703,253 @@ app.get('/health', (_req, res) => {
   return res.status(200).json({ ok: true, service: 'codexweb' });
 });
 
+app.get('/ok', (_req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, max-age=0, must-revalidate');
+  res.type('text/plain; charset=utf-8');
+  return res.status(200).send(`ok codexweb dev ${new Date().toISOString()}`);
+});
+
+app.get('/api/health', (_req, res) => {
+  return res.status(200).json({ ok: true, service: 'codexweb' });
+});
+
+app.get('/api/claude/health', requireAuth, async (_req, res) => {
+  if (!claudeCodeEnabled) {
+    return res.status(200).json({
+      ok: false,
+      enabled: false,
+      installed: false,
+      bin: claudeCodeBin,
+      version: null,
+      message: 'Claude Code desactivado (CLAUDE_CODE_ENABLED=false)'
+    });
+  }
+  let claudePath = null;
+  let installed = false;
+  let version = null;
+  try {
+    claudePath = await resolveClaudeCodePath();
+    installed = true;
+  } catch (_error) {
+    installed = false;
+  }
+  if (installed) {
+    try {
+      const result = await execFileAsync(claudePath, ['--version'], { timeout: 8000, env: process.env });
+      version = String(result.stdout || result.stderr || '').trim().split('\n')[0] || null;
+    } catch (_error) {
+      version = null;
+    }
+  }
+  return res.status(200).json({
+    ok: installed,
+    enabled: claudeCodeEnabled,
+    installed,
+    bin: claudePath || claudeCodeBin,
+    version,
+    defaultCwd: claudeCodeDefaultCwd,
+    allowedCwds: claudeCodeAllowedCwds,
+    message: installed ? 'Claude Code disponible' : 'Claude Code no encontrado en el servidor'
+  });
+});
+
+app.get('/api/version', (_req, res) => {
+  refreshFrontendEntrypointAssetCache();
+  res.set('Cache-Control', 'no-store, max-age=0, must-revalidate');
+  const entryJs = frontendEntrypointAssetCache.js ? `/assets/${path.basename(frontendEntrypointAssetCache.js)}` : '';
+  const entryCss = frontendEntrypointAssetCache.css
+    ? `/assets/${path.basename(frontendEntrypointAssetCache.css)}`
+    : '';
+  return res.status(200).json({
+    ok: true,
+    service: 'codexweb',
+    environment: isDevDeployment ? 'dev' : 'prod',
+    nodeVersion: process.version,
+    startedAt: frontendBuildStartedAtIso,
+    staticAssetsDir: compactDiagValue(staticAssetsDirNormalized, 220),
+    entrypoint: {
+      js: entryJs,
+      css: entryCss
+    },
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.post('/api/frontend/bootstrap-error', (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const code = truncateForNotify(body.code || body.stage || 'bootstrap_error', 80) || 'bootstrap_error';
+    const stage = truncateForNotify(body.stage || code, 80) || code;
+    const message = truncateForNotify(body.message || 'frontend_startup_error', 260) || 'frontend_startup_error';
+    const detail = truncateForNotify(body.detail || '', 900);
+    const pathHint = truncateForNotify(body.path || req.headers.referer || '', 220);
+    const userAgent = truncateForNotify(req.headers['user-agent'] || body.userAgent || '', 260);
+    const username = truncateForNotify(req.session && req.session.username ? req.session.username : 'anon', 80);
+
+    const dedupKey = `${req.ip || 'ip'}|${code}|${stage}|${message}|${pathHint}`;
+    const nowMs = Date.now();
+    const lastNotifiedMs = Number(frontendBootstrapErrorDedup.get(dedupKey) || 0);
+    if (nowMs - lastNotifiedMs >= frontendBootstrapErrorDedupMs) {
+      frontendBootstrapErrorDedup.set(dedupKey, nowMs);
+      const logChunks = [
+        `FRONTEND_BOOT_ERROR code=${code}`,
+        `stage=${stage}`,
+        `user=${username}`,
+        pathHint ? `path=${pathHint}` : '',
+        userAgent ? `ua=${userAgent}` : '',
+        `message=${message}`,
+        detail ? `detail=${detail}` : ''
+      ].filter(Boolean);
+      void notify(logChunks.join(' | '));
+    }
+
+    if (isDevDeployment) {
+      pushFrontendDiagReport({
+        receivedAt: new Date().toISOString(),
+        source: 'bootstrap-error',
+        code,
+        stage,
+        message,
+        detail,
+        userAgent,
+        url: pathHint,
+        ip: compactDiagValue(req.ip || '', 120),
+        username
+      });
+    }
+
+    return res.status(202).json({ ok: true });
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'bootstrap_error_log_failed', 180);
+    void notify(`WARN frontend_bootstrap_error_log_failed reason=${reason}`);
+    return res.status(202).json({ ok: false });
+  }
+});
+
+app.post('/api/frontend/diag-report', (req, res) => {
+  if (!isDevDeployment) {
+    return res.status(404).json({ error: 'not_available' });
+  }
+  res.set('Cache-Control', 'no-store, max-age=0, must-revalidate');
+  try {
+    const report = normalizeFrontendDiagReportPayload(req);
+    pushFrontendDiagReport(report);
+    const code = compactDiagValue(report.code || report.stage || 'diag_report', 80) || 'diag_report';
+    const message = compactDiagValue(report.message || 'frontend_diag_report', 220) || 'frontend_diag_report';
+    const dedupKey = `${report.ip || 'ip'}|${code}|${message}|${report.url || ''}`;
+    const nowMs = Date.now();
+    const lastNotifiedMs = Number(frontendBootstrapErrorDedup.get(dedupKey) || 0);
+    if (nowMs - lastNotifiedMs >= frontendBootstrapErrorDedupMs) {
+      frontendBootstrapErrorDedup.set(dedupKey, nowMs);
+      const logChunks = [
+        `FRONTEND_DIAG_REPORT code=${code}`,
+        report.stage ? `stage=${compactDiagValue(report.stage, 80)}` : '',
+        report.url ? `url=${compactDiagValue(report.url, 220)}` : '',
+        report.userAgent ? `ua=${compactDiagValue(report.userAgent, 260)}` : '',
+        `message=${message}`
+      ].filter(Boolean);
+      void notify(logChunks.join(' | '));
+    }
+    return res.status(202).json({
+      ok: true,
+      stored: frontendDiagReports.length
+    });
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'diag_report_failed', 180);
+    void notify(`WARN frontend_diag_report_failed reason=${reason}`);
+    return res.status(202).json({ ok: false });
+  }
+});
+
+app.get('/api/frontend/diag-reports/recent', (req, res) => {
+  if (!isDevDeployment) {
+    return res.status(404).json({ error: 'not_available' });
+  }
+  res.set('Cache-Control', 'no-store, max-age=0, must-revalidate');
+  const rawLimit = Number.parseInt(String(req.query.limit || '20'), 10);
+  const limit =
+    Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, frontendDiagReportsLimit) : 20;
+  const rows = frontendDiagReports.slice(Math.max(0, frontendDiagReports.length - limit));
+  return res.status(200).json({
+    ok: true,
+    limit,
+    total: frontendDiagReports.length,
+    reports: rows
+  });
+});
+
 function requireAuth(req, res, next) {
   if (!req.session.userId) {
     return res.status(401).json({ error: 'No autorizado' });
   }
   next();
 }
+
+app.get('/api/quetzal-relay/status', requireAuth, async (req, res) => {
+  try {
+    const payload = await collectRelayStatus();
+    return res.json(payload);
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'quetzal_relay_status_failed', 220);
+    void notify(`QUETZAL RELAY status failed user=${truncateForNotify(req.session.username)} reason=${reason}`);
+    return res.status(500).json({ error: `No se pudo leer el estado de Quetzal Relay: ${reason}` });
+  }
+});
+
+app.post('/api/quetzal-relay/config', requireAuth, async (req, res) => {
+  try {
+    const config = saveQuetzalRelayConfig(req.body || {});
+    const status = await collectRelayStatus();
+    void notify(
+      `QUETZAL RELAY config saved user=${truncateForNotify(req.session.username)} port=${config.port} host=${truncateForNotify(config.publicHost, 120)}`
+    );
+    return res.json({ ok: true, config, status });
+  } catch (error) {
+    const message = error && error.message ? error.message : 'Configuración inválida';
+    return res.status(400).json({ error: message });
+  }
+});
+
+app.get('/api/quetzal-relay/commands', requireAuth, async (req, res) => {
+  try {
+    return res.json(await getQuetzalRelayCommandsPayload());
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'quetzal_relay_commands_failed', 220);
+    void notify(`QUETZAL RELAY commands failed user=${truncateForNotify(req.session.username)} reason=${reason}`);
+    return res.status(500).json({ error: `No se pudieron generar los comandos de Quetzal Relay: ${reason}` });
+  }
+});
+
+app.get('/api/quetzal-relay/diagnostics', requireAuth, async (req, res) => {
+  try {
+    return res.json(await getQuetzalRelayDiagnosticsPayload());
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'quetzal_relay_diag_failed', 220);
+    void notify(`QUETZAL RELAY diagnostics failed user=${truncateForNotify(req.session.username)} reason=${reason}`);
+    return res.status(500).json({ error: `No se pudieron leer los diagnósticos de Quetzal Relay: ${reason}` });
+  }
+});
+
+app.post('/api/quetzal-relay/prepare', requireAuth, async (req, res) => {
+  void notify(`QUETZAL RELAY prepare started user=${truncateForNotify(req.session.username)}`);
+  try {
+    const payload = await prepareRelay();
+    if (payload.ok) {
+      void notify(
+        `QUETZAL RELAY prepared user=${truncateForNotify(req.session.username)} backup=${truncateForNotify(payload.backupPath, 200)}`
+      );
+      return res.json(payload);
+    }
+    void notify(
+      `QUETZAL RELAY prepare failed user=${truncateForNotify(req.session.username)} reason=${truncateForNotify(payload.error, 220)}`
+    );
+    return res.status(400).json(payload);
+  } catch (error) {
+    const reason = truncateForNotify(error && error.message ? error.message : 'quetzal_relay_prepare_failed', 220);
+    void notify(`QUETZAL RELAY prepare crashed user=${truncateForNotify(req.session.username)} reason=${reason}`);
+    return res.status(500).json({ ok: false, error: `No se pudo preparar Quetzal Relay: ${reason}` });
+  }
+});
 
 app.get('/uploads/:conversationId/:storedName', requireAuth, (req, res) => {
   return serveManagedAttachmentFromParams(req, res, req.params.conversationId, req.params.storedName);
@@ -11919,6 +14032,767 @@ function maskSecretValue(rawValue) {
   if (!value) return '';
   if (value.length <= 8) return '*'.repeat(Math.max(value.length, 4));
   return `${value.slice(0, 4)}${'*'.repeat(Math.max(4, value.length - 6))}${value.slice(-2)}`;
+}
+
+function normalizeSteamDeckJobStatus(rawValue, fallback = 'queued') {
+  const value = String(rawValue || '')
+    .trim()
+    .toLowerCase();
+  if (value === 'queued' || value === 'running' || value === 'succeeded' || value === 'failed' || value === 'cancelled') {
+    return value;
+  }
+  return String(fallback || 'queued').trim().toLowerCase() || 'queued';
+}
+
+function normalizeSteamDeckJobKind(rawValue, fallback = 'command') {
+  const value = String(rawValue || '')
+    .trim()
+    .toLowerCase();
+  if (value === 'command' || value === 'codex' || value === 'detect') return value;
+  return String(fallback || 'command').trim().toLowerCase() || 'command';
+}
+
+function buildSteamDeckDefaultConfig() {
+  return {
+    deviceName: 'Steam Deck',
+    host: steamDeckDefaultHost,
+    port: steamDeckDefaultPort,
+    user: steamDeckDefaultUser,
+    authMethod: 'key',
+    remoteWorkdir: steamDeckDefaultWorkdir,
+    codexBin: steamDeckDefaultCodexBin,
+    networkMode: 'auto',
+    allowDangerousCommands: steamDeckAllowDangerousCommandsDefault,
+    notifyDiscord: false,
+    keyPath: steamDeckSshKeyPathDefault,
+    hasPassword: false,
+    hasPrivateKey: false,
+    keyPathExists: false,
+    keyFileMode: '',
+    keyFileModeSafe: false
+  };
+}
+
+function getSteamDeckKeyState(keyPath) {
+  const safePath = resolveSteamDeckKeyPathFromConfig(keyPath);
+  let exists = false;
+  let modeValue = '';
+  let modeSafe = false;
+  try {
+    const stats = fs.statSync(safePath);
+    exists = Boolean(stats && stats.isFile());
+    if (exists) {
+      const mode = Number(stats.mode) & 0o777;
+      modeValue = mode.toString(8).padStart(3, '0');
+      modeSafe = mode === 0o600;
+    }
+  } catch (_error) {
+    exists = false;
+  }
+  return {
+    keyPath: safePath,
+    exists,
+    mode: modeValue,
+    modeSafe
+  };
+}
+
+function normalizeSteamDeckConfigRow(row, options = {}) {
+  const source = row && typeof row === 'object' ? row : {};
+  const defaults = buildSteamDeckDefaultConfig();
+  const keyPath = resolveSteamDeckKeyPathFromConfig(source.key_path || defaults.keyPath);
+  const keyState = getSteamDeckKeyState(keyPath);
+  const authMethod = normalizeSteamDeckAuthMethod(source.auth_method || defaults.authMethod, defaults.authMethod);
+  const hasPassword = String(source.password_cipher || '').trim().length > 0;
+  const configured =
+    Boolean(sanitizeSteamDeckHost(source.host || defaults.host)) &&
+    ((authMethod === 'key' && keyState.exists) || (authMethod === 'password' && hasPassword));
+  const includeSecret = Boolean(options.includeSecret);
+  let password = '';
+  if (includeSecret && hasPassword) {
+    try {
+      password = decryptSecretText(source.password_cipher);
+    } catch (_error) {
+      password = '';
+    }
+  }
+  return {
+    enabled: steamDeckSshFeatureEnabled,
+    configured,
+    status: !steamDeckSshFeatureEnabled ? 'disabled' : configured ? 'ready' : 'not_configured',
+    deviceName: sanitizeSteamDeckDeviceName(source.device_name || defaults.deviceName),
+    host: sanitizeSteamDeckHost(source.host || defaults.host),
+    port: normalizeSteamDeckPort(source.ssh_port, defaults.port),
+    user: sanitizeSteamDeckUser(source.ssh_user || defaults.user, defaults.user),
+    authMethod,
+    remoteWorkdir: sanitizeSteamDeckWorkdir(source.remote_workdir || defaults.remoteWorkdir, defaults.remoteWorkdir),
+    codexBin: sanitizeSteamDeckCodexBin(source.codex_bin || defaults.codexBin, defaults.codexBin),
+    networkMode: normalizeSteamDeckNetworkMode(source.network_mode || defaults.networkMode, defaults.networkMode),
+    allowDangerousCommands: parseBooleanSetting(
+      source.allow_dangerous_commands,
+      defaults.allowDangerousCommands
+    ),
+    notifyDiscord: parseBooleanSetting(source.notify_discord, defaults.notifyDiscord),
+    keyPath,
+    hasPassword,
+    hasPrivateKey: keyState.exists,
+    keyPathExists: keyState.exists,
+    keyFileMode: keyState.mode,
+    keyFileModeSafe: keyState.modeSafe,
+    warningPublicHost: looksPublicNetworkHost(source.host || defaults.host),
+    createdAt: String(source.created_at || '').trim(),
+    updatedAt: String(source.updated_at || '').trim(),
+    password
+  };
+}
+
+function getSteamDeckConfigForUser(userId, options = {}) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) {
+    throw createClientRequestError('user_id inválido', 400);
+  }
+  const row = getSteamDeckConfigForUserStmt.get(safeUserId);
+  return normalizeSteamDeckConfigRow(row || {}, options);
+}
+
+function persistSteamDeckConfigForUser(userId, inputPayload = {}) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) {
+    throw createClientRequestError('user_id inválido', 400);
+  }
+  const body = inputPayload && typeof inputPayload === 'object' ? inputPayload : {};
+  const currentRow = getSteamDeckConfigForUserStmt.get(safeUserId);
+  const current = normalizeSteamDeckConfigRow(currentRow || {}, { includeSecret: true });
+
+  const deviceName = Object.prototype.hasOwnProperty.call(body, 'deviceName')
+    ? sanitizeSteamDeckDeviceName(body.deviceName)
+    : current.deviceName;
+  const host = Object.prototype.hasOwnProperty.call(body, 'host')
+    ? sanitizeSteamDeckHost(body.host)
+    : current.host;
+  const port = Object.prototype.hasOwnProperty.call(body, 'port')
+    ? normalizeSteamDeckPort(body.port, current.port)
+    : current.port;
+  const user = Object.prototype.hasOwnProperty.call(body, 'user')
+    ? sanitizeSteamDeckUser(body.user, current.user)
+    : current.user;
+  const authMethod = Object.prototype.hasOwnProperty.call(body, 'authMethod')
+    ? normalizeSteamDeckAuthMethod(body.authMethod, current.authMethod)
+    : current.authMethod;
+  const remoteWorkdir = Object.prototype.hasOwnProperty.call(body, 'remoteWorkdir')
+    ? sanitizeSteamDeckWorkdir(body.remoteWorkdir, current.remoteWorkdir)
+    : current.remoteWorkdir;
+  const codexBin = Object.prototype.hasOwnProperty.call(body, 'codexBin')
+    ? sanitizeSteamDeckCodexBin(body.codexBin, current.codexBin)
+    : current.codexBin;
+  const networkMode = Object.prototype.hasOwnProperty.call(body, 'networkMode')
+    ? normalizeSteamDeckNetworkMode(body.networkMode, current.networkMode)
+    : current.networkMode;
+  const allowDangerousCommands = Object.prototype.hasOwnProperty.call(body, 'allowDangerousCommands')
+    ? parseBooleanSetting(body.allowDangerousCommands, current.allowDangerousCommands)
+    : current.allowDangerousCommands;
+  const notifyDiscord = Object.prototype.hasOwnProperty.call(body, 'notifyDiscord')
+    ? parseBooleanSetting(body.notifyDiscord, current.notifyDiscord)
+    : current.notifyDiscord;
+  const requestedKeyPath = Object.prototype.hasOwnProperty.call(body, 'keyPath')
+    ? resolveSteamDeckKeyPathFromConfig(body.keyPath || current.keyPath)
+    : current.keyPath;
+  ensureSteamDeckSecretFilePermission(requestedKeyPath);
+
+  let nextPasswordCipher = String((currentRow && currentRow.password_cipher) || '').trim();
+  if (Object.prototype.hasOwnProperty.call(body, 'clearPassword') && parseBooleanSetting(body.clearPassword, false)) {
+    nextPasswordCipher = '';
+  } else if (Object.prototype.hasOwnProperty.call(body, 'password')) {
+    const plainPassword = String(body.password || '');
+    if (plainPassword.trim()) {
+      nextPasswordCipher = encryptSecretText(plainPassword.trim());
+    } else if (authMethod === 'password' && host) {
+      throw createClientRequestError('Password SSH requerido para auth method=password.', 400);
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(body, 'privateKey')) {
+    const providedPrivateKey = String(body.privateKey || '').replace(/\r\n/g, '\n').trim();
+    if (!providedPrivateKey) {
+      throw createClientRequestError('Clave privada SSH vacía.', 400);
+    }
+    if (!/^-----BEGIN [A-Z0-9 ]+ PRIVATE KEY-----/m.test(providedPrivateKey)) {
+      throw createClientRequestError('Formato de clave privada SSH no válido.', 400);
+    }
+    ensureSteamDeckSecretFilePermission(requestedKeyPath);
+    fs.writeFileSync(requestedKeyPath, `${providedPrivateKey}\n`, { mode: 0o600 });
+    try {
+      fs.chmodSync(requestedKeyPath, 0o600);
+    } catch (_error) {
+      // best effort
+    }
+  } else if (Object.prototype.hasOwnProperty.call(body, 'clearPrivateKey') && parseBooleanSetting(body.clearPrivateKey, false)) {
+    try {
+      if (fs.existsSync(requestedKeyPath)) {
+        fs.unlinkSync(requestedKeyPath);
+      }
+    } catch (_error) {
+      // best effort
+    }
+  }
+
+  if (authMethod === 'key' && host) {
+    const keyState = getSteamDeckKeyState(requestedKeyPath);
+    if (!keyState.exists) {
+      throw createClientRequestError(
+        'No hay clave privada SSH disponible. Genera una clave o pega una clave privada.',
+        409
+      );
+    }
+  } else if (authMethod === 'password' && host && !String(nextPasswordCipher || '').trim()) {
+    throw createClientRequestError('Password SSH requerido para auth method=password.', 400);
+  }
+
+  const now = nowIso();
+  upsertSteamDeckConfigForUserStmt.run(
+    safeUserId,
+    deviceName,
+    host,
+    port,
+    user,
+    authMethod,
+    nextPasswordCipher,
+    remoteWorkdir,
+    codexBin,
+    networkMode,
+    allowDangerousCommands ? 1 : 0,
+    notifyDiscord ? 1 : 0,
+    requestedKeyPath,
+    current.createdAt || now,
+    now
+  );
+  return getSteamDeckConfigForUser(safeUserId);
+}
+
+function serializeSteamDeckJobRow(row) {
+  if (!row || typeof row !== 'object') return null;
+  return {
+    id: String(row.id || '').trim(),
+    kind: normalizeSteamDeckJobKind(row.kind),
+    status: normalizeSteamDeckJobStatus(row.status),
+    command: String(row.command_text || '').trim(),
+    payload: safeParseJsonObject(row.payload_json),
+    stdout: String(row.stdout_text || ''),
+    stderr: String(row.stderr_text || ''),
+    log: String(row.log_text || ''),
+    exitCode: Number.isInteger(Number(row.exit_code)) ? Number(row.exit_code) : null,
+    error: String(row.error_text || '').trim(),
+    cancelRequested: Number(row.cancel_requested) === 1,
+    createdAt: String(row.created_at || '').trim(),
+    updatedAt: String(row.updated_at || '').trim(),
+    startedAt: String(row.started_at || '').trim(),
+    finishedAt: String(row.finished_at || '').trim()
+  };
+}
+
+function resolveSteamDeckNotificationWebhook(userId) {
+  const settings = getUserNotificationSettings(userId);
+  const resolved = sanitizeDiscordWebhookUrl(settings.discordWebhookUrl, defaultWebhookUrl);
+  return resolved || '';
+}
+
+function notifySteamDeckEvent(userId, config, message) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) return;
+  const shouldNotify = Boolean(config && config.notifyDiscord);
+  if (!shouldNotify) return;
+  const webhookUrl = resolveSteamDeckNotificationWebhook(safeUserId);
+  if (!webhookUrl) return;
+  void notify(`[SteamDeck] ${truncateForNotify(message, 1700)}`, { webhookUrl });
+}
+
+function buildSteamDeckSshSpawnDescriptor(config, remoteCommand, timeoutMs) {
+  const safeHost = sanitizeSteamDeckHost(config.host);
+  const safePort = normalizeSteamDeckPort(config.port, steamDeckDefaultPort);
+  const safeUser = sanitizeSteamDeckUser(config.user, steamDeckDefaultUser);
+  const safeAuthMethod = normalizeSteamDeckAuthMethod(config.authMethod, 'key');
+  const safeKeyPath = resolveSteamDeckKeyPathFromConfig(config.keyPath);
+  const safeTimeoutMs = normalizeSteamDeckTimeoutMs(timeoutMs, steamDeckCommandTimeoutMs);
+  const connectTimeoutSec = Math.max(4, Math.min(35, Math.round(safeTimeoutMs / 1000)));
+
+  const sshArgs = [
+    '-o',
+    'LogLevel=ERROR',
+    '-o',
+    'ServerAliveInterval=10',
+    '-o',
+    'ServerAliveCountMax=3',
+    '-o',
+    `ConnectTimeout=${connectTimeoutSec}`,
+    '-o',
+    'StrictHostKeyChecking=accept-new',
+    '-p',
+    String(safePort)
+  ];
+  if (safeAuthMethod === 'key') {
+    sshArgs.push('-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-i', safeKeyPath);
+  } else {
+    sshArgs.push('-o', 'PreferredAuthentications=password', '-o', 'PubkeyAuthentication=no', '-o', 'NumberOfPasswordPrompts=1');
+  }
+  sshArgs.push(`${safeUser}@${safeHost}`, remoteCommand);
+
+  let command = 'ssh';
+  let args = sshArgs.slice();
+  const envPatch = {};
+  if (safeAuthMethod === 'password') {
+    if (!commandExistsSync('sshpass')) {
+      throw createClientRequestError(
+        'sshpass no está instalado en el servidor. Usa autenticación por clave o instala sshpass.',
+        409
+      );
+    }
+    const password = String(config.password || '').trim();
+    if (!password) {
+      throw createClientRequestError('Password SSH requerido para auth method=password.', 400);
+    }
+    command = 'sshpass';
+    args = ['-e', 'ssh', ...sshArgs];
+    envPatch.SSHPASS = password;
+  }
+  return {
+    command,
+    args,
+    envPatch,
+    timeoutMs: safeTimeoutMs,
+    authMethod: safeAuthMethod
+  };
+}
+
+function executeSteamDeckSshCommand(config, remoteCommand, options = {}) {
+  const descriptor = buildSteamDeckSshSpawnDescriptor(
+    config,
+    remoteCommand,
+    normalizeSteamDeckTimeoutMs(options.timeoutMs, steamDeckCommandTimeoutMs)
+  );
+  return new Promise((resolve) => {
+    let stdoutText = '';
+    let stderrText = '';
+    let errored = false;
+    let timedOut = false;
+    let cancelled = false;
+    let settled = false;
+    let lastErrorMessage = '';
+    const startedAtMs = Date.now();
+    const child = spawn(descriptor.command, descriptor.args, {
+      env: { ...process.env, ...descriptor.envPatch },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      resolve(payload);
+    };
+
+    const killChild = (reason = 'cancelled') => {
+      cancelled = true;
+      lastErrorMessage = String(reason || 'cancelled');
+      try {
+        child.kill('SIGTERM');
+      } catch (_error) {
+        // ignore
+      }
+      setTimeout(() => {
+        try {
+          if (child.exitCode === null && !child.killed) child.kill('SIGKILL');
+        } catch (_error) {
+          // ignore
+        }
+      }, 600);
+    };
+
+    if (typeof options.onSpawn === 'function') {
+      try {
+        options.onSpawn({
+          pid: Number(child.pid || 0) || null,
+          kill: killChild
+        });
+      } catch (_error) {
+        // ignore callback failures
+      }
+    }
+
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      killChild('timeout');
+    }, descriptor.timeoutMs);
+
+    child.stdout.on('data', (chunk) => {
+      const text = String(chunk || '');
+      stdoutText = truncateSteamDeckOutput(stdoutText + text, steamDeckJobOutputMaxChars);
+      if (typeof options.onStdout === 'function') {
+        try {
+          options.onStdout(text, stdoutText);
+        } catch (_error) {
+          // ignore callback failures
+        }
+      }
+    });
+
+    child.stderr.on('data', (chunk) => {
+      const text = String(chunk || '');
+      stderrText = truncateSteamDeckOutput(stderrText + text, steamDeckJobOutputMaxChars);
+      if (typeof options.onStderr === 'function') {
+        try {
+          options.onStderr(text, stderrText);
+        } catch (_error) {
+          // ignore callback failures
+        }
+      }
+    });
+
+    child.on('error', (error) => {
+      errored = true;
+      lastErrorMessage = String((error && error.message) || 'spawn_failed');
+    });
+
+    child.on('close', (code, signal) => {
+      clearTimeout(timeoutId);
+      const exitCode = Number.isInteger(Number(code)) ? Number(code) : null;
+      const durationMs = Date.now() - startedAtMs;
+      const ok = !errored && !timedOut && !cancelled && exitCode === 0;
+      const failureReason =
+        ok
+          ? ''
+          : timedOut
+            ? 'timeout'
+            : cancelled
+              ? lastErrorMessage || 'cancelled'
+              : lastErrorMessage || truncateForNotify(stderrText || `ssh_exit_${exitCode}`, 220);
+      finish({
+        ok,
+        exitCode,
+        signal: String(signal || ''),
+        durationMs,
+        stdout: stdoutText,
+        stderr: stderrText,
+        timedOut,
+        cancelled,
+        error: failureReason
+      });
+    });
+  });
+}
+
+function buildSteamDeckDetectRemoteCommand() {
+  const script = [
+    'set -e',
+    'echo "__SECTION__hostname"',
+    'hostname',
+    'echo "__SECTION__whoami"',
+    'whoami',
+    'echo "__SECTION__uname"',
+    'uname -a',
+    'echo "__SECTION__os_release"',
+    'cat /etc/os-release || true',
+    'echo "__SECTION__which_codex"',
+    'which codex || true',
+    'echo "__SECTION__codex_version"',
+    'codex --version || true',
+    'echo "__SECTION__df_root"',
+    'df -h /',
+    'echo "__SECTION__free_mem"',
+    'free -h || true',
+    'echo "__SECTION__uptime"',
+    'uptime || true',
+    'echo "__SECTION__ip_addr"',
+    'ip addr show | head -120 || true',
+    'echo "__SECTION__sshd"',
+    'systemctl is-active sshd || true'
+  ].join('; ');
+  return `bash -lc ${shellSingleQuote(script)}`;
+}
+
+function parseSteamDeckDetectOutput(stdoutText, stderrText) {
+  const lines = String(stdoutText || '')
+    .replace(/\r/g, '')
+    .split('\n');
+  const sections = {};
+  let current = '';
+  lines.forEach((line) => {
+    if (line.startsWith('__SECTION__')) {
+      current = line.slice('__SECTION__'.length).trim().toLowerCase();
+      if (!sections[current]) sections[current] = [];
+      return;
+    }
+    if (!current) return;
+    sections[current].push(line);
+  });
+  const hostname = String((sections.hostname || []).join('\n')).trim();
+  const user = String((sections.whoami || []).join('\n')).trim();
+  const uname = String((sections.uname || []).join('\n')).trim();
+  const osRelease = String((sections.os_release || []).join('\n')).trim();
+  const codexPath = String((sections.which_codex || []).join('\n')).trim().split('\n')[0] || '';
+  const codexVersion = String((sections.codex_version || []).join('\n')).trim().split('\n')[0] || '';
+  const dfRoot = String((sections.df_root || []).join('\n')).trim();
+  const ipLines = (sections.ip_addr || [])
+    .map((line) => String(line || '').trim())
+    .filter((line) => /\binet\b/.test(line))
+    .slice(0, 24);
+  const sshStatus = String((sections.sshd || []).join('\n')).trim().split('\n')[0] || '';
+  return {
+    hostname,
+    user,
+    uname,
+    osRelease,
+    steamOsLikely: /steamos|holo|steam deck/i.test(`${uname}\n${osRelease}`),
+    codexInstalled: Boolean(codexPath),
+    codexPath,
+    codexVersion,
+    diskRoot: dfRoot,
+    memory: String((sections.free_mem || []).join('\n')).trim(),
+    uptime: String((sections.uptime || []).join('\n')).trim(),
+    ipAddresses: ipLines,
+    sshStatus,
+    raw: {
+      stdout: String(stdoutText || ''),
+      stderr: String(stderrText || '')
+    }
+  };
+}
+
+function buildSteamDeckCodexRemoteCommand(payload = {}, config = {}) {
+  const prompt = String(payload.prompt || '').trim();
+  if (!prompt) {
+    throw createClientRequestError('Prompt vacío para tarea Codex remota.', 400);
+  }
+  const remoteWorkdir = sanitizeSteamDeckWorkdir(payload.remoteWorkdir || config.remoteWorkdir, config.remoteWorkdir);
+  const codexBin = sanitizeSteamDeckCodexBin(payload.codexBin || config.codexBin, config.codexBin);
+  const inheritEnv = parseBooleanSetting(payload.inheritEnvironment, true);
+  const dangerSandbox = parseBooleanSetting(payload.dangerSandbox, true);
+  const args = ['exec'];
+  if (inheritEnv) args.push('-c', 'shell_environment_policy.inherit=all');
+  if (dangerSandbox) args.push('--sandbox', 'danger-full-access');
+  args.push(prompt);
+  const commandLine = [codexBin, ...args].map((entry) => shellSingleQuote(entry)).join(' ');
+  const script = `cd ${shellSingleQuote(remoteWorkdir)} && ${commandLine}`;
+  return `bash -lc ${shellSingleQuote(script)}`;
+}
+
+function createSteamDeckJob(userId, kind, commandText, payload = {}) {
+  const safeUserId = getSafeUserId(userId);
+  if (!safeUserId) throw createClientRequestError('user_id inválido', 400);
+  const safeKind = normalizeSteamDeckJobKind(kind, 'command');
+  const jobId = buildSteamDeckJobId(safeKind);
+  const now = nowIso();
+  insertSteamDeckJobStmt.run(
+    jobId,
+    safeUserId,
+    safeKind,
+    'queued',
+    String(commandText || '').slice(0, 4000),
+    JSON.stringify(payload && typeof payload === 'object' ? payload : {}),
+    now,
+    now
+  );
+  scheduleSteamDeckJob(jobId);
+  const created = getSteamDeckJobForUserStmt.get(jobId, safeUserId);
+  return serializeSteamDeckJobRow(created);
+}
+
+function updateSteamDeckJobProgress(jobId, stdoutText, stderrText, logText) {
+  const safeJobId = String(jobId || '').trim();
+  if (!safeJobId) return;
+  updateSteamDeckJobProgressStmt.run(
+    truncateSteamDeckOutput(stdoutText, steamDeckJobOutputMaxChars),
+    truncateSteamDeckOutput(stderrText, steamDeckJobOutputMaxChars),
+    truncateSteamDeckOutput(logText, steamDeckJobLogMaxChars),
+    nowIso(),
+    safeJobId
+  );
+}
+
+async function runSteamDeckJobById(jobId) {
+  const safeJobId = String(jobId || '').trim();
+  if (!safeJobId) return;
+  const row = getSteamDeckJobByIdStmt.get(safeJobId);
+  if (!row) return;
+  const status = normalizeSteamDeckJobStatus(row.status);
+  if (status === 'succeeded' || status === 'failed' || status === 'cancelled') return;
+  if (Number(row.cancel_requested) === 1) {
+    const cancelledAt = nowIso();
+    updateSteamDeckJobCancelledStmt.run('', '', appendSteamDeckLogText('', 'Cancelado antes de iniciar.'), null, cancelledAt, cancelledAt, safeJobId);
+    return;
+  }
+
+  const safeUserId = getSafeUserId(row.user_id);
+  if (!safeUserId) {
+    const failedAt = nowIso();
+    updateSteamDeckJobFailedStmt.run('', '', appendSteamDeckLogText('', 'ERROR: user_id inválido'), null, 'user_id_invalid', failedAt, failedAt, safeJobId);
+    return;
+  }
+  const config = getSteamDeckConfigForUser(safeUserId, { includeSecret: true });
+  const payload = safeParseJsonObject(row.payload_json);
+  const kind = normalizeSteamDeckJobKind(row.kind, 'command');
+  const timeoutMs = normalizeSteamDeckTimeoutMs(payload.timeoutMs, steamDeckCommandTimeoutMs);
+
+  const runningAt = nowIso();
+  updateSteamDeckJobRunningStmt.run(runningAt, runningAt, safeJobId);
+
+  let remoteCommand = String(row.command_text || '');
+  if (kind === 'codex') {
+    remoteCommand = buildSteamDeckCodexRemoteCommand(payload, config);
+  } else if (kind === 'detect') {
+    remoteCommand = buildSteamDeckDetectRemoteCommand();
+  }
+
+  let liveStdout = '';
+  let liveStderr = '';
+  let liveLog = appendSteamDeckLogText('', `Iniciando job ${kind}`);
+  let lastFlushAt = 0;
+  const flushProgress = (force = false) => {
+    const nowMs = Date.now();
+    if (!force && nowMs - lastFlushAt < 350) return;
+    lastFlushAt = nowMs;
+    updateSteamDeckJobProgress(safeJobId, liveStdout, liveStderr, liveLog);
+  };
+
+  const result = await executeSteamDeckSshCommand(config, remoteCommand, {
+    timeoutMs,
+    onSpawn: (procHandle) => {
+      activeSteamDeckProcesses.set(safeJobId, {
+        userId: safeUserId,
+        kill: typeof procHandle.kill === 'function' ? procHandle.kill : () => {},
+        pid: procHandle.pid
+      });
+    },
+    onStdout: (chunk, allStdout) => {
+      liveStdout = allStdout;
+      liveLog = appendSteamDeckLogText(liveLog, `stdout +${String(chunk || '').length} bytes`);
+      flushProgress(false);
+    },
+    onStderr: (chunk, allStderr) => {
+      liveStderr = allStderr;
+      liveLog = appendSteamDeckLogText(liveLog, `stderr +${String(chunk || '').length} bytes`);
+      flushProgress(false);
+    }
+  });
+  activeSteamDeckProcesses.delete(safeJobId);
+  flushProgress(true);
+
+  if (result.cancelled || Number(getSteamDeckJobByIdStmt.get(safeJobId)?.cancel_requested) === 1) {
+    const finishedAt = nowIso();
+    liveLog = appendSteamDeckLogText(liveLog, 'Job cancelado');
+    updateSteamDeckJobCancelledStmt.run(
+      result.stdout || liveStdout,
+      result.stderr || liveStderr,
+      liveLog,
+      result.exitCode,
+      finishedAt,
+      finishedAt,
+      safeJobId
+    );
+    notifySteamDeckEvent(safeUserId, config, `Job cancelado: ${safeJobId}`);
+    return;
+  }
+
+  if (!result.ok) {
+    const failedAt = nowIso();
+    let reason = truncateForNotify(result.error || `ssh_exit_${result.exitCode}`, 500);
+    if (
+      kind === 'codex' &&
+      /not found|command not found|no such file or directory/i.test(
+        `${String(result.stderr || '')}\n${String(result.stdout || '')}`
+      )
+    ) {
+      reason =
+        'Codex CLI no encontrado en la Steam Deck. Verifica `which codex`, revisa `$PATH` e instala/configura Codex CLI.';
+    }
+    liveLog = appendSteamDeckLogText(liveLog, `ERROR: ${reason}`);
+    updateSteamDeckJobFailedStmt.run(
+      result.stdout || liveStdout,
+      result.stderr || liveStderr,
+      liveLog,
+      result.exitCode,
+      reason,
+      failedAt,
+      failedAt,
+      safeJobId
+    );
+    notifySteamDeckEvent(safeUserId, config, `Job falló: ${safeJobId} (${reason})`);
+    return;
+  }
+
+  const succeededAt = nowIso();
+  liveLog = appendSteamDeckLogText(liveLog, 'Job completado correctamente');
+  updateSteamDeckJobSucceededStmt.run(
+    result.stdout || liveStdout,
+    result.stderr || liveStderr,
+    liveLog,
+    result.exitCode,
+    succeededAt,
+    succeededAt,
+    safeJobId
+  );
+  notifySteamDeckEvent(safeUserId, config, `Job completado: ${safeJobId}`);
+}
+
+function scheduleSteamDeckJob(jobId) {
+  const safeJobId = String(jobId || '').trim();
+  if (!safeJobId || activeSteamDeckJobWorkers.has(safeJobId)) return;
+  activeSteamDeckJobWorkers.add(safeJobId);
+  setTimeout(() => {
+    void runSteamDeckJobById(safeJobId).finally(() => {
+      activeSteamDeckJobWorkers.delete(safeJobId);
+      activeSteamDeckProcesses.delete(safeJobId);
+    });
+  }, 12);
+}
+
+function resumePendingSteamDeckJobs() {
+  const rows = listPendingSteamDeckJobsStmt.all(Math.max(40, steamDeckJobsMaxItems * 2));
+  rows.forEach((row) => {
+    const jobId = String(row && row.id ? row.id : '').trim();
+    if (!jobId) return;
+    scheduleSteamDeckJob(jobId);
+  });
+}
+
+function guardSteamDeckFeatureEnabled(res) {
+  if (steamDeckSshFeatureEnabled) return true;
+  if (res && typeof res.status === 'function') {
+    res.status(403).json({
+      error:
+        'Steam Deck SSH está desactivado en este entorno. Activa STEAMDECK_SSH_ENABLED=true para habilitarlo.'
+    });
+  }
+  return false;
+}
+
+function assertSteamDeckConnectionReady(config) {
+  const safeConfig = config && typeof config === 'object' ? config : {};
+  if (!sanitizeSteamDeckHost(safeConfig.host)) {
+    throw createClientRequestError('Configura host/IP de Steam Deck antes de conectar.', 400);
+  }
+  const authMethod = normalizeSteamDeckAuthMethod(safeConfig.authMethod, 'key');
+  if (authMethod === 'key' && !safeConfig.hasPrivateKey) {
+    throw createClientRequestError('No hay clave SSH configurada. Genera o pega una clave privada.', 409);
+  }
+  if (authMethod === 'password' && !String(safeConfig.password || '').trim()) {
+    throw createClientRequestError('No hay password SSH configurado.', 409);
+  }
+}
+
+function buildSteamDeckConnectivityError(result) {
+  const stderr = String((result && result.stderr) || '');
+  const error = String((result && result.error) || '');
+  const combined = `${stderr}\n${error}`.toLowerCase();
+  if (
+    /timed out|no route to host|connection refused|network is unreachable|could not resolve|name or service not known|host unreachable/i.test(
+      combined
+    )
+  ) {
+    return 'Steam Deck no accesible / apagada / sin red.';
+  }
+  if (/permission denied|authentication failed/i.test(combined)) {
+    return 'Autenticación SSH fallida. Revisa usuario/clave/password.';
+  }
+  return `Conexión SSH fallida: ${truncateForNotify(error || stderr || 'ssh_failed', 220)}`;
 }
 
 function normalizeSupportedAiAgentId(rawValue) {
@@ -12069,11 +14943,36 @@ const aiHttpProviderAdapters = Object.freeze({
       };
     },
     buildChatRequest({ model, prompt, integration, baseUrl }) {
+      const safeModel = String(model || '').toLowerCase();
+      const isAnthropicModel =
+        safeModel.startsWith('anthropic/') ||
+        safeModel.startsWith('claude-') ||
+        safeModel.includes('/claude-');
+      const endpoint = `${baseUrl.replace(/\/+$/, '')}/chat/completions`;
+      const baseHeaders = buildOpenAiCompatibleHeaders(integration.apiKey, {
+        includeOpenRouterHeaders: true
+      });
+      if (isAnthropicModel) {
+        // Phase 3A — Prompt Caching: use content block with cache_control so Anthropic caches
+        // the static prefix (system context + older history) across turns.
+        return {
+          endpoint,
+          headers: { ...baseHeaders, 'anthropic-beta': 'prompt-caching-2024-07-31' },
+          body: {
+            model,
+            stream: true,
+            messages: [
+              {
+                role: 'user',
+                content: [{ type: 'text', text: prompt, cache_control: { type: 'ephemeral' } }]
+              }
+            ]
+          }
+        };
+      }
       return {
-        endpoint: `${baseUrl.replace(/\/+$/, '')}/chat/completions`,
-        headers: buildOpenAiCompatibleHeaders(integration.apiKey, {
-          includeOpenRouterHeaders: true
-        }),
+        endpoint,
+        headers: baseHeaders,
         body: {
           model,
           stream: true,
@@ -12290,6 +15189,9 @@ function isAiAgentConfiguredForUser(agentId, integrationRow, options = {}) {
   if (safeAgentId === 'codex-cli') {
     return codexLinked;
   }
+  if (safeAgentId === 'claude-code') {
+    return claudeCodeEnabled;
+  }
   const httpAdapter = getAiHttpProviderAdapter(safeAgentId);
   if (httpAdapter) {
     if (httpAdapter.requiresApiKey && !String(normalized.apiKey || '').trim()) {
@@ -12340,6 +15242,9 @@ function getAiProviderStaticModelOptions(providerId) {
   }
   if (safeProviderId === 'lmstudio') {
     return [...lmStudioFallbackModels];
+  }
+  if (safeProviderId === 'claude-code') {
+    return [...claudeCodeModelOptions];
   }
   return [];
 }
@@ -13191,14 +16096,46 @@ function getChatAgentModelOptions(agentId, userId = 0) {
 
 function getChatAgentDefaultModel(agentId) {
   const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  if (safeAgentId === 'claude-code') {
+    return normalizeClaudeCodeModel(claudeCodeConfiguredDefaultModel, 'claude-sonnet-4-5');
+  }
   const provider = getAiProviderDefinition(safeAgentId);
   return String((provider && provider.defaultModel) || DEFAULT_CHAT_MODEL).trim() || DEFAULT_CHAT_MODEL;
+}
+
+function normalizeClaudeCodeModel(rawModel, fallback = 'claude-sonnet-4-5') {
+  const normalized = sanitizeConversationModel(rawModel);
+  if (claudeCodeModelOptions.includes(normalized)) {
+    return normalized;
+  }
+  if (claudeCodeModelOptions.includes(fallback)) {
+    return fallback;
+  }
+  return 'claude-sonnet-4-5';
+}
+
+function getChatAgentDefaultReasoningEffort(agentId) {
+  const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  if (safeAgentId === 'claude-code') {
+    const normalized = sanitizeReasoningEffort(claudeCodeConfiguredDefaultReasoningEffort, 'low');
+    return normalized === 'minimal' ? 'low' : normalized;
+  }
+  return DEFAULT_REASONING_EFFORT;
+}
+
+function mapReasoningEffortToClaudeCli(rawValue) {
+  const normalized = sanitizeReasoningEffort(rawValue, getChatAgentDefaultReasoningEffort('claude-code'));
+  if (normalized === 'minimal') return 'low';
+  return normalized;
 }
 
 function normalizeChatAgentModel(agentId, rawModel) {
   const fallbackModel = getChatAgentDefaultModel(agentId);
   const normalized = sanitizeConversationModel(rawModel);
   if (!normalized) return fallbackModel;
+  if (agentId === 'claude-code') {
+    return normalizeClaudeCodeModel(normalized, fallbackModel);
+  }
   if (agentId === 'gemini-cli') {
     if (normalized.startsWith('gemini-')) {
       return normalized;
@@ -13250,7 +16187,7 @@ function resolveChatAgentRuntimeForUser(userId) {
     reasoningEfforts: [...chatReasoningEffortOptions],
     defaults: {
       model: defaultModel,
-      reasoningEffort: DEFAULT_REASONING_EFFORT
+      reasoningEffort: getChatAgentDefaultReasoningEffort(effectiveAgentId)
     }
   };
 }
@@ -13772,6 +16709,16 @@ function listAttachmentsForUser(userId, maxItems) {
   return attachments.slice(0, limit);
 }
 
+
+function sanitizeModelForChatGptAccount(rawValue) {
+  const value = String(rawValue || '').trim();
+  if (!value) return '';
+  if (unsupportedChatGptAccountModels.has(value)) {
+    return '';
+  }
+  return value;
+}
+
 function loadCodexModelsFromCache() {
   try {
     const cachePath = path.join(os.homedir(), '.codex', 'models_cache.json');
@@ -13834,182 +16781,649 @@ function buildAbortableRunHandle(abortController) {
   return state;
 }
 
-app.post('/api/register', async (req, res) => {
-  const rawUsername = typeof req.body?.username === 'string' ? req.body.username : '';
-  const rawPassword = typeof req.body?.password === 'string' ? req.body.password : '';
-  const username = rawUsername.trim();
-  const password = rawPassword;
-  const safeUsername = truncateForNotify(username || rawUsername);
+require('./routes/auth')(app, {
+  db,
+  notify,
+  truncateForNotify,
+  requireAuth,
+  getUserNotificationSettings,
+  getRestartStatusPayload,
+  updateUserNotificationSettingsStmt,
+  sanitizeDiscordWebhookUrl,
+  defaultWebhookUrl,
+  parseBooleanSetting,
+});
 
-  if (!username || !password) {
-    void notify(`REGISTER failed username=${safeUsername} reason=missing_fields`);
-    return res.status(400).json({ error: 'Usuario y contraseña obligatorios' });
+app.get('/api/devices/steamdeck/config', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
   }
-  if (username.length < 3 || username.length > 48) {
-    void notify(`REGISTER failed username=${safeUsername} reason=invalid_username_length`);
-    return res.status(400).json({ error: 'El usuario debe tener entre 3 y 48 caracteres' });
-  }
-  if (!/^[a-zA-Z0-9._-]+$/.test(username)) {
-    void notify(`REGISTER failed username=${safeUsername} reason=invalid_username_chars`);
-    return res.status(400).json({ error: 'Usuario inválido (usa letras, números, punto, guion o guion bajo)' });
-  }
-  if (password.length < 8) {
-    void notify(`REGISTER failed username=${safeUsername} reason=weak_password`);
-    return res.status(400).json({ error: 'La contraseña debe tener al menos 8 caracteres' });
-  }
-
   try {
-    const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
-    if (existing) {
-      void notify(`REGISTER failed username=${safeUsername} reason=already_exists`);
-      return res.status(409).json({ error: 'Ese usuario ya existe' });
-    }
-    const passwordHash = await bcrypt.hash(password, 12);
-    const created = db.prepare('INSERT INTO users (username, password_hash) VALUES (?, ?)').run(username, passwordHash);
-    const userId = Number(created.lastInsertRowid);
-    req.session.userId = userId;
-    req.session.username = username;
-    void notify(`REGISTER ok username=${safeUsername}`);
-    return res.status(201).json({ ok: true, username });
+    const config = getSteamDeckConfigForUser(safeUserId);
+    return res.json({
+      ok: true,
+      enabled: steamDeckSshFeatureEnabled,
+      config
+    });
   } catch (error) {
-    const reason = truncateForNotify(error && error.message ? error.message : 'register_error', 180);
-    void notify(`REGISTER failed username=${safeUsername} reason=${reason}`);
-    return res.status(500).json({ error: 'No se pudo crear la cuenta' });
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo leer configuración Steam Deck: ${truncateForNotify(error && error.message ? error.message : 'steamdeck_config_read_failed', 220)}`
+    });
   }
 });
 
-app.post('/api/login', async (req, res) => {
-  const { username, password } = req.body;
-  const requestedUsername = truncateForNotify(username);
-  if (!username || !password) {
-    void notify(`LOGIN failed username=${requestedUsername} reason=missing_fields`);
-    return res.status(400).json({ error: 'Usuario y contraseña obligatorios' });
+app.post('/api/devices/steamdeck/config', requireAuth, (req, res) => {
+  if (!guardSteamDeckFeatureEnabled(res)) return;
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
   }
-
-  const user = db.prepare('SELECT id, username, password_hash FROM users WHERE username = ?').get(username.trim());
-  if (!user) {
-    void notify(`LOGIN failed username=${requestedUsername} reason=invalid_credentials`);
-    return res.status(401).json({ error: 'Credenciales inválidas' });
+  try {
+    const saved = persistSteamDeckConfigForUser(safeUserId, req.body && typeof req.body === 'object' ? req.body : {});
+    return res.json({
+      ok: true,
+      config: saved
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo guardar configuración Steam Deck: ${truncateForNotify(error && error.message ? error.message : 'steamdeck_config_save_failed', 220)}`
+    });
   }
-
-  const isMatch = await bcrypt.compare(password, user.password_hash);
-  if (!isMatch) {
-    void notify(`LOGIN failed username=${requestedUsername} reason=invalid_credentials`);
-    return res.status(401).json({ error: 'Credenciales inválidas' });
-  }
-
-  req.session.userId = user.id;
-  req.session.username = user.username;
-  void notify(`LOGIN ok username=${truncateForNotify(user.username)}`);
-  return res.json({ ok: true, username: user.username });
 });
 
-app.post('/api/logout', (req, res) => {
-  const username = truncateForNotify(req.session && req.session.username ? req.session.username : 'anon');
-  req.session.destroy(() => {
-    void notify(`LOGOUT ok username=${username}`);
-    res.json({ ok: true });
-  });
+app.post('/api/devices/steamdeck/generate-key', requireAuth, (req, res) => {
+  if (!guardSteamDeckFeatureEnabled(res)) return;
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  if (!commandExistsSync('ssh-keygen')) {
+    return res.status(409).json({ error: 'ssh-keygen no está instalado en el servidor.' });
+  }
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const force = parseBooleanSetting(body.force, false);
+  try {
+    const current = getSteamDeckConfigForUser(safeUserId, { includeSecret: true });
+    const requestedKeyPath = resolveSteamDeckKeyPathFromConfig(body.keyPath || current.keyPath);
+    ensureSteamDeckSecretFilePermission(requestedKeyPath);
+    const pubPath = `${requestedKeyPath}.pub`;
+    if (!force && (fs.existsSync(requestedKeyPath) || fs.existsSync(pubPath))) {
+      return res.status(409).json({
+        error: 'Ya existe una clave SSH. Usa force=true si quieres regenerarla.'
+      });
+    }
+    try {
+      if (force && fs.existsSync(requestedKeyPath)) fs.unlinkSync(requestedKeyPath);
+      if (force && fs.existsSync(pubPath)) fs.unlinkSync(pubPath);
+    } catch (_error) {
+      // ignore cleanup failures
+    }
+    const keygen = runSystemCommandSync(
+      'ssh-keygen',
+      ['-t', 'ed25519', '-f', requestedKeyPath, '-N', '', '-C', `codexweb-steamdeck-user_${safeUserId}`],
+      {
+        timeoutMs: 20000,
+        maxBuffer: 1024 * 256
+      }
+    );
+    if (!keygen.ok || Number(keygen.code) !== 0) {
+      return res.status(500).json({
+        error: `No se pudo generar clave SSH: ${truncateForNotify(keygen.stderr || keygen.stdout || 'ssh_keygen_failed', 240)}`
+      });
+    }
+    ensureSteamDeckSecretFilePermission(requestedKeyPath);
+    const publicKey = fs.existsSync(pubPath) ? String(fs.readFileSync(pubPath, 'utf8') || '').trim() : '';
+    const saved = persistSteamDeckConfigForUser(safeUserId, {
+      keyPath: requestedKeyPath,
+      authMethod: 'key'
+    });
+    return res.json({
+      ok: true,
+      keyPath: requestedKeyPath,
+      publicKey,
+      config: saved
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo generar clave SSH: ${truncateForNotify(error && error.message ? error.message : 'steamdeck_generate_key_failed', 220)}`
+    });
+  }
 });
 
-app.get('/api/restart/status', (_req, res) => {
+app.post('/api/devices/steamdeck/test', requireAuth, async (req, res) => {
+  if (!guardSteamDeckFeatureEnabled(res)) return;
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  try {
+    const config = getSteamDeckConfigForUser(safeUserId, { includeSecret: true });
+    assertSteamDeckConnectionReady(config);
+    const timeoutMs = normalizeSteamDeckTimeoutMs(req.body && req.body.timeoutMs, steamDeckCommandTimeoutMs);
+    const remoteCommand = `bash -lc ${shellSingleQuote('echo "__CODEXWEB_STEAMDECK_TEST__"; hostname; whoami')}`;
+    const result = await executeSteamDeckSshCommand(config, remoteCommand, { timeoutMs });
+    if (!result.ok) {
+      const message = buildSteamDeckConnectivityError(result);
+      notifySteamDeckEvent(safeUserId, config, `Test conexión fallido: ${message}`);
+      return res.status(502).json({
+        ok: false,
+        error: message,
+        detail: truncateForNotify(result.stderr || result.error || '', 280),
+        result: {
+          exitCode: result.exitCode,
+          durationMs: result.durationMs
+        }
+      });
+    }
+    notifySteamDeckEvent(safeUserId, config, 'Test conexión correcto.');
+    return res.json({
+      ok: true,
+      status: 'connected',
+      host: config.host,
+      user: config.user,
+      exitCode: result.exitCode,
+      durationMs: result.durationMs,
+      stdout: truncateSteamDeckOutput(result.stdout, 8000),
+      stderr: truncateSteamDeckOutput(result.stderr, 8000)
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo probar conexión SSH: ${truncateForNotify(error && error.message ? error.message : 'steamdeck_test_failed', 220)}`
+    });
+  }
+});
+
+app.post('/api/devices/steamdeck/detect', requireAuth, async (req, res) => {
+  if (!guardSteamDeckFeatureEnabled(res)) return;
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  try {
+    const config = getSteamDeckConfigForUser(safeUserId, { includeSecret: true });
+    assertSteamDeckConnectionReady(config);
+    const timeoutMs = normalizeSteamDeckTimeoutMs(req.body && req.body.timeoutMs, steamDeckCommandTimeoutMs);
+    const result = await executeSteamDeckSshCommand(config, buildSteamDeckDetectRemoteCommand(), { timeoutMs });
+    if (!result.ok) {
+      const message = buildSteamDeckConnectivityError(result);
+      notifySteamDeckEvent(safeUserId, config, `Detect environment fallido: ${message}`);
+      return res.status(502).json({
+        ok: false,
+        error: message,
+        detail: truncateForNotify(result.stderr || result.error || '', 280)
+      });
+    }
+    const detection = parseSteamDeckDetectOutput(result.stdout, result.stderr);
+    notifySteamDeckEvent(safeUserId, config, 'Detect environment completado.');
+    return res.json({
+      ok: true,
+      detection
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo detectar entorno Steam Deck: ${truncateForNotify(error && error.message ? error.message : 'steamdeck_detect_failed', 220)}`
+    });
+  }
+});
+
+app.post('/api/devices/steamdeck/command', requireAuth, async (req, res) => {
+  if (!guardSteamDeckFeatureEnabled(res)) return;
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const command = String(body.command || '').trim();
+  if (!command) {
+    return res.status(400).json({ error: 'Comando vacío. Escribe un comando a ejecutar.' });
+  }
+  try {
+    const config = getSteamDeckConfigForUser(safeUserId, { includeSecret: true });
+    assertSteamDeckConnectionReady(config);
+    const dangerHits = detectSteamDeckDangerousCommand(command);
+    const confirmDangerous = parseBooleanSetting(body.confirmDangerous, false);
+    if (dangerHits.length > 0 && !config.allowDangerousCommands && !confirmDangerous) {
+      return res.status(409).json({
+        error: 'Comando potencialmente peligroso detectado. Confirma explícitamente para continuar.',
+        dangerousDetected: true,
+        warnings: dangerHits
+      });
+    }
+
+    const timeoutMs = normalizeSteamDeckTimeoutMs(body.timeoutMs, steamDeckCommandTimeoutMs);
+    const runInBackground = parseBooleanSetting(body.background, false);
+    const remoteCommand = `bash -lc ${shellSingleQuote(command)}`;
+    if (runInBackground) {
+      const job = createSteamDeckJob(safeUserId, 'command', remoteCommand, {
+        rawCommand: command,
+        timeoutMs,
+        warnings: dangerHits
+      });
+      notifySteamDeckEvent(safeUserId, config, `Job comando iniciado: ${job.id}`);
+      return res.json({
+        ok: true,
+        queued: true,
+        dangerousDetected: dangerHits.length > 0,
+        warnings: dangerHits,
+        job
+      });
+    }
+
+    notifySteamDeckEvent(safeUserId, config, `Comando SSH iniciado: ${truncateForNotify(command, 160)}`);
+    const result = await executeSteamDeckSshCommand(config, remoteCommand, { timeoutMs });
+    if (!result.ok) {
+      const reason = buildSteamDeckConnectivityError(result);
+      notifySteamDeckEvent(safeUserId, config, `Comando SSH fallido: ${reason}`);
+      return res.status(502).json({
+        ok: false,
+        error: reason,
+        dangerousDetected: dangerHits.length > 0,
+        warnings: dangerHits,
+        result: {
+          exitCode: result.exitCode,
+          durationMs: result.durationMs,
+          stdout: truncateSteamDeckOutput(result.stdout, 16000),
+          stderr: truncateSteamDeckOutput(result.stderr, 16000)
+        }
+      });
+    }
+    notifySteamDeckEvent(safeUserId, config, `Comando SSH completado (${result.durationMs}ms).`);
+    return res.json({
+      ok: true,
+      dangerousDetected: dangerHits.length > 0,
+      warnings: dangerHits,
+      result: {
+        exitCode: result.exitCode,
+        durationMs: result.durationMs,
+        stdout: truncateSteamDeckOutput(result.stdout, 20000),
+        stderr: truncateSteamDeckOutput(result.stderr, 20000)
+      }
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo ejecutar comando SSH: ${truncateForNotify(error && error.message ? error.message : 'steamdeck_command_failed', 220)}`
+    });
+  }
+});
+
+app.post('/api/devices/steamdeck/codex', requireAuth, (req, res) => {
+  if (!guardSteamDeckFeatureEnabled(res)) return;
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  try {
+    const config = getSteamDeckConfigForUser(safeUserId, { includeSecret: true });
+    assertSteamDeckConnectionReady(config);
+    const codexCommand = buildSteamDeckCodexRemoteCommand(body, config);
+    const timeoutMs = normalizeSteamDeckTimeoutMs(body.timeoutMs, Math.max(steamDeckCommandTimeoutMs, 1000 * 60 * 20));
+    const job = createSteamDeckJob(safeUserId, 'codex', codexCommand, {
+      promptPreview: truncateForNotify(String(body.prompt || ''), 300),
+      promptLength: String(body.prompt || '').length,
+      timeoutMs,
+      remoteWorkdir: sanitizeSteamDeckWorkdir(body.remoteWorkdir || config.remoteWorkdir, config.remoteWorkdir),
+      codexBin: sanitizeSteamDeckCodexBin(body.codexBin || config.codexBin, config.codexBin),
+      inheritEnvironment: parseBooleanSetting(body.inheritEnvironment, true),
+      dangerSandbox: parseBooleanSetting(body.dangerSandbox, true)
+    });
+    notifySteamDeckEvent(safeUserId, config, `Tarea Codex remota iniciada: ${job.id}`);
+    return res.json({
+      ok: true,
+      queued: true,
+      job
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo iniciar tarea Codex remota: ${truncateForNotify(error && error.message ? error.message : 'steamdeck_codex_failed', 220)}`
+    });
+  }
+});
+
+app.get('/api/devices/steamdeck/jobs', requireAuth, (req, res) => {
+  if (!guardSteamDeckFeatureEnabled(res)) return;
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const rawLimit = Number.parseInt(String(req.query.limit || ''), 10);
+  const limit = Number.isInteger(rawLimit) ? Math.min(Math.max(rawLimit, 1), steamDeckJobsMaxItems) : 40;
+  const rows = listSteamDeckJobsForUserStmt.all(safeUserId, limit);
   return res.json({
     ok: true,
-    restart: getRestartStatusPayload(),
-    pid: process.pid
+    jobs: rows.map((row) => serializeSteamDeckJobRow(row)).filter(Boolean)
   });
 });
 
-app.get('/api/me', (req, res) => {
-  if (!req.session.userId) {
-    return res.json({ authenticated: false, user: null });
+app.get('/api/devices/steamdeck/jobs/:id', requireAuth, (req, res) => {
+  if (!guardSteamDeckFeatureEnabled(res)) return;
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
   }
-  return res.json({
-    authenticated: true,
-    user: {
-      id: req.session.userId,
-      username: req.session.username
-    }
-  });
-});
-
-app.get('/api/settings/notifications', requireAuth, (req, res) => {
-  const notifications = getUserNotificationSettings(req.session.userId);
+  const jobId = String(req.params.id || '').trim();
+  if (!jobId) {
+    return res.status(400).json({ error: 'job_id inválido' });
+  }
+  const row = getSteamDeckJobForUserStmt.get(jobId, safeUserId);
+  if (!row) {
+    return res.status(404).json({ error: 'Job no encontrado.' });
+  }
   return res.json({
     ok: true,
-    notifications
+    job: serializeSteamDeckJobRow(row)
   });
 });
 
-app.patch('/api/settings/notifications', requireAuth, (req, res) => {
-  const currentSettings = getUserNotificationSettings(req.session.userId);
-  const webhookWasProvided =
-    req.body && Object.prototype.hasOwnProperty.call(req.body, 'discordWebhookUrl');
-  const notifyWasProvided =
-    req.body && Object.prototype.hasOwnProperty.call(req.body, 'notifyOnFinish');
-  const includeWasProvided =
-    req.body && Object.prototype.hasOwnProperty.call(req.body, 'includeResult');
-
-  const rawWebhookUrl = webhookWasProvided ? req.body.discordWebhookUrl : currentSettings.discordWebhookUrl;
-  if (webhookWasProvided && typeof rawWebhookUrl !== 'string') {
-    return res.status(400).json({ error: 'Webhook de Discord inválido' });
+app.post('/api/devices/steamdeck/jobs/:id/cancel', requireAuth, (req, res) => {
+  if (!guardSteamDeckFeatureEnabled(res)) return;
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
   }
-  const normalizedWebhook = sanitizeDiscordWebhookUrl(rawWebhookUrl, '');
-  if (webhookWasProvided && String(rawWebhookUrl || '').trim() && !normalizedWebhook) {
-    return res.status(400).json({ error: 'Webhook de Discord inválido' });
+  const jobId = String(req.params.id || '').trim();
+  if (!jobId) {
+    return res.status(400).json({ error: 'job_id inválido' });
   }
-
-  let notifyOnFinish = currentSettings.notifyOnFinish;
-  if (notifyWasProvided) {
-    const rawNotify = req.body.notifyOnFinish;
-    const rawType = typeof rawNotify;
-    if (
-      !(
-        rawType === 'boolean' ||
-        rawNotify === 0 ||
-        rawNotify === 1 ||
-        rawNotify === '0' ||
-        rawNotify === '1'
-      )
-    ) {
-      return res.status(400).json({ error: 'Valor inválido para notifyOnFinish' });
+  const row = getSteamDeckJobForUserStmt.get(jobId, safeUserId);
+  if (!row) {
+    return res.status(404).json({ error: 'Job no encontrado.' });
+  }
+  const status = normalizeSteamDeckJobStatus(row.status);
+  if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
+    return res.json({
+      ok: true,
+      alreadyFinished: true,
+      job: serializeSteamDeckJobRow(row)
+    });
+  }
+  const now = nowIso();
+  requestSteamDeckJobCancelStmt.run(now, jobId);
+  const active = activeSteamDeckProcesses.get(jobId);
+  if (active && Number(active.userId) === safeUserId && typeof active.kill === 'function') {
+    try {
+      active.kill('cancelled_by_user');
+    } catch (_error) {
+      // best effort kill
     }
-    notifyOnFinish = parseBooleanSetting(rawNotify, currentSettings.notifyOnFinish);
+  } else if (status === 'queued') {
+    const logText = appendSteamDeckLogText(String(row.log_text || ''), 'Cancelado por el usuario.');
+    updateSteamDeckJobCancelledStmt.run(
+      String(row.stdout_text || ''),
+      String(row.stderr_text || ''),
+      logText,
+      Number.isInteger(Number(row.exit_code)) ? Number(row.exit_code) : null,
+      now,
+      now,
+      jobId
+    );
   }
-
-  let includeResult = currentSettings.includeResult;
-  if (includeWasProvided) {
-    const rawInclude = req.body.includeResult;
-    const rawType = typeof rawInclude;
-    if (
-      !(
-        rawType === 'boolean' ||
-        rawInclude === 0 ||
-        rawInclude === 1 ||
-        rawInclude === '0' ||
-        rawInclude === '1'
-      )
-    ) {
-      return res.status(400).json({ error: 'Valor inválido para includeResult' });
-    }
-    includeResult = parseBooleanSetting(rawInclude, currentSettings.includeResult);
-  }
-
-  if (notifyOnFinish && !sanitizeDiscordWebhookUrl(normalizedWebhook, defaultWebhookUrl)) {
-    return res.status(400).json({ error: 'Configura un webhook de Discord antes de habilitar notificaciones' });
-  }
-
-  updateUserNotificationSettingsStmt.run(
-    normalizedWebhook,
-    notifyOnFinish ? 1 : 0,
-    includeResult ? 1 : 0,
-    req.session.userId
-  );
-  const notifications = getUserNotificationSettings(req.session.userId);
+  const updated = getSteamDeckJobForUserStmt.get(jobId, safeUserId);
   return res.json({
     ok: true,
-    notifications
+    cancelled: true,
+    job: serializeSteamDeckJobRow(updated || row)
   });
+});
+
+// Generate a one-time magic setup link for the Steam Deck
+app.get('/api/devices/steamdeck/setup-link', requireAuth, (req, res) => {
+  if (!guardSteamDeckFeatureEnabled(res)) return;
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) return res.status(400).json({ error: 'user_id inválido' });
+  try {
+    const config = getSteamDeckConfigForUser(safeUserId, { includeSecret: true });
+    const keyPath = resolveSteamDeckKeyPathFromConfig(config.keyPath);
+    const pubPath = `${keyPath}.pub`;
+    if (!fs.existsSync(pubPath)) {
+      return res.status(409).json({ error: 'No hay clave SSH generada. Genera primero una clave en la sección Configuración.' });
+    }
+    const publicKey = String(fs.readFileSync(pubPath, 'utf8') || '').trim();
+    if (!publicKey) {
+      return res.status(409).json({ error: 'La clave pública está vacía. Regenera la clave SSH.' });
+    }
+
+    // Generate reverse-tunnel keypair so the Deck can tunnel back to this server
+    const tunnelKeyPath = path.join(__dirname, 'data', 'secrets', `steamdeck_tunnel_key_${safeUserId}`);
+    const tunnelPubPath = `${tunnelKeyPath}.pub`;
+    if (!fs.existsSync(tunnelKeyPath)) {
+      execFileSync('ssh-keygen', ['-t', 'ed25519', '-f', tunnelKeyPath, '-N', '', '-C', `codexweb-deck-tunnel-${safeUserId}`], { stdio: 'pipe' });
+    }
+    const tunnelPrivKey = fs.readFileSync(tunnelKeyPath, 'utf8').trim();
+    const tunnelPubKey = fs.readFileSync(tunnelPubPath, 'utf8').trim();
+
+    // Add tunnel pubkey to server authorized_keys with port-forwarding only (no shell)
+    const authorizedKeysPath = '/root/.ssh/authorized_keys';
+    const tunnelKeyComment = `codexweb-deck-tunnel-${safeUserId}`;
+    let akContent = '';
+    try { akContent = fs.readFileSync(authorizedKeysPath, 'utf8') || ''; } catch {}
+    if (!akContent.includes(tunnelKeyComment)) {
+      fs.appendFileSync(authorizedKeysPath, `\nrestrict,port-forwarding ${tunnelPubKey}\n`);
+    }
+
+    // Port 2222 + (userId - 1) so multiple users don't collide
+    const tunnelPort = 2222 + (Math.max(0, parseInt(safeUserId, 10) - 1));
+
+    const token = crypto.randomBytes(24).toString('hex');
+    const expiresAt = Date.now() + 60 * 60 * 1000;
+    const protocol = req.get('x-forwarded-proto') || req.protocol || 'https';
+    const host = req.get('x-forwarded-host') || req.get('host') || 'localhost';
+    const serverBaseUrl = `${protocol}://${host}`;
+    steamDeckSetupTokens.set(token, { userId: safeUserId, publicKey, tunnelPrivKey, tunnelPort, serverBaseUrl, expiresAt });
+    for (const [tk, val] of steamDeckSetupTokens.entries()) {
+      if (val.expiresAt < Date.now()) steamDeckSetupTokens.delete(tk);
+    }
+    const setupPageUrl = `${serverBaseUrl}/api/devices/steamdeck/setup-page/${token}`;
+    const scriptUrl = `${serverBaseUrl}/api/devices/steamdeck/setup-script/${token}`;
+    const curlCommand = `curl -fsSL "${scriptUrl}" | bash`;
+    return res.json({ ok: true, token, setupPageUrl, scriptUrl, curlCommand, expiresAt: new Date(expiresAt).toISOString() });
+  } catch (error) {
+    return res.status(500).json({ error: (error && error.message) ? error.message : 'Error generando link' });
+  }
+});
+
+// Setup HTML page served to the Steam Deck browser (public, token-protected)
+app.get('/api/devices/steamdeck/setup-page/:token', (req, res) => {
+  const token = String(req.params.token || '').trim();
+  const entry = steamDeckSetupTokens.get(token);
+  if (!entry || entry.expiresAt < Date.now()) {
+    return res.status(404).type('text/html').send('<html><body style="font-family:sans-serif;background:#0f0f11;color:#e4e4e7;padding:2rem"><h2 style="color:#f87171">Link expirado o no válido.</h2><p>Genera un nuevo link desde CodexWeb Settings.</p></body></html>');
+  }
+  const scriptUrl = `${entry.serverBaseUrl}/api/devices/steamdeck/setup-script/${token}`;
+  const curlCommand = `curl -fsSL "${scriptUrl}" | bash`;
+  const escapedCmd = curlCommand.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const html = `<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CodexWeb — Steam Deck Setup</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0f0f11;color:#e4e4e7;max-width:600px;margin:0 auto;padding:2rem 1rem;line-height:1.5}
+h1{color:#a78bfa;font-size:1.4rem;margin-bottom:.4rem}
+.sub{color:#71717a;font-size:.85rem;margin-bottom:1.4rem}
+.step{background:#18181b;border:1px solid #3f3f46;border-radius:12px;padding:1.2rem;margin:.8rem 0}
+.step h2{font-size:.9rem;font-weight:600;color:#d4d4d8;margin-bottom:.5rem}
+.step p{font-size:.8rem;color:#a1a1aa}
+pre{background:#09090b;border:1px solid #27272a;border-radius:8px;padding:.9rem;font-size:.78rem;color:#86efac;overflow-x:auto;white-space:pre-wrap;word-break:break-all;margin:.6rem 0}
+button{background:#7c3aed;color:#fff;border:none;border-radius:8px;padding:.55rem 1.1rem;font-size:.82rem;cursor:pointer;margin-top:.4rem;transition:background .15s}
+button:hover{background:#6d28d9}
+button:active{background:#5b21b6}
+.expires{color:#f59e0b;font-size:.75rem;margin-bottom:1rem}
+.ok{color:#34d399;font-size:.8rem;margin-top:.4rem;display:none}
+</style>
+</head>
+<body>
+<h1>Steam Deck — Configuraci&#xF3;n autom&#xE1;tica</h1>
+<p class="sub">Conecta tu Steam Deck con CodexWeb en segundos.</p>
+<p class="expires">&#9203; Este link expira en 1 hora.</p>
+<div class="step">
+  <h2>1. Abre Konsole en la Steam Deck</h2>
+  <p>Modo escritorio &#x2192; Men&#xFA; Inicio &#x2192; Sistema &#x2192; Konsole</p>
+</div>
+<div class="step">
+  <h2>2. Copia y ejecuta este comando</h2>
+  <pre id="cmd">${escapedCmd}</pre>
+  <button onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById('cmd').textContent.trim()).then(()=>{this.textContent='&#x2713; Copiado!';setTimeout(()=>this.textContent='Copiar comando',2000)}).catch(()=>{})">Copiar comando</button>
+  <p style="margin-top:.6rem">El script activa SSH, a&#xF1;ade la clave del servidor y registra tu Deck autom&#xE1;ticamente.</p>
+</div>
+<div class="step">
+  <h2>3. Listo</h2>
+  <p>En segundos, CodexWeb detectar&#xE1; tu Steam Deck y podr&#xE1;s controlarla desde tu m&#xF3;vil.</p>
+</div>
+</body>
+</html>`;
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.send(html);
+});
+
+// Serve the setup bash script (public, token-protected)
+app.get('/api/devices/steamdeck/setup-script/:token', (req, res) => {
+  const token = String(req.params.token || '').trim();
+  const entry = steamDeckSetupTokens.get(token);
+  if (!entry || entry.expiresAt < Date.now()) {
+    return res.status(404).type('text/plain').send('#!/bin/bash\necho "Error: token expirado o no valido. Genera un nuevo link desde CodexWeb."\nexit 1\n');
+  }
+  const registerUrl = `${entry.serverBaseUrl}/api/devices/steamdeck/register`;
+  const safePublicKey = entry.publicKey.replace(/'/g, "'\\''");
+  const tunnelPrivKeyB64 = Buffer.from(entry.tunnelPrivKey || '').toString('base64');
+  const serverHost = (() => { try { return new URL(entry.serverBaseUrl).hostname; } catch { return entry.serverBaseUrl; } })();
+  const tunnelPort = entry.tunnelPort || 2222;
+  const script = `#!/bin/bash
+set -e
+echo "[CodexWeb] Configurando Steam Deck..."
+
+# 1. Activar SSH en la Deck
+if command -v systemctl &>/dev/null; then
+  sudo systemctl enable --now sshd 2>/dev/null && echo "[OK] SSH activado." || echo "[INFO] SSH ya activo o sin permisos sudo."
+fi
+
+# 2. Añadir clave publica del servidor (para que el servidor entre a la Deck directamente en LAN)
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+PUB_KEY='${safePublicKey}'
+if ! grep -qF "$PUB_KEY" ~/.ssh/authorized_keys 2>/dev/null; then
+  echo "$PUB_KEY" >> ~/.ssh/authorized_keys
+  echo "[OK] Clave del servidor anadida."
+else
+  echo "[INFO] Clave del servidor ya estaba presente."
+fi
+chmod 600 ~/.ssh/authorized_keys
+
+# 3. Guardar clave privada de tunel inverso (la Deck se conecta al servidor)
+echo "${tunnelPrivKeyB64}" | base64 -d > ~/.ssh/codexweb_tunnel_key
+chmod 600 ~/.ssh/codexweb_tunnel_key
+echo "[OK] Clave de tunel guardada."
+
+# 4. Configurar servicio systemd para tunel inverso permanente
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/codexweb-tunnel.service << 'SVCEOF'
+[Unit]
+Description=CodexWeb Reverse SSH Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=AUTOSSH_GATETIME=0
+ExecStart=/usr/bin/autossh -M 0 -N -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -i %h/.ssh/codexweb_tunnel_key -R ${tunnelPort}:localhost:22 root@${serverHost} -p 22
+ExecStartPre=/bin/sh -c 'command -v autossh || (sudo pacman -S --noconfirm autossh 2>/dev/null || true)'
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target
+SVCEOF
+
+systemctl --user daemon-reload
+systemctl --user enable codexweb-tunnel.service 2>/dev/null || true
+
+# Instalar autossh si no existe
+if ! command -v autossh &>/dev/null; then
+  echo "[INFO] Instalando autossh..."
+  sudo pacman -S --noconfirm autossh 2>/dev/null && echo "[OK] autossh instalado." || echo "[WARN] No se pudo instalar autossh, usando ssh basico."
+fi
+
+# Iniciar el tunel
+if command -v autossh &>/dev/null; then
+  systemctl --user start codexweb-tunnel.service 2>/dev/null && echo "[OK] Servicio de tunel iniciado con autossh." || echo "[WARN] No se pudo iniciar el servicio (intenta: loginctl enable-linger $USER)"
+else
+  echo "[INFO] Iniciando tunel SSH basico en background..."
+  nohup ssh -N -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -i ~/.ssh/codexweb_tunnel_key -R ${tunnelPort}:localhost:22 root@${serverHost} -p 22 &>/tmp/codexweb-tunnel.log &
+  echo "[OK] Tunel basico iniciado (log: /tmp/codexweb-tunnel.log)"
+fi
+
+# Persistir servicio tras cerrar sesion
+loginctl enable-linger $USER 2>/dev/null || true
+
+# 5. Registrar la Deck con el servidor via tunel inverso
+DECK_USER=$(whoami)
+echo "[CodexWeb] Registrando Deck (host=127.0.0.1 port=${tunnelPort})..."
+REG=$(curl -fsS -X POST "${registerUrl}" \\
+  -H "Content-Type: application/json" \\
+  --connect-timeout 15 \\
+  -d "{\\"token\\":\\"${token}\\",\\"host\\":\\"127.0.0.1\\",\\"port\\":${tunnelPort},\\"user\\":\\"$DECK_USER\\"}" 2>&1) || REG="error_curl"
+echo "[CodexWeb] Respuesta: $REG"
+echo ""
+echo "=== Configuracion completa ==="
+echo "El servidor puede conectar a tu Steam Deck via tunel inverso en localhost:${tunnelPort}"
+echo "Vuelve a CodexWeb en tu movil y pulsa 'Probar conexion'."
+`;
+  res.setHeader('Content-Type', 'text/x-sh; charset=utf-8');
+  res.setHeader('Content-Disposition', 'inline; filename="steamdeck-setup.sh"');
+  return res.send(script);
+});
+
+// Receive registration callback from the Steam Deck (public, token-protected)
+app.post('/api/devices/steamdeck/register', (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const token = String(body.token || '').trim();
+  if (!token) return res.status(400).json({ error: 'token requerido' });
+  const entry = steamDeckSetupTokens.get(token);
+  if (!entry || entry.expiresAt < Date.now()) {
+    return res.status(404).json({ error: 'token expirado o no válido' });
+  }
+  const host = sanitizeSteamDeckHost(String(body.host || '').trim());
+  const port = normalizeSteamDeckPort(body.port, 22);
+  const user = sanitizeSteamDeckUser(String(body.user || '').trim(), 'deck');
+  if (!host) return res.status(400).json({ error: 'host inválido' });
+  try {
+    persistSteamDeckConfigForUser(entry.userId, { host, port, user });
+    steamDeckSetupTokens.delete(token);
+    return res.json({ ok: true, message: 'Steam Deck registrada correctamente.' });
+  } catch (error) {
+    return res.status(500).json({ error: (error && error.message) ? error.message : 'Error guardando config' });
+  }
 });
 
 app.get('/api/settings/ai-agents', requireAuth, (req, res) => {
@@ -14576,8 +17990,8 @@ app.patch('/api/conversations/:id/project', requireAuth, (req, res) => {
 
 app.get('/api/conversations', requireAuth, (req, res) => {
   const scope = String(req.query.scope || '').trim().toLowerCase();
-  if (scope && scope !== 'all' && scope !== 'unassigned' && scope !== 'project') {
-    return res.status(400).json({ error: 'scope inválido. Usa all, unassigned o project.' });
+  if (scope && scope !== 'all' && scope !== 'unassigned' && scope !== 'project' && scope !== 'deck') {
+    return res.status(400).json({ error: 'scope inválido. Usa all, unassigned, project o deck.' });
   }
 
   const hasProjectQuery = Object.prototype.hasOwnProperty.call(req.query || {}, 'projectId');
@@ -14606,6 +18020,8 @@ app.get('/api/conversations', requireAuth, (req, res) => {
       const conversationProjectId = Number(conversation.project_id);
       return !Number.isInteger(conversationProjectId) || conversationProjectId <= 0;
     });
+  } else if (scope === 'deck') {
+    conversations = conversations.filter((conversation) => Number(conversation.deck_chat) === 1);
   } else if (requestedProjectId !== null) {
     conversations = conversations.filter((conversation) => Number(conversation.project_id) === requestedProjectId);
   }
@@ -14618,6 +18034,7 @@ app.get('/api/conversations', requireAuth, (req, res) => {
       title: conversation.title,
       model: conversation.model || '',
       reasoningEffort: sanitizeReasoningEffort(conversation.reasoning_effort, DEFAULT_REASONING_EFFORT),
+      deckChat: Number(conversation.deck_chat) === 1,
       created_at: conversation.created_at,
       last_message_at: conversation.last_message_at || conversation.created_at,
       liveDraftOpen:
@@ -14633,6 +18050,7 @@ app.post('/api/conversations', requireAuth, (req, res) => {
   const title = buildConversationTitle(rawTitle);
   const selectedModel = sanitizeConversationModel(req.body && req.body.model);
   const requestedProjectId = parseProjectIdInput(req.body && req.body.projectId);
+  const isDeckChat = req.body && req.body.deckChat === true ? 1 : 0;
   let projectRow = null;
   if (requestedProjectId !== null) {
     projectRow = getOwnedProjectOrNull(requestedProjectId, req.session.userId);
@@ -14649,7 +18067,8 @@ app.post('/api/conversations', requireAuth, (req, res) => {
     requestedProjectId,
     title,
     selectedModel,
-    selectedReasoningEffort
+    selectedReasoningEffort,
+    isDeckChat
   );
   return res.json({
     ok: true,
@@ -14659,7 +18078,8 @@ app.post('/api/conversations', requireAuth, (req, res) => {
       project: projectRow ? serializeChatProjectRow(projectRow, { includePreview: true }) : null,
       title,
       model: selectedModel,
-      reasoningEffort: selectedReasoningEffort
+      reasoningEffort: selectedReasoningEffort,
+      deckChat: isDeckChat === 1
     }
   });
 });
@@ -15064,13 +18484,24 @@ app.get('/api/codex/runs', requireAuth, (req, res) => {
       const parsedStart = Number(run.startedAtMs);
       const startedAt = Number.isFinite(parsedStart) ? new Date(parsedStart).toISOString() : nowIso();
       const pid = Number(run.process && run.process.pid);
+      const runtimePhase = String(run.phase || '').trim().toLowerCase();
       return {
         conversationId: Number(run.conversationId),
         title: conversation ? String(conversation.title || 'Chat') : `Chat ${run.conversationId}`,
         startedAt,
         pid: Number.isInteger(pid) && pid > 0 ? pid : null,
         status: run.killRequested ? 'stopping' : 'running',
-        killRequested: Boolean(run.killRequested)
+        killRequested: Boolean(run.killRequested),
+        phase: runtimePhase || (run.killRequested ? 'stopping' : 'running'),
+        updatedAt: Number.isFinite(Number(run.lastActivityAtMs))
+          ? new Date(Number(run.lastActivityAtMs)).toISOString()
+          : startedAt,
+        continuationCount: Number.isFinite(Number(run.continuationCount))
+          ? Math.max(0, Number(run.continuationCount))
+          : 0,
+        continuationLimit: Number.isFinite(Number(run.continuationLimit))
+          ? Math.max(0, Number(run.continuationLimit))
+          : chatAutoContinuationLimit
       };
     })
     .sort((a, b) => Date.parse(b.startedAt || '') - Date.parse(a.startedAt || ''));
@@ -15775,6 +19206,110 @@ app.post('/api/tools/storage/cleanup/analyze', requireAuth, async (req, res) => 
               220
             )}`
     });
+  }
+});
+
+app.post('/api/tools/storage/cleanup/quick', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'storage', {
+    requiresSensitiveTool: true,
+    writeIntent: true
+  });
+  if (!permission) return;
+  try {
+    const requestPayload = req.body && typeof req.body === 'object' ? req.body : {};
+    const result = runStorageQuickCleanup(requestPayload, {
+      permissionProfile: permission.profile
+    });
+    return res.json({
+      ok: true,
+      ...result
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    return res.status(statusCode).json({
+      error:
+        error && error.exposeToClient
+          ? error.message
+          : `No se pudo ejecutar limpieza rápida: ${truncateForNotify(
+              error && error.message ? error.message : 'storage_cleanup_quick_failed',
+              220
+            )}`
+    });
+  }
+});
+
+app.post('/api/tools/storage/system/dev-quick-cleanup', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+  const permission = guardRequestPermissionOrRespond(req, res, 'storage', {
+    requiresSensitiveTool: true,
+    writeIntent: true,
+    targetPath: '/'
+  });
+  if (!permission) return;
+  try {
+    assertDevStorageQuickCleanupRequestAllowed(req);
+    devStorageQuickCleanupPermissionTargets.forEach((targetPath) => {
+      assertAiPermissionForAction(permission.profile, 'storage', {
+        requiresSensitiveTool: true,
+        writeIntent: true,
+        targetPath
+      });
+    });
+    const startedAt = nowIso();
+    const startedAtMs = Date.now();
+    const commandResult = runDevStorageQuickCleanupCommand();
+    const finishedAt = nowIso();
+    const durationMs = Math.max(0, Date.now() - startedAtMs);
+    const exitCode = Number.isInteger(Number(commandResult.result.code)) ? Number(commandResult.result.code) : 1;
+    const outputRaw = `${String(commandResult.result.stdout || '')}${String(commandResult.result.stderr || '')}`;
+    const output = truncateRawText(outputRaw, devStorageQuickCleanupOutputMaxChars);
+    const outputTail =
+      output.length > devStorageQuickCleanupOutputTailMaxChars
+        ? output.slice(output.length - devStorageQuickCleanupOutputTailMaxChars)
+        : output;
+    if (!commandResult.result.ok || exitCode !== 0) {
+      const reason = truncateForNotify(outputTail || output || 'sin salida', 320);
+      return res.status(500).json({
+        error: `La limpieza rápida DEV falló (exit ${exitCode}). ${reason}`,
+        exitCode,
+        ranWith: commandResult.ranWith,
+        startedAt,
+        finishedAt,
+        durationMs,
+        output,
+        outputTail
+      });
+    }
+    const durationSeconds = Math.max(1, Math.round(durationMs / 1000));
+    const summary = `Limpieza rápida DEV completada en ${durationSeconds}s usando ${commandResult.ranWith}.`;
+    return res.json({
+      ok: true,
+      startedAt,
+      finishedAt,
+      durationMs,
+      ranWith: commandResult.ranWith,
+      exitCode,
+      summary,
+      output,
+      outputTail
+    });
+  } catch (error) {
+    const statusCode = Number.isInteger(error && error.statusCode) ? error.statusCode : 500;
+    const message =
+      error && error.exposeToClient
+        ? error.message
+        : `No se pudo ejecutar limpieza rápida DEV: ${truncateForNotify(
+            error && error.message ? error.message : 'dev_quick_cleanup_failed',
+            240
+          )}`;
+    return res.status(statusCode).json({ error: message });
   }
 });
 
@@ -16953,7 +20488,8 @@ app.post('/api/tools/git/repos/:repoId/resolve-conflicts', requireAuth, (req, re
     null,
     title,
     DEFAULT_CHAT_MODEL,
-    DEFAULT_REASONING_EFFORT
+    DEFAULT_REASONING_EFFORT,
+    0
   );
   const conversationId = Number(created.lastInsertRowid);
   if (!Number.isInteger(conversationId) || conversationId <= 0) {
@@ -17201,6 +20737,217 @@ app.post('/api/codex/auth/logout', requireAuth, async (req, res) => {
   codexQuotaStateByUser.delete(safeUserId);
   return res.json({ ok: true });
 });
+
+// ─── Claude Code auth flow ────────────────────────────────────────────────────
+// Server-wide singleton: claude auth login is a global process, not per-user.
+let claudeCodeAuthFlow = null;
+
+function serializeClaudeCodeAuthFlow(flow) {
+  if (!flow) return null;
+  return {
+    startedAt: flow.startedAt,
+    inProgress: Boolean(flow.inProgress),
+    completed: Boolean(flow.completed),
+    failed: Boolean(flow.failed),
+    cancelled: Boolean(flow.cancelled),
+    statusText: String(flow.statusText || ''),
+    url: String(flow.url || ''),
+    error: String(flow.error || ''),
+    needsCode: Boolean(flow.needsCode)
+  };
+}
+
+app.get('/api/claude-code/auth/status', requireAuth, async (req, res) => {
+  let loggedIn = false;
+  let email = '';
+  let authMethod = '';
+  let subscriptionType = '';
+  let statusText = '';
+  try {
+    const result = await execFileAsync(claudeCodeBin, ['auth', 'status', '--json'], {
+      timeout: 8000,
+      env: process.env,
+      maxBuffer: 64 * 1024
+    });
+    const data = JSON.parse(String(result.stdout || '{}'));
+    loggedIn = Boolean(data.loggedIn);
+    email = String(data.email || '');
+    authMethod = String(data.authMethod || data.apiProvider || '');
+    subscriptionType = String(data.subscriptionType || '');
+    statusText = loggedIn ? `Sesión activa (${email})` : 'Sin sesión activa';
+  } catch (err) {
+    const raw = String((err && err.stdout) || (err && err.stderr) || (err && err.message) || '');
+    statusText = raw.toLowerCase().includes('not logged in') ? 'Sin sesión activa' : 'No se pudo leer estado';
+  }
+  const flow = claudeCodeAuthFlow;
+  return res.json({
+    ok: true,
+    loggedIn,
+    email,
+    authMethod,
+    subscriptionType,
+    statusText,
+    loginInProgress: Boolean(flow && flow.inProgress),
+    login: serializeClaudeCodeAuthFlow(flow)
+  });
+});
+
+app.post('/api/claude-code/auth/start', requireAuth, async (req, res) => {
+  if (claudeCodeAuthFlow && claudeCodeAuthFlow.inProgress) {
+    return res.json({ ok: true, login: serializeClaudeCodeAuthFlow(claudeCodeAuthFlow) });
+  }
+
+  claudeCodeAuthFlow = {
+    startedAt: nowIso(),
+    process: null,
+    inProgress: true,
+    completed: false,
+    failed: false,
+    cancelled: false,
+    needsCode: false,
+    statusText: 'Iniciando autenticación Claude Code...',
+    url: '',
+    error: ''
+  };
+
+  const env = {
+    ...process.env,
+    DISPLAY: '',
+    BROWSER: 'echo'
+  };
+
+  let proc;
+  try {
+    proc = spawn(claudeCodeBin, ['auth', 'login'], {
+      env,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+  } catch (spawnErr) {
+    claudeCodeAuthFlow.inProgress = false;
+    claudeCodeAuthFlow.failed = true;
+    claudeCodeAuthFlow.error = spawnErr && spawnErr.message ? spawnErr.message : 'No se pudo iniciar claude auth login';
+    claudeCodeAuthFlow.statusText = claudeCodeAuthFlow.error;
+    return res.status(500).json({ error: claudeCodeAuthFlow.error });
+  }
+
+  claudeCodeAuthFlow.process = proc;
+
+  const captureOutput = (chunk) => {
+    const text = String(chunk || '');
+    if (!text) return;
+    claudeCodeAuthFlow.statusText = (claudeCodeAuthFlow.statusText + '\n' + text).trim();
+    if (!claudeCodeAuthFlow.url) {
+      const urlMatch = text.match(/https?:\/\/[^\s\n\r"']+/);
+      if (urlMatch) {
+        claudeCodeAuthFlow.url = urlMatch[0].replace(/[.,;:!?)]+$/, '');
+      }
+    }
+    // Detect when the process is waiting for a code to be entered
+    const lower = text.toLowerCase();
+    if (!claudeCodeAuthFlow.needsCode && (
+      lower.includes('enter') && (lower.includes('code') || lower.includes('token')) ||
+      lower.includes('paste') && (lower.includes('code') || lower.includes('token')) ||
+      lower.includes('authorization code') ||
+      lower.includes('verification code') ||
+      lower.includes('código') ||
+      lower.includes('código de autorización')
+    )) {
+      claudeCodeAuthFlow.needsCode = true;
+    }
+  };
+
+  if (proc.stdout) proc.stdout.on('data', captureOutput);
+  if (proc.stderr) proc.stderr.on('data', captureOutput);
+
+  proc.on('error', (err) => {
+    claudeCodeAuthFlow.inProgress = false;
+    claudeCodeAuthFlow.failed = true;
+    claudeCodeAuthFlow.error = err && err.message ? err.message : 'Error en claude auth login';
+    claudeCodeAuthFlow.statusText = claudeCodeAuthFlow.error;
+    claudeCodeAuthFlow.process = null;
+  });
+
+  proc.on('close', (code) => {
+    claudeCodeAuthFlow.process = null;
+    claudeCodeAuthFlow.inProgress = false;
+    if (claudeCodeAuthFlow.cancelled) {
+      claudeCodeAuthFlow.statusText = 'Login cancelado.';
+    } else if (code === 0) {
+      claudeCodeAuthFlow.completed = true;
+      claudeCodeAuthFlow.statusText = 'Sesión iniciada correctamente en Claude Code.';
+    } else {
+      claudeCodeAuthFlow.failed = true;
+      claudeCodeAuthFlow.error = claudeCodeAuthFlow.error || `claude auth login terminó con código ${code ?? 'n/a'}`;
+      claudeCodeAuthFlow.statusText = claudeCodeAuthFlow.error;
+    }
+  });
+
+  // Wait briefly so the process can emit its initial URL/instructions.
+  await new Promise((resolve) => setTimeout(resolve, 1800));
+
+  return res.json({ ok: true, login: serializeClaudeCodeAuthFlow(claudeCodeAuthFlow) });
+});
+
+app.post('/api/claude-code/auth/send-code', requireAuth, (req, res) => {
+  const code = String((req.body && req.body.code) || '').trim();
+  if (!code) {
+    return res.status(400).json({ error: 'El campo code es obligatorio.' });
+  }
+  if (!claudeCodeAuthFlow || !claudeCodeAuthFlow.inProgress) {
+    return res.status(409).json({ error: 'No hay ningún proceso de autenticación activo.' });
+  }
+  if (!claudeCodeAuthFlow.process || !claudeCodeAuthFlow.process.stdin) {
+    return res.status(409).json({ error: 'El proceso no acepta entrada en este momento.' });
+  }
+  try {
+    claudeCodeAuthFlow.process.stdin.write(code + '\n');
+    claudeCodeAuthFlow.needsCode = false;
+    claudeCodeAuthFlow.statusText = (claudeCodeAuthFlow.statusText + '\nCódigo enviado. Esperando respuesta...').trim();
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: err && err.message ? err.message : 'No se pudo enviar el código.' });
+  }
+});
+
+app.post('/api/claude-code/auth/cancel', requireAuth, (req, res) => {
+  if (!claudeCodeAuthFlow || !claudeCodeAuthFlow.inProgress) {
+    return res.json({ ok: true, cancelled: false, reason: 'no_active_login' });
+  }
+  claudeCodeAuthFlow.cancelled = true;
+  claudeCodeAuthFlow.inProgress = false;
+  if (claudeCodeAuthFlow.process) {
+    try { claudeCodeAuthFlow.process.kill('SIGTERM'); } catch (_) {}
+    claudeCodeAuthFlow.process = null;
+  }
+  return res.json({ ok: true, cancelled: true });
+});
+
+app.post('/api/claude-code/auth/logout', requireAuth, async (req, res) => {
+  if (claudeCodeAuthFlow && claudeCodeAuthFlow.inProgress) {
+    claudeCodeAuthFlow.cancelled = true;
+    claudeCodeAuthFlow.inProgress = false;
+    if (claudeCodeAuthFlow.process) {
+      try { claudeCodeAuthFlow.process.kill('SIGTERM'); } catch (_) {}
+      claudeCodeAuthFlow.process = null;
+    }
+  }
+  try {
+    await execFileAsync(claudeCodeBin, ['auth', 'logout'], {
+      env: process.env,
+      timeout: 10000,
+      maxBuffer: 64 * 1024
+    });
+  } catch (err) {
+    const raw = String((err && err.stderr) || (err && err.stdout) || (err && err.message) || '').toLowerCase();
+    if (!raw.includes('not logged in') && !raw.includes('already logged out')) {
+      const reason = truncateForNotify(raw || 'claude_auth_logout_error', 160);
+      return res.status(500).json({ error: `No se pudo cerrar sesión de Claude Code: ${reason}` });
+    }
+  }
+  claudeCodeAuthFlow = null;
+  return res.json({ ok: true });
+});
+// ─── end Claude Code auth flow ────────────────────────────────────────────────
 
 app.get('/api/attachments', requireAuth, (req, res) => {
   const rawLimit = Number.parseInt(String(req.query.limit || ''), 10);
@@ -17670,6 +21417,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       : '';
   const requestedConversationId = req.body && req.body.conversationId ? Number(req.body.conversationId) : null;
   const requestedProjectId = parseProjectIdInput(req.body && req.body.projectId);
+  const requestedDeckChat = req.body && req.body.deckChat === true ? 1 : 0;
   const rawAttachments = req.body && Array.isArray(req.body.attachments) ? req.body.attachments : [];
   const username = truncateForNotify(req.session && req.session.username ? req.session.username : 'anon');
   const userNotificationSettings = getUserNotificationSettings(req.session.userId);
@@ -17728,6 +21476,109 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   const taskCommandStateByItem = new Map();
   const taskTestCommands = new Set();
   let taskCompletionWritten = false;
+  let lastTaskHeartbeatMs = 0;
+  const chatRequestId = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const logChatStream = (stage, details = {}) => {
+    try {
+      const payload = {
+        requestId: chatRequestId,
+        userId: Number(req.session && req.session.userId),
+        conversationId: Number.isInteger(Number(conversationId)) ? Number(conversationId) : null,
+        agent: chatRuntime && chatRuntime.activeAgentId ? String(chatRuntime.activeAgentId) : '',
+        ...details
+      };
+      const compact = Object.entries(payload)
+        .filter(([, value]) => value !== undefined && value !== null && value !== '')
+        .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+        .join(' ');
+      console.info(`[chat-stream] stage=${stage} ${compact}`);
+    } catch (_error) {
+      // ignore logging errors
+    }
+  };
+
+  const touchTaskRunHeartbeat = (force = false) => {
+    if (!taskRunId) return;
+    const nowMs = Date.now();
+    if (!force && nowMs - lastTaskHeartbeatMs < 1500) {
+      return;
+    }
+    lastTaskHeartbeatMs = nowMs;
+    try {
+      touchTaskRunHeartbeatStmt.run(nowIso(), taskRunId, req.session.userId);
+    } catch (_error) {
+      // best-effort heartbeat only.
+    }
+  };
+
+  const createInactivityWatchdog = (source, onTimeout, options = {}) => {
+    let timeoutId = null;
+    let triggered = false;
+    const configuredTimeoutMs = Number(options && options.timeoutMs);
+    const timeoutMs =
+      Number.isInteger(configuredTimeoutMs) && configuredTimeoutMs >= 1000
+        ? configuredTimeoutMs
+        : chatInactivityTimeoutMs;
+    const startedAtMs = Date.now();
+    let lastActivityAtMs = startedAtMs;
+    let timeoutStrike = 0;
+    const clear = () => {
+      if (timeoutId !== null) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+    };
+    const arm = () => {
+      if (triggered) return;
+      clear();
+      timeoutId = setTimeout(() => {
+        timeoutId = null;
+        if (triggered) return;
+        timeoutStrike += 1;
+        const nowMs = Date.now();
+        const idleMs = Math.max(0, nowMs - lastActivityAtMs);
+        const elapsedMs = Math.max(0, nowMs - startedAtMs);
+        logChatStream('inactivity_timeout', { source, timeoutMs });
+        let decision = null;
+        try {
+          decision = onTimeout({
+            source,
+            timeoutMs,
+            idleMs,
+            elapsedMs,
+            strike: timeoutStrike
+          });
+        } catch (_error) {
+          // no-op
+        }
+        if (decision && typeof decision === 'object' && decision.extend === true) {
+          lastActivityAtMs = nowMs;
+          arm();
+          return;
+        }
+        triggered = true;
+      }, timeoutMs);
+      if (timeoutId && typeof timeoutId.unref === 'function') {
+        timeoutId.unref();
+      }
+    };
+    arm();
+    return {
+      touch() {
+        lastActivityAtMs = Date.now();
+        arm();
+      },
+      clear() {
+        clear();
+      },
+      didTimeout() {
+        return triggered;
+      },
+      getLastActivityAtMs() {
+        return lastActivityAtMs;
+      }
+    };
+  };
 
   const scheduleProjectContextRefreshAfterChat = (trigger, force = false) => {
     if (!conversationProjectId) return;
@@ -17777,7 +21628,18 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       structured: Boolean(payload.structured),
       filesTouchedCount: filesTouched.length,
       clientDisconnected: Boolean(payload.clientDisconnected),
-      snapshotReady: Boolean(taskSnapshot && taskSnapshot.snapshotReady)
+      snapshotReady: Boolean(taskSnapshot && taskSnapshot.snapshotReady),
+      providerId: String(chatRuntime.activeAgentId || ''),
+      providerName: String(chatRuntime.activeAgentName || ''),
+      timedOut: Boolean(payload.timedOut),
+      phase: String(payload.phase || (status === 'running' ? 'running' : status || 'unknown')).trim().toLowerCase(),
+      continuationCount: Number.isFinite(Number(payload.continuationCount))
+        ? Math.max(0, Number(payload.continuationCount))
+        : 0,
+      continuationLimit: Number.isFinite(Number(payload.continuationLimit))
+        ? Math.max(0, Number(payload.continuationLimit))
+        : chatAutoContinuationLimit,
+      lastActivityAt: String(payload.lastActivityAt || nowIso())
     };
     try {
       completeTaskRunStmt.run(
@@ -17859,7 +21721,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       conversationProjectId,
       title,
       selectedModel,
-      selectedReasoningEffort
+      selectedReasoningEffort,
+      requestedDeckChat
     );
     conversationId = Number(created.lastInsertRowid);
     conversationCreatedForRequest = true;
@@ -17880,6 +21743,20 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         taskStartedAt
       );
       taskRunId = Number(createdTask.lastInsertRowid);
+      touchTaskRunHeartbeat(true);
+      updateRunningTaskRunMetricsStmt.run(
+        JSON.stringify({
+          phase: 'queued',
+          continuationCount: 0,
+          continuationLimit: chatAutoContinuationLimit,
+          inactivityTimeoutMs: chatInactivityTimeoutMs,
+          hardTimeoutMs: chatHardTimeoutMs,
+          lastActivityAt: taskStartedAt
+        }),
+        nowIso(),
+        taskRunId,
+        req.session.userId
+      );
       taskSnapshot = createTaskSnapshot(taskRunId);
       if (taskRunId) {
         updateTaskRunSnapshotStmt.run(
@@ -17927,10 +21804,56 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       }
     }
     const conversationMessages = listMessagesStmt.all(conversationId);
-    const promptWithHistory = buildPromptWithConversationHistory(prompt, conversationMessages);
+    // ── Token Saver: optimize conversation history before building prompt ──
+    let tsResult = null;
+    let optimizedMessages = conversationMessages;
+    let effectiveTsSettings = null;
+    try {
+      effectiveTsSettings = getEffectiveTsSettings(req.session.userId, conversationId);
+      tsResult = tokenSaver.buildOptimizedContext(conversationMessages, effectiveTsSettings, prompt);
+      optimizedMessages = tsResult.messages;
+      // Phase 3B — Auto-summarization: if there are skipped old messages, compress them
+      if (tsResult.summarizeRequest && tsResult.summarizeRequest.oldMessages) {
+        try {
+          const activeAgentId = chatRuntime && chatRuntime.activeAgentId;
+          const isOpenRouter = activeAgentId === 'openrouter';
+          if (isOpenRouter) {
+            const orIntegration = getUserAiAgentIntegration(req.session.userId, 'openrouter');
+            const orApiKey = String(orIntegration && orIntegration.apiKey || '').trim();
+            const orBaseUrl = resolveAiProviderBaseUrl('openrouter', orIntegration) || OPENROUTER_DEFAULT_BASE_URL;
+            if (orApiKey) {
+              const summary = await callTsSummarizer(
+                conversationId,
+                tsResult.summarizeRequest.oldMessages,
+                orApiKey,
+                orBaseUrl
+              );
+              if (summary) {
+                optimizedMessages = [
+                  { role: 'system', content: `[MEMORIA DE CONVERSACIÓN ANTERIOR]\n${summary}` },
+                  ...optimizedMessages
+                ];
+              }
+            }
+          }
+        } catch (_sumErr) {
+          // Summarization failure is non-fatal
+        }
+      }
+      saveTsMetric(req.session.userId, conversationId, tsResult);
+    } catch (_tsErr) {
+      // Token Saver failure is non-fatal; fall through with original messages
+      optimizedMessages = conversationMessages;
+    }
+    const promptWithHistory = buildPromptWithConversationHistory(prompt, optimizedMessages);
     const promptWithProjectContext = buildPromptWithProjectContext(promptWithHistory, conversationProjectRow);
     const promptWithRepoContext = buildPromptWithRepoContext(promptWithProjectContext, prompt);
     const executionPrompt = buildPromptWithAttachments(promptWithRepoContext, persistedAttachments);
+    logChatStream('stream_start', {
+      model: selectedModel,
+      reasoningEffort: selectedReasoningEffort,
+      attachments: persistedAttachments.length
+    });
     const httpProviderAdapter = getAiHttpProviderAdapter(chatRuntime.activeAgentId);
     if (httpProviderAdapter && typeof httpProviderAdapter.buildChatRequest === 'function') {
       const selectedProviderId = chatRuntime.activeAgentId;
@@ -17996,16 +21919,34 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       res.flushHeaders();
 
       let clientDisconnected = false;
-      const handleHttpProviderClientDisconnect = () => {
+      const handleHttpProviderClientDisconnect = (source) => {
         clientDisconnected = true;
+        logChatStream('client_disconnect', { source });
       };
-      req.on('aborted', handleHttpProviderClientDisconnect);
-      req.on('close', handleHttpProviderClientDisconnect);
-      res.on('close', handleHttpProviderClientDisconnect);
-      res.on('error', handleHttpProviderClientDisconnect);
+      req.on('aborted', () => handleHttpProviderClientDisconnect('request_aborted'));
+      res.on('close', () => {
+        if (!res.writableEnded) {
+          handleHttpProviderClientDisconnect('response_close');
+        } else {
+          logChatStream('response_close', { source: 'http_provider', writableEnded: true });
+        }
+      });
+      res.on('error', () => handleHttpProviderClientDisconnect('response_error'));
+      res.on('finish', () => {
+        logChatStream('response_finish', { source: 'http_provider' });
+      });
 
       sendSseComment(res, 'ok');
       sendSse(res, 'conversation', { conversationId });
+      if (tsResult) {
+        sendSse(res, 'ts_stats', {
+          savings: tsResult.estimatedSavings || 0,
+          before: tsResult.estimatedTokensBefore || 0,
+          after: tsResult.estimatedTokensAfter || 0,
+          percent: tsResult.savingsPercent || 0,
+          mode: (tsResult.sections && tsResult.sections.mode) || 'off'
+        });
+      }
       sendSse(res, 'chat_agent', {
         id: chatRuntime.activeAgentId,
         name: chatRuntime.activeAgentName,
@@ -18043,8 +21984,10 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       const reasoningGuidance =
         geminiReasoningInstructionsByEffort[selectedReasoning] ||
         geminiReasoningInstructionsByEffort[DEFAULT_REASONING_EFFORT];
+      const tsBrevity = tokenSaver.getBrevityInstruction(effectiveTsSettings);
       const providerPrompt = [
         `Instruccion de razonamiento (${selectedReasoning}): ${reasoningGuidance}`,
+        tsBrevity ? `[INSTRUCCION DE AHORRO]\n${tsBrevity}` : '',
         executionPrompt,
         permissionHints.length > 0 ? `\n[POLITICA]\n${permissionHints.join('\n')}` : ''
       ]
@@ -18058,10 +22001,60 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       let structuredOutput = true;
       let finalized = false;
       let streamedAssistantOutput = false;
+      let firstVisibleAssistantDeltaLogged = false;
+      let lastPersistedAssistantOutput = '';
+      let providerPersistErrorLogged = false;
+      const providerTimeoutMessage = `${providerLabel} no emitió actividad en ${formatDurationMinutes(
+        chatInactivityTimeoutMs
+      )}. La ejecución se canceló por timeout de inactividad.`;
+      const providerWatchdog = createInactivityWatchdog('http_provider', () => {
+        if (activeRun) {
+          terminateActiveChatRun(activeRun, 'timeout');
+        }
+        try {
+          providerAbortController.abort();
+        } catch (_error) {
+          // no-op
+        }
+        finalizeHttpProviderRequest({
+          ok: false,
+          closeReason: 'timeout',
+          output: providerTimeoutMessage
+        });
+      });
+
+      const persistHttpProviderSnapshot = (isFinal = false) => {
+        if (!assistantMessageId) return;
+        if (!isFinal && assistantOutput === lastPersistedAssistantOutput) return;
+        try {
+          updateMessageContentStmt.run(assistantOutput, assistantMessageId);
+          lastPersistedAssistantOutput = assistantOutput;
+          touchTaskRunHeartbeat();
+          if (liveDraftId) {
+            updateLiveDraftSnapshotStmt.run(
+              conversationId,
+              assistantMessageId,
+              assistantOutput,
+              '{}',
+              isFinal ? 1 : 0,
+              nowIso(),
+              liveDraftId,
+              req.session.userId
+            );
+          }
+        } catch (error) {
+          if (!providerPersistErrorLogged) {
+            providerPersistErrorLogged = true;
+            const reason = truncateForNotify(error && error.message ? error.message : 'provider_persist_failed', 180);
+            void notify(`WARN chat_persist_failed user=${username} conv=${conversationId} reason=${reason}`);
+          }
+        }
+      };
 
       const finalizeHttpProviderRequest = ({ ok, closeReason, output }) => {
         if (finalized) return;
         finalized = true;
+        providerWatchdog.clear();
         const safeOutput = String(output || '').trim() || `(Sin salida de ${providerLabel})`;
         const runWasKilled = Boolean(activeRun && activeRun.killRequested);
         const success = Boolean(ok) && !runWasKilled;
@@ -18096,6 +22089,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
             // ignore fallback draft update errors
           }
         }
+        lastPersistedAssistantOutput = safeOutput;
 
         if (!clientDisconnected) {
           if (!streamedAssistantOutput) {
@@ -18110,13 +22104,23 @@ app.post('/api/chat', requireAuth, async (req, res) => {
             }
           }
           if (!clientDisconnected) {
+            logChatStream('done_emit', {
+              ok: success,
+              exitCode: safeExitCode,
+              closeReason: effectiveCloseReason,
+              visibleOutput: safeOutput.trim().length > 0
+            });
             sendSse(res, 'done', {
               ok: success,
               conversationId,
               exitCode: safeExitCode,
               closeReason: effectiveCloseReason,
               usage: usageSummary,
-              structured: structuredOutput
+              structured: structuredOutput,
+              providerId: selectedProviderId,
+              providerName: providerLabel,
+              result: truncateRawText(safeOutput, 8000),
+              error: success ? '' : truncateForNotify(safeOutput, 420)
             });
             if (!res.writableEnded && !res.destroyed) {
               res.end();
@@ -18126,6 +22130,13 @@ app.post('/api/chat', requireAuth, async (req, res) => {
 
         const finishedAt = nowIso();
         const durationMs = Math.max(0, Date.now() - requestStartedAtMs);
+        logChatStream('process_exit', {
+          source: 'http_provider',
+          ok: success,
+          exitCode: safeExitCode,
+          closeReason: effectiveCloseReason,
+          durationMs
+        });
         finalizeTaskRun({
           status: success ? 'success' : 'failed',
           closeReason: effectiveCloseReason,
@@ -18135,7 +22146,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           durationMs,
           usage: usageSummary,
           structured: structuredOutput,
-          clientDisconnected
+          clientDisconnected,
+          timedOut: effectiveCloseReason === 'timeout'
         });
         scheduleProjectContextRefreshAfterChat(success ? 'chat_completed' : 'chat_failed');
         if (userNotificationSettings.notifyOnFinish) {
@@ -18192,6 +22204,16 @@ app.post('/api/chat', requireAuth, async (req, res) => {
               stream: true,
               messages: [{ role: 'user', content: providerPrompt }]
             };
+      // Phase 1 Token Saver: cap output tokens per preset if not already set by the adapter
+      if (
+        effectiveTsSettings &&
+        effectiveTsSettings.enabled &&
+        effectiveTsSettings.maxOutputTokens &&
+        !providerBody.max_tokens &&
+        !providerBody.max_completion_tokens
+      ) {
+        providerBody.max_tokens = effectiveTsSettings.maxOutputTokens;
+      }
       const providerStreamFormat =
         providerRequest && typeof providerRequest.streamFormat === 'string'
           ? providerRequest.streamFormat
@@ -18273,8 +22295,17 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       const emitAssistantDelta = (text) => {
         const delta = String(text || '');
         if (!delta) return;
+        providerWatchdog.touch();
         streamedAssistantOutput = true;
         assistantOutput += delta;
+        if (!firstVisibleAssistantDeltaLogged) {
+          firstVisibleAssistantDeltaLogged = true;
+          logChatStream('first_visible_delta', {
+            source: 'http_provider',
+            bytes: Buffer.byteLength(delta, 'utf8')
+          });
+        }
+        persistHttpProviderSnapshot(false);
         if (!clientDisconnected) {
           sendSse(res, 'assistant_delta', { text: delta });
         }
@@ -18283,6 +22314,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       const emitReasoningDelta = (text) => {
         const delta = String(text || '');
         if (!delta) return;
+        providerWatchdog.touch();
+        touchTaskRunHeartbeat();
         if (!clientDisconnected) {
           sendSse(res, 'reasoning_delta', {
             itemId: `${selectedProviderId}_thinking`,
@@ -18379,6 +22412,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           if (done) {
             streamDone = true;
           } else {
+            providerWatchdog.touch();
+            touchTaskRunHeartbeat();
             pending += decoder.decode(value, { stream: true });
           }
           const normalized = pending.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -18417,6 +22452,660 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         closeReason: finishReason || 'completed',
         output: assistantOutput
       });
+      return;
+    }
+
+    if (chatRuntime.activeAgentId === 'claude-code') {
+      if (!claudeCodeEnabled) {
+        throw createClientRequestError(
+          'Claude Code está desactivado en esta instancia (CLAUDE_CODE_ENABLED=false).',
+          503
+        );
+      }
+      let claudeExecPath = '';
+      try {
+        claudeExecPath = await resolveClaudeCodePath();
+      } catch (_error) {
+        throw createClientRequestError(
+          'Claude Code CLI no está instalado en el servidor. Instala claude o configura CLAUDE_CODE_BIN.',
+          503
+        );
+      }
+
+      const requestedCwd = String(runtimePolicy.cwd || claudeCodeDefaultCwd).trim();
+      const effectiveCwd = isClaudeCodeCwdAllowed(requestedCwd) ? path.resolve(requestedCwd) : path.resolve(claudeCodeDefaultCwd);
+
+      const permissionHintsForClaude = [];
+      if (runtimePolicy.profile.readOnly || !runtimePolicy.profile.canWriteFiles) {
+        permissionHintsForClaude.push('Perfil activo: solo lectura. No modifiques archivos.');
+      }
+      if (!runtimePolicy.profile.allowNetwork) {
+        permissionHintsForClaude.push('Perfil activo: red bloqueada. No hagas llamadas de red.');
+      }
+      if (!runtimePolicy.profile.allowGit) {
+        permissionHintsForClaude.push('Perfil activo: operaciones Git bloqueadas.');
+      }
+      const claudePrompt = [
+        'Modo agente operativo (root): puedes leer/escribir archivos y ejecutar comandos del sistema.',
+        'Si el usuario pide estado de procesos/servicios/puertos/sistema, verifica con comandos reales antes de responder.',
+        permissionHintsForClaude.length > 0 ? `\n[POLITICA]\n${permissionHintsForClaude.join('\n')}` : '',
+        '',
+        String(executionPrompt || '').trim()
+      ].filter(Boolean).join('\n');
+
+      const claudeArgs = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages'];
+      const claudeCliModel = normalizeClaudeCodeModel(selectedModel, getChatAgentDefaultModel('claude-code'));
+      const claudeCliEffort = mapReasoningEffortToClaudeCli(selectedReasoningEffort);
+      if (claudeCliModel) {
+        claudeArgs.push('--model', claudeCliModel);
+      }
+      if (claudeCliEffort) {
+        claudeArgs.push('--effort', claudeCliEffort);
+      }
+      claudeArgs.push(claudePrompt);
+
+      const claudeEnv = {
+        ...process.env,
+        CODEXWEB_ACTIVE_PROVIDER: chatRuntime.providerId,
+        CODEXWEB_PERMISSION_PROFILE: JSON.stringify({
+          agentId: chatRuntime.providerId,
+          accessMode: runtimePolicy.accessMode,
+          allowRoot: runtimePolicy.profile.allowRoot,
+          canWriteFiles: runtimePolicy.profile.canWriteFiles,
+          readOnly: runtimePolicy.profile.readOnly,
+          allowNetwork: runtimePolicy.profile.allowNetwork,
+          allowGit: runtimePolicy.profile.allowGit,
+          allowedPaths: runtimePolicy.allowedPaths
+        })
+      };
+
+      const assistantMessageForClaude = insertMessageStmt.run(conversationId, 'assistant', '');
+      assistantMessageId = Number(assistantMessageForClaude.lastInsertRowid);
+      const draftCreatedAtForClaude = nowIso();
+      closeOpenDraftsByConversationStmt.run(draftCreatedAtForClaude, req.session.userId, conversationId);
+      const draftInsertForClaude = insertLiveDraftStmt.run(
+        req.session.userId, conversationId, assistantMessageId, liveDraftRequestId,
+        prompt, '', '{}', 0, draftCreatedAtForClaude, draftCreatedAtForClaude
+      );
+      liveDraftId = Number(draftInsertForClaude.lastInsertRowid);
+
+      res.status(200);
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.setHeader('X-Conversation-Id', String(conversationId));
+      req.setTimeout(0);
+      res.setTimeout(0);
+      if (req.socket && typeof req.socket.setTimeout === 'function') req.socket.setTimeout(0);
+      if (res.socket && typeof res.socket.setTimeout === 'function') res.socket.setTimeout(0);
+      if (req.socket && typeof req.socket.setKeepAlive === 'function') req.socket.setKeepAlive(true);
+      if (req.socket && typeof req.socket.setNoDelay === 'function') req.socket.setNoDelay(true);
+      if (res.socket && typeof res.socket.setKeepAlive === 'function') res.socket.setKeepAlive(true);
+      if (res.socket && typeof res.socket.setNoDelay === 'function') res.socket.setNoDelay(true);
+      res.flushHeaders();
+
+      let claudeClientDisconnected = false;
+      const handleClaudeClientDisconnect = (source) => {
+        claudeClientDisconnected = true;
+        logChatStream('client_disconnect', { source });
+      };
+      req.on('aborted', () => handleClaudeClientDisconnect('request_aborted'));
+      res.on('close', () => {
+        if (!res.writableEnded) {
+          handleClaudeClientDisconnect('response_close');
+        } else {
+          logChatStream('response_close', { source: 'claude_code', writableEnded: true });
+        }
+      });
+      res.on('error', () => handleClaudeClientDisconnect('response_error'));
+      res.on('finish', () => { logChatStream('response_finish', { source: 'claude_code' }); });
+
+      sendSseComment(res, 'ok');
+      sendSse(res, 'conversation', { conversationId });
+      if (tsResult) {
+        sendSse(res, 'ts_stats', {
+          savings: tsResult.estimatedSavings || 0,
+          before: tsResult.estimatedTokensBefore || 0,
+          after: tsResult.estimatedTokensAfter || 0,
+          percent: tsResult.savingsPercent || 0,
+          mode: (tsResult.sections && tsResult.sections.mode) || 'off'
+        });
+      }
+      sendSse(res, 'chat_agent', {
+        id: chatRuntime.activeAgentId,
+        name: chatRuntime.activeAgentName,
+        provider: chatRuntime.runtimeProvider
+      });
+      sendSse(res, 'reasoning_step', {
+        itemId: 'agent_runtime',
+        text: `Agente activo: ${chatRuntime.activeAgentName} (modo agente CLI)`
+      });
+      sendSse(res, 'reasoning_step', {
+        itemId: 'permission_profile',
+        text: `Permisos: root=${runtimePolicy.profile.allowRoot ? 'si' : 'no'}, shell=${
+          runtimePolicy.profile.allowShell ? 'si' : 'no'
+        }, red=${runtimePolicy.profile.allowNetwork ? 'si' : 'no'}, git=${
+          runtimePolicy.profile.allowGit ? 'si' : 'no'
+        }, escritura=${runtimePolicy.profile.canWriteFiles ? 'si' : 'no'}, modo=${runtimePolicy.accessMode}`
+      });
+      sendSse(res, 'reasoning_step', {
+        itemId: 'claude_cwd',
+        text: `Directorio de trabajo: ${effectiveCwd}`
+      });
+
+      let claudeProcess = null;
+      let claudeActiveRun = null;
+      let claudeFinished = false;
+      let claudeStdoutText = '';
+      let claudeStderrText = '';
+      let claudeAssistantOutput = '';
+      let claudeLastPersisted = '';
+      let claudePersistErrorLogged = false;
+      const claudePerMsgSnapshots = new Map();
+      const claudeReasoningSnapshots = new Map();
+      const claudeToolRuns = new Map();
+      let claudeHasStreamedDelta = false;
+      let claudeResultWasError = false;
+      let claudeReportedError = '';
+      let claudeTerminalReason = '';
+
+      const claudeTimeoutMessage = `Claude Code no emitió actividad en ${formatDurationMinutes(claudeCodeTimeoutMs)}. La ejecución se canceló por timeout.`;
+      const claudeWatchdog = createInactivityWatchdog('claude_code', () => {
+        if (claudeActiveRun) terminateActiveChatRun(claudeActiveRun, 'timeout');
+        finalizeClaudeRequest({ ok: false, exitCode: 124, closeReason: 'timeout', output: claudeTimeoutMessage });
+      });
+
+      const persistClaudeSnapshot = (isFinal = false) => {
+        if (!assistantMessageId) return;
+        if (!isFinal && claudeAssistantOutput === claudeLastPersisted) return;
+        try {
+          updateMessageContentStmt.run(claudeAssistantOutput, assistantMessageId);
+          claudeLastPersisted = claudeAssistantOutput;
+          touchTaskRunHeartbeat();
+          if (liveDraftId) {
+            updateLiveDraftSnapshotStmt.run(
+              conversationId, assistantMessageId, claudeAssistantOutput, '{}',
+              isFinal ? 1 : 0, nowIso(), liveDraftId, req.session.userId
+            );
+          }
+        } catch (error) {
+          if (!claudePersistErrorLogged) {
+            claudePersistErrorLogged = true;
+            const reason = truncateForNotify(error && error.message ? error.message : 'claude_persist_failed', 180);
+            void notify(`WARN chat_persist_failed user=${username} conv=${conversationId} reason=${reason}`);
+          }
+        }
+      };
+
+      const finalizeClaudeRequest = ({ ok, exitCode, closeReason, output }) => {
+        if (claudeFinished) return;
+        claudeFinished = true;
+        claudeWatchdog.clear();
+        const safeOutput = String(output || '').trim() || '(Sin salida de Claude Code)';
+        const runWasKilled = Boolean(claudeActiveRun && claudeActiveRun.killRequested);
+        const safeExitCode = Number.isInteger(exitCode) ? Number(exitCode) : runWasKilled ? 130 : 1;
+        const effectiveCloseReason = runWasKilled
+          ? String(claudeActiveRun && claudeActiveRun.killReason ? claudeActiveRun.killReason : closeReason || 'killed_by_user')
+          : String(closeReason || (ok ? 'completed' : 'provider_error'));
+        const success = Boolean(ok) && !runWasKilled;
+        if (claudeActiveRun) clearActiveChatRun(claudeActiveRun);
+
+        if (assistantMessageId) {
+          updateMessageContentStmt.run(safeOutput, assistantMessageId);
+        } else {
+          const fallback = insertMessageStmt.run(conversationId, 'assistant', safeOutput);
+          assistantMessageId = Number(fallback.lastInsertRowid);
+        }
+        if (liveDraftId) {
+          try {
+            updateLiveDraftSnapshotStmt.run(
+              conversationId, assistantMessageId, safeOutput, '{}',
+              1, nowIso(), liveDraftId, req.session.userId
+            );
+          } catch (_draftError) { /* ignore */ }
+        }
+        claudeLastPersisted = safeOutput;
+
+        if (!claudeClientDisconnected) {
+          if (!claudeHasStreamedDelta) {
+            const chunkSize = 1600;
+            for (let index = 0; index < safeOutput.length; index += chunkSize) {
+              const chunk = safeOutput.slice(index, index + chunkSize);
+              if (!chunk) continue;
+              if (!sendSse(res, 'assistant_delta', { text: chunk })) {
+                claudeClientDisconnected = true;
+                break;
+              }
+            }
+          }
+          if (!claudeClientDisconnected) {
+            logChatStream('done_emit', { ok: success, exitCode: safeExitCode, closeReason: effectiveCloseReason, visibleOutput: safeOutput.trim().length > 0 });
+            sendSse(res, 'done', {
+              ok: success, conversationId, exitCode: safeExitCode, closeReason: effectiveCloseReason,
+              usage: null, structured: false, providerId: chatRuntime.activeAgentId,
+              providerName: chatRuntime.activeAgentName,
+              result: truncateRawText(safeOutput, 8000),
+              error: success ? '' : truncateForNotify(safeOutput, 420)
+            });
+            if (!res.writableEnded && !res.destroyed) res.end();
+          }
+        }
+
+        const finishedAt = nowIso();
+        const durationMs = Math.max(0, Date.now() - requestStartedAtMs);
+        logChatStream('process_exit', { source: 'claude_code', ok: success, exitCode: safeExitCode, closeReason: effectiveCloseReason, durationMs });
+        finalizeTaskRun({
+          status: success ? 'success' : 'failed', closeReason: effectiveCloseReason,
+          resultSummary: safeOutput, planText: '', finishedAt, durationMs,
+          usage: null, structured: false, clientDisconnected: claudeClientDisconnected,
+          timedOut: effectiveCloseReason === 'timeout'
+        });
+        scheduleProjectContextRefreshAfterChat(success ? 'chat_completed' : 'chat_failed');
+        if (userNotificationSettings.notifyOnFinish) {
+          const message = buildChatCompletionDiscordMessage({
+            status: success ? 'ok' : 'error', username, conversationId, finishedAt, durationMs,
+            closeReason: effectiveCloseReason, includeResult: userNotificationSettings.includeResult, result: safeOutput
+          });
+          if (message) void notify(message, { webhookUrl: userNotificationSettings.discordWebhookUrl });
+        }
+        if (success) {
+          void notify(`Chat ejecutado OK user=${username} conv=${conversationId} agent=${chatRuntime.activeAgentId} result=${truncateForNotify(safeOutput, 1000)}`);
+        } else {
+          void notify(`Error en chat user=${username} conv=${conversationId} agent=${chatRuntime.activeAgentId}: ${truncateForNotify(safeOutput, 240)}`);
+        }
+      };
+
+      try {
+        const spawnOptions = {
+          cwd: effectiveCwd,
+          env: claudeEnv,
+          stdio: ['ignore', 'pipe', 'pipe']
+        };
+        if (runtimePolicy.runAsIdentity) {
+          spawnOptions.uid = runtimePolicy.runAsIdentity.uid;
+          spawnOptions.gid = runtimePolicy.runAsIdentity.gid;
+        }
+        claudeProcess = spawn(claudeExecPath, claudeArgs, spawnOptions);
+      } catch (error) {
+        const reason = truncateForNotify(error && error.message ? error.message : 'claude_spawn_error', 200);
+        finalizeClaudeRequest({ ok: false, exitCode: 1, closeReason: 'spawn_error', output: `No se pudo iniciar Claude Code: ${reason}` });
+        return;
+      }
+
+      claudeActiveRun = registerActiveChatRun(req.session.userId, conversationId, claudeProcess);
+      claudeWatchdog.touch();
+      touchTaskRunHeartbeat(true);
+      logChatStream('process_spawned', {
+        requestId: liveDraftRequestId, userId: req.session.userId, conversationId,
+        agent: 'claude-code', pid: claudeProcess.pid, command: claudeExecPath,
+        args: claudeArgs.slice(0, -1)
+      });
+
+      const diffClaudeSnapshot = (snapshotMap, rawKey, rawValue) => {
+        const key = String(rawKey || '').trim() || 'default';
+        const nextValue = String(rawValue || '');
+        const previousValue = snapshotMap.get(key) || '';
+        snapshotMap.set(key, nextValue);
+        if (!nextValue || nextValue === previousValue) return '';
+        return nextValue.startsWith(previousValue) ? nextValue.slice(previousValue.length) : nextValue;
+      };
+
+      const appendClaudeAssistantDelta = (text) => {
+        const value = String(text || '');
+        if (!value) return;
+        claudeAssistantOutput += value;
+        claudeHasStreamedDelta = true;
+        sendSse(res, 'assistant_delta', { text: value });
+        persistClaudeSnapshot(false);
+      };
+
+      const mergeClaudeAssistantResult = (text) => {
+        const value = String(text || '').trim();
+        if (!value || value === claudeAssistantOutput) return;
+        if (!claudeAssistantOutput) {
+          claudeAssistantOutput = value;
+          persistClaudeSnapshot(false);
+          return;
+        }
+        if (value.startsWith(claudeAssistantOutput)) {
+          appendClaudeAssistantDelta(value.slice(claudeAssistantOutput.length));
+          return;
+        }
+        if (value.length > claudeAssistantOutput.length) {
+          claudeAssistantOutput = value;
+          persistClaudeSnapshot(false);
+        }
+      };
+
+      const emitClaudeReasoningDelta = (itemId, text) => {
+        const safeItemId = String(itemId || '').trim() || 'claude_reasoning';
+        const delta = diffClaudeSnapshot(claudeReasoningSnapshots, safeItemId, text);
+        if (!delta) return;
+        sendSse(res, 'reasoning_delta', { itemId: safeItemId, text: delta });
+      };
+
+      const extractClaudeTextPayload = (rawValue) => {
+        if (!rawValue) return '';
+        if (typeof rawValue === 'string') return rawValue;
+        if (Array.isArray(rawValue)) {
+          return rawValue.map((entry) => extractClaudeTextPayload(entry)).filter(Boolean).join('\n');
+        }
+        if (typeof rawValue === 'object') {
+          const directText = [
+            rawValue.text,
+            rawValue.output,
+            rawValue.stdout,
+            rawValue.stderr,
+            rawValue.message,
+            rawValue.result
+          ]
+            .filter((entry) => typeof entry === 'string' && entry.trim())
+            .join('\n');
+          if (directText) return directText;
+          if (Array.isArray(rawValue.content)) {
+            return rawValue.content.map((entry) => extractClaudeTextPayload(entry)).filter(Boolean).join('\n');
+          }
+          if (Array.isArray(rawValue.lines)) {
+            return rawValue.lines
+              .map((entry) => (typeof entry === 'string' ? entry : extractClaudeTextPayload(entry)))
+              .filter(Boolean)
+              .join('\n');
+          }
+          try {
+            return JSON.stringify(rawValue);
+          } catch (_error) {
+            return '';
+          }
+        }
+        return '';
+      };
+
+      const isClaudeCommandTool = (toolName) => {
+        const value = String(toolName || '').trim().toLowerCase();
+        return value === 'bash' || value === 'shell' || value === 'terminal' || value === 'command';
+      };
+
+      const extractClaudeToolCommand = (toolName, input) => {
+        if (typeof input === 'string') return input.trim();
+        if (input && typeof input === 'object') {
+          const candidates = [input.command, input.cmd, input.script, input.shell_command, input.shellCommand];
+          const direct = candidates.find((entry) => typeof entry === 'string' && entry.trim());
+          if (typeof direct === 'string' && direct.trim()) return direct.trim();
+          if (Array.isArray(input.commands)) {
+            const commands = input.commands
+              .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
+              .filter(Boolean);
+            if (commands.length > 0) return commands.join('\n');
+          }
+        }
+        const fallback = extractClaudeTextPayload(input).trim();
+        if (!fallback) return '';
+        return isClaudeCommandTool(toolName) ? fallback : '';
+      };
+
+      const formatClaudeToolLabel = (toolName, input) => {
+        const command = extractClaudeToolCommand(toolName, input);
+        if (command) return command;
+        const preview = extractClaudeTextPayload(input).trim();
+        if (!preview) return `[${toolName}]`;
+        return `[${toolName}] ${truncateRawText(preview, 220)}`;
+      };
+
+      const resolveClaudeToolItemId = (payload, toolName, fallbackPrefix = 'claude_tool') => {
+        const rawId =
+          String(
+            payload.tool_use_id ||
+              payload.toolUseId ||
+              payload.parent_tool_use_id ||
+              payload.parentToolUseId ||
+              payload.id ||
+              payload.uuid ||
+              ''
+          ).trim() ||
+          `${fallbackPrefix}_${String(toolName || 'tool').trim().toLowerCase()}_${claudeToolRuns.size + 1}`;
+        return rawId.replace(/[^a-zA-Z0-9._-]+/g, '_');
+      };
+
+      let claudeStreamBuffer = '';
+      claudeProcess.stdout.on('data', (chunk) => {
+        claudeWatchdog.touch();
+        touchTaskRunHeartbeat();
+        const text = String(chunk || '');
+        claudeStdoutText += text;
+        claudeStreamBuffer += text;
+        const lines = claudeStreamBuffer.split('\n');
+        claudeStreamBuffer = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const parsed = JSON.parse(trimmed);
+            const msgType = String(parsed.type || '');
+            if (msgType === 'assistant') {
+              const messageId = String((parsed.message && parsed.message.id) || 'msg_default');
+              const contentArr = Array.isArray(parsed.message && parsed.message.content) ? parsed.message.content : [];
+              let fullMsgText = '';
+              for (let index = 0; index < contentArr.length; index += 1) {
+                const block = contentArr[index];
+                if (block && block.type === 'text' && typeof block.text === 'string') {
+                  fullMsgText += block.text;
+                }
+                if (
+                  block &&
+                  (block.type === 'thinking' || block.type === 'reasoning') &&
+                  typeof (block.thinking || block.text || block.reasoning) === 'string'
+                ) {
+                  const thinkingText = String(block.thinking || block.text || block.reasoning || '');
+                  if (thinkingText) {
+                    emitClaudeReasoningDelta(`claude_thinking_${messageId}_${index}`, thinkingText);
+                  }
+                }
+              }
+              if (fullMsgText) {
+                const trueDelta = diffClaudeSnapshot(claudePerMsgSnapshots, messageId, fullMsgText);
+                if (trueDelta) {
+                  appendClaudeAssistantDelta(trueDelta);
+                }
+              }
+              const assistantError = String(parsed.error || '').trim();
+              if (assistantError) {
+                claudeReportedError = assistantError;
+                sendSse(res, 'reasoning_step', {
+                  itemId: 'claude_error',
+                  text: `Claude reportó error: ${assistantError}`
+                });
+              }
+            } else if (msgType === 'tool_use' || msgType === 'tool_result') {
+              const toolName = String(parsed.tool_name || parsed.name || 'tool');
+              const itemId = resolveClaudeToolItemId(parsed, toolName);
+              if (msgType === 'tool_use') {
+                const command = formatClaudeToolLabel(toolName, parsed.input);
+                claudeToolRuns.set(itemId, {
+                  toolName,
+                  command,
+                  output: ''
+                });
+                if (isClaudeCommandTool(toolName)) {
+                  sendSse(res, 'command_started', {
+                    itemId,
+                    command,
+                    status: 'in_progress'
+                  });
+                } else {
+                  sendSse(res, 'reasoning_step', {
+                    itemId: `claude_tool_${itemId}`,
+                    text: `Tool ${toolName}: ${command}`
+                  });
+                }
+              } else {
+                const previousRun = claudeToolRuns.get(itemId) || {
+                  toolName,
+                  command: `[${toolName}]`,
+                  output: ''
+                };
+                const output = extractClaudeTextPayload(
+                  parsed.result || parsed.output || parsed.content || parsed.text || parsed.message
+                ).trim();
+                const previousOutput = String(previousRun.output || '');
+                if (isClaudeCommandTool(previousRun.toolName || toolName)) {
+                  if (output) {
+                    const outputDelta = output.startsWith(previousOutput)
+                      ? output.slice(previousOutput.length)
+                      : output;
+                    if (outputDelta) {
+                      sendSse(res, 'command_output_delta', {
+                        itemId,
+                        text: outputDelta
+                      });
+                    }
+                  }
+                  const exitCode = Number.isInteger(Number(parsed.exit_code))
+                    ? Number(parsed.exit_code)
+                    : Number.isInteger(Number(parsed.exitCode))
+                      ? Number(parsed.exitCode)
+                      : null;
+                  const failed =
+                    parsed.is_error === true || (Number.isInteger(exitCode) && exitCode !== 0);
+                  sendSse(res, 'command_completed', {
+                    itemId,
+                    command: previousRun.command,
+                    status: failed ? 'failed' : 'completed',
+                    output,
+                    exitCode
+                  });
+                } else if (output) {
+                  emitClaudeReasoningDelta(`claude_tool_result_${itemId}`, `[${toolName}] ${output}`);
+                }
+                claudeToolRuns.set(itemId, {
+                  ...previousRun,
+                  output
+                });
+              }
+            } else if (msgType === 'system' || msgType === 'result') {
+              const subtype = String(parsed.subtype || '');
+              if (msgType === 'system' && subtype === 'status') {
+                const statusText = String(parsed.status || '').trim();
+                if (statusText) {
+                  sendSse(res, 'reasoning_step', {
+                    itemId: 'claude_status',
+                    text: `Claude: ${statusText}`
+                  });
+                }
+              }
+              if (subtype === 'success') {
+                const result = String(parsed.result || '').trim();
+                if (parsed.is_error === true) {
+                  claudeResultWasError = true;
+                  if (result) {
+                    claudeReportedError = result;
+                  }
+                }
+                const terminalReason = String(parsed.terminal_reason || parsed.terminalReason || '').trim();
+                if (terminalReason) {
+                  claudeTerminalReason = terminalReason;
+                }
+                if (result) {
+                  mergeClaudeAssistantResult(result);
+                }
+              }
+            }
+          } catch (_parseError) {
+            const stripped = stripAnsi(trimmed);
+            if (stripped) {
+              sendSse(res, 'reasoning_delta', { itemId: 'claude_stdout', text: `${stripped}\n` });
+            }
+          }
+        }
+      });
+
+      claudeProcess.stderr.on('data', (chunk) => {
+        claudeWatchdog.touch();
+        touchTaskRunHeartbeat();
+        const text = String(chunk || '');
+        claudeStderrText += text;
+        const stripped = stripAnsi(text).trim();
+        if (stripped) {
+          const lines = stripped.split(/\r?\n/).filter(Boolean);
+          for (const line of lines) {
+            sendSse(res, 'reasoning_delta', { itemId: 'claude_stderr', text: `${line}\n` });
+          }
+        }
+      });
+
+      claudeProcess.on('error', (error) => {
+        const codeNotFound = error && (error.code === 'ENOENT' || error.errno === 'ENOENT');
+        const reason = truncateForNotify(error && error.message ? error.message : 'claude_exec_error', 220);
+        finalizeClaudeRequest({
+          ok: false,
+          exitCode: codeNotFound ? 127 : 1,
+          closeReason: codeNotFound ? 'claude_not_found' : 'spawn_error',
+          output: codeNotFound
+            ? 'No se encontró el binario `claude` en el servidor. Instala Claude Code o configura CLAUDE_CODE_BIN.'
+            : `No se pudo iniciar Claude Code: ${reason}`
+        });
+      });
+
+      claudeProcess.on('close', (code, signal) => {
+        if (claudeStreamBuffer.trim()) {
+          try {
+            const parsed = JSON.parse(claudeStreamBuffer.trim());
+            const bufType = String(parsed.type || '');
+            if (bufType === 'result' || bufType === 'system') {
+              if (String(parsed.subtype || '') === 'success') {
+                const result = String(parsed.result || '').trim();
+                if (parsed.is_error === true) {
+                  claudeResultWasError = true;
+                  if (result) {
+                    claudeReportedError = result;
+                  }
+                }
+                const terminalReason = String(parsed.terminal_reason || parsed.terminalReason || '').trim();
+                if (terminalReason) {
+                  claudeTerminalReason = terminalReason;
+                }
+                if (result) {
+                  mergeClaudeAssistantResult(result);
+                }
+              }
+            }
+          } catch (_error) { /* ignore */ }
+        }
+        const normalizedExitCode = Number.isInteger(code) ? Number(code) : signal ? 130 : 1;
+        const runWasKilled = Boolean(claudeActiveRun && claudeActiveRun.killRequested);
+        const cleanStderr = stripAnsi(String(claudeStderrText || '')).trim();
+        const cleanStdoutForErrors = stripAnsi(String(claudeStdoutText || '')).trim();
+
+        let success = normalizedExitCode === 0 && !runWasKilled && !claudeResultWasError;
+        let closeReason = success ? 'completed' : 'provider_error';
+        if (runWasKilled) closeReason = String(claudeActiveRun && claudeActiveRun.killReason ? claudeActiveRun.killReason : 'killed_by_user');
+
+        let output = claudeAssistantOutput;
+        if (!success && !runWasKilled) {
+          const hasAuthError = /not logged in|authentication|login required|claude auth/i.test(cleanStderr + cleanStdoutForErrors);
+          const hasRateLimit = /rate.?limit|quota|too many requests|429/i.test(cleanStderr + cleanStdoutForErrors);
+          if (hasAuthError) {
+            closeReason = 'auth_error';
+            output = 'Claude Code requiere autenticación. Ejecuta `claude auth login` en el servidor.';
+          } else if (hasRateLimit) {
+            closeReason = 'quota_exhausted';
+            output = 'Claude Code alcanzó el límite de cuota. Espera o revisa tu plan Anthropic.';
+          } else if (claudeReportedError) {
+            closeReason = claudeTerminalReason || 'provider_error';
+            output = claudeReportedError;
+          } else if (!output) {
+            output =
+              cleanStderr ||
+              cleanStdoutForErrors ||
+              `Claude Code terminó con código ${normalizedExitCode}${signal ? ` (señal ${signal})` : ''}.`;
+          }
+        } else if (!output && success) {
+          output = '(Tarea completada)';
+        }
+
+        finalizeClaudeRequest({ ok: success, exitCode: normalizedExitCode, closeReason, output });
+      });
+
       return;
     }
 
@@ -18485,16 +23174,34 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       res.flushHeaders();
 
       let clientDisconnected = false;
-      const handleGeminiClientDisconnect = () => {
+      const handleGeminiClientDisconnect = (source) => {
         clientDisconnected = true;
+        logChatStream('client_disconnect', { source });
       };
-      req.on('aborted', handleGeminiClientDisconnect);
-      req.on('close', handleGeminiClientDisconnect);
-      res.on('close', handleGeminiClientDisconnect);
-      res.on('error', handleGeminiClientDisconnect);
+      req.on('aborted', () => handleGeminiClientDisconnect('request_aborted'));
+      res.on('close', () => {
+        if (!res.writableEnded) {
+          handleGeminiClientDisconnect('response_close');
+        } else {
+          logChatStream('response_close', { source: 'gemini_cli', writableEnded: true });
+        }
+      });
+      res.on('error', () => handleGeminiClientDisconnect('response_error'));
+      res.on('finish', () => {
+        logChatStream('response_finish', { source: 'gemini_cli' });
+      });
 
       sendSseComment(res, 'ok');
       sendSse(res, 'conversation', { conversationId });
+      if (tsResult) {
+        sendSse(res, 'ts_stats', {
+          savings: tsResult.estimatedSavings || 0,
+          before: tsResult.estimatedTokensBefore || 0,
+          after: tsResult.estimatedTokensAfter || 0,
+          percent: tsResult.savingsPercent || 0,
+          mode: (tsResult.sections && tsResult.sections.mode) || 'off'
+        });
+      }
       sendSse(res, 'chat_agent', {
         id: chatRuntime.activeAgentId,
         name: chatRuntime.activeAgentName,
@@ -18563,6 +23270,20 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       let finished = false;
       let stdoutText = '';
       let stderrText = '';
+      const geminiTimeoutMessage = `Gemini CLI no emitió actividad en ${formatDurationMinutes(
+        chatInactivityTimeoutMs
+      )}. La ejecución se canceló por timeout de inactividad.`;
+      const geminiWatchdog = createInactivityWatchdog('gemini_cli', () => {
+        if (activeRun) {
+          terminateActiveChatRun(activeRun, 'timeout');
+        }
+        finalizeGeminiRequest({
+          ok: false,
+          exitCode: 124,
+          closeReason: 'timeout',
+          output: geminiTimeoutMessage
+        });
+      });
       const getGeminiFailureSummary = (stdoutValue, stderrValue) => {
         const cleanStdout = stripAnsi(String(stdoutValue || '')).trim();
         const cleanStderr = stripAnsi(String(stderrValue || '')).trim();
@@ -18625,6 +23346,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       const finalizeGeminiRequest = ({ ok, exitCode, closeReason, output }) => {
         if (finished) return;
         finished = true;
+        geminiWatchdog.clear();
         const safeOutput = String(output || '').trim() || '(Sin salida de Gemini CLI)';
         const runWasKilled = Boolean(activeRun && activeRun.killRequested);
         const safeExitCode = Number.isInteger(exitCode) ? Number(exitCode) : runWasKilled ? 130 : 1;
@@ -18670,13 +23392,23 @@ app.post('/api/chat', requireAuth, async (req, res) => {
             }
           }
           if (!clientDisconnected) {
+            logChatStream('done_emit', {
+              ok: success,
+              exitCode: safeExitCode,
+              closeReason: effectiveCloseReason,
+              visibleOutput: safeOutput.trim().length > 0
+            });
             sendSse(res, 'done', {
               ok: success,
               conversationId,
               exitCode: safeExitCode,
               closeReason: effectiveCloseReason,
               usage: null,
-              structured: false
+              structured: false,
+              providerId: chatRuntime.activeAgentId,
+              providerName: chatRuntime.activeAgentName,
+              result: truncateRawText(safeOutput, 8000),
+              error: success ? '' : truncateForNotify(safeOutput, 420)
             });
             if (!res.writableEnded && !res.destroyed) {
               res.end();
@@ -18686,6 +23418,13 @@ app.post('/api/chat', requireAuth, async (req, res) => {
 
         const finishedAt = nowIso();
         const durationMs = Math.max(0, Date.now() - requestStartedAtMs);
+        logChatStream('process_exit', {
+          source: 'gemini_cli',
+          ok: success,
+          exitCode: safeExitCode,
+          closeReason: effectiveCloseReason,
+          durationMs
+        });
         finalizeTaskRun({
           status: success ? 'success' : 'failed',
           closeReason: effectiveCloseReason,
@@ -18695,7 +23434,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           durationMs,
           usage: null,
           structured: false,
-          clientDisconnected
+          clientDisconnected,
+          timedOut: effectiveCloseReason === 'timeout'
         });
         scheduleProjectContextRefreshAfterChat(success ? 'chat_completed' : 'chat_failed');
         if (userNotificationSettings.notifyOnFinish) {
@@ -18757,6 +23497,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       }
 
       activeRun = registerActiveChatRun(req.session.userId, conversationId, geminiProcess);
+      geminiWatchdog.touch();
+      touchTaskRunHeartbeat(true);
 
       const emitGeminiReasoningChunk = (chunk, source = 'stderr') => {
         const raw = stripAnsi(String(chunk || ''));
@@ -18780,10 +23522,14 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       };
 
       geminiProcess.stdout.on('data', (chunk) => {
+        geminiWatchdog.touch();
+        touchTaskRunHeartbeat();
         stdoutText += String(chunk || '');
         emitGeminiReasoningChunk(chunk, 'stdout');
       });
       geminiProcess.stderr.on('data', (chunk) => {
+        geminiWatchdog.touch();
+        touchTaskRunHeartbeat();
         stderrText += String(chunk || '');
         emitGeminiReasoningChunk(chunk, 'stderr');
       });
@@ -18845,7 +23591,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     }
 
     const codexPath = await resolveCodexPath();
-    const args = [
+    const argsBase = [
       '-c',
       'shell_environment_policy.inherit=all',
       'exec',
@@ -18857,10 +23603,10 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       'never'
     ];
     if (selectedModel) {
-      args.push('-m', selectedModel);
+      argsBase.push('-m', selectedModel);
     }
     if (selectedReasoningEffort) {
-      args.push('-c', `model_reasoning_effort="${selectedReasoningEffort}"`);
+      argsBase.push('-c', `model_reasoning_effort="${selectedReasoningEffort}"`);
     }
     const codexPermissionHints = [];
     if (runtimePolicy.profile.readOnly || !runtimePolicy.profile.canWriteFiles) {
@@ -18882,7 +23628,6 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       codexPermissionHints.length > 0
         ? `${executionPrompt}\n\n[POLITICA]\n${codexPermissionHints.join('\n')}`
         : executionPrompt;
-    args.push(codexPrompt);
 
     const assistantMessage = insertMessageStmt.run(conversationId, 'assistant', '');
     assistantMessageId = Number(assistantMessage.lastInsertRowid);
@@ -18931,6 +23676,22 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     let codexProcess = null;
     let activeRun = null;
     let clientDisconnected = false;
+    let codexAttempt = 0;
+    let codexContinuationCount = 0;
+    let runPhase = 'queued';
+    let lastActivityAtMs = Date.now();
+    let lastInactivityNoticeAtMs = 0;
+    let lastRuntimeMetricsPersistMs = 0;
+    let attemptAssistantStartLength = 0;
+    let latestAttemptError = '';
+    const chatRuntimeMetrics = {
+      phase: runPhase,
+      continuationCount: 0,
+      continuationLimit: chatAutoContinuationLimit,
+      inactivityTimeoutMs: chatInactivityTimeoutMs,
+      hardTimeoutMs: chatHardTimeoutMs,
+      lastActivityAt: new Date(lastActivityAtMs).toISOString()
+    };
     const sseWriteQueue = [];
     let sseBlocked = false;
     let queuedBytes = 0;
@@ -19009,6 +23770,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         return true;
       }
       const canContinue = res.write(text);
+      flushSseResponse(res);
       if (!canContinue) {
         sseBlocked = true;
         pauseCodexStreams();
@@ -19023,6 +23785,74 @@ app.post('/api/chat', requireAuth, async (req, res) => {
 
     const sendSseCommentSafe = (comment) => {
       return enqueueSseChunk(`: ${String(comment || '').trim() || 'ping'}\n\n`);
+    };
+
+    const persistRunningTaskMetrics = (patch = {}, forceHeartbeat = false) => {
+      if (!taskRunId || taskCompletionWritten) return;
+      Object.assign(chatRuntimeMetrics, patch || {});
+      try {
+        updateRunningTaskRunMetricsStmt.run(
+          JSON.stringify(chatRuntimeMetrics),
+          nowIso(),
+          taskRunId,
+          req.session.userId
+        );
+        touchTaskRunHeartbeat(forceHeartbeat);
+      } catch (_error) {
+        // best-effort runtime snapshot only.
+      }
+    };
+
+    const setRunPhase = (phase, details = {}) => {
+      const normalizedPhase = String(phase || '').trim().toLowerCase() || 'running';
+      runPhase = normalizedPhase;
+      const activityMs = Date.now();
+      const activityIso = new Date(activityMs).toISOString();
+      lastActivityAtMs = activityMs;
+      if (activeRun) {
+        activeRun.phase = normalizedPhase;
+        activeRun.lastActivityAtMs = activityMs;
+        activeRun.continuationCount = codexContinuationCount;
+        activeRun.continuationLimit = chatAutoContinuationLimit;
+      }
+      const payload = {
+        phase: normalizedPhase,
+        attempt: codexAttempt,
+        continuationCount: codexContinuationCount,
+        continuationLimit: chatAutoContinuationLimit,
+        ...details
+      };
+      sendSseSafe('run_phase', payload);
+      persistRunningTaskMetrics(
+        {
+          phase: normalizedPhase,
+          continuationCount: codexContinuationCount,
+          continuationLimit: chatAutoContinuationLimit,
+          lastActivityAt: activityIso
+        },
+        true
+      );
+    };
+
+    const markRuntimeActivity = (nextPhase = '') => {
+      const nowMs = Date.now();
+      const nowAt = new Date(nowMs).toISOString();
+      lastActivityAtMs = nowMs;
+      if (activeRun) {
+        activeRun.lastActivityAtMs = nowMs;
+      }
+      if (nextPhase) {
+        setRunPhase(nextPhase);
+        return;
+      }
+      if (runPhase === 'waiting_for_more_work') {
+        setRunPhase('running');
+        return;
+      }
+      if (nowMs - lastRuntimeMetricsPersistMs >= 4000) {
+        lastRuntimeMetricsPersistMs = nowMs;
+        persistRunningTaskMetrics({ lastActivityAt: nowAt });
+      }
     };
 
     res.on('drain', () => {
@@ -19048,6 +23878,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         text: `Ejecucion forzada como root para evitar fallo de permisos: ${runtimePolicy.identityFallbackReason}`
       });
     }
+    setRunPhase('starting', { elapsedMs: 0 });
     let heartbeatTimer = null;
     const stopHeartbeat = () => {
       if (heartbeatTimer !== null) {
@@ -19056,11 +23887,17 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       }
     };
     heartbeatTimer = setInterval(() => {
-      if (!sendSseCommentSafe('ping')) {
+      const heartbeatSent =
+        sendSseCommentSafe('ping') &&
+        sendSseSafe('heartbeat', {
+          at: nowIso(),
+          phase: runPhase || 'running'
+        });
+      if (!heartbeatSent) {
         stopHeartbeat();
       }
     }, 11000);
-    const handleClientDisconnect = () => {
+    const handleClientDisconnect = (source) => {
       if (clientDisconnected) return;
       clientDisconnected = true;
       stopHeartbeat();
@@ -19069,12 +23906,21 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       queuedBytes = 0;
       pendingStreamEnd = false;
       resumeCodexStreams();
+      logChatStream('client_disconnect', { source: source || 'response_disconnect' });
       notifyMilestone('fix_disconnect_no_kill', 'FIX aplicado: disconnect SSE no mata proceso Codex');
     };
-    req.on('aborted', handleClientDisconnect);
-    req.on('close', handleClientDisconnect);
-    res.on('close', handleClientDisconnect);
-    res.on('error', handleClientDisconnect);
+    req.on('aborted', () => handleClientDisconnect('request_aborted'));
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        handleClientDisconnect('response_close');
+      } else {
+        logChatStream('response_close', { source: 'codex_cli', writableEnded: true });
+      }
+    });
+    res.on('error', () => handleClientDisconnect('response_error'));
+    res.on('finish', () => {
+      logChatStream('response_finish', { source: 'codex_cli' });
+    });
 
     let assistantOutput = '';
     let stdoutPending = '';
@@ -19083,6 +23929,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     const codexNotices = [];
     const reasoningLines = [];
     const assistantItemTexts = new Map();
+    const committedAssistantItemTexts = new Map();
     const reasoningItemTexts = new Map();
     const commandOutputByItem = new Map();
     let usageSummary = null;
@@ -19093,6 +23940,46 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     let lastCodexError = '';
     let latestAssistantMessage = '';
     let finished = false;
+    let firstVisibleAssistantDeltaLogged = false;
+    let firstReasoningDeltaLogged = false;
+    const codexWatchdog = createInactivityWatchdog('codex_cli', ({ idleMs, elapsedMs }) => {
+      const processAlive =
+        Boolean(codexProcess) &&
+        codexProcess.exitCode === null &&
+        !codexProcess.killed &&
+        !(activeRun && activeRun.killRequested);
+      if (processAlive && elapsedMs < chatHardTimeoutMs) {
+        const nowMs = Date.now();
+        if (nowMs - lastInactivityNoticeAtMs >= chatInactivityNoticeIntervalMs) {
+          lastInactivityNoticeAtMs = nowMs;
+          pushSystemNotice(
+            `Codex sigue ejecutándose sin nueva salida (${formatDurationMs(
+              idleMs
+            )} en silencio). Continúo esperando para no cortar la tarea a medias.`
+          );
+        }
+        setRunPhase('waiting_for_more_work', {
+          idleMs: Math.max(0, Number(idleMs) || 0),
+          elapsedMs: Math.max(0, Number(elapsedMs) || 0)
+        });
+        return { extend: true };
+      }
+      const hardTimeoutReached = elapsedMs >= chatHardTimeoutMs;
+      const timeoutMessage = hardTimeoutReached
+        ? `Codex superó el límite máximo de ejecución (${formatDurationMs(
+            chatHardTimeoutMs
+          )}) y se detuvo para evitar bloqueo indefinido.`
+        : `Codex no emitió actividad en ${formatDurationMinutes(
+            chatInactivityTimeoutMs
+          )} y ya no había proceso vivo para continuar.`;
+      lastCodexError = timeoutMessage;
+      pushSystemNotice(timeoutMessage);
+      if (activeRun) {
+        terminateActiveChatRun(activeRun, hardTimeoutReached ? 'hard_timeout' : 'timeout');
+      }
+      finalizeResponse(124, hardTimeoutReached ? 'hard_timeout' : 'timeout');
+      return null;
+    });
 
     const toSnakeCase = (value) =>
       String(value || '')
@@ -19179,6 +24066,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           );
         }
         lastPersistedDraftSignature = signature;
+        touchTaskRunHeartbeat();
       } catch (error) {
         if (!assistantPersistErrorLogged) {
           assistantPersistErrorLogged = true;
@@ -19209,6 +24097,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       try {
         updateMessageContentStmt.run(contentToSave, assistantMessageId);
         lastPersistedAssistantContent = contentToSave;
+        touchTaskRunHeartbeat();
         persistLiveDraftSnapshot(false);
       } catch (error) {
         if (!assistantPersistErrorLogged) {
@@ -19222,7 +24111,15 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     const pushAssistantDelta = (text) => {
       const value = String(text || '');
       if (!value) return;
+      codexWatchdog.touch();
+      markRuntimeActivity('running');
       assistantOutput += value;
+      if (!firstVisibleAssistantDeltaLogged) {
+        firstVisibleAssistantDeltaLogged = true;
+        logChatStream('first_visible_delta', {
+          bytes: Buffer.byteLength(value, 'utf8')
+        });
+      }
       sendSseSafe('assistant_delta', { text: value });
       persistAssistantSnapshot(false);
     };
@@ -19234,9 +24131,33 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       pushAssistantDelta(`${prefix}${value}`);
     };
 
+    const syncAssistantItemText = (itemId, nextText) => {
+      const safeText = String(nextText || '');
+      if (!safeText) return;
+      const safeItemId = String(itemId || '').trim() || `assistant_item_${committedAssistantItemTexts.size + 1}`;
+      const previousCommitted = committedAssistantItemTexts.get(safeItemId) || '';
+      committedAssistantItemTexts.set(safeItemId, safeText);
+      latestAssistantMessage = safeText;
+      if (safeText === previousCommitted) return;
+      if (previousCommitted && safeText.startsWith(previousCommitted)) {
+        pushAssistantDelta(safeText.slice(previousCommitted.length));
+        return;
+      }
+      pushAssistantMessage(safeText);
+    };
+
     const upsertReasoningLine = (text, itemId) => {
       const value = String(text || '').trim();
       if (!value) return;
+      codexWatchdog.touch();
+      markRuntimeActivity();
+      if (!firstReasoningDeltaLogged) {
+        firstReasoningDeltaLogged = true;
+        logChatStream('first_reasoning_delta', {
+          itemId: String(itemId || ''),
+          bytes: Buffer.byteLength(value, 'utf8')
+        });
+      }
       if (itemId) {
         const idx = reasoningLines.findIndex((entry) => entry.itemId === itemId);
         if (idx >= 0) {
@@ -19341,6 +24262,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           finishedAt,
           durationMs
         });
+        touchTaskRunHeartbeat();
       }
       return next;
     };
@@ -19349,13 +24271,10 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       const itemId = getStringField(item, ['id', 'itemId']);
       const nextText = getStringField(item, ['text', 'message']);
       if (!nextText) return;
-      const safeProgressItemId = itemId ? `agent_${itemId}` : 'agent_progress';
       if (itemId) {
         assistantItemTexts.set(itemId, nextText);
       }
-      latestAssistantMessage = nextText;
-      upsertReasoningLine(nextText, safeProgressItemId);
-      sendSseSafe('reasoning_step', { itemId: safeProgressItemId, text: nextText });
+      syncAssistantItemText(itemId, nextText);
     };
 
     const handleReasoningCompleted = (item) => {
@@ -19485,6 +24404,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           normalizeErrorText(getStringField(getObjectField(item, ['error']), ['message'])) ||
           'Error reportado por Codex';
         lastCodexError = errorText;
+        latestAttemptError = errorText;
         pushSystemNotice(errorText);
       }
     };
@@ -19495,21 +24415,11 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       if (!delta) return;
 
       if (eventType.includes('agent_message') || eventType.includes('assistant_message')) {
-        const safeProgressItemId = itemId ? `agent_${itemId}` : 'agent_progress';
-        if (itemId) {
-          const previous = assistantItemTexts.get(itemId) || '';
-          const nextText = `${previous}${delta}`;
-          assistantItemTexts.set(itemId, nextText);
-          latestAssistantMessage = nextText;
-          upsertReasoningLine(nextText, safeProgressItemId);
-        } else {
-          const previous = assistantItemTexts.get(safeProgressItemId) || '';
-          const nextText = `${previous}${delta}`;
-          assistantItemTexts.set(safeProgressItemId, nextText);
-          latestAssistantMessage = nextText;
-          upsertReasoningLine(nextText, safeProgressItemId);
-        }
-        sendSseSafe('reasoning_delta', { itemId: safeProgressItemId, text: delta });
+        const safeItemId = itemId || 'assistant_stream';
+        const previous = assistantItemTexts.get(safeItemId) || '';
+        const nextText = `${previous}${delta}`;
+        assistantItemTexts.set(safeItemId, nextText);
+        syncAssistantItemText(safeItemId, nextText);
         return;
       }
 
@@ -19535,6 +24445,9 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       if (!eventObj || typeof eventObj !== 'object') return false;
       const eventType = toSnakeCase(getStringField(eventObj, ['type']));
       if (!eventType) return false;
+      codexWatchdog.touch();
+      touchTaskRunHeartbeat();
+      markRuntimeActivity();
       sawStructuredEvents = true;
 
       if (eventType === 'thread_started') {
@@ -19562,6 +24475,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           normalizeErrorText(getStringField(eventObj, ['message'])) ||
           'La ejecución de Codex falló.';
         lastCodexError = failedText;
+        latestAttemptError = failedText;
         pushSystemNotice(failedText);
         return true;
       }
@@ -19606,6 +24520,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           normalizeErrorText(getStringField(getObjectField(eventObj, ['error']), ['message'])) ||
           'Error reportado por Codex';
         lastCodexError = errorText;
+        latestAttemptError = errorText;
         pushSystemNotice(errorText);
         return true;
       }
@@ -19675,9 +24590,6 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       codexExecOptions.uid = runtimePolicy.runAsIdentity.uid;
       codexExecOptions.gid = runtimePolicy.runAsIdentity.gid;
     }
-    codexProcess = execFile(codexPath, args, codexExecOptions);
-    activeRun = registerActiveChatRun(req.session.userId, conversationId, codexProcess);
-    notifyMilestone('execfile_stdio_fixed', 'FIX aplicado: execFile invocado sin opción stdio');
 
     const flushStderrPending = () => {
       const tail = stderrPending.trim();
@@ -19687,9 +24599,79 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       pushSystemNotice(tail);
     };
 
+    const hasOpenTaskCommands = () => {
+      return Array.from(taskCommandStateByItem.values()).some((entry) => {
+        return toTaskCommandStatus(entry.status || '', entry.exitCode) === 'running';
+      });
+    };
+
+    const looksLikeIncompleteAssistantOutput = (rawText) => {
+      const text = String(rawText || '').trim();
+      if (!text) return 'empty_output';
+      const tail = text.slice(-360);
+      const tailLower = tail.toLowerCase();
+      const unfinishedFence = (text.match(/```/g) || []).length % 2 !== 0;
+      if (unfinishedFence) return 'open_code_fence';
+      if (/[,:;\-]$/.test(tail)) return 'unfinished_tail';
+      if (/\.\.\.$/.test(tail)) return 'truncated_tail';
+      if (
+        /(continuar|continuaré|continuare|seguir[eé]|pendiente|por hacer|falt(a|an)|next step|remaining|to do|wip)/i.test(
+          tailLower
+        )
+      ) {
+        return 'self_reported_incomplete';
+      }
+      return '';
+    };
+
+    const buildContinuationPrompt = (reason) => {
+      const outputTail = String(assistantOutput || '').slice(-chatContinuationTailChars);
+      return [
+        'CONTINUA LA EJECUCION ANTERIOR.',
+        '',
+        `Motivo detectado: ${reason}.`,
+        `Intento de continuación: ${codexContinuationCount + 1}/${chatAutoContinuationLimit}.`,
+        '',
+        'Objetivo original del usuario:',
+        prompt,
+        '',
+        'Ultimo contexto visible de salida:',
+        '```text',
+        outputTail || '(sin salida visible)',
+        '```',
+        '',
+        'Instrucciones:',
+        '- Continúa desde donde se quedó, sin reiniciar trabajo ya hecho.',
+        '- Si detectas pasos pendientes, ejecútalos hasta cerrarlos.',
+        '- Solo finaliza cuando la tarea quede completada de verdad o falle con causa concreta.',
+        '- No repitas bloques largos ya emitidos; aporta únicamente progreso nuevo.'
+      ].join('\n');
+    };
+
+    const shouldAutoContinue = (exitCode, closeReason) => {
+      if (chatAutoContinuationLimit <= 0) return { continueRun: false, reason: '' };
+      if (codexContinuationCount >= chatAutoContinuationLimit) return { continueRun: false, reason: '' };
+      if (Number(exitCode) !== 0) return { continueRun: false, reason: '' };
+      if (activeRun && activeRun.killRequested) return { continueRun: false, reason: '' };
+      const normalizedCloseReason = String(closeReason || '').trim().toLowerCase();
+      if (normalizedCloseReason && normalizedCloseReason !== 'client_closed') {
+        return { continueRun: false, reason: '' };
+      }
+      if (hasOpenTaskCommands()) {
+        return { continueRun: true, reason: 'open_commands' };
+      }
+      const attemptOutput = String(assistantOutput || '').slice(attemptAssistantStartLength);
+      const outputReason = looksLikeIncompleteAssistantOutput(attemptOutput);
+      if (outputReason) {
+        return { continueRun: true, reason: outputReason };
+      }
+      return { continueRun: false, reason: '' };
+    };
+
     const finalizeResponse = (exitCode, closeReason) => {
       if (finished) return;
       finished = true;
+      codexWatchdog.clear();
       clearActiveChatRun(activeRun);
       stopHeartbeat();
       flushStdoutPending();
@@ -19717,6 +24699,10 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         pushAssistantMessage(fallbackMessage);
       }
       const outputContent = assistantOutput.trim() ? assistantOutput.trim() : '(Sin salida de Codex)';
+      setRunPhase(exitCode === 0 ? 'completed' : 'failed', {
+        closeReason: String(closeReason || ''),
+        continuationCount: codexContinuationCount
+      });
       persistAssistantSnapshot(true);
       persistLiveDraftSnapshot(true);
       notifyMilestone('draft_persists_offline', 'FIX aplicado: live draft persiste y finaliza aun sin cliente SSE');
@@ -19728,7 +24714,25 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           exitCode,
           closeReason: closeReason || '',
           usage: usageSummary,
-          structured: sawStructuredEvents
+          structured: sawStructuredEvents,
+          providerId: chatRuntime.activeAgentId,
+          providerName: chatRuntime.activeAgentName,
+          continuationCount: codexContinuationCount,
+          continuationLimit: chatAutoContinuationLimit,
+          phase: runPhase,
+          result: truncateRawText(outputContent, 8000),
+          error:
+            exitCode === 0
+              ? ''
+              : truncateForNotify(lastCodexError || outputContent || closeReason || `exit_code_${exitCode}`, 420)
+        });
+        logChatStream('done_emit', {
+          ok: exitCode === 0,
+          exitCode,
+          closeReason: closeReason || '',
+          visibleOutput: outputContent.trim().length > 0,
+          queued: doneQueued,
+          continuations: codexContinuationCount
         });
         if (doneQueued) {
           pendingStreamEnd = true;
@@ -19738,6 +24742,14 @@ app.post('/api/chat', requireAuth, async (req, res) => {
 
       const finishedAt = nowIso();
       const durationMs = Math.max(0, Date.now() - requestStartedAtMs);
+      logChatStream('process_exit', {
+        source: 'codex_cli',
+        pid: Number(codexProcess && codexProcess.pid),
+        exitCode,
+        closeReason: closeReason || '',
+        durationMs,
+        continuations: codexContinuationCount
+      });
       const closeReasonText =
         closeReason || (exitCode === 0 ? 'completed' : `exit_code_${Number(exitCode)}`);
       finalizeTaskRun({
@@ -19749,7 +24761,11 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         durationMs,
         usage: usageSummary,
         structured: sawStructuredEvents,
-        clientDisconnected
+        clientDisconnected,
+        timedOut: closeReasonText === 'timeout' || closeReasonText === 'hard_timeout',
+        phase: runPhase,
+        continuationCount: codexContinuationCount,
+        continuationLimit: chatAutoContinuationLimit
       });
       scheduleProjectContextRefreshAfterChat(exitCode === 0 ? 'chat_completed' : 'chat_failed');
       if (userNotificationSettings.notifyOnFinish) {
@@ -19791,85 +24807,159 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       }
     };
 
-    codexProcess.stdout.on('data', (chunk) => {
-      const text = chunk
-        .toString('utf8')
-        .replace(/\r\n/g, '\n')
-        .replace(/\r/g, '\n');
-      if (!text) return;
-      const hadNewline = text.includes('\n');
-      stdoutPending += text;
-
-      let newlineIndex = stdoutPending.indexOf('\n');
-      while (newlineIndex >= 0) {
-        let line = stdoutPending.slice(0, newlineIndex);
-        if (line.endsWith('\r')) {
-          line = line.slice(0, -1);
-        }
-        stdoutPending = stdoutPending.slice(newlineIndex + 1);
-        handleStdoutLine(line);
-        newlineIndex = stdoutPending.indexOf('\n');
-      }
-
-      if (!hadNewline && stdoutPending) {
-        pushRawStdoutDelta(text);
-      }
-    });
-
-    codexProcess.stderr.on('data', (chunk) => {
-      const text = chunk.toString('utf8');
-      stderrPending += text;
-      const lines = stderrPending.split(/\r?\n/);
-      stderrPending = lines.pop() || '';
-      lines.forEach((line) => {
-        const trimmed = line.trim();
-        if (!trimmed) return;
-        stderrLines.push(trimmed);
-        pushSystemNotice(trimmed);
-      });
-    });
-
-    codexProcess.on('error', (error) => {
-      const msg = `No se pudo iniciar codex: ${truncateForNotify(error.message || 'spawn_error', 160)}`;
-      pushAssistantMessage(msg);
-      finalizeResponse(1, 'error');
-    });
-
     let stdoutEnded = false;
     let stderrEnded = false;
     let processClosed = false;
     let pendingExitCode = 0;
     let pendingCloseReason = null;
 
-    const finalizeWhenDrained = () => {
-      if (!processClosed || !stdoutEnded || !stderrEnded) return;
-      finalizeResponse(pendingExitCode, pendingCloseReason);
+    const resetDrainState = () => {
+      stdoutEnded = false;
+      stderrEnded = false;
+      processClosed = false;
+      pendingExitCode = 0;
+      pendingCloseReason = null;
+      stdoutPending = '';
+      stderrPending = '';
     };
 
-    codexProcess.stdout.on('end', () => {
-      stdoutEnded = true;
-      finalizeWhenDrained();
-    });
-
-    codexProcess.stderr.on('end', () => {
-      stderrEnded = true;
-      finalizeWhenDrained();
-    });
-
-    codexProcess.on('close', (code, signal) => {
-      processClosed = true;
-      pendingExitCode = Number.isInteger(code) ? code : 0;
-      if (activeRun && activeRun.killRequested && activeRun.killReason) {
-        pendingCloseReason = activeRun.killReason;
-      } else {
-        pendingCloseReason = clientDisconnected
-          ? 'client_closed'
-          : signal
-            ? `signal ${signal}`
-            : null;
+    const startCodexAttempt = (attemptPrompt, reason = 'initial') => {
+      if (finished) return;
+      codexAttempt += 1;
+      attemptAssistantStartLength = assistantOutput.length;
+      latestAttemptError = '';
+      resetDrainState();
+      const args = [...argsBase, attemptPrompt];
+      codexProcess = execFile(codexPath, args, codexExecOptions);
+      activeRun = registerActiveChatRun(req.session.userId, conversationId, codexProcess);
+      if (activeRun) {
+        const nowMs = Date.now();
+        activeRun.phase = 'starting';
+        activeRun.lastActivityAtMs = nowMs;
+        activeRun.continuationCount = codexContinuationCount;
+        activeRun.continuationLimit = chatAutoContinuationLimit;
       }
-      finalizeWhenDrained();
-    });
+      codexWatchdog.touch();
+      touchTaskRunHeartbeat(true);
+      setRunPhase('starting', {
+        attempt: codexAttempt,
+        reason,
+        continuationCount: codexContinuationCount
+      });
+      logChatStream('process_spawned', {
+        pid: Number(codexProcess && codexProcess.pid),
+        command: codexPath,
+        args,
+        attempt: codexAttempt,
+        reason
+      });
+      notifyMilestone('execfile_stdio_fixed', 'FIX aplicado: execFile invocado sin opción stdio');
+
+      codexProcess.stdout.on('data', (chunk) => {
+        codexWatchdog.touch();
+        touchTaskRunHeartbeat();
+        markRuntimeActivity();
+        const text = chunk
+          .toString('utf8')
+          .replace(/\r\n/g, '\n')
+          .replace(/\r/g, '\n');
+        if (!text) return;
+        const hadNewline = text.includes('\n');
+        stdoutPending += text;
+
+        let newlineIndex = stdoutPending.indexOf('\n');
+        while (newlineIndex >= 0) {
+          let line = stdoutPending.slice(0, newlineIndex);
+          if (line.endsWith('\r')) {
+            line = line.slice(0, -1);
+          }
+          stdoutPending = stdoutPending.slice(newlineIndex + 1);
+          handleStdoutLine(line);
+          newlineIndex = stdoutPending.indexOf('\n');
+        }
+
+        if (!hadNewline && stdoutPending) {
+          pushRawStdoutDelta(text);
+        }
+      });
+
+      codexProcess.stderr.on('data', (chunk) => {
+        codexWatchdog.touch();
+        touchTaskRunHeartbeat();
+        markRuntimeActivity();
+        const text = chunk.toString('utf8');
+        stderrPending += text;
+        const lines = stderrPending.split(/\r?\n/);
+        stderrPending = lines.pop() || '';
+        lines.forEach((line) => {
+          const trimmed = line.trim();
+          if (!trimmed) return;
+          stderrLines.push(trimmed);
+          pushSystemNotice(trimmed);
+        });
+      });
+
+      codexProcess.on('error', (error) => {
+        const msg = `No se pudo iniciar codex: ${truncateForNotify(error.message || 'spawn_error', 160)}`;
+        pushAssistantMessage(msg);
+        finalizeResponse(1, 'error');
+      });
+
+      const finalizeWhenDrained = () => {
+        if (!processClosed || !stdoutEnded || !stderrEnded) return;
+        flushStdoutPending();
+        flushStderrPending();
+        if (!assistantOutput.trim() && latestAssistantMessage.trim()) {
+          assistantOutput = latestAssistantMessage.trim();
+        }
+        if (pendingExitCode === 0 && latestAttemptError) {
+          finalizeResponse(1, 'provider_error');
+          return;
+        }
+        const continuation = shouldAutoContinue(pendingExitCode, pendingCloseReason);
+        if (continuation.continueRun) {
+          codexContinuationCount += 1;
+          const continuationPrompt = buildContinuationPrompt(continuation.reason);
+          pushSystemNotice(
+            `Salida parcial detectada (${continuation.reason}). Reanudando automáticamente (${codexContinuationCount}/${chatAutoContinuationLimit}).`
+          );
+          setRunPhase('waiting_for_more_work', {
+            reason: continuation.reason,
+            continuationCount: codexContinuationCount
+          });
+          startCodexAttempt(continuationPrompt, `continuation_${continuation.reason}`);
+          return;
+        }
+        finalizeResponse(pendingExitCode, pendingCloseReason);
+      };
+
+      codexProcess.stdout.on('end', () => {
+        stdoutEnded = true;
+        finalizeWhenDrained();
+      });
+
+      codexProcess.stderr.on('end', () => {
+        stderrEnded = true;
+        finalizeWhenDrained();
+      });
+
+      codexProcess.on('close', (code, signal) => {
+        processClosed = true;
+        pendingExitCode = Number.isInteger(code) ? code : 0;
+        if (activeRun && activeRun.killRequested && activeRun.killReason) {
+          pendingCloseReason = activeRun.killReason;
+        } else {
+          pendingCloseReason = signal
+            ? `signal ${signal}`
+            : clientDisconnected && pendingExitCode === 0
+              ? 'client_closed'
+              : null;
+        }
+        finalizeWhenDrained();
+      });
+    };
+
+    startCodexAttempt(codexPrompt, 'initial');
 
     notifyMilestone('codex_full_access', 'CodexWeb ejecuta Codex CLI con acceso total');
     notifyMilestone('streaming_realtime', 'Streaming en tiempo real implementado');
@@ -20072,6 +25162,7 @@ process.on('uncaughtException', (error) => {
 
 markStaleTaskRunsOnStartup();
 markRestartRecoveredOnStartup();
+sweepStaleRunningTaskRuns();
 try {
   pruneTaskSnapshots({ force: true });
 } catch (error) {
@@ -20088,9 +25179,33 @@ const taskSnapshotPruneTimer = setInterval(() => {
 if (taskSnapshotPruneTimer && typeof taskSnapshotPruneTimer.unref === 'function') {
   taskSnapshotPruneTimer.unref();
 }
+const staleTaskSweepTimer = setInterval(() => {
+  sweepStaleRunningTaskRuns();
+}, chatStaleSweepIntervalMs);
+if (staleTaskSweepTimer && typeof staleTaskSweepTimer.unref === 'function') {
+  staleTaskSweepTimer.unref();
+}
 resumePendingDeployedDescriptionJobs();
 resumePendingStorageJobs();
+resumePendingSteamDeckJobs();
 grantFullAccessToActiveProviderForAdminUsersOnStartup();
+
+require('./routes/tokenSaver')(app, {
+  requireAuth,
+  tsStmts,
+  getTsGlobalSettings,
+  getTsChatSettings,
+  getEffectiveTsSettings,
+  nowIso,
+  getConversationStmt,
+  listMessagesStmt,
+  getRecentProjectsStmt,
+  sanitizePreview,
+  getSafeUserId,
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+
 if (process.env.CODEXWEB_NO_LISTEN === '1') {
   module.exports = {
     app,
@@ -20132,6 +25247,16 @@ if (process.env.CODEXWEB_NO_LISTEN === '1') {
         const reason = truncateForNotify(error && error.message ? error.message : 'GEMINI_NOT_FOUND', 120);
         console.warn(`No se pudo precargar ruta de gemini: ${reason}`);
       });
+    if (claudeCodeEnabled) {
+      resolveClaudeCodePath()
+        .then((claudePath) => {
+          console.log(`Claude Code CLI detectado en ${claudePath}`);
+        })
+        .catch((error) => {
+          const reason = truncateForNotify(error && error.message ? error.message : 'CLAUDE_CODE_NOT_FOUND', 120);
+          console.warn(`No se pudo precargar ruta de claude: ${reason}`);
+        });
+    }
     notifyMilestone('codex_permissions_root_default_started', 'codex_permissions_root_default_started');
     notifyMilestone('codex_permissions_migration_done', 'codex_permissions_migration_done');
     notifyMilestone('codex_permissions_backend_done', 'codex_permissions_backend_done');

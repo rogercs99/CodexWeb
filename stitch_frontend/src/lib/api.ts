@@ -38,17 +38,38 @@ import type {
   ToolsStorageOverview,
   ToolsStorageResidualAnalysis,
   ToolsStorageResidualCandidate,
+  QuetzalRelayCommandsPayload,
+  QuetzalRelayConfig,
+  QuetzalRelayDiagnosticsPayload,
+  QuetzalRelayPreparePayload,
+  QuetzalRelayStatusPayload,
   RestartState,
   StorageHealthSnapshot,
+  SteamDeckCommandResult,
+  SteamDeckConfig,
+  SteamDeckDetectResult,
+  SteamDeckJob,
   TaskRecovery,
   TaskRunDashboardItem,
   UnifiedSearchPayload,
   ObservabilitySnapshot,
-  User
+  User,
+  ClaudeCodeAuthStatus,
+  ClaudeCodeAuthLogin
 } from './types';
 
 interface ApiError extends Error {
   status?: number;
+  data?: any;
+}
+
+export interface SteamDeckSetupLink {
+  ok: boolean;
+  token: string;
+  setupPageUrl: string;
+  scriptUrl: string;
+  curlCommand: string;
+  expiresAt: string;
 }
 
 async function parseJsonSafe(response: Response): Promise<any> {
@@ -84,9 +105,38 @@ export async function api<T = any>(url: string, init?: RequestInit): Promise<T> 
   if (!response.ok) {
     const err = new Error(data?.error || `Request failed (${response.status})`) as ApiError;
     err.status = response.status;
+    err.data = data;
     throw err;
   }
   return data as T;
+}
+
+export async function getQuetzalRelayStatus(): Promise<QuetzalRelayStatusPayload> {
+  return api('/api/quetzal-relay/status');
+}
+
+export async function updateQuetzalRelayConfig(config: QuetzalRelayConfig): Promise<{
+  ok: boolean;
+  config: QuetzalRelayConfig;
+  status: QuetzalRelayStatusPayload;
+}> {
+  return api('/api/quetzal-relay/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config)
+  });
+}
+
+export async function prepareQuetzalRelay(): Promise<QuetzalRelayPreparePayload> {
+  return api('/api/quetzal-relay/prepare', { method: 'POST' });
+}
+
+export async function getQuetzalRelayCommands(): Promise<QuetzalRelayCommandsPayload> {
+  return api('/api/quetzal-relay/commands');
+}
+
+export async function getQuetzalRelayDiagnostics(): Promise<QuetzalRelayDiagnosticsPayload> {
+  return api('/api/quetzal-relay/diagnostics');
 }
 
 function normalizeAiProviderQuota(rawValue: any): AiProviderQuota {
@@ -188,6 +238,91 @@ function normalizeAiProviderInfo(rawValue: any): AiProviderInfo {
       chat: Boolean(rawValue?.availability?.chat),
       configured: Boolean(rawValue?.availability?.configured),
       enabled: Boolean(rawValue?.availability?.enabled)
+    }
+  };
+}
+
+function normalizeSteamDeckConfig(rawValue: any): SteamDeckConfig {
+  const authRaw = String(rawValue?.authMethod || '').trim().toLowerCase();
+  const networkRaw = String(rawValue?.networkMode || '').trim().toLowerCase();
+  const statusRaw = String(rawValue?.status || '').trim().toLowerCase();
+  return {
+    enabled: Boolean(rawValue?.enabled),
+    configured: Boolean(rawValue?.configured),
+    status: statusRaw === 'disabled' || statusRaw === 'ready' ? statusRaw : 'not_configured',
+    deviceName: String(rawValue?.deviceName || 'Steam Deck'),
+    host: String(rawValue?.host || ''),
+    port: Number.isInteger(Number(rawValue?.port)) ? Number(rawValue.port) : 22,
+    user: String(rawValue?.user || 'deck'),
+    authMethod: authRaw === 'password' ? 'password' : 'key',
+    remoteWorkdir: String(rawValue?.remoteWorkdir || '/home/deck'),
+    codexBin: String(rawValue?.codexBin || 'codex'),
+    networkMode:
+      networkRaw === 'tailscale' || networkRaw === 'wireguard' || networkRaw === 'lan'
+        ? networkRaw
+        : 'auto',
+    allowDangerousCommands: Boolean(rawValue?.allowDangerousCommands),
+    notifyDiscord: Boolean(rawValue?.notifyDiscord),
+    keyPath: String(rawValue?.keyPath || ''),
+    hasPassword: Boolean(rawValue?.hasPassword),
+    hasPrivateKey: Boolean(rawValue?.hasPrivateKey),
+    keyPathExists: Boolean(rawValue?.keyPathExists),
+    keyFileMode: String(rawValue?.keyFileMode || ''),
+    keyFileModeSafe: Boolean(rawValue?.keyFileModeSafe),
+    warningPublicHost: Boolean(rawValue?.warningPublicHost),
+    createdAt: String(rawValue?.createdAt || ''),
+    updatedAt: String(rawValue?.updatedAt || '')
+  };
+}
+
+function normalizeSteamDeckJob(rawValue: any): SteamDeckJob {
+  const kindRaw = String(rawValue?.kind || '').trim().toLowerCase();
+  const statusRaw = String(rawValue?.status || '').trim().toLowerCase();
+  return {
+    id: String(rawValue?.id || ''),
+    kind: kindRaw === 'codex' || kindRaw === 'detect' ? kindRaw : 'command',
+    status:
+      statusRaw === 'running' ||
+      statusRaw === 'succeeded' ||
+      statusRaw === 'failed' ||
+      statusRaw === 'cancelled'
+        ? statusRaw
+        : 'queued',
+    command: String(rawValue?.command || ''),
+    payload: rawValue?.payload && typeof rawValue.payload === 'object' ? rawValue.payload : {},
+    stdout: String(rawValue?.stdout || ''),
+    stderr: String(rawValue?.stderr || ''),
+    log: String(rawValue?.log || ''),
+    exitCode: Number.isInteger(Number(rawValue?.exitCode)) ? Number(rawValue.exitCode) : null,
+    error: String(rawValue?.error || ''),
+    cancelRequested: Boolean(rawValue?.cancelRequested),
+    createdAt: String(rawValue?.createdAt || ''),
+    updatedAt: String(rawValue?.updatedAt || ''),
+    startedAt: String(rawValue?.startedAt || ''),
+    finishedAt: String(rawValue?.finishedAt || '')
+  };
+}
+
+function normalizeSteamDeckDetectResult(rawValue: any): SteamDeckDetectResult {
+  return {
+    hostname: String(rawValue?.hostname || ''),
+    user: String(rawValue?.user || ''),
+    uname: String(rawValue?.uname || ''),
+    osRelease: String(rawValue?.osRelease || ''),
+    steamOsLikely: Boolean(rawValue?.steamOsLikely),
+    codexInstalled: Boolean(rawValue?.codexInstalled),
+    codexPath: String(rawValue?.codexPath || ''),
+    codexVersion: String(rawValue?.codexVersion || ''),
+    diskRoot: String(rawValue?.diskRoot || ''),
+    memory: String(rawValue?.memory || ''),
+    uptime: String(rawValue?.uptime || ''),
+    ipAddresses: Array.isArray(rawValue?.ipAddresses)
+      ? rawValue.ipAddresses.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+      : [],
+    sshStatus: String(rawValue?.sshStatus || ''),
+    raw: {
+      stdout: String(rawValue?.raw?.stdout || ''),
+      stderr: String(rawValue?.raw?.stderr || '')
     }
   };
 }
@@ -603,6 +738,183 @@ export async function updateNotificationSettings(
     body: JSON.stringify(payload)
   });
   return data.notifications;
+}
+
+export async function getSteamDeckConfig(): Promise<{ enabled: boolean; config: SteamDeckConfig }> {
+  const data = await api<{ enabled?: boolean; config?: any }>('/api/devices/steamdeck/config');
+  return {
+    enabled: Boolean(data?.enabled),
+    config: normalizeSteamDeckConfig(data?.config)
+  };
+}
+
+export async function saveSteamDeckConfig(payload: {
+  deviceName?: string;
+  host?: string;
+  port?: number;
+  user?: string;
+  authMethod?: 'key' | 'password';
+  password?: string;
+  clearPassword?: boolean;
+  privateKey?: string;
+  clearPrivateKey?: boolean;
+  remoteWorkdir?: string;
+  codexBin?: string;
+  networkMode?: 'auto' | 'tailscale' | 'wireguard' | 'lan';
+  allowDangerousCommands?: boolean;
+  notifyDiscord?: boolean;
+  keyPath?: string;
+}): Promise<SteamDeckConfig> {
+  const data = await api<{ config?: any }>('/api/devices/steamdeck/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  return normalizeSteamDeckConfig(data?.config);
+}
+
+export async function generateSteamDeckKey(payload?: {
+  keyPath?: string;
+  force?: boolean;
+}): Promise<{ keyPath: string; publicKey: string; config: SteamDeckConfig }> {
+  const data = await api<{ keyPath?: string; publicKey?: string; config?: any }>('/api/devices/steamdeck/generate-key', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {})
+  });
+  return {
+    keyPath: String(data?.keyPath || ''),
+    publicKey: String(data?.publicKey || ''),
+    config: normalizeSteamDeckConfig(data?.config)
+  };
+}
+
+export async function getSteamDeckSetupLink(): Promise<SteamDeckSetupLink> {
+  const data = await api<SteamDeckSetupLink>('/api/devices/steamdeck/setup-link');
+  return {
+    ok: Boolean(data?.ok),
+    token: String(data?.token || ''),
+    setupPageUrl: String(data?.setupPageUrl || ''),
+    scriptUrl: String(data?.scriptUrl || ''),
+    curlCommand: String(data?.curlCommand || ''),
+    expiresAt: String(data?.expiresAt || '')
+  };
+}
+
+export async function testSteamDeckConnection(payload?: {
+  timeoutMs?: number;
+}): Promise<{
+  status: string;
+  host: string;
+  user: string;
+  exitCode: number | null;
+  durationMs: number;
+  stdout: string;
+  stderr: string;
+}> {
+  const data = await api<any>('/api/devices/steamdeck/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {})
+  });
+  return {
+    status: String(data?.status || ''),
+    host: String(data?.host || ''),
+    user: String(data?.user || ''),
+    exitCode: Number.isInteger(Number(data?.exitCode)) ? Number(data.exitCode) : null,
+    durationMs: Number(data?.durationMs) || 0,
+    stdout: String(data?.stdout || ''),
+    stderr: String(data?.stderr || '')
+  };
+}
+
+export async function detectSteamDeckEnvironment(payload?: {
+  timeoutMs?: number;
+}): Promise<SteamDeckDetectResult> {
+  const data = await api<{ detection?: any }>('/api/devices/steamdeck/detect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {})
+  });
+  return normalizeSteamDeckDetectResult(data?.detection);
+}
+
+export async function runSteamDeckCommand(payload: {
+  command: string;
+  timeoutMs?: number;
+  background?: boolean;
+  confirmDangerous?: boolean;
+}): Promise<{
+  queued: boolean;
+  dangerousDetected: boolean;
+  warnings: Array<{ id: string; label: string }>;
+  result: SteamDeckCommandResult | null;
+  job: SteamDeckJob | null;
+}> {
+  const data = await api<any>('/api/devices/steamdeck/command', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  return {
+    queued: Boolean(data?.queued),
+    dangerousDetected: Boolean(data?.dangerousDetected),
+    warnings: Array.isArray(data?.warnings)
+      ? data.warnings
+          .map((entry: any) => ({
+            id: String(entry?.id || ''),
+            label: String(entry?.label || '')
+          }))
+          .filter((entry: { id: string; label: string }) => Boolean(entry.id))
+      : [],
+    result: data?.result
+      ? {
+          exitCode: Number.isInteger(Number(data?.result?.exitCode)) ? Number(data.result.exitCode) : null,
+          durationMs: Number(data?.result?.durationMs) || 0,
+          stdout: String(data?.result?.stdout || ''),
+          stderr: String(data?.result?.stderr || '')
+        }
+      : null,
+    job: data?.job ? normalizeSteamDeckJob(data.job) : null
+  };
+}
+
+export async function runSteamDeckCodex(payload: {
+  prompt: string;
+  remoteWorkdir?: string;
+  codexBin?: string;
+  inheritEnvironment?: boolean;
+  dangerSandbox?: boolean;
+  timeoutMs?: number;
+}): Promise<{ queued: boolean; job: SteamDeckJob | null }> {
+  const data = await api<any>('/api/devices/steamdeck/codex', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  return {
+    queued: Boolean(data?.queued),
+    job: data?.job ? normalizeSteamDeckJob(data.job) : null
+  };
+}
+
+export async function getSteamDeckJobs(limit = 40): Promise<SteamDeckJob[]> {
+  const safeLimit = Number.isInteger(limit) ? Math.min(Math.max(limit, 1), 120) : 40;
+  const data = await api<{ jobs?: any[] }>(`/api/devices/steamdeck/jobs?limit=${safeLimit}`);
+  return Array.isArray(data?.jobs) ? data.jobs.map((row: any) => normalizeSteamDeckJob(row)) : [];
+}
+
+export async function getSteamDeckJob(jobId: string): Promise<SteamDeckJob> {
+  const data = await api<{ job?: any }>(`/api/devices/steamdeck/jobs/${encodeURIComponent(String(jobId || '').trim())}`);
+  return normalizeSteamDeckJob(data?.job);
+}
+
+export async function cancelSteamDeckJob(jobId: string): Promise<SteamDeckJob> {
+  const data = await api<{ job?: any }>(
+    `/api/devices/steamdeck/jobs/${encodeURIComponent(String(jobId || '').trim())}/cancel`,
+    { method: 'POST' }
+  );
+  return normalizeSteamDeckJob(data?.job);
 }
 
 export async function getAiAgentSettings(): Promise<AiAgentSettingsPayload> {
@@ -1803,6 +2115,34 @@ export async function logoutCodexAuth(): Promise<void> {
   await api('/api/codex/auth/logout', { method: 'POST' });
 }
 
+export async function getClaudeCodeAuthStatus(): Promise<ClaudeCodeAuthStatus> {
+  const data = await api<ClaudeCodeAuthStatus & { ok: boolean }>('/api/claude-code/auth/status');
+  return data;
+}
+
+export async function startClaudeCodeAuth(): Promise<ClaudeCodeAuthLogin | null> {
+  const data = await api<{ ok: boolean; login: ClaudeCodeAuthLogin | null }>('/api/claude-code/auth/start', {
+    method: 'POST'
+  });
+  return data.login ?? null;
+}
+
+export async function sendClaudeCodeAuthCode(code: string): Promise<void> {
+  await api('/api/claude-code/auth/send-code', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code })
+  });
+}
+
+export async function cancelClaudeCodeAuth(): Promise<void> {
+  await api('/api/claude-code/auth/cancel', { method: 'POST' });
+}
+
+export async function logoutClaudeCodeAuth(): Promise<void> {
+  await api('/api/claude-code/auth/logout', { method: 'POST' });
+}
+
 export async function listAttachments(limit = 200): Promise<AttachmentItem[]> {
   const data = await api<{ attachments: AttachmentItem[] }>(`/api/attachments?limit=${limit}`);
   return Array.isArray(data.attachments) ? data.attachments : [];
@@ -2153,4 +2493,73 @@ export async function startChatStream(payload: {
   }
 
   return response;
+}
+
+export async function startTerminalLiveStream(payload: {
+  command: string;
+  timeoutMs?: number;
+  confirmDangerous?: boolean;
+  signal: AbortSignal;
+}): Promise<Response> {
+  const response = await fetch('/api/tools/terminal-live/stream', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      command: payload.command,
+      timeoutMs: payload.timeoutMs,
+      confirmDangerous: Boolean(payload.confirmDangerous)
+    }),
+    signal: payload.signal
+  });
+
+  if (!response.ok) {
+    const data = await parseJsonSafe(response);
+    const err = new Error(data?.error || `No se pudo iniciar Terminal Live (${response.status})`) as ApiError;
+    err.status = response.status;
+    err.data = data;
+    throw err;
+  }
+
+  return response;
+}
+
+export async function getTokenSaverStatus(): Promise<any> {
+  return api('/api/token-saver/status');
+}
+
+export async function getTokenSaverSettings(): Promise<any> {
+  return api('/api/token-saver/settings');
+}
+
+export async function putTokenSaverSettings(settings: Record<string, any>): Promise<any> {
+  return api('/api/token-saver/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings)
+  });
+}
+
+export async function getTokenSaverPresets(): Promise<any> {
+  return api('/api/token-saver/presets');
+}
+
+export async function resetTokenSaverPreset(mode: string): Promise<any> {
+  return api('/api/token-saver/presets/reset', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode })
+  });
+}
+
+export async function getTokenSaverPreview(chatId: number, currentPrompt: string): Promise<any> {
+  return api('/api/token-saver/preview', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chatId, currentPrompt })
+  });
+}
+
+export async function clearTokenSaverCache(): Promise<any> {
+  return api('/api/token-saver/cache/clear', { method: 'POST' });
 }

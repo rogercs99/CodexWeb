@@ -1,36 +1,36 @@
 {
-  "attemptId": "1773231109202-88cb4f29",
+  "attemptId": "1782166872002-dca64cc9",
   "active": false,
   "phase": "completed",
   "requestedBy": "roger",
   "notifyWebhookUrl": "https://discord.com/api/webhooks/1386130341357424801/4UKIDRm_ldPvCLTTdPJ9ZEbXCVKo234_l49TV8oAr04CzVvvUIAQLcO-Ru-7VUvyTtuW",
-  "startedAt": "2026-03-11T12:11:49.202Z",
-  "finishedAt": "2026-03-11T12:11:52.167Z",
-  "updatedAt": "2026-03-11T12:11:52.167Z",
+  "startedAt": "2026-06-22T22:21:12.002Z",
+  "finishedAt": "2026-06-22T22:21:14.342Z",
+  "updatedAt": "2026-06-22T22:21:14.342Z",
   "logs": [
     {
-      "at": "2026-03-11T12:11:49.202Z",
+      "at": "2026-06-22T22:21:12.002Z",
       "message": "Reinicio solicitado por roger"
     },
     {
-      "at": "2026-03-11T12:11:49.205Z",
+      "at": "2026-06-22T22:21:12.004Z",
       "message": "Preparando helper de reinicio"
     },
     {
-      "at": "2026-03-11T12:11:49.209Z",
+      "at": "2026-06-22T22:21:12.007Z",
       "message": "Helper de reinicio lanzado"
     },
     {
-      "at": "2026-03-11T12:11:49.221Z",
+      "at": "2026-06-22T22:21:12.013Z",
       "message": "Respuesta enviada. Cerrando proceso actual"
     },
     {
-      "at": "2026-03-11T12:11:49.278Z",
+      "at": "2026-06-22T22:21:12.045Z",
       "message": "Helper de reinicio iniciado"
     },
     {
-      "at": "2026-03-11T12:11:52.167Z",
-      "message": "Nuevo proceso iniciado (pid 777591)"
+      "at": "2026-06-22T22:21:14.342Z",
+      "message": "Nuevo proceso iniciado (pid 1177866)"
     }
   ]
 }

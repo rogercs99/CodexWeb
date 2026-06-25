@@ -1,16 +1,22 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ChevronDown, ChevronLeft, ChevronRight, ExternalLink, RefreshCw } from 'lucide-react';
 import BottomNav from './BottomNav';
+import SteamDeckSettingsPanel from './SteamDeckSettingsPanel';
 import {
+  cancelClaudeCodeAuth,
   getAiAgentSettings,
   getAiProviderQuota,
-  listAiProviders,
   cancelCodexDeviceLogin,
-  grantAiProviderFullPermissions,
+  getClaudeCodeAuthStatus,
   getCodexAuthStatus,
-  getNotificationSettings,
   getCodexQuota,
+  getNotificationSettings,
+  grantAiProviderFullPermissions,
+  listAiProviders,
+  logoutClaudeCodeAuth,
   logoutCodexAuth,
+  sendClaudeCodeAuthCode,
+  startClaudeCodeAuth,
   startCodexDeviceLogin,
   updateActiveAiAgentSetting,
   updateAiAgentSetting,
@@ -23,6 +29,7 @@ import type {
   AiProviderPermissionProfile,
   Capabilities,
   ChatOptions,
+  ClaudeCodeAuthStatus,
   CodexAuthStatus,
   CodexQuota,
   CodexQuotaWindow,
@@ -70,6 +77,7 @@ type SettingsView =
   | 'activeAgent'
   | 'agentQuotas'
   | 'agentPermissions'
+  | 'steamDeck'
   | 'webhook';
 
 const providerPermissionToolCatalog = [
@@ -141,6 +149,12 @@ export default function SettingsScreen({
   const [authLoading, setAuthLoading] = useState(true);
   const [authError, setAuthError] = useState('');
   const [authActionBusy, setAuthActionBusy] = useState(false);
+  const [ccAuth, setCcAuth] = useState<ClaudeCodeAuthStatus | null>(null);
+  const [ccAuthLoading, setCcAuthLoading] = useState(false);
+  const [ccAuthBusy, setCcAuthBusy] = useState(false);
+  const [ccAuthError, setCcAuthError] = useState('');
+  const [ccAuthCode, setCcAuthCode] = useState('');
+  const [ccAuthSentMessage, setCcAuthSentMessage] = useState('');
   const [notifications, setNotifications] = useState<NotificationSettings>({
     discordWebhookUrl: '',
     notifyOnFinish: false,
@@ -197,6 +211,26 @@ export default function SettingsScreen({
     } finally {
       if (!silent) {
         setAuthLoading(false);
+      }
+    }
+  }, []);
+
+  const loadCcAuth = useCallback(async (silent = false) => {
+    if (!silent) {
+      setCcAuthLoading(true);
+    }
+    setCcAuthError('');
+    try {
+      const status = await getClaudeCodeAuthStatus();
+      setCcAuth(status);
+      if (!status?.loginInProgress) {
+        setCcAuthCode('');
+      }
+    } catch (error) {
+      setCcAuthError(error instanceof Error ? error.message : 'No se pudo leer estado de Claude Code');
+    } finally {
+      if (!silent) {
+        setCcAuthLoading(false);
       }
     }
   }, []);
@@ -298,10 +332,11 @@ export default function SettingsScreen({
   useEffect(() => {
     loadQuota();
     loadAuth();
+    void loadCcAuth();
     loadNotifications();
     loadAiAgents();
     loadProviders();
-  }, [loadAiAgents, loadAuth, loadNotifications, loadProviders, loadQuota]);
+  }, [loadAiAgents, loadAuth, loadCcAuth, loadNotifications, loadProviders, loadQuota]);
 
   useEffect(() => {
     if (!auth?.loginInProgress) return undefined;
@@ -312,6 +347,16 @@ export default function SettingsScreen({
       window.clearInterval(pollId);
     };
   }, [auth?.loginInProgress, loadAuth]);
+
+  useEffect(() => {
+    if (!ccAuth?.loginInProgress) return undefined;
+    const pollId = window.setInterval(() => {
+      void loadCcAuth(true);
+    }, 3000);
+    return () => {
+      window.clearInterval(pollId);
+    };
+  }, [ccAuth?.loginInProgress, loadCcAuth]);
 
   const buildPermissionPayload = useCallback((draft: AiProviderPermissionProfile): AiProviderPermissionProfile => {
     const accessMode = draft.accessMode || 'full_access';
@@ -573,6 +618,81 @@ export default function SettingsScreen({
     }
   };
 
+  const startCcAuth = async () => {
+    setCcAuthBusy(true);
+    setCcAuthError('');
+    setCcAuthSentMessage('');
+    try {
+      const login = await startClaudeCodeAuth();
+      setCcAuth((prev) => ({
+        loggedIn: prev?.loggedIn || false,
+        email: prev?.email || '',
+        authMethod: prev?.authMethod || '',
+        subscriptionType: prev?.subscriptionType || '',
+        statusText: login?.statusText || 'Autenticando...',
+        loginInProgress: Boolean(login?.inProgress),
+        login: login || null
+      }));
+      await loadCcAuth(true);
+      await loadAiAgents();
+      await loadProviders();
+    } catch (error) {
+      setCcAuthError(error instanceof Error ? error.message : 'No se pudo iniciar autenticación de Claude Code');
+    } finally {
+      setCcAuthBusy(false);
+    }
+  };
+
+  const submitCcAuthCode = async () => {
+    const trimmedCode = String(ccAuthCode || '').trim();
+    if (!trimmedCode) {
+      setCcAuthError('Introduce el código de Claude Code.');
+      return;
+    }
+    setCcAuthBusy(true);
+    setCcAuthError('');
+    setCcAuthSentMessage('');
+    try {
+      await sendClaudeCodeAuthCode(trimmedCode);
+      setCcAuthSentMessage('Código enviado. Esperando respuesta...');
+      await loadCcAuth(true);
+    } catch (error) {
+      setCcAuthError(error instanceof Error ? error.message : 'No se pudo enviar el código de Claude Code');
+    } finally {
+      setCcAuthBusy(false);
+    }
+  };
+
+  const cancelCcAuth = async () => {
+    setCcAuthBusy(true);
+    setCcAuthError('');
+    setCcAuthSentMessage('');
+    try {
+      await cancelClaudeCodeAuth();
+      await loadCcAuth(true);
+    } catch (error) {
+      setCcAuthError(error instanceof Error ? error.message : 'No se pudo cancelar autenticación de Claude Code');
+    } finally {
+      setCcAuthBusy(false);
+    }
+  };
+
+  const logoutCcAuth = async () => {
+    setCcAuthBusy(true);
+    setCcAuthError('');
+    setCcAuthSentMessage('');
+    try {
+      await logoutClaudeCodeAuth();
+      await loadCcAuth(true);
+      await loadAiAgents();
+      await loadProviders();
+    } catch (error) {
+      setCcAuthError(error instanceof Error ? error.message : 'No se pudo cerrar sesión de Claude Code');
+    } finally {
+      setCcAuthBusy(false);
+    }
+  };
+
   const formatWindowLabel = (windowData: CodexQuotaWindow | null, fallback: string) => {
     if (!windowData) return fallback;
     const minutes = Number(windowData.windowMinutes || 0);
@@ -677,7 +797,9 @@ export default function SettingsScreen({
               ? 'Settings · Cuotas de agentes'
               : activeView === 'agentPermissions'
                 ? 'Settings · Permisos por IA'
-              : 'Settings · Webhook';
+                : activeView === 'steamDeck'
+                  ? 'Settings · Steam Deck SSH'
+                  : 'Settings · Webhook';
 
   const handleBack = () => {
     if (activeView === 'menu') {
@@ -694,6 +816,7 @@ export default function SettingsScreen({
     if (activeView === 'aiIntegrations') {
       void loadAiAgents();
       void loadAuth();
+      void loadCcAuth();
       void loadProviders();
       return;
     }
@@ -715,9 +838,13 @@ export default function SettingsScreen({
       void loadNotifications();
       return;
     }
+    if (activeView === 'steamDeck') {
+      return;
+    }
     void loadAiAgents();
     void loadProviders();
     void loadAuth();
+    void loadCcAuth();
     void loadQuota();
     void loadNotifications();
   };
@@ -817,6 +944,38 @@ export default function SettingsScreen({
                     <p className="text-sm text-zinc-100">Permisos por IA</p>
                     <p className="text-xs text-zinc-500 truncate">
                       Modos `full_access`, `workspace_only`, `restricted_paths` y `read_only`.
+                    </p>
+                  </div>
+                  <ChevronRight size={16} className="text-zinc-600" />
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => onNavigate('quetzalRelay')}
+                className="w-full text-left rounded-xl border border-cyan-500/20 bg-cyan-500/10 p-3 hover:border-cyan-400/40 transition-colors"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-sm text-cyan-50">Quetzal Relay</p>
+                    <p className="text-xs text-cyan-100/70 truncate">
+                      Reverse SSH relay para el flujo remoto sin depender de VPN.
+                    </p>
+                  </div>
+                  <ChevronRight size={16} className="text-cyan-200" />
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveView('steamDeck')}
+                className="w-full text-left rounded-xl border border-zinc-800 bg-black/40 p-3 hover:border-zinc-700 transition-colors"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-sm text-zinc-100">Steam Deck SSH</p>
+                    <p className="text-xs text-zinc-500 truncate">
+                      Configuración remota, test, detect y jobs.
                     </p>
                   </div>
                   <ChevronRight size={16} className="text-zinc-600" />
@@ -965,18 +1124,26 @@ export default function SettingsScreen({
                   const draft = agentsDrafts[agent.id] || fallbackDraft;
                   const isExpanded = Boolean(expandedAgentIds[agent.id]);
                   const isCodexAgent = agent.id === 'codex-cli';
+                  const isClaudeCodeAgent = agent.id === 'claude-code';
                   const showApiKey = agent.integrationType === 'api_key';
                   const enabledChanged = draft.enabled !== agent.integration.enabled;
                   const baseUrlChanged = (draft.baseUrl || '').trim() !== (agent.integration.baseUrl || '').trim();
                   const hasChanges = enabledChanged || baseUrlChanged || draft.apiKeyDirty;
                   const isSaving = agentsSavingId === agent.id;
                   const codexReady = Boolean(auth?.loggedIn);
+                  const ccReady = Boolean(ccAuth?.loggedIn);
                   const statusText = !draft.enabled
                     ? 'Desactivado'
                     : isCodexAgent
                       ? codexReady
                         ? 'Listo'
                         : 'Falta iniciar sesion'
+                    : isClaudeCodeAgent
+                      ? ccReady
+                        ? 'Listo'
+                        : ccAuth?.loginInProgress
+                          ? 'Autenticando...'
+                          : 'Falta autenticar'
                       : agent.integration.configured || !showApiKey
                         ? 'Listo'
                         : 'Falta API key';
@@ -1200,6 +1367,154 @@ export default function SettingsScreen({
                                     type="button"
                                     onClick={cancelDeviceAuth}
                                     disabled={authActionBusy}
+                                    className="text-xs px-3 py-1.5 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-50"
+                                  >
+                                    Cancelar login
+                                  </button>
+                                ) : null}
+                              </div>
+                            </div>
+                          ) : null}
+
+                          {isClaudeCodeAgent ? (
+                            <div className="rounded-lg border border-zinc-800 bg-black/40 p-3 space-y-3">
+                              <div className="flex items-center justify-between gap-2">
+                                <p className="text-xs text-zinc-300">Cuenta Claude Code</p>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    void loadCcAuth();
+                                    void loadAiAgents();
+                                  }}
+                                  disabled={ccAuthLoading || ccAuthBusy}
+                                  className="text-[11px] px-2 py-1 rounded border border-zinc-700 text-zinc-300 hover:text-white disabled:opacity-50"
+                                >
+                                  {ccAuthLoading ? 'Cargando...' : 'Refrescar estado'}
+                                </button>
+                              </div>
+
+                              <p className="text-xs text-zinc-500">
+                                Estado:{' '}
+                                {ccAuth?.loggedIn ? (
+                                  <span className="text-emerald-300">Conectado</span>
+                                ) : ccAuth?.loginInProgress ? (
+                                  <span className="text-amber-300">Autenticando...</span>
+                                ) : (
+                                  <span className="text-zinc-400">Sin conectar</span>
+                                )}
+                              </p>
+
+                              {ccAuth?.statusText ? (
+                                <p className="text-xs text-zinc-500 whitespace-pre-wrap break-words">{ccAuth.statusText}</p>
+                              ) : null}
+
+                              {ccAuth?.loggedIn ? (
+                                <div className="rounded-lg border border-zinc-800 bg-black/30 p-3 space-y-2">
+                                  <p className="text-[11px] uppercase tracking-wide text-zinc-500">Cuenta asociada</p>
+                                  <div className="space-y-2 text-xs">
+                                    <div className="flex items-start justify-between gap-3">
+                                      <span className="text-zinc-500">Email</span>
+                                      <span className="text-zinc-200 text-right break-all">{ccAuth.email || '-'}</span>
+                                    </div>
+                                    <div className="flex items-start justify-between gap-3">
+                                      <span className="text-zinc-500">Metodo</span>
+                                      <span className="text-zinc-200 text-right">{ccAuth.authMethod || '-'}</span>
+                                    </div>
+                                    <div className="flex items-start justify-between gap-3">
+                                      <span className="text-zinc-500">Suscripción</span>
+                                      <span className="text-zinc-200 text-right capitalize">{ccAuth.subscriptionType || '-'}</span>
+                                    </div>
+                                  </div>
+                                </div>
+                              ) : null}
+
+                              {ccAuth?.loginInProgress && ccAuth.login?.url ? (
+                                <div className="space-y-2 rounded-lg border border-zinc-800 bg-black/30 p-3">
+                                  <p className="text-xs text-zinc-400">1) Abre este enlace y termina la autenticación:</p>
+                                  <div className="flex items-center gap-2">
+                                    <p className="text-xs text-blue-300 break-all flex-1">{ccAuth.login.url}</p>
+                                    <button
+                                      type="button"
+                                      onClick={() => copyText(ccAuth.login?.url || '')}
+                                      className="text-[11px] px-2 py-1 rounded border border-zinc-700 text-zinc-300 hover:text-white"
+                                    >
+                                      Copiar
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : null}
+
+                              {ccAuth?.loginInProgress && ccAuth.login?.needsCode ? (
+                                <div className="space-y-2 rounded-lg border border-zinc-800 bg-black/30 p-3">
+                                  <p className="text-xs text-zinc-400">2) Si Claude pide un código, pégalo aquí:</p>
+                                  <div className="flex items-center gap-2">
+                                    <input
+                                      type="text"
+                                      value={ccAuthCode}
+                                      onChange={(event) => {
+                                        setCcAuthCode(event.target.value);
+                                        if (ccAuthError) setCcAuthError('');
+                                        if (ccAuthSentMessage) setCcAuthSentMessage('');
+                                      }}
+                                      placeholder="Código de verificación"
+                                      className="flex-1 bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-sm"
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        void submitCcAuthCode();
+                                      }}
+                                      disabled={ccAuthBusy || !ccAuthCode.trim()}
+                                      className="text-[11px] px-3 py-2 rounded border border-blue-500/40 bg-blue-600/20 text-blue-200 hover:bg-blue-600/30 disabled:opacity-50"
+                                    >
+                                      {ccAuthBusy ? 'Enviando...' : 'Enviar código'}
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : null}
+
+                              {ccAuthSentMessage ? (
+                                <p className="text-xs text-emerald-300">{ccAuthSentMessage}</p>
+                              ) : null}
+
+                              {ccAuthError ? (
+                                <p className="text-xs text-red-300">{ccAuthError}</p>
+                              ) : null}
+
+                              <div className="flex flex-wrap gap-2">
+                                {!ccAuth?.loggedIn && !ccAuth?.loginInProgress ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      void startCcAuth();
+                                    }}
+                                    disabled={ccAuthBusy || ccAuthLoading}
+                                    className="text-xs px-3 py-1.5 rounded-lg border border-blue-500/40 bg-blue-600/20 text-blue-200 hover:bg-blue-600/30 disabled:opacity-50"
+                                  >
+                                    {ccAuthBusy ? 'Iniciando...' : 'Autenticar Claude Code'}
+                                  </button>
+                                ) : null}
+
+                                {ccAuth?.loggedIn ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      void logoutCcAuth();
+                                    }}
+                                    disabled={ccAuthBusy || ccAuthLoading}
+                                    className="text-xs px-3 py-1.5 rounded-lg border border-red-500/40 bg-red-600/20 text-red-200 hover:bg-red-600/30 disabled:opacity-50"
+                                  >
+                                    Cerrar sesión
+                                  </button>
+                                ) : null}
+
+                                {ccAuth?.loginInProgress ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      void cancelCcAuth();
+                                    }}
+                                    disabled={ccAuthBusy}
                                     className="text-xs px-3 py-1.5 rounded-lg border border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500 disabled:opacity-50"
                                   >
                                     Cancelar login
@@ -1797,6 +2112,8 @@ export default function SettingsScreen({
             </div>
           </section>
         ) : null}
+
+        {activeView === 'steamDeck' ? <SteamDeckSettingsPanel /> : null}
 
         {activeView === 'webhook' ? (
           <section className="rounded-2xl border border-zinc-800 bg-zinc-900/40 p-4 space-y-4">

@@ -6,6 +6,9 @@ import SearchScreen from './components/SearchScreen';
 import TerminalLogScreen from './components/TerminalLogScreen';
 import AttachmentsScreen from './components/AttachmentsScreen';
 import SettingsScreen from './components/SettingsScreen';
+import QuetzalRelayScreen from './components/QuetzalRelayScreen';
+import TokenSaverPanel from './components/TokenSaverPanel';
+import TerminalLivePanel from './components/TerminalLivePanel';
 import SystemRebootScreen from './components/SystemRebootScreen';
 import OfflineErrorScreen from './components/OfflineErrorScreen';
 import {
@@ -701,8 +704,7 @@ export default function App() {
           'local_delete_paths',
           'drive_upload_files',
           'deployed_backup_create',
-          'deployed_backup_restore',
-          'project_context_refresh'
+          'deployed_backup_restore'
         ]);
         const nowMs = Date.now();
         const nextNotices = (Array.isArray(jobs) ? jobs : [])
@@ -2877,12 +2879,28 @@ export default function App() {
         />
       )}
 
+      {screen === 'quetzalRelay' && (
+        <QuetzalRelayScreen
+          onNavigate={navigate}
+        />
+      )}
+
       {screen === 'reboot' && (
         <SystemRebootScreen
           restart={restartState}
           busy={restartBusy}
           onBack={() => navigate('hub')}
         />
+      )}
+
+      {/* Token Saver Panel - lateral derecho */}
+      {screen === 'chat' && currentConversation && (
+        <TokenSaverPanel chatId={currentConversation.id} />
+      )}
+
+      {/* Terminal Live Panel - lateral derecho inferior */}
+      {screen === 'chat' && currentConversation && (
+        <TerminalLivePanel chatId={currentConversation.id} />
       )}
     </div>
   );

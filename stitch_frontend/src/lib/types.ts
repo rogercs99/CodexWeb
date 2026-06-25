@@ -6,12 +6,109 @@ export type Screen =
   | 'attachments'
   | 'terminal'
   | 'settings'
+  | 'quetzalRelay'
   | 'reboot'
   | 'offline';
 
 export interface User {
   id: number;
   username: string;
+}
+
+export interface QuetzalRelayConfig {
+  port: number;
+  publicHost: string;
+  localTargetHost: string;
+  localTargetPort: number;
+  sshUser: string;
+}
+
+export interface QuetzalRelayCommands {
+  mainCommand: string;
+  alternativeCommand: string;
+  friendInstructions: string;
+  myInstructions: string[];
+  explanations: string[];
+}
+
+export interface QuetzalRelayStatusPayload {
+  ok: boolean;
+  checkedAt: string;
+  host: string;
+  config: QuetzalRelayConfig;
+  commands: QuetzalRelayCommands;
+  sshd: {
+    serviceName: string;
+    active: boolean;
+    enabled: boolean;
+    allowTcpForwarding: string;
+    gatewayPorts: string;
+  };
+  listening: {
+    port: number;
+    active: boolean;
+    tunnelActive: boolean;
+    processes: string[];
+    lines: string[];
+  };
+  firewall: {
+    active: boolean;
+    portAllowed: boolean;
+  };
+  summary: {
+    vpsPrepared: boolean;
+    needsSshdPrepare: boolean;
+    allowTcpForwardingOk: boolean;
+    gatewayPortsOk: boolean;
+    portListening: boolean;
+    tunnelActive: boolean;
+    firewallCouldBlock: boolean;
+    firewallOpen: boolean;
+  };
+  humanStates: string[];
+  diagnostics: Record<string, string>;
+}
+
+export interface QuetzalRelayDiagnosticsPayload {
+  ok: boolean;
+  checkedAt: string;
+  diagnostics: Record<string, string>;
+  summary: QuetzalRelayStatusPayload['summary'];
+  humanStates: string[];
+  listening: QuetzalRelayStatusPayload['listening'];
+  firewall: QuetzalRelayStatusPayload['firewall'];
+  sshd: QuetzalRelayStatusPayload['sshd'];
+  config: QuetzalRelayConfig;
+}
+
+export interface QuetzalRelayCommandsPayload {
+  ok: boolean;
+  config: QuetzalRelayConfig;
+  commands: QuetzalRelayCommands;
+}
+
+export interface QuetzalRelayPreparePayload {
+  ok: boolean;
+  backupPath?: string;
+  targetConfigPath?: string;
+  error?: string;
+  config?: QuetzalRelayConfig;
+  validation?: {
+    stdout: string;
+    stderr: string;
+  };
+  restart?: {
+    serviceName?: string;
+    stdout: string;
+    stderr: string;
+  };
+  ufw?: {
+    active?: boolean;
+    changed?: boolean;
+    stdout: string;
+    stderr: string;
+  };
+  status?: QuetzalRelayStatusPayload;
 }
 
 export interface Conversation {
@@ -851,4 +948,101 @@ export interface CodexAuthStatus {
   details?: CodexAuthDetails | null;
   loginInProgress: boolean;
   login: CodexDeviceLogin | null;
+}
+
+export interface ClaudeCodeAuthLogin {
+  startedAt: string;
+  inProgress: boolean;
+  completed: boolean;
+  failed: boolean;
+  cancelled: boolean;
+  statusText: string;
+  url: string;
+  error: string;
+  needsCode: boolean;
+}
+
+export interface ClaudeCodeAuthStatus {
+  loggedIn: boolean;
+  email: string;
+  authMethod: string;
+  subscriptionType: string;
+  statusText: string;
+  loginInProgress: boolean;
+  login: ClaudeCodeAuthLogin | null;
+}
+
+export type SteamDeckAuthMethod = 'key' | 'password';
+export type SteamDeckNetworkMode = 'auto' | 'tailscale' | 'wireguard' | 'lan';
+export type SteamDeckJobKind = 'command' | 'codex' | 'detect';
+export type SteamDeckJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+
+export interface SteamDeckConfig {
+  enabled: boolean;
+  configured: boolean;
+  status: 'disabled' | 'ready' | 'not_configured';
+  deviceName: string;
+  host: string;
+  port: number;
+  user: string;
+  authMethod: SteamDeckAuthMethod;
+  remoteWorkdir: string;
+  codexBin: string;
+  networkMode: SteamDeckNetworkMode;
+  allowDangerousCommands: boolean;
+  notifyDiscord: boolean;
+  keyPath: string;
+  hasPassword: boolean;
+  hasPrivateKey: boolean;
+  keyPathExists: boolean;
+  keyFileMode: string;
+  keyFileModeSafe: boolean;
+  warningPublicHost: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SteamDeckDetectResult {
+  hostname: string;
+  user: string;
+  uname: string;
+  osRelease: string;
+  steamOsLikely: boolean;
+  codexInstalled: boolean;
+  codexPath: string;
+  codexVersion: string;
+  diskRoot: string;
+  memory: string;
+  uptime: string;
+  ipAddresses: string[];
+  sshStatus: string;
+  raw: {
+    stdout: string;
+    stderr: string;
+  };
+}
+
+export interface SteamDeckCommandResult {
+  exitCode: number | null;
+  durationMs: number;
+  stdout: string;
+  stderr: string;
+}
+
+export interface SteamDeckJob {
+  id: string;
+  kind: SteamDeckJobKind;
+  status: SteamDeckJobStatus;
+  command: string;
+  payload: Record<string, any>;
+  stdout: string;
+  stderr: string;
+  log: string;
+  exitCode: number | null;
+  error: string;
+  cancelRequested: boolean;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string;
+  finishedAt: string;
 }

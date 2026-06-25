@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>CodexWeb DEV Diagnostico</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #05070b;
+        color: #e2e8f0;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+      }
+      .wrap {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 16px;
+      }
+      .card {
+        background: #0f172a;
+        border: 1px solid #334155;
+        border-radius: 12px;
+        padding: 14px;
+        margin-bottom: 12px;
+      }
+      h1,
+      h2 {
+        margin: 0 0 10px 0;
+      }
+      h1 {
+        font-size: 22px;
+      }
+      h2 {
+        font-size: 15px;
+        color: #bfdbfe;
+      }
+      p,
+      li,
+      td,
+      th,
+      button {
+        font-size: 13px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th,
+      td {
+        text-align: left;
+        border-bottom: 1px solid #1e293b;
+        padding: 8px 6px;
+        vertical-align: top;
+      }
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+        font-size: 12px;
+      }
+      .ok {
+        color: #34d399;
+      }
+      .warn {
+        color: #fbbf24;
+      }
+      .err {
+        color: #fda4af;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      button,
+      .btn {
+        border: 1px solid #334155;
+        border-radius: 10px;
+        background: #111827;
+        color: #e2e8f0;
+        padding: 8px 10px;
+        cursor: pointer;
+        text-decoration: none;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: #020617;
+        border: 1px solid #1e293b;
+        border-radius: 8px;
+        padding: 8px;
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>Diagnostico CodexWeb DEV</h1>
+        <p>
+          Esta pagina no depende de React. Si la app principal falla en iPhone/Safari, usa este panel para enviar
+          reporte real.
+        </p>
+        <div class="row">
+          <button id="btnSend">Enviar diagnostico</button>
+          <button id="btnClear">Limpiar cache local y recargar</button>
+          <a class="btn" id="btnStart" href="/?debug=1">Probar arranque app</a>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Entorno del dispositivo</h2>
+        <table>
+          <tbody id="envRows"></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Compatibilidad</h2>
+        <table>
+          <tbody id="featureRows"></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Endpoints y assets</h2>
+        <table>
+          <tbody id="networkRows"></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Errores capturados</h2>
+        <pre id="errorLog" class="mono">(sin errores capturados en esta pagina)</pre>
+      </div>
+
+      <div class="card">
+        <h2>Payload actual</h2>
+        <pre id="payloadPreview" class="mono"></pre>
+      </div>
+    </div>
+    <script src="/diag.js?v=dev-20260509"></script>
+  </body>
+</html>

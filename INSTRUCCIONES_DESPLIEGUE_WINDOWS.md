@@ -61,7 +61,14 @@ Abre en el navegador:
 ```powershell
 cd stitch_frontend
 npm install
+Copy-Item .env.example .env
 npm run dev
+```
+
+Si tu backend corre en otro puerto, ajusta en `stitch_frontend/.env`:
+
+```env
+VITE_BACKEND_URL=http://127.0.0.1:3050
 ```
 
 Abre:

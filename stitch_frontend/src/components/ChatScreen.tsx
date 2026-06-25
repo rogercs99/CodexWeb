@@ -1,4 +1,4 @@
-import { Check, ChevronLeft, Clipboard, Copy, Paperclip, RefreshCw, Send, Settings, Square, X } from 'lucide-react';
+import { Check, ChevronLeft, Clipboard, Copy, Mic, Paperclip, RefreshCw, Send, Settings, Square, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -26,6 +26,45 @@ function formatElapsed(totalSeconds: number) {
   const minutes = Math.floor(safeSeconds / 60);
   const seconds = safeSeconds % 60;
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+type BrowserSpeechRecognitionCtor = new () => any;
+
+function getSpeechRecognitionConstructor(): BrowserSpeechRecognitionCtor | null {
+  if (typeof window === 'undefined') return null;
+  const speechWindow = window as Window & {
+    SpeechRecognition?: BrowserSpeechRecognitionCtor;
+    webkitSpeechRecognition?: BrowserSpeechRecognitionCtor;
+  };
+  const ctor = speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
+  return typeof ctor === 'function' ? ctor : null;
+}
+
+function describeVoiceError(rawCode: string) {
+  const code = String(rawCode || '').trim().toLowerCase();
+  if (!code) return 'No se pudo completar el dictado de voz.';
+  if (code === 'not-allowed' || code === 'service-not-allowed') {
+    return 'El navegador bloqueó el micrófono. Revisa los permisos y vuelve a intentarlo.';
+  }
+  if (code === 'no-speech') {
+    return 'No se detectó voz. Inténtalo otra vez.';
+  }
+  if (code === 'audio-capture') {
+    return 'No se encontró un micrófono disponible.';
+  }
+  if (code === 'network') {
+    return 'El reconocimiento de voz falló por red o servicio no disponible.';
+  }
+  return `Error de voz: ${code}`;
+}
+
+function appendTranscriptToInput(previousValue: string, nextChunk: string) {
+  const previous = String(previousValue || '');
+  const chunk = String(nextChunk || '').trim();
+  if (!chunk) return previous;
+  if (!previous) return chunk;
+  const separator = /[\s\n]$/.test(previous) ? '' : ' ';
+  return `${previous}${separator}${chunk}`;
 }
 
 function normalizeTitle(value: string) {
@@ -337,11 +376,15 @@ export default function ChatScreen({
   const [hasTerminalActivity, setHasTerminalActivity] = useState(false);
   const [showTitleModal, setShowTitleModal] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState<number | null>(null);
+  const [voiceState, setVoiceState] = useState<'idle' | 'listening' | 'error'>('idle');
+  const [voiceFeedback, setVoiceFeedback] = useState('');
   const fileRef = useRef<HTMLInputElement | null>(null);
+  const speechRecognitionRef = useRef<any>(null);
   const headerRef = useRef<HTMLElement | null>(null);
   const messagesRef = useRef<HTMLElement | null>(null);
   const messageCopyTimerRef = useRef<number | null>(null);
   const [headerOffset, setHeaderOffset] = useState(136);
+  const voiceSupported = typeof window !== 'undefined' && Boolean(getSpeechRecognitionConstructor());
 
   const grouped = useMemo(() => messages, [messages]);
   const fullTitle = normalizeTitle(chatTitle);
@@ -417,8 +460,31 @@ export default function ChatScreen({
       if (messageCopyTimerRef.current !== null) {
         window.clearTimeout(messageCopyTimerRef.current);
       }
+      const recognition = speechRecognitionRef.current;
+      speechRecognitionRef.current = null;
+      if (recognition && typeof recognition.abort === 'function') {
+        try {
+          recognition.abort();
+        } catch (_error) {
+          // ignore cleanup failures
+        }
+      }
     };
   }, []);
+
+  useEffect(() => {
+    const recognition = speechRecognitionRef.current;
+    speechRecognitionRef.current = null;
+    if (recognition && typeof recognition.abort === 'function') {
+      try {
+        recognition.abort();
+      } catch (_error) {
+        // ignore reset failures
+      }
+    }
+    setVoiceState('idle');
+    setVoiceFeedback('');
+  }, [conversationId]);
 
   useEffect(() => {
     if (!loadingMoreMessages) {
@@ -511,11 +577,91 @@ export default function ChatScreen({
     onLoadMoreMessages();
   };
 
+  const stopVoiceInput = (mode: 'stop' | 'abort' = 'stop') => {
+    const recognition = speechRecognitionRef.current;
+    if (!recognition) return;
+    try {
+      if (mode === 'abort' && typeof recognition.abort === 'function') {
+        recognition.abort();
+      } else if (typeof recognition.stop === 'function') {
+        recognition.stop();
+      } else if (typeof recognition.abort === 'function') {
+        recognition.abort();
+      }
+    } catch (_error) {
+      speechRecognitionRef.current = null;
+      setVoiceState('idle');
+    }
+  };
+
+  const toggleVoiceInput = () => {
+    if (voiceState === 'listening') {
+      stopVoiceInput('stop');
+      return;
+    }
+    const SpeechRecognitionCtor = getSpeechRecognitionConstructor();
+    if (!SpeechRecognitionCtor) {
+      setVoiceState('error');
+      setVoiceFeedback('Reconocimiento de voz no disponible en este navegador.');
+      return;
+    }
+
+    setVoiceFeedback('');
+    const recognition = new SpeechRecognitionCtor();
+    speechRecognitionRef.current = recognition;
+    recognition.lang = navigator.language || 'es-ES';
+    recognition.continuous = true;
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = () => {
+      setVoiceState('listening');
+      setVoiceFeedback('Escuchando...');
+    };
+
+    recognition.onresult = (event: any) => {
+      const startIndex = Math.max(0, Number(event?.resultIndex) || 0);
+      const totalResults = Math.max(0, Number(event?.results?.length) || 0);
+      let transcript = '';
+      for (let index = startIndex; index < totalResults; index += 1) {
+        const result = event?.results?.[index];
+        const chunk = String(result?.[0]?.transcript || '').trim();
+        if (!chunk) continue;
+        transcript = transcript ? `${transcript} ${chunk}` : chunk;
+      }
+      if (!transcript) return;
+      setInput((prev) => appendTranscriptToInput(prev, transcript));
+      setVoiceFeedback('Transcripción añadida al input.');
+    };
+
+    recognition.onerror = (event: any) => {
+      speechRecognitionRef.current = null;
+      setVoiceState('error');
+      setVoiceFeedback(describeVoiceError(String(event?.error || '')));
+    };
+
+    recognition.onend = () => {
+      speechRecognitionRef.current = null;
+      setVoiceState((prev) => (prev === 'error' ? 'error' : 'idle'));
+      setVoiceFeedback((prev) => (prev === 'Escuchando...' ? 'Dictado detenido.' : prev));
+    };
+
+    try {
+      recognition.start();
+    } catch (_error) {
+      speechRecognitionRef.current = null;
+      setVoiceState('error');
+      setVoiceFeedback('No se pudo iniciar el dictado. Revisa los permisos del micrófono.');
+    }
+  };
+
   const sendCurrent = () => {
     if (sending || isRunning) return;
     if (!input.trim() && selectedFiles.length === 0) return;
+    stopVoiceInput('stop');
     onSend(input);
     setInput('');
+    setVoiceFeedback('');
   };
 
   const handleCopyMessage = async (messageId: number, text: string) => {
@@ -840,6 +986,31 @@ export default function ChatScreen({
             </button>
           </div>
         ) : null}
+        {voiceState === 'listening' || voiceFeedback ? (
+          <div
+            className={`mb-2 rounded-xl border px-3 py-2 pointer-events-auto ${
+              voiceState === 'listening'
+                ? 'border-red-500/30 bg-red-500/10'
+                : voiceState === 'error'
+                ? 'border-amber-500/30 bg-amber-500/10'
+                : 'border-zinc-800 bg-zinc-900/85'
+            }`}
+          >
+            <p
+              className={`text-[11px] ${
+                voiceState === 'listening'
+                  ? 'text-red-200'
+                  : voiceState === 'error'
+                  ? 'text-amber-200'
+                  : 'text-zinc-300'
+              }`}
+            >
+              {voiceState === 'listening'
+                ? 'Micrófono activo. Habla y vuelve a tocar el icono para detener.'
+                : voiceFeedback}
+            </p>
+          </div>
+        ) : null}
         {composerUploadProgress ? (
           <div className="mb-2 rounded-xl border border-zinc-800 bg-zinc-900/85 px-3 py-2 pointer-events-auto">
             <div className="flex items-center justify-between gap-2 text-[11px] text-zinc-300">
@@ -940,6 +1111,26 @@ export default function ChatScreen({
           >
             <Clipboard size={14} />
             Pegar
+          </button>
+
+          <button
+            onClick={toggleVoiceInput}
+            className={`w-10 h-10 flex items-center justify-center rounded-xl border transition-colors ${
+              voiceState === 'listening'
+                ? 'border-red-500/40 bg-red-500/15 text-red-200'
+                : 'border-transparent text-zinc-400 hover:text-white hover:bg-zinc-800'
+            } ${voiceSupported ? '' : 'hover:border-amber-500/30'}`}
+            type="button"
+            aria-label={voiceState === 'listening' ? 'Detener dictado por voz' : 'Dictar mensaje con voz'}
+            title={
+              voiceSupported
+                ? voiceState === 'listening'
+                  ? 'Detener dictado'
+                  : 'Dictar mensaje'
+                : 'Reconocimiento de voz no disponible en este navegador'
+            }
+          >
+            <Mic size={18} />
           </button>
 
           <textarea

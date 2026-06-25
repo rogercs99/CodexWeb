@@ -73,6 +73,13 @@ Para levantar `codexwebdev.gamemodai.pro` sin tocar `codexweb.gamemodai.pro`, re
 
 - `docs/deployment-codexwebdev-isolation-2026-03-11.md`
 
+Para desplegar el frontend real de DEV sobre el directorio que sirve `codexwebdev`, usa:
+
+```bash
+cd /root/CodexWeb/stitch_frontend && npm run build
+cd /root/CodexWeb && ./deploy/deploy-dev-frontend.sh
+```
+
 ## Google Drive con rclone (DEV)
 
 Guía de integración real (rclone + Google Drive) para CodexWebDEV:

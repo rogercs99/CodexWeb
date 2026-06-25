@@ -1,0 +1,26 @@
+{
+  "firstStartTime": "2026-06-22T22:49:57.861Z",
+  "opusProMigrationComplete": true,
+  "sonnet1m45MigrationComplete": true,
+  "seenNotifications": {},
+  "migrationVersion": 13,
+  "userID": "4023803013053c8bad163d2681411e79c1512b5428d8fef91e4001e019399b1c",
+  "oauthAccount": {
+    "accountUuid": "5b5c5898-7b61-4854-a61b-8a333e89910a",
+    "emailAddress": "rogercampos18@gmail.com",
+    "organizationUuid": "592df6dd-b515-460b-a17e-52340c84fd62",
+    "hasExtraUsageEnabled": false,
+    "billingType": "apple_subscription",
+    "accountCreatedAt": "2025-07-25T14:00:30.981494Z",
+    "subscriptionCreatedAt": "2026-06-16T19:13:12.119761Z",
+    "ccOnboardingFlags": {},
+    "claudeCodeTrialEndsAt": null,
+    "claudeCodeTrialDurationDays": null,
+    "seatTier": null,
+    "displayName": "Roegr",
+    "organizationRole": "admin",
+    "workspaceRole": null,
+    "organizationName": "rogercampos18@gmail.com's Organization"
+  },
+  "claudeCodeFirstTokenDate": "2026-06-16T19:25:44.123690Z"
+}
