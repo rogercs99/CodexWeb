@@ -58,11 +58,27 @@ systemctl status codexweb.service       # Prod (no tocar)
 ```
 
 ## Flujo de deploy dev (frontend)
-1. Editar código en `stitch_frontend/src/`
-2. `cd /root/CodexWeb/stitch_frontend && npm run build`
-3. `bash /root/CodexWeb/deploy/deploy-dev-frontend.sh`  (copia dist → `.runtime/dev/public/`)
-4. `systemctl restart codexwebdev.service`
-5. Verificar: `curl http://127.0.0.1:3060/api/health`
+
+**⚠️ CRÍTICO**: Siempre commitear cambios ANTES de recompilar para evitar regresiones.
+
+**Flujo seguro** (un comando):
+```bash
+/root/CodexWeb/deploy/full-deploy-dev.sh
+```
+
+**Flujo manual** (paso a paso):
+1. Commitear cambios: `git add -A && git commit -m "..."`
+2. Build: `cd /root/CodexWeb/stitch_frontend && npm run build`
+3. Deploy: `/root/CodexWeb/deploy/deploy-dev-frontend.sh`
+4. Restart: `sudo systemctl restart codexwebdev.service`
+5. Verificar: https://codexwebdev.gamemodai.pro
+
+**Documentación completa**: `docs/DEPLOY_WORKFLOW.md`
+
+**Scripts disponibles**:
+- `deploy/full-deploy-dev.sh` — Build + deploy + restart (todo en uno)
+- `deploy/deploy-dev-frontend.sh` — Solo deploy (requiere build previo)
+- `deploy/verify-before-deploy.sh` — Verifica git state antes de deploy
 
 ## Endpoints principales del backend
 - `GET  /api/health` — healthcheck
