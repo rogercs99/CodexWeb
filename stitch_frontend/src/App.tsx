@@ -16,6 +16,7 @@ import {
   deleteAttachment,
   deleteProject,
   deleteConversation,
+  getAiAgentSettings,
   getChatOptions,
   getCodexRuns,
   getMe,
@@ -33,6 +34,7 @@ import {
   regenerateProjectContext,
   restartServer,
   startChatStream,
+  updateActiveAiAgentSetting,
   updateProject,
   updateConversationSettings,
   updateConversationTitle,
@@ -41,6 +43,7 @@ import {
 } from './lib/api';
 import { consumeSse } from './lib/sse';
 import type {
+  AiAgentSettingsItem,
   AttachmentItem,
   Capabilities,
   ChatProject,
@@ -651,6 +654,7 @@ export default function App() {
     activeAgentName: 'Codex CLI',
     runtimeProvider: 'codex'
   });
+  const [availableAgents, setAvailableAgents] = useState<AiAgentSettingsItem[]>([]);
   const [defaultModel, setDefaultModel] = useState(DEFAULT_MODEL);
   const [defaultReasoningEffort, setDefaultReasoningEffort] = useState(DEFAULT_REASONING_EFFORT);
   const [chatModel, setChatModel] = useState(DEFAULT_MODEL);
@@ -663,7 +667,6 @@ export default function App() {
   const [restartBusy, setRestartBusy] = useState(false);
   const [liveReasoning, setLiveReasoning] = useState('');
   const [isTokenSaverOpen, setIsTokenSaverOpen] = useState(false);
-  const [isTerminalLiveOpen, setIsTerminalLiveOpen] = useState(false);
   const [hubViewIntent, setHubViewIntent] = useState<NavigateData['hubView'] | null>(null);
   const [hubViewIntentVersion, setHubViewIntentVersion] = useState(0);
   const [pendingChatDraft, setPendingChatDraft] = useState<{
@@ -1354,9 +1357,14 @@ export default function App() {
 
         setUser(me.user);
 
-        const [opts, storedAttachments] = await Promise.all([getChatOptions(), listAttachments(200)]);
+        const [opts, storedAttachments, agentSettings] = await Promise.all([
+          getChatOptions(),
+          listAttachments(200),
+          getAiAgentSettings().catch(() => ({ agents: [], activeAgentId: 'codex-cli' }))
+        ]);
         setOptions(opts);
         setAttachments(storedAttachments);
+        setAvailableAgents(agentSettings.agents);
 
         try {
           const savedModel =
@@ -1681,7 +1689,6 @@ export default function App() {
       }
       if (next !== 'chat') {
         setActiveConversationProjectContext(null);
-        setIsTerminalLiveOpen(false);
       }
       setScreen(next);
     },
@@ -2126,6 +2133,26 @@ export default function App() {
       }
     },
     [activeConversationId, options]
+  );
+
+  const handleAgentChange = useCallback(
+    async (agentId: string) => {
+      try {
+        setStatus('Cambiando agente activo...');
+        const result = await updateActiveAiAgentSetting(agentId);
+        const [updatedOptions, agentSettings] = await Promise.all([
+          getChatOptions(),
+          getAiAgentSettings().catch(() => ({ agents: [], activeAgentId: agentId }))
+        ]);
+        setOptions(updatedOptions);
+        setAvailableAgents(agentSettings.agents);
+        setStatus(`Agente cambiado a: ${updatedOptions.activeAgentName || agentId}`);
+        setTimeout(() => setStatus(''), 2000);
+      } catch (error: any) {
+        setStatus(error?.message || 'No se pudo cambiar el agente activo.');
+      }
+    },
+    []
   );
 
   const handleStop = useCallback(async () => {
@@ -2821,10 +2848,6 @@ export default function App() {
   }, [activeConversationId, loadConversationsAndPick, screen]);
 
   const filteredConversations = useMemo(() => byDateDesc(conversations), [conversations]);
-  const activeChatTerminalEntries = useMemo(() => {
-    if (!activeConversationId || activeConversationId <= 0) return [];
-    return terminalEntries.filter((entry) => Number(entry.conversationId) === activeConversationId);
-  }, [activeConversationId, terminalEntries]);
 
   if (screen === 'login') {
     return <LoginScreen onLogin={handleLogin} status={status} />;
@@ -2891,7 +2914,6 @@ export default function App() {
           loadingMoreMessages={messagesLoadingMore}
           onLoadMoreMessages={handleLoadOlderMessages}
           liveReasoning={liveReasoning}
-          terminalEntries={activeChatTerminalEntries}
           sending={sending}
           sendElapsedSeconds={sendElapsedSeconds}
           isRunning={
@@ -2903,6 +2925,8 @@ export default function App() {
           uploadProgress={uploadProgress}
           attachmentPipeline={attachmentPipeline}
           activeAgentName={String(options.activeAgentName || 'Codex CLI')}
+          activeAgentId={String(options.activeAgentId || 'codex-cli')}
+          availableAgents={availableAgents}
           model={chatModel}
           reasoningEffort={chatReasoningEffort}
           options={options}
@@ -2916,8 +2940,8 @@ export default function App() {
           onNavigate={navigate}
           onModelChange={handleChatModelChange}
           onReasoningChange={handleChatReasoningChange}
+          onAgentChange={handleAgentChange}
           tokenSaverOpen={isTokenSaverOpen}
-          terminalLiveOpen={isTerminalLiveOpen}
           onOpenTokenSaver={() => {
             setIsTokenSaverOpen(true);
             persistTokenSaverUiState(true);
@@ -2928,9 +2952,6 @@ export default function App() {
               hubView: projectId ? 'project' : 'projects',
               projectId
             });
-          }}
-          onOpenTerminalLive={() => {
-            setIsTerminalLiveOpen(true);
           }}
         />
       )}
@@ -2944,6 +2965,10 @@ export default function App() {
       )}
 
       {screen === 'terminal' && (
+        <TerminalLivePanel onNavigate={navigate} />
+      )}
+
+      {screen === 'tools' && (
         <TerminalLogScreen
           entries={terminalEntries}
           conversations={filteredConversations}
@@ -3021,15 +3046,6 @@ export default function App() {
           onClose={() => {
             setIsTokenSaverOpen(false);
             persistTokenSaverUiState(false);
-          }}
-        />
-      )}
-
-      {/* Terminal Live Panel - lateral derecho inferior */}
-      {screen === 'chat' && activeConversationId !== null && isTerminalLiveOpen && (
-        <TerminalLivePanel
-          onClose={() => {
-            setIsTerminalLiveOpen(false);
           }}
         />
       )}

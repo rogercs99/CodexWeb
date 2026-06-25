@@ -1,9 +1,9 @@
-import { Check, ChevronLeft, Clipboard, Copy, FolderOpen, Mic, Paperclip, RefreshCw, Send, Settings, Square, TerminalSquare, X, Zap } from 'lucide-react';
+import { Check, ChevronLeft, Clipboard, Copy, FolderOpen, Mic, Paperclip, RefreshCw, Send, Settings, Square, X, Zap } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import BottomNav from './BottomNav';
-import type { ChatOptions, ChatProject, ConversationProjectContext, Message, Screen, TerminalEntry } from '../lib/types';
+import type { AiAgentSettingsItem, ChatOptions, ChatProject, ConversationProjectContext, Message, Screen } from '../lib/types';
 
 const TITLE_MAX_LENGTH = 40;
 const TOP_LOAD_THRESHOLD_PX = 72;
@@ -303,7 +303,6 @@ export default function ChatScreen({
   hasMoreMessages,
   loadingMoreMessages,
   liveReasoning,
-  terminalEntries,
   sending,
   sendElapsedSeconds,
   isRunning,
@@ -319,17 +318,18 @@ export default function ChatScreen({
   onRefresh,
   onNavigate,
   activeAgentName,
+  activeAgentId,
+  availableAgents,
   model,
   reasoningEffort,
   options,
   onLoadMoreMessages,
   onModelChange,
   onReasoningChange,
+  onAgentChange,
   tokenSaverOpen,
-  terminalLiveOpen,
   onOpenTokenSaver,
-  onOpenProjectChats,
-  onOpenTerminalLive
+  onOpenProjectChats
 }: {
   chatTitle: string;
   conversationId: number | null;
@@ -339,7 +339,6 @@ export default function ChatScreen({
   hasMoreMessages: boolean;
   loadingMoreMessages: boolean;
   liveReasoning: string;
-  terminalEntries: TerminalEntry[];
   sending: boolean;
   sendElapsedSeconds: number;
   isRunning: boolean;
@@ -371,19 +370,18 @@ export default function ChatScreen({
   onRefresh: () => void;
   onNavigate: (screen: Screen) => void;
   activeAgentName: string;
+  activeAgentId: string;
+  availableAgents: AiAgentSettingsItem[];
   onLoadMoreMessages: () => void;
   onModelChange: (value: string) => void;
   onReasoningChange: (value: string) => void;
+  onAgentChange: (agentId: string) => void;
   tokenSaverOpen: boolean;
-  terminalLiveOpen: boolean;
   onOpenTokenSaver: () => void;
   onOpenProjectChats: () => void;
-  onOpenTerminalLive: () => void;
 }) {
   const [input, setInput] = useState('');
   const [showReasoning, setShowReasoning] = useState(false);
-  const [showTerminal, setShowTerminal] = useState(false);
-  const [hasTerminalActivity, setHasTerminalActivity] = useState(false);
   const [showTitleModal, setShowTitleModal] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState<number | null>(null);
   const [voiceState, setVoiceState] = useState<'idle' | 'listening' | 'error'>('idle');
@@ -414,15 +412,9 @@ export default function ChatScreen({
       ? `${grouped[0].id}:${String(grouped[0].content || '').length}`
       : 'none';
   const lastMessageFingerprint = grouped.length > 0 ? `${grouped[grouped.length - 1].id}:${String(grouped[grouped.length - 1].content || '').length}` : 'none';
-  const lastTerminalEntry = terminalEntries.length > 0 ? terminalEntries[terminalEntries.length - 1] : null;
-  const terminalFingerprint =
-    lastTerminalEntry && typeof lastTerminalEntry === 'object'
-      ? `${terminalEntries.length}:${String(lastTerminalEntry.id || '')}:${String(lastTerminalEntry.output || '').length}`
-      : '0';
   const hasReasoningActivity = liveReasoning.trim().length > 0;
   const showReasoningPanel = hasReasoningActivity || sending || isRunning;
   const hadReasoningRef = useRef(liveReasoning.trim().length > 0);
-  const terminalFingerprintRef = useRef(terminalFingerprint);
   const wasSendingRef = useRef(sending);
   const stickToBottomRef = useRef(true);
   const prependScrollHeightRef = useRef<number | null>(null);
@@ -528,27 +520,21 @@ export default function ChatScreen({
     if (!node) return;
     if (!stickToBottomRef.current) return;
     node.scrollTo({ top: node.scrollHeight, behavior: 'auto' });
-  }, [lastMessageFingerprint, liveReasoning.length, terminalFingerprint]);
+  }, [lastMessageFingerprint, liveReasoning.length]);
 
   useEffect(() => {
     setShowReasoning(false);
-    setShowTerminal(false);
-    setHasTerminalActivity(Boolean((sending || isRunning) && terminalEntries.length > 0));
     hadReasoningRef.current = liveReasoning.trim().length > 0;
-    terminalFingerprintRef.current = terminalFingerprint;
     wasSendingRef.current = sending;
-  }, [conversationId, liveReasoning, terminalFingerprint, sending, isRunning, terminalEntries.length]);
+  }, [conversationId, liveReasoning, sending]);
 
   useEffect(() => {
     if (!wasSendingRef.current && sending) {
       setShowReasoning(true);
-      setShowTerminal(false);
-      setHasTerminalActivity(false);
       hadReasoningRef.current = false;
-      terminalFingerprintRef.current = terminalFingerprint;
     }
     wasSendingRef.current = sending;
-  }, [sending, terminalFingerprint]);
+  }, [sending]);
 
   useEffect(() => {
     const hasReasoning = liveReasoning.trim().length > 0;
@@ -557,15 +543,6 @@ export default function ChatScreen({
     }
     hadReasoningRef.current = hasReasoning;
   }, [liveReasoning]);
-
-  useEffect(() => {
-    const changed = terminalFingerprintRef.current !== terminalFingerprint;
-    terminalFingerprintRef.current = terminalFingerprint;
-    if (changed && terminalEntries.length > 0 && (sending || isRunning)) {
-      setHasTerminalActivity(true);
-      setShowTerminal(true);
-    }
-  }, [terminalFingerprint, terminalEntries.length, sending, isRunning]);
 
   const handleMessagesScroll = () => {
     const node = messagesRef.current;
@@ -798,7 +775,6 @@ export default function ChatScreen({
                   </div>
                 </div>
               ) : null}
-              <p className="text-[11px] text-zinc-400">IA activa: {activeAgentName || 'Codex CLI'}</p>
               {projectLabel ? (
                 <button
                   type="button"
@@ -811,18 +787,6 @@ export default function ChatScreen({
               ) : null}
             </div>
             <div className="flex items-center gap-1 shrink-0">
-              <button
-                onClick={onOpenTerminalLive}
-                className={`w-8 h-8 rounded-full border flex items-center justify-center ${
-                  terminalLiveOpen
-                    ? 'border-sky-500/50 bg-sky-500/10 text-sky-300'
-                    : 'border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500'
-                }`}
-                type="button"
-                aria-label="Abrir Terminal Live"
-              >
-                <TerminalSquare size={15} />
-              </button>
               <button
                 onClick={onOpenTokenSaver}
                 className={`w-8 h-8 rounded-full border flex items-center justify-center ${
@@ -853,28 +817,43 @@ export default function ChatScreen({
               </button>
             </div>
           </div>
-          <div className="mt-2 grid grid-cols-2 gap-2">
+          <div className="mt-2 space-y-2">
             <select
-              value={model}
-              onChange={(event) => onModelChange(event.target.value)}
+              value={activeAgentId}
+              onChange={(event) => onAgentChange(event.target.value)}
               className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-200"
-              aria-label={`Modelo para ${activeAgentName || 'IA activa'}`}
+              aria-label="Agente activo"
+              disabled={sending || isRunning}
             >
-              <option value="">Automatico ({activeAgentName || 'IA activa'})</option>
-              {options.models.map((item) => (
-                <option key={item} value={item}>{item}</option>
+              {availableAgents.filter(agent => agent.integration.enabled).map((agent) => (
+                <option key={agent.id} value={agent.id}>
+                  {agent.name} {agent.isFree ? '(gratis)' : ''}
+                </option>
               ))}
             </select>
-            <select
-              value={reasoningEffort}
-              onChange={(event) => onReasoningChange(event.target.value)}
-              className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-200"
-              aria-label={`Nivel de razonamiento para ${activeAgentName || 'IA activa'}`}
-            >
-              {options.reasoningEfforts.map((item) => (
-                <option key={item} value={item}>{item}</option>
-              ))}
-            </select>
+            <div className="grid grid-cols-2 gap-2">
+              <select
+                value={model}
+                onChange={(event) => onModelChange(event.target.value)}
+                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-200"
+                aria-label={`Modelo para ${activeAgentName || 'IA activa'}`}
+              >
+                <option value="">Automatico ({activeAgentName || 'IA activa'})</option>
+                {options.models.map((item) => (
+                  <option key={item} value={item}>{item}</option>
+                ))}
+              </select>
+              <select
+                value={reasoningEffort}
+                onChange={(event) => onReasoningChange(event.target.value)}
+                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-2 py-1.5 text-xs text-zinc-200"
+                aria-label={`Nivel de razonamiento para ${activeAgentName || 'IA activa'}`}
+              >
+                {options.reasoningEfforts.map((item) => (
+                  <option key={item} value={item}>{item}</option>
+                ))}
+              </select>
+            </div>
           </div>
         </div>
       </header>
@@ -980,30 +959,6 @@ export default function ChatScreen({
           </section>
         ) : null}
 
-        {hasTerminalActivity ? (
-          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/50">
-            <button
-              type="button"
-              className="w-full px-3 py-2 text-left text-xs uppercase tracking-wide text-zinc-300"
-              onClick={() => setShowTerminal((prev) => !prev)}
-            >
-              {showTerminal ? '▾' : '▸'} Terminal live ({terminalEntries.length})
-            </button>
-            {showTerminal ? (
-              <div className="max-h-80 overflow-auto border-t border-zinc-800 px-3 py-2 space-y-2">
-                {terminalEntries.map((entry) => (
-                  <article key={entry.id} className="rounded-lg border border-zinc-800 bg-black/50 p-2">
-                    <div className="text-[10px] text-zinc-400 uppercase">{entry.statusText || entry.kind}</div>
-                    <pre className="text-xs text-zinc-200 whitespace-pre-wrap break-words mt-1">{entry.command}</pre>
-                    {entry.output ? (
-                      <pre className="text-xs text-zinc-400 whitespace-pre-wrap break-words mt-1">{entry.output}</pre>
-                    ) : null}
-                  </article>
-                ))}
-              </div>
-            ) : null}
-          </section>
-        ) : null}
       </main>
 
       <div className="fixed bottom-[74px] left-0 right-0 p-4 bg-gradient-to-t from-black via-black/90 to-transparent z-[60] pointer-events-none">

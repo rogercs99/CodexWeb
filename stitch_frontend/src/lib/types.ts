@@ -5,6 +5,7 @@ export type Screen =
   | 'search'
   | 'attachments'
   | 'terminal'
+  | 'tools'
   | 'settings'
   | 'quetzalRelay'
   | 'reboot'

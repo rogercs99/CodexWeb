@@ -35,6 +35,7 @@
 
 ## UX y estados
 
+- Acceso actual: `Terminal Live` se abre desde la pestana `Terminal` de la barra inferior; no hay boton ni panel embebido dentro de `ChatScreen`.
 - Estados expuestos: `idle`, `typing`, `blocked`, `waiting_confirmation`, `executing`, `streaming`, `success`, `error`, `canceled`, `timeout`, `exporting`, `copied`.
 - Composer movil con `Enter` para ejecutar y `Shift+Enter` para nueva linea.
 - Quick commands para validacion.

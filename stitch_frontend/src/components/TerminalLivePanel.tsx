@@ -31,6 +31,8 @@ import {
   type TerminalLiveSessionState,
   type TerminalLiveWarning
 } from '../lib/terminalLive';
+import BottomNav from './BottomNav';
+import type { Screen } from '../lib/types';
 
 const TERMINAL_LIVE_KEY = 'codexweb_terminal_live_sessions_v1';
 const TERMINAL_LIVE_LIMIT = 18;
@@ -410,7 +412,7 @@ function SystemdSection({ summary, logs }: { summary: SystemdSummary; logs: stri
   );
 }
 
-export default function TerminalLivePanel({ onClose }: { onClose?: () => void }) {
+export default function TerminalLivePanel({ onClose, onNavigate }: { onClose?: () => void; onNavigate?: (screen: Screen) => void }) {
   const [input, setInput] = useState('');
   const [sessions, setSessions] = useState<TerminalLiveSession[]>([]);
   const [screenState, setScreenState] = useState<TerminalLiveSessionState>('idle');
@@ -489,6 +491,14 @@ export default function TerminalLivePanel({ onClose }: { onClose?: () => void })
     ],
     []
   );
+
+  const isFloating = Boolean(onClose);
+  const rootClassName = isFloating
+    ? 'fixed inset-x-2 bottom-[88px] top-[max(72px,env(safe-area-inset-top)+56px)] z-[190] overflow-y-auto rounded-[28px] border border-zinc-800 bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.12),_transparent_38%),linear-gradient(180deg,rgba(24,24,27,0.96),rgba(9,9,11,0.99))] p-4 shadow-[0_18px_60px_rgba(0,0,0,0.4)] sm:left-auto sm:right-4 sm:top-24 sm:bottom-4 sm:w-[min(560px,calc(100vw-2rem))]'
+    : 'min-h-screen bg-black text-white pb-[max(92px,env(safe-area-inset-bottom)+92px)]';
+  const contentClassName = isFloating
+    ? 'space-y-4'
+    : 'mx-auto flex min-h-screen max-w-5xl flex-col space-y-4 px-4 pb-6 pt-[max(env(safe-area-inset-top)+8px,8px)]';
 
   const updateSession = (sessionId: string, updater: (session: TerminalLiveSession) => TerminalLiveSession) => {
     setSessions((prev) =>
@@ -781,385 +791,413 @@ export default function TerminalLivePanel({ onClose }: { onClose?: () => void })
   }, [input, pendingConfirmation]);
 
   return (
-    <section className="fixed inset-x-2 bottom-[88px] top-[max(72px,env(safe-area-inset-top)+56px)] z-[190] overflow-y-auto rounded-[28px] border border-zinc-800 bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.12),_transparent_38%),linear-gradient(180deg,rgba(24,24,27,0.96),rgba(9,9,11,0.99))] p-4 shadow-[0_18px_60px_rgba(0,0,0,0.4)] space-y-4 sm:left-auto sm:right-4 sm:top-24 sm:bottom-4 sm:w-[min(560px,calc(100vw-2rem))]">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <TerminalSquare size={18} className="text-sky-300 shrink-0" />
-            <h2 className="text-sm font-semibold text-zinc-100">Terminal Live</h2>
-            <StateBadge state={screenState} />
-          </div>
-          <p className="mt-1 text-xs text-zinc-400">{statusText}</p>
-          <p className="mt-2 text-[11px] text-zinc-500">
-            Ejecuta bloques completos con streaming real, parser visual y export listo para ChatGPT.
-          </p>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <button
-            type="button"
-            onClick={clearLiveHistory}
-            disabled={running || sessions.length === 0}
-            className="rounded-full border border-zinc-700 bg-zinc-950/70 px-3 py-1.5 text-[11px] text-zinc-300 disabled:opacity-40"
-          >
-            Limpiar
-          </button>
-          {onClose ? (
-            <button
-              type="button"
-              onClick={onClose}
-              className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-700 bg-zinc-950/70 text-zinc-300"
-              aria-label="Cerrar Terminal Live"
-            >
-              <ChevronDown size={18} />
-            </button>
-          ) : null}
-        </div>
-      </div>
-
-      <div className="rounded-2xl border border-zinc-800 bg-black/35 p-3">
-        <div className="flex flex-wrap gap-2">
-          {quickCommands.map((command) => (
-            <button
-              key={command}
-              type="button"
-              onClick={() => {
-                setInput(command);
-                setScreenState('typing');
-                setStatusText('Atajo cargado en el composer.');
-              }}
-              className="rounded-full border border-zinc-700 bg-zinc-950/60 px-3 py-1.5 text-[11px] text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
-            >
-              {command}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {pendingConfirmation ? (
-        <article className="rounded-2xl border border-amber-500/40 bg-amber-500/10 p-4">
-          <div className="flex items-start gap-3">
-            <ShieldAlert size={18} className="mt-0.5 shrink-0 text-amber-300" />
+    <section className={rootClassName}>
+      <div className={contentClassName}>
+        {isFloating ? (
+          <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
-              <p className="text-sm font-medium text-amber-100">Comando bloqueado hasta confirmar</p>
-              <p className="mt-1 text-xs text-amber-200/80 break-words">{parseCommandBlock(pendingConfirmation.command).preview}</p>
-              <div className="mt-3 space-y-2">
-                {pendingConfirmation.warnings.map((warning) => (
-                  <div key={`${warning.id}:${warning.label}`} className="rounded-xl border border-amber-500/30 bg-black/20 px-3 py-2 text-xs text-amber-100">
-                    <p className="font-medium">{warning.label}</p>
-                    {warning.detail ? <p className="mt-1 text-amber-100/80 break-words">{warning.detail}</p> : null}
-                  </div>
-                ))}
+              <div className="flex items-center gap-2">
+                <TerminalSquare size={18} className="text-sky-300 shrink-0" />
+                <h2 className="text-sm font-semibold text-zinc-100">Terminal Live</h2>
+                <StateBadge state={screenState} />
               </div>
-              <div className="mt-3 flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    void executeCommand(pendingConfirmation.command, {
-                      confirmDangerous: true,
-                      reuseSessionId: pendingConfirmation.sessionId
-                    });
-                  }}
-                  className="rounded-xl border border-amber-300/40 bg-amber-300/10 px-3 py-2 text-xs font-medium text-amber-100"
-                >
-                  Ejecutar igualmente
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    updateSession(pendingConfirmation.sessionId, (session) => ({
-                      ...session,
-                      state: 'canceled',
-                      finishedAt: new Date().toISOString(),
-                      stderr: `${session.stderr}${session.stderr ? '\n' : ''}Cancelado antes de confirmar.`
-                    }));
-                    setPendingConfirmation(null);
-                    setScreenState('canceled');
-                    setStatusText('Comando cancelado antes de ejecutar.');
-                  }}
-                  className="rounded-xl border border-zinc-700 bg-black/35 px-3 py-2 text-xs text-zinc-300"
-                >
-                  Cancelar
-                </button>
-              </div>
+              <p className="mt-1 text-xs text-zinc-400">{statusText}</p>
+              <p className="mt-2 text-[11px] text-zinc-500">
+                Ejecuta bloques completos con streaming real, parser visual y export listo para ChatGPT.
+              </p>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <button
+                type="button"
+                onClick={clearLiveHistory}
+                disabled={running || sessions.length === 0}
+                className="rounded-full border border-zinc-700 bg-zinc-950/70 px-3 py-1.5 text-[11px] text-zinc-300 disabled:opacity-40"
+              >
+                Limpiar
+              </button>
+              <button
+                type="button"
+                onClick={onClose}
+                className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-700 bg-zinc-950/70 text-zinc-300"
+                aria-label="Cerrar Terminal Live"
+              >
+                <ChevronDown size={18} />
+              </button>
             </div>
           </div>
-        </article>
-      ) : null}
+        ) : (
+          <header className="sticky top-0 z-20 bg-black/95 backdrop-blur-xl border-b border-zinc-900 px-4 py-3 -mx-4 mb-4">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2 min-w-0">
+                <TerminalSquare size={20} className="text-sky-400 shrink-0" />
+                <h1 className="text-lg font-semibold text-white">Terminal</h1>
+                <StateBadge state={screenState} />
+              </div>
+              <button
+                type="button"
+                onClick={clearLiveHistory}
+                disabled={running || sessions.length === 0}
+                className="rounded-full border border-zinc-700 bg-zinc-900/90 px-3 py-1.5 text-[11px] text-zinc-300 disabled:opacity-40"
+              >
+                Limpiar
+              </button>
+            </div>
+            <p className="mt-1 text-sm text-zinc-400">{statusText}</p>
+          </header>
+        )}
 
-      <form
-        className="rounded-[24px] border border-zinc-800 bg-black/45 p-3 shadow-inner shadow-black/20"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void executeCommand(input);
-        }}
-      >
-        <div className="flex items-start gap-2">
-          <textarea
-            rows={4}
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                event.preventDefault();
-                void executeCommand(input);
-              }
-            }}
-            placeholder={'set -e\necho "== sistema =="\nhostname'}
-            className="min-h-[112px] flex-1 resize-y rounded-2xl border border-zinc-800 bg-zinc-950/70 px-3 py-3 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-zinc-600 focus:outline-none"
-          />
-          <div className="flex shrink-0 flex-col gap-2">
-            <button
-              type="button"
-              onClick={async () => {
-                try {
-                  const text = await navigator.clipboard.readText();
-                  if (!text) return;
-                  setInput((prev) => (prev.trim() ? `${prev}\n${text}` : text));
+        <div className="rounded-2xl border border-zinc-800 bg-zinc-950/60 p-3 shadow-sm">
+          <div className="mb-2">
+            <p className="text-xs font-medium text-zinc-300">Atajos rápidos</p>
+            <p className="mt-0.5 text-[11px] text-zinc-500">Toca para cargar y editar antes de ejecutar</p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {quickCommands.map((command) => (
+              <button
+                key={command}
+                type="button"
+                onClick={() => {
+                  setInput(command);
                   setScreenState('typing');
-                  setStatusText('Bloque pegado desde el portapapeles.');
-                } catch (_error) {
-                  setScreenState('error');
-                  setStatusText('No se pudo leer el portapapeles.');
-                }
-              }}
-              className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-zinc-700 bg-zinc-950/70 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
-              aria-label="Pegar desde portapapeles"
-              title="Pegar"
-            >
-              <Clipboard size={16} />
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setInput('');
-                setScreenState('idle');
-                setStatusText('Composer vaciado.');
-              }}
-              className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-zinc-700 bg-zinc-950/70 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
-              aria-label="Vaciar composer"
-              title="Vaciar"
-            >
-              <RefreshCw size={16} />
-            </button>
-            <button
-              type={running ? 'button' : 'submit'}
-              onClick={running ? stopRun : undefined}
-              disabled={!running && !input.trim()}
-              className={`inline-flex h-12 w-12 items-center justify-center rounded-2xl border text-white transition-colors ${
-                running
-                  ? 'border-red-500/50 bg-red-600'
-                  : input.trim()
-                    ? 'border-sky-400/40 bg-sky-500'
-                    : 'border-zinc-800 bg-zinc-900 text-zinc-500'
-              } disabled:opacity-50`}
-              aria-label={running ? 'Cancelar ejecucion' : 'Ejecutar bloque'}
-              title={running ? 'Cancelar' : 'Ejecutar'}
-            >
-              {running ? <Square size={16} /> : <Play size={16} />}
-            </button>
+                  setStatusText('Atajo cargado en el composer.');
+                }}
+                className="rounded-full border border-zinc-700 bg-zinc-900/80 px-3 py-1.5 text-[11px] text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
+              >
+                {command}
+              </button>
+            ))}
           </div>
         </div>
-        <p className="mt-2 text-[11px] text-zinc-500">
-          `Enter` ejecuta. `Shift+Enter` inserta nueva linea. Los bloques multi-linea se ejecutan como una sola unidad.
-        </p>
-      </form>
 
-      <div className="space-y-5">
-        {sessions.length === 0 ? (
-          <div className="rounded-2xl border border-dashed border-zinc-800 bg-black/20 px-4 py-8 text-center text-sm text-zinc-500">
-            Aun no hay sesiones. Ejecuta `echo ok` o pega el bloque de diagnostico para empezar.
-          </div>
-        ) : null}
-
-        {sessions.map((session) => {
-          const rawText = [session.stdout, session.stderr].filter(Boolean).join('\n');
-          const parsed = session.parsed;
-          const expandedRaw = Boolean(expandedRawBySession[session.id]);
-          return (
-            <article key={session.id} className="space-y-3">
-              <div className="flex justify-end">
-                <div className="max-w-[92%] rounded-[28px] rounded-br-md border border-sky-400/20 bg-sky-500/10 px-4 py-3 text-sm text-sky-50 shadow-[0_14px_38px_rgba(14,165,233,0.12)]">
-                  <p className="text-[11px] uppercase tracking-[0.18em] text-sky-200/80">Comando</p>
-                  <pre className="mt-2 whitespace-pre-wrap break-words font-sans text-sm leading-6">{session.command}</pre>
-                  <p className="mt-2 text-[10px] text-sky-100/60">{formatTime(session.startedAt)}</p>
+        {pendingConfirmation ? (
+          <article className="rounded-[28px] border border-amber-500/40 bg-amber-500/10 p-4">
+            <div className="flex items-start gap-3">
+              <ShieldAlert size={18} className="mt-0.5 shrink-0 text-amber-300" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-amber-100">Comando bloqueado hasta confirmar</p>
+                <p className="mt-1 text-xs text-amber-200/80 break-words">{parseCommandBlock(pendingConfirmation.command).preview}</p>
+                <div className="mt-3 space-y-2">
+                  {pendingConfirmation.warnings.map((warning) => (
+                    <div key={`${warning.id}:${warning.label}`} className="rounded-xl border border-amber-500/30 bg-black/20 px-3 py-2 text-xs text-amber-100">
+                      <p className="font-medium">{warning.label}</p>
+                      {warning.detail ? <p className="mt-1 text-amber-100/80 break-words">{warning.detail}</p> : null}
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void executeCommand(pendingConfirmation.command, {
+                        confirmDangerous: true,
+                        reuseSessionId: pendingConfirmation.sessionId
+                      });
+                    }}
+                    className="rounded-xl border border-amber-300/40 bg-amber-300/10 px-3 py-2 text-xs font-medium text-amber-100"
+                  >
+                    Ejecutar igualmente
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      updateSession(pendingConfirmation.sessionId, (session) => ({
+                        ...session,
+                        state: 'canceled',
+                        finishedAt: new Date().toISOString(),
+                        stderr: `${session.stderr}${session.stderr ? '\n' : ''}Cancelado antes de confirmar.`
+                      }));
+                      setPendingConfirmation(null);
+                      setScreenState('canceled');
+                      setStatusText('Comando cancelado antes de ejecutar.');
+                    }}
+                    className="rounded-xl border border-zinc-700 bg-black/35 px-3 py-2 text-xs text-zinc-300"
+                  >
+                    Cancelar
+                  </button>
                 </div>
               </div>
+            </div>
+          </article>
+        ) : null}
 
-              <div className="flex justify-start">
-                <div className="max-w-[96%] rounded-[28px] rounded-tl-md border border-zinc-800 bg-zinc-950/90 px-4 py-4 shadow-[0_20px_44px_rgba(0,0,0,0.24)] space-y-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <StateBadge state={session.state} />
-                      {session.exitCode !== null ? (
-                        <span className="rounded-full border border-zinc-700 bg-zinc-900/80 px-2 py-1 text-[10px] uppercase text-zinc-300">
-                          exit {session.exitCode}
-                        </span>
-                      ) : null}
-                      {session.durationMs > 0 ? (
-                        <span className="rounded-full border border-zinc-700 bg-zinc-900/80 px-2 py-1 text-[10px] uppercase text-zinc-300">
-                          {formatDurationMs(session.durationMs)}
-                        </span>
-                      ) : null}
-                    </div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void handleCopyOutput(session);
-                        }}
-                        className={`inline-flex h-8 w-8 items-center justify-center rounded-full border ${
-                          copiedSessionId === session.id
-                            ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
-                            : 'border-zinc-700 bg-zinc-900/80 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100'
-                        }`}
-                        aria-label="Copiar salida"
-                        title="Copiar salida"
-                      >
-                        {copiedSessionId === session.id ? <Check size={14} /> : <Copy size={14} />}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void handleExport(session);
-                        }}
-                        className={`inline-flex h-8 w-8 items-center justify-center rounded-full border ${
-                          exportedSessionId === session.id
-                            ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
-                            : 'border-zinc-700 bg-zinc-900/80 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100'
-                        }`}
-                        aria-label="Exportar diagnostico"
-                        title="Exportar diagnostico"
-                      >
-                        {exportedSessionId === session.id ? <Check size={14} /> : <FileText size={14} />}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void executeCommand(session.command);
-                        }}
-                        disabled={running}
-                        className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-zinc-700 bg-zinc-900/80 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100 disabled:opacity-40"
-                        aria-label="Reintentar comando"
-                        title="Reintentar"
-                      >
-                        <RefreshCw size={14} />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setExpandedRawBySession((prev) => ({ ...prev, [session.id]: !prev[session.id] }));
-                        }}
-                        className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-zinc-700 bg-zinc-900/80 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
-                        aria-label={expandedRaw ? 'Ocultar salida raw' : 'Ver salida raw'}
-                        title={expandedRaw ? 'Ocultar raw' : 'Ver raw'}
-                      >
-                        {expandedRaw ? <EyeOff size={14} /> : <Eye size={14} />}
-                      </button>
-                    </div>
+        <form
+          className="rounded-2xl border border-zinc-800 bg-zinc-950/60 p-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void executeCommand(input);
+          }}
+        >
+          <div className="mb-2">
+            <p className="text-xs font-medium text-zinc-300">Ejecutar comando</p>
+            <p className="mt-0.5 text-[11px] text-zinc-500">Enter para ejecutar, Shift+Enter para nueva línea</p>
+          </div>
+          <div className="flex items-start gap-2">
+            <textarea
+              rows={4}
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  void executeCommand(input);
+                }
+              }}
+              placeholder={'set -e\necho "== sistema =="\nhostname'}
+              className="min-h-[112px] flex-1 resize-y rounded-2xl border border-zinc-800 bg-black/35 px-3 py-3 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-zinc-600 focus:outline-none"
+            />
+            <div className="flex shrink-0 flex-col gap-2">
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    const text = await navigator.clipboard.readText();
+                    if (!text) return;
+                    setInput((prev) => (prev.trim() ? `${prev}\n${text}` : text));
+                    setScreenState('typing');
+                    setStatusText('Bloque pegado desde el portapapeles.');
+                  } catch (_error) {
+                    setScreenState('error');
+                    setStatusText('No se pudo leer el portapapeles.');
+                  }
+                }}
+                className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-zinc-700 bg-zinc-900/90 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
+                aria-label="Pegar desde portapapeles"
+                title="Pegar"
+              >
+                <Clipboard size={16} />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setInput('');
+                  setScreenState('idle');
+                  setStatusText('Composer vaciado.');
+                }}
+                className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-zinc-700 bg-zinc-900/90 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
+                aria-label="Vaciar composer"
+                title="Vaciar"
+              >
+                <RefreshCw size={16} />
+              </button>
+              <button
+                type={running ? 'button' : 'submit'}
+                onClick={running ? stopRun : undefined}
+                disabled={!running && !input.trim()}
+                className={`inline-flex h-12 w-12 items-center justify-center rounded-2xl border text-white transition-colors ${
+                  running
+                    ? 'border-red-500/50 bg-red-600'
+                    : input.trim()
+                      ? 'border-sky-400/40 bg-sky-500'
+                      : 'border-zinc-800 bg-zinc-900 text-zinc-500'
+                } disabled:opacity-50`}
+                aria-label={running ? 'Cancelar ejecucion' : 'Ejecutar bloque'}
+                title={running ? 'Cancelar' : 'Ejecutar'}
+              >
+                {running ? <Square size={16} /> : <Play size={16} />}
+              </button>
+            </div>
+          </div>
+        </form>
+
+        <div className="space-y-4">
+          {sessions.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-zinc-800 bg-zinc-950/40 px-4 py-6 text-center text-sm text-zinc-500">
+              No hay sesiones aún. Ejecuta un comando para empezar.
+            </div>
+          ) : null}
+
+          {sessions.map((session) => {
+            const rawText = [session.stdout, session.stderr].filter(Boolean).join('\n');
+            const parsed = session.parsed;
+            const expandedRaw = Boolean(expandedRawBySession[session.id]);
+            return (
+              <article key={session.id} className="space-y-2">
+                <div className="flex justify-end">
+                  <div className="max-w-[88%] rounded-2xl rounded-br-md border border-sky-500/30 bg-gradient-to-br from-sky-500/12 to-sky-600/8 px-3.5 py-2.5 shadow-sm">
+                    <p className="text-[10px] font-medium uppercase tracking-wider text-sky-300/70 mb-1.5">Comando</p>
+                    <pre className="whitespace-pre-wrap break-words font-mono text-[13px] leading-5 text-sky-50">{session.command}</pre>
+                    <p className="mt-1.5 text-[10px] text-sky-200/50">{formatTime(session.startedAt)}</p>
                   </div>
+                </div>
 
-                  <div className="flex flex-wrap gap-2 text-[11px] text-zinc-500">
-                    <span>cwd: {session.cwd || '/root/CodexWeb'}</span>
-                    {session.runAsUser ? <span>usuario: {session.runAsUser}</span> : null}
-                    <span>timeout: {formatTimeoutMs(session.timeoutMs)}</span>
-                    {session.outputTruncated ? <span>salida truncada al maximo configurado</span> : null}
-                  </div>
+                <div className="flex justify-start">
+                  <div className="max-w-[92%] rounded-2xl rounded-tl-md border border-zinc-800 bg-zinc-950/80 px-3.5 py-3 shadow-sm space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <StateBadge state={session.state} />
+                        {session.exitCode !== null ? (
+                          <span className="rounded-full border border-zinc-700 bg-zinc-900/80 px-2 py-1 text-[10px] uppercase text-zinc-300">
+                            exit {session.exitCode}
+                          </span>
+                        ) : null}
+                        {session.durationMs > 0 ? (
+                          <span className="rounded-full border border-zinc-700 bg-zinc-900/80 px-2 py-1 text-[10px] uppercase text-zinc-300">
+                            {formatDurationMs(session.durationMs)}
+                          </span>
+                        ) : null}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void handleCopyOutput(session);
+                          }}
+                          className={`inline-flex h-8 w-8 items-center justify-center rounded-full border ${
+                            copiedSessionId === session.id
+                              ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                              : 'border-zinc-700 bg-zinc-900/80 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100'
+                          }`}
+                          aria-label="Copiar salida"
+                          title="Copiar salida"
+                        >
+                          {copiedSessionId === session.id ? <Check size={14} /> : <Copy size={14} />}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void handleExport(session);
+                          }}
+                          className={`inline-flex h-8 w-8 items-center justify-center rounded-full border ${
+                            exportedSessionId === session.id
+                              ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                              : 'border-zinc-700 bg-zinc-900/80 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100'
+                          }`}
+                          aria-label="Exportar diagnostico"
+                          title="Exportar diagnostico"
+                        >
+                          {exportedSessionId === session.id ? <Check size={14} /> : <FileText size={14} />}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void executeCommand(session.command);
+                          }}
+                          disabled={running}
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-zinc-700 bg-zinc-900/80 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100 disabled:opacity-40"
+                          aria-label="Reintentar comando"
+                          title="Reintentar"
+                        >
+                          <RefreshCw size={14} />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setExpandedRawBySession((prev) => ({ ...prev, [session.id]: !prev[session.id] }));
+                          }}
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-zinc-700 bg-zinc-900/80 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
+                          aria-label={expandedRaw ? 'Ocultar salida raw' : 'Ver salida raw'}
+                          title={expandedRaw ? 'Ocultar raw' : 'Ver raw'}
+                        >
+                          {expandedRaw ? <EyeOff size={14} /> : <Eye size={14} />}
+                        </button>
+                      </div>
+                    </div>
 
-                  {session.warnings.length > 0 ? (
-                    <div className="space-y-2">
-                      <SectionHeader title="Warnings" />
-                      {session.warnings.map((warning) => (
-                        <div key={`${warning.id}:${warning.label}`} className="rounded-2xl border border-amber-500/30 bg-amber-500/8 px-3 py-2 text-xs text-amber-100">
-                          <div className="flex items-start gap-2">
-                            <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-300" />
-                            <div className="min-w-0">
-                              <p className="font-medium">{warning.label}</p>
-                              {warning.detail ? <p className="mt-1 text-amber-100/80 break-words">{warning.detail}</p> : null}
+                    <div className="flex flex-wrap gap-2 text-[11px] text-zinc-500">
+                      <span>cwd: {session.cwd || '/root/CodexWeb'}</span>
+                      {session.runAsUser ? <span>usuario: {session.runAsUser}</span> : null}
+                      <span>timeout: {formatTimeoutMs(session.timeoutMs)}</span>
+                      {session.outputTruncated ? <span>salida truncada al maximo configurado</span> : null}
+                    </div>
+
+                    {session.warnings.length > 0 ? (
+                      <div className="space-y-2">
+                        <SectionHeader title="Warnings" />
+                        {session.warnings.map((warning) => (
+                          <div key={`${warning.id}:${warning.label}`} className="rounded-2xl border border-amber-500/30 bg-amber-500/8 px-3 py-2 text-xs text-amber-100">
+                            <div className="flex items-start gap-2">
+                              <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-300" />
+                              <div className="min-w-0">
+                                <p className="font-medium">{warning.label}</p>
+                                {warning.detail ? <p className="mt-1 text-amber-100/80 break-words">{warning.detail}</p> : null}
+                              </div>
                             </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
-
-                  {parsed && parsed.urls.length > 0 ? (
-                    <div className="space-y-2">
-                      <SectionHeader title="URLs detectadas" />
-                      <div className="flex flex-wrap gap-2">
-                        {parsed.urls.map((url) => (
-                          <div key={url} className="flex max-w-full items-center gap-1 rounded-full border border-zinc-700 bg-zinc-900/70 px-3 py-1.5 text-[11px] text-zinc-200">
-                            <a href={url} target="_blank" rel="noreferrer" className="truncate text-sky-300 underline underline-offset-2">
-                              {url}
-                            </a>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                void handleCopyUrl(url);
-                              }}
-                              className={`inline-flex h-6 w-6 items-center justify-center rounded-full ${
-                                copiedUrl === url ? 'bg-emerald-500/10 text-emerald-200' : 'text-zinc-400 hover:text-zinc-100'
-                              }`}
-                              aria-label="Copiar URL"
-                            >
-                              {copiedUrl === url ? <Check size={12} /> : <ExternalLink size={12} />}
-                            </button>
                           </div>
                         ))}
                       </div>
-                    </div>
-                  ) : null}
+                    ) : null}
 
-                  {parsed ? (
-                    <div className="space-y-3">
-                      {parsed.sections.map((section, index) => (
-                        <div key={`${session.id}_${section.kind}_${index}`} className="space-y-2">
-                          <SectionHeader title={section.title} />
-                          {section.kind === 'docker_ps' ? <DockerSection entries={section.containers} /> : null}
-                          {section.kind === 'df_h' ? <DiskSection entries={section.mounts} /> : null}
-                          {section.kind === 'free_h' ? <MemorySection rows={section.rows} /> : null}
-                          {section.kind === 'systemd' ? <SystemdSection summary={section.summary} logs={section.logs} /> : null}
-                          {section.kind === 'journal' ? <LogBlock text={section.lines.join('\n')} tone="plain" /> : null}
-                          {section.kind === 'json' ? <LogBlock text={section.text} tone="plain" /> : null}
-                          {section.kind === 'raw' ? (
-                            <LogBlock
-                              text={section.text}
-                              tone={
-                                section.tone === 'stderr'
-                                  ? 'warning'
-                                  : session.state === 'error' || session.state === 'timeout'
-                                    ? 'error'
-                                    : 'plain'
-                              }
-                            />
-                          ) : null}
+                    {parsed && parsed.urls.length > 0 ? (
+                      <div className="space-y-2">
+                        <SectionHeader title="URLs detectadas" />
+                        <div className="flex flex-wrap gap-2">
+                          {parsed.urls.map((url) => (
+                            <div key={url} className="flex max-w-full items-center gap-1 rounded-full border border-zinc-700 bg-zinc-900/70 px-3 py-1.5 text-[11px] text-zinc-200">
+                              <a href={url} target="_blank" rel="noreferrer" className="truncate text-sky-300 underline underline-offset-2">
+                                {url}
+                              </a>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  void handleCopyUrl(url);
+                                }}
+                                className={`inline-flex h-6 w-6 items-center justify-center rounded-full ${
+                                  copiedUrl === url ? 'bg-emerald-500/10 text-emerald-200' : 'text-zinc-400 hover:text-zinc-100'
+                                }`}
+                                aria-label="Copiar URL"
+                              >
+                                {copiedUrl === url ? <Check size={12} /> : <ExternalLink size={12} />}
+                              </button>
+                            </div>
+                          ))}
                         </div>
-                      ))}
-                    </div>
-                  ) : null}
+                      </div>
+                    ) : null}
 
-                  {expandedRaw && rawText ? (
-                    <div className="space-y-2">
-                      <SectionHeader title="Raw output" />
-                      <LogBlock
-                        text={rawText}
-                        tone={session.state === 'error' || session.state === 'timeout' ? 'error' : 'plain'}
-                      />
-                    </div>
-                  ) : null}
+                    {parsed ? (
+                      <div className="space-y-3">
+                        {parsed.sections.map((section, index) => (
+                          <div key={`${session.id}_${section.kind}_${index}`} className="space-y-2">
+                            <SectionHeader title={section.title} />
+                            {section.kind === 'docker_ps' ? <DockerSection entries={section.containers} /> : null}
+                            {section.kind === 'df_h' ? <DiskSection entries={section.mounts} /> : null}
+                            {section.kind === 'free_h' ? <MemorySection rows={section.rows} /> : null}
+                            {section.kind === 'systemd' ? <SystemdSection summary={section.summary} logs={section.logs} /> : null}
+                            {section.kind === 'journal' ? <LogBlock text={section.lines.join('\n')} tone="plain" /> : null}
+                            {section.kind === 'json' ? <LogBlock text={section.text} tone="plain" /> : null}
+                            {section.kind === 'raw' ? (
+                              <LogBlock
+                                text={section.text}
+                                tone={
+                                  section.tone === 'stderr'
+                                    ? 'warning'
+                                    : session.state === 'error' || session.state === 'timeout'
+                                      ? 'error'
+                                      : 'plain'
+                                }
+                              />
+                            ) : null}
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
 
-                  {!rawText && session.state !== 'waiting_confirmation' ? (
-                    <div className="rounded-2xl border border-zinc-800 bg-black/20 px-3 py-4 text-sm text-zinc-500">
-                      {session.state === 'executing' || session.state === 'streaming'
-                        ? 'Esperando salida del proceso...'
-                        : 'La sesion termino sin salida visible.'}
-                    </div>
-                  ) : null}
+                    {expandedRaw && rawText ? (
+                      <div className="space-y-2">
+                        <SectionHeader title="Raw output" />
+                        <LogBlock
+                          text={rawText}
+                          tone={session.state === 'error' || session.state === 'timeout' ? 'error' : 'plain'}
+                        />
+                      </div>
+                    ) : null}
+
+                    {!rawText && session.state !== 'waiting_confirmation' ? (
+                      <div className="rounded-2xl border border-zinc-800 bg-black/20 px-3 py-4 text-sm text-zinc-500">
+                        {session.state === 'executing' || session.state === 'streaming'
+                          ? 'Esperando salida del proceso...'
+                          : 'La sesion termino sin salida visible.'}
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
-              </div>
-            </article>
-          );
-        })}
-        <div ref={endRef} />
+              </article>
+            );
+          })}
+          <div ref={endRef} />
+        </div>
+
+        {!isFloating && onNavigate ? <BottomNav active="terminal" onNavigate={onNavigate} /> : null}
       </div>
     </section>
   );
