@@ -1,4 +1,4 @@
-import { Check, ChevronLeft, Clipboard, Copy, Mic, Paperclip, RefreshCw, Send, Settings, Square, X, Zap } from 'lucide-react';
+import { Check, ChevronLeft, Clipboard, Copy, FolderOpen, Mic, Paperclip, RefreshCw, Send, Settings, Square, TerminalSquare, X, Zap } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -326,7 +326,10 @@ export default function ChatScreen({
   onModelChange,
   onReasoningChange,
   tokenSaverOpen,
-  onOpenTokenSaver
+  terminalLiveOpen,
+  onOpenTokenSaver,
+  onOpenProjectChats,
+  onOpenTerminalLive
 }: {
   chatTitle: string;
   conversationId: number | null;
@@ -372,7 +375,10 @@ export default function ChatScreen({
   onModelChange: (value: string) => void;
   onReasoningChange: (value: string) => void;
   tokenSaverOpen: boolean;
+  terminalLiveOpen: boolean;
   onOpenTokenSaver: () => void;
+  onOpenProjectChats: () => void;
+  onOpenTerminalLive: () => void;
 }) {
   const [input, setInput] = useState('');
   const [showReasoning, setShowReasoning] = useState(false);
@@ -794,12 +800,29 @@ export default function ChatScreen({
               ) : null}
               <p className="text-[11px] text-zinc-400">IA activa: {activeAgentName || 'Codex CLI'}</p>
               {projectLabel ? (
-                <p className="text-[11px] text-cyan-300/90">
-                  Proyecto: {projectLabel}
-                </p>
+                <button
+                  type="button"
+                  onClick={onOpenProjectChats}
+                  className="mt-1 inline-flex max-w-full items-center gap-1 rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2 py-1 text-[11px] text-cyan-200"
+                >
+                  <FolderOpen size={11} className="shrink-0" />
+                  <span className="truncate">Proyecto: {projectLabel}</span>
+                </button>
               ) : null}
             </div>
             <div className="flex items-center gap-1 shrink-0">
+              <button
+                onClick={onOpenTerminalLive}
+                className={`w-8 h-8 rounded-full border flex items-center justify-center ${
+                  terminalLiveOpen
+                    ? 'border-sky-500/50 bg-sky-500/10 text-sky-300'
+                    : 'border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500'
+                }`}
+                type="button"
+                aria-label="Abrir Terminal Live"
+              >
+                <TerminalSquare size={15} />
+              </button>
               <button
                 onClick={onOpenTokenSaver}
                 className={`w-8 h-8 rounded-full border flex items-center justify-center ${

@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   Check,
+  ChevronDown,
   Clipboard,
   Copy,
   ExternalLink,
@@ -409,7 +410,7 @@ function SystemdSection({ summary, logs }: { summary: SystemdSummary; logs: stri
   );
 }
 
-export default function TerminalLivePanel() {
+export default function TerminalLivePanel({ onClose }: { onClose?: () => void }) {
   const [input, setInput] = useState('');
   const [sessions, setSessions] = useState<TerminalLiveSession[]>([]);
   const [screenState, setScreenState] = useState<TerminalLiveSessionState>('idle');
@@ -780,7 +781,7 @@ export default function TerminalLivePanel() {
   }, [input, pendingConfirmation]);
 
   return (
-    <section className="rounded-[28px] border border-zinc-800 bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.12),_transparent_38%),linear-gradient(180deg,rgba(24,24,27,0.92),rgba(9,9,11,0.98))] p-4 shadow-[0_18px_60px_rgba(0,0,0,0.28)] space-y-4">
+    <section className="fixed inset-x-2 bottom-[88px] top-[max(72px,env(safe-area-inset-top)+56px)] z-[190] overflow-y-auto rounded-[28px] border border-zinc-800 bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.12),_transparent_38%),linear-gradient(180deg,rgba(24,24,27,0.96),rgba(9,9,11,0.99))] p-4 shadow-[0_18px_60px_rgba(0,0,0,0.4)] space-y-4 sm:left-auto sm:right-4 sm:top-24 sm:bottom-4 sm:w-[min(560px,calc(100vw-2rem))]">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
@@ -793,14 +794,26 @@ export default function TerminalLivePanel() {
             Ejecuta bloques completos con streaming real, parser visual y export listo para ChatGPT.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={clearLiveHistory}
-          disabled={running || sessions.length === 0}
-          className="shrink-0 rounded-full border border-zinc-700 bg-zinc-950/70 px-3 py-1.5 text-[11px] text-zinc-300 disabled:opacity-40"
-        >
-          Limpiar
-        </button>
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            type="button"
+            onClick={clearLiveHistory}
+            disabled={running || sessions.length === 0}
+            className="rounded-full border border-zinc-700 bg-zinc-950/70 px-3 py-1.5 text-[11px] text-zinc-300 disabled:opacity-40"
+          >
+            Limpiar
+          </button>
+          {onClose ? (
+            <button
+              type="button"
+              onClick={onClose}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-700 bg-zinc-950/70 text-zinc-300"
+              aria-label="Cerrar Terminal Live"
+            >
+              <ChevronDown size={18} />
+            </button>
+          ) : null}
+        </div>
       </div>
 
       <div className="rounded-2xl border border-zinc-800 bg-black/35 p-3">

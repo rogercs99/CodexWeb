@@ -8,7 +8,7 @@
   var REPORT_TIMEOUT_MS = 2200;
   var MAX_LOG_LINES = 200;
   var MAX_ERROR_LINES = 40;
-  var VERSION = '20260509-ios-debug-1';
+  var VERSION = '20260625-boot-fix-1';
 
   function nowIso() {
     return new Date().toISOString();

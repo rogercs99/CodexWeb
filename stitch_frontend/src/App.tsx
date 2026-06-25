@@ -378,6 +378,8 @@ interface NavigateData {
   chatId?: number;
   draftMessage?: string;
   autoSend?: boolean;
+  projectId?: number | null;
+  hubView?: 'home' | 'projects' | 'project';
 }
 
 interface UploadProgressState {
@@ -661,6 +663,9 @@ export default function App() {
   const [restartBusy, setRestartBusy] = useState(false);
   const [liveReasoning, setLiveReasoning] = useState('');
   const [isTokenSaverOpen, setIsTokenSaverOpen] = useState(false);
+  const [isTerminalLiveOpen, setIsTerminalLiveOpen] = useState(false);
+  const [hubViewIntent, setHubViewIntent] = useState<NavigateData['hubView'] | null>(null);
+  const [hubViewIntentVersion, setHubViewIntentVersion] = useState(0);
   const [pendingChatDraft, setPendingChatDraft] = useState<{
     chatId: number;
     message: string;
@@ -712,6 +717,24 @@ export default function App() {
   useEffect(() => {
     messagesNextBeforeIdRef.current = messagesNextBeforeId;
   }, [messagesNextBeforeId]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const monitor = window.__CODEXWEB_BOOT_MONITOR__;
+    if (!monitor?.markBooted) return;
+    const markReady = () => {
+      monitor.mark?.('APP_READY_EFFECT', `screen=${screen}`);
+      monitor.markBooted?.();
+    };
+    if (typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(markReady);
+      });
+      return;
+    }
+    const timer = window.setTimeout(markReady, 0);
+    return () => window.clearTimeout(timer);
+  }, [screen]);
 
   useEffect(() => {
     if (!user || screen === 'login' || screen === 'offline' || screen === 'reboot') {
@@ -1554,6 +1577,8 @@ export default function App() {
 
       const targetChatId =
         next === 'chat' && Number.isInteger(data?.chatId) ? Number(data?.chatId) : null;
+      const targetProjectId =
+        Number.isInteger(Number(data?.projectId)) && Number(data?.projectId) > 0 ? Number(data?.projectId) : null;
       const incomingDraft = String(data?.draftMessage || '').trim();
       const shouldAutoSendDraft = Boolean(data?.autoSend);
       const shouldKeepStreamingInTools = next === 'terminal';
@@ -1563,6 +1588,18 @@ export default function App() {
         (next !== 'chat' || !targetChatId || targetChatId !== activeConversationId)
       ) {
         detachActiveStream('Ejecución en segundo plano para el chat anterior.');
+      }
+
+      if (next === 'hub') {
+        if (data?.hubView) {
+          setHubViewIntent(data.hubView);
+          setHubViewIntentVersion((prev) => prev + 1);
+        }
+        if (targetProjectId !== null) {
+          setSelectedProjectId(targetProjectId);
+        } else if (data?.hubView === 'home') {
+          setSelectedProjectId(null);
+        }
       }
 
       if (next === 'chat' && targetChatId) {
@@ -1644,6 +1681,7 @@ export default function App() {
       }
       if (next !== 'chat') {
         setActiveConversationProjectContext(null);
+        setIsTerminalLiveOpen(false);
       }
       setScreen(next);
     },
@@ -2812,6 +2850,8 @@ export default function App() {
           user={user}
           conversations={filteredConversations}
           projects={projects}
+          viewIntent={hubViewIntent}
+          viewIntentVersion={hubViewIntentVersion}
           selectedProjectId={selectedProjectId}
           unassignedCount={unassignedConversationCount}
           activeConversationId={activeConversationId}
@@ -2877,9 +2917,20 @@ export default function App() {
           onModelChange={handleChatModelChange}
           onReasoningChange={handleChatReasoningChange}
           tokenSaverOpen={isTokenSaverOpen}
+          terminalLiveOpen={isTerminalLiveOpen}
           onOpenTokenSaver={() => {
             setIsTokenSaverOpen(true);
             persistTokenSaverUiState(true);
+          }}
+          onOpenProjectChats={() => {
+            const projectId = activeConversationProjectContext?.projectId || draftProjectId || null;
+            navigate('hub', {
+              hubView: projectId ? 'project' : 'projects',
+              projectId
+            });
+          }}
+          onOpenTerminalLive={() => {
+            setIsTerminalLiveOpen(true);
           }}
         />
       )}
@@ -2975,8 +3026,12 @@ export default function App() {
       )}
 
       {/* Terminal Live Panel - lateral derecho inferior */}
-      {screen === 'chat' && activeConversationId !== null && (
-        <TerminalLivePanel chatId={activeConversationId} />
+      {screen === 'chat' && activeConversationId !== null && isTerminalLiveOpen && (
+        <TerminalLivePanel
+          onClose={() => {
+            setIsTerminalLiveOpen(false);
+          }}
+        />
       )}
     </div>
   );

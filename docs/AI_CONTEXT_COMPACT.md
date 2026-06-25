@@ -1,5 +1,48 @@
 # AI_CONTEXT_COMPACT.md
 
+## Actualizacion 2026-06-25E
+
+- **Servicios reales**
+  - Prod: `codexweb.service` -> `http://127.0.0.1:3050` -> `STATIC_ASSETS_DIR=/root/CodexWeb/public`
+  - Dev: `codexwebdev.service` -> `http://127.0.0.1:3060` -> `STATIC_ASSETS_DIR=/root/CodexWeb/.runtime/dev/public`
+  - Tunnel: `cloudflared-codexweb.service` -> `/etc/cloudflared/config.yml`
+  - Script operativo/notificaciones: `/usr/local/bin/codex_ask.sh`
+- **Build/start correctos**
+  - Build frontend: `cd /root/CodexWeb/stitch_frontend && npm run build`
+  - Deploy prod local: copiar `stitch_frontend/dist/.` a `public/` + extras `boot-monitor.js`, `diag.html`, `diag.js`, `legacy-bootstrap.js` desde `stitch_frontend/public/`
+  - Deploy dev local: copiar `stitch_frontend/dist/.` a `.runtime/dev/public/` + mismos extras
+  - Restart selectivo: `systemctl restart codexweb.service codexwebdev.service`
+- **Estructura frontend/backend**
+  - Backend: `/root/CodexWeb/server.js`
+  - Frontend source: `/root/CodexWeb/stitch_frontend/src`
+  - Frontend public source: `/root/CodexWeb/stitch_frontend/public`
+  - Build output actual valido: `dist/assets/index-CCKC3Xma.js` + `dist/assets/index-CmLdUeI1.css`
+- **BOOT_TIMEOUT**
+  - Causa real encontrada el `2026-06-25`: `public/` y `.runtime/dev/public/` servian un bundle equivocado (`index-Be24ctB6.js`) ajeno a CodexWeb, con referencias a `__stremioBoot` y montaje en `#app`
+  - Resultado: el HTML de CodexWeb exponia `#root`, pero el JS servido no montaba React ahi y el monitor entraba en `BOOT_TIMEOUT`
+  - Fix real: rebuild desde `stitch_frontend/src`, desplegar bundle correcto y emitir `markBooted()` desde la app montada
+  - Version monitor actual: `20260625-boot-fix-1`
+- **Terminal Live**
+  - Ya no debe montarse por defecto al entrar en chats
+  - Apertura correcta: boton explicito desde `ChatScreen`
+  - Cierre correcto: control visible en el propio panel, tambien en movil
+- **Token Saver**
+  - Debe permanecer cerrado por defecto
+  - Persistencia valida: `localStorage` por usuario con schema `{ version: 1, open: boolean }`
+  - Storage corrupto o legado invalido => fallback cerrado, sin bloquear bootstrap
+- **Accesos rapidos a proyectos**
+  - Desde la vista de chat debe existir acceso rapido al proyecto activo
+  - La navegacion inferior sigue siendo `Chats / Files / Tools / Settings`; el acceso a proyectos no debe romperla
+- **Validaciones prod/dev**
+  - `curl -vkL --max-time 15 http://127.0.0.1:3050/`
+  - `curl -vkL --max-time 15 http://127.0.0.1:3060/`
+  - `curl -vkL --max-time 20 https://codexweb.gamemodai.pro/`
+  - `curl -vkL --max-time 20 https://codexwebdev.gamemodai.pro/`
+  - `curl http://127.0.0.1:3050/boot-monitor.js | grep 20260625-boot-fix-1`
+  - `curl http://127.0.0.1:3060/boot-monitor.js | grep 20260625-boot-fix-1`
+  - `curl http://127.0.0.1:3050/health` y `curl http://127.0.0.1:3060/health`
+  - `curl http://127.0.0.1:3050/api/me` y `curl http://127.0.0.1:3060/api/me`
+
 ## Actualizacion 2026-06-25D
 
 - **Puertos reales**:

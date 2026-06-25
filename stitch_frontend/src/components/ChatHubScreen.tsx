@@ -76,6 +76,8 @@ export default function ChatHubScreen({
   user,
   conversations,
   projects,
+  viewIntent,
+  viewIntentVersion,
   selectedProjectId,
   unassignedCount,
   activeConversationId,
@@ -101,6 +103,8 @@ export default function ChatHubScreen({
   user: User | null;
   conversations: Conversation[];
   projects: ChatProject[];
+  viewIntent?: HubView | null;
+  viewIntentVersion?: number;
   selectedProjectId: number | null;
   unassignedCount: number;
   activeConversationId: number | null;
@@ -194,6 +198,15 @@ export default function ChatHubScreen({
     if (selectedProject) return;
     setHubView('projects');
   }, [hubView, selectedProject]);
+
+  useEffect(() => {
+    if (!viewIntent) return;
+    if (viewIntent === 'project' && !selectedProjectId) {
+      setHubView('projects');
+      return;
+    }
+    setHubView(viewIntent);
+  }, [selectedProjectId, viewIntent, viewIntentVersion]);
 
   useEffect(() => {
     const existingIds = new Set(visibleConversations.map((item) => item.id));
