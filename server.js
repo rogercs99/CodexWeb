@@ -22562,6 +22562,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       let claudeClientDisconnected = false;
       const handleClaudeClientDisconnect = (source) => {
         claudeClientDisconnected = true;
+        stopClaudeHeartbeat();
         logChatStream('client_disconnect', { source });
       };
       req.on('aborted', () => handleClaudeClientDisconnect('request_aborted'));
@@ -22607,6 +22608,29 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         itemId: 'claude_cwd',
         text: `Directorio de trabajo: ${effectiveCwd}`
       });
+
+      let claudeHeartbeatTimer = null;
+      const stopClaudeHeartbeat = () => {
+        if (claudeHeartbeatTimer !== null) {
+          clearInterval(claudeHeartbeatTimer);
+          claudeHeartbeatTimer = null;
+        }
+      };
+      claudeHeartbeatTimer = setInterval(() => {
+        if (claudeClientDisconnected || res.writableEnded || res.destroyed) {
+          stopClaudeHeartbeat();
+          return;
+        }
+        try {
+          res.write(': ping\n\n');
+          sendSse(res, 'heartbeat', {
+            at: nowIso(),
+            phase: 'running'
+          });
+        } catch (_error) {
+          stopClaudeHeartbeat();
+        }
+      }, 11000);
 
       let claudeProcess = null;
       let claudeActiveRun = null;
@@ -22655,6 +22679,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       const finalizeClaudeRequest = ({ ok, exitCode, closeReason, output }) => {
         if (claudeFinished) return;
         claudeFinished = true;
+        stopClaudeHeartbeat();
         claudeWatchdog.clear();
         const safeOutput = String(output || '').trim() || '(Sin salida de Claude Code)';
         const runWasKilled = Boolean(claudeActiveRun && claudeActiveRun.killRequested);
