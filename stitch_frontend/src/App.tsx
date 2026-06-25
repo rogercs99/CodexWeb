@@ -2894,13 +2894,13 @@ export default function App() {
       )}
 
       {/* Token Saver Panel - lateral derecho */}
-      {screen === 'chat' && currentConversation && (
-        <TokenSaverPanel chatId={currentConversation.id} />
+      {screen === 'chat' && activeConversationId !== null && (
+        <TokenSaverPanel chatId={activeConversationId} />
       )}
 
       {/* Terminal Live Panel - lateral derecho inferior */}
-      {screen === 'chat' && currentConversation && (
-        <TerminalLivePanel chatId={currentConversation.id} />
+      {screen === 'chat' && activeConversationId !== null && (
+        <TerminalLivePanel chatId={activeConversationId} />
       )}
     </div>
   );
