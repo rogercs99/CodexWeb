@@ -262,6 +262,27 @@ function buildOptimizedContext(allMessages, settings, currentPrompt) {
     };
   }
 
+  // ── Phase 4: Listen-Only Mode (shortcut para confirmaciones) ──
+  if (detectListenOnlyMode(currentPrompt)) {
+    const listenOnly = buildListenOnlyContext(normalized, currentPrompt);
+    listenOnly.estimatedSavings = Math.max(0, tokensBefore - listenOnly.estimatedTokensAfter);
+    listenOnly.savingsPercent = tokensBefore > 0
+      ? Math.round((listenOnly.estimatedSavings / tokensBefore) * 100)
+      : 0;
+    return listenOnly;
+  }
+
+  // ── Phase 5: Command Context Freeze (para comandos largos) ──
+  const lastAssistant = [...normalized].reverse().find(m => m.role === 'assistant');
+  if (lastAssistant && detectCommandContextFreeze(lastAssistant.content)) {
+    const commandFreeze = buildCommandFreezeContext(normalized, s);
+    commandFreeze.estimatedSavings = Math.max(0, tokensBefore - commandFreeze.estimatedTokensAfter);
+    commandFreeze.savingsPercent = tokensBefore > 0
+      ? Math.round((commandFreeze.estimatedSavings / tokensBefore) * 100)
+      : 0;
+    return commandFreeze;
+  }
+
   // Apply window: take last N messages
   const windowSize = Math.max(1, s.recentMessagesCount || 12);
   const windowed = normalized.slice(-windowSize);
@@ -474,6 +495,126 @@ function buildSummaryRequestMessages(oldMessages) {
   ];
 }
 
+// ─── Phase 4: Listen-Only Mode ───────────────────────────────────────────────
+
+/**
+ * Detecta si el mensaje del usuario es de tipo "escucha" (sin necesidad de respuesta detallada).
+ * Patrones: "ok", "continúa", "sigue", "adelante", comandos de confirmación.
+ * En estos casos, podemos omitir TODO el contexto y solo enviar un ACK mínimo.
+ */
+function detectListenOnlyMode(prompt) {
+  if (!prompt || typeof prompt !== 'string') return false;
+  const trimmed = prompt.trim().toLowerCase();
+  const listenOnlyPatterns = [
+    /^(ok|okay|oks?|vale|bien|entendido|claro|s[íi]|yes|y|adelante|continua|sigue|procede|go|next|siguiente)$/,
+    /^(hazlo|h[áa]zmelo|aplicalo|impl[ée]mentalo|ejecuta)$/,
+    /^(👍|✓|✔️|👌)$/,
+    /^(continue|proceed|go ahead)$/i
+  ];
+  return listenOnlyPatterns.some(regex => regex.test(trimmed));
+}
+
+/**
+ * Construye contexto ultra-mínimo para Listen-Only.
+ * Solo incluye el último mensaje del asistente (si existe) + el prompt actual.
+ * Ahorro típico: 85-95% en prompts de confirmación.
+ */
+function buildListenOnlyContext(allMessages, currentPrompt) {
+  const lastAssistantMessage = [...allMessages]
+    .reverse()
+    .find(m => m.role === 'assistant');
+
+  const minimal = lastAssistantMessage
+    ? [{ role: 'assistant', content: truncateMiddle(lastAssistantMessage.content, 800, 300, 400) }]
+    : [];
+
+  return {
+    messages: minimal,
+    sections: {
+      type: 'listen-only',
+      totalMessages: allMessages.length,
+      messageCount: minimal.length,
+      skippedMessages: allMessages.length - minimal.length
+    },
+    estimatedTokensBefore: estimateTokens(allMessages.map(m => m.content).join('\n')),
+    estimatedTokensAfter: estimateTokens(minimal.map(m => m.content).join('\n')),
+    estimatedSavings: 0,
+    savingsPercent: 0
+  };
+}
+
+// ─── Phase 5: Command Context Freeze ─────────────────────────────────────────
+
+/**
+ * Detecta si el asistente está ejecutando un comando largo que no requiere contexto.
+ * Patrones: npm install, build, git clone, compilaciones, descargas.
+ * Durante estos comandos, el contexto puede congelarse completamente.
+ */
+function detectCommandContextFreeze(lastAssistantContent) {
+  if (!lastAssistantContent || typeof lastAssistantContent !== 'string') return false;
+  const lower = lastAssistantContent.toLowerCase();
+  const freezePatterns = [
+    /npm\s+(install|i|ci|run\s+build|run\s+test)/,
+    /git\s+clone/,
+    /yarn\s+(install|build)/,
+    /pnpm\s+(install|build)/,
+    /docker\s+build/,
+    /cargo\s+build/,
+    /mvn\s+(clean|install|package)/,
+    /gradle\s+build/,
+    /executing.*command/i,
+    /running.*build/i,
+    /downloading/i,
+    /installing.*packages/i
+  ];
+  return freezePatterns.some(regex => regex.test(lower));
+}
+
+/**
+ * Construye contexto congelado para comandos largos.
+ * Solo incluye: último mensaje del usuario + confirmación de comando ejecutándose.
+ * Ahorro típico: 70-90% durante ejecución de comandos largos.
+ */
+function buildCommandFreezeContext(allMessages, settings) {
+  const lastUserMessage = [...allMessages]
+    .reverse()
+    .find(m => m.role === 'user');
+
+  const lastAssistantMessage = [...allMessages]
+    .reverse()
+    .find(m => m.role === 'assistant');
+
+  const frozen = [];
+  if (lastUserMessage) {
+    frozen.push({
+      role: 'user',
+      content: truncateMiddle(lastUserMessage.content, 500, 200, 200)
+    });
+  }
+  if (lastAssistantMessage) {
+    // Solo primeras líneas del comando ejecutándose
+    const lines = lastAssistantMessage.content.split('\n').slice(0, 5).join('\n');
+    frozen.push({
+      role: 'assistant',
+      content: lines + '\n[...comando en ejecución, contexto congelado...]'
+    });
+  }
+
+  return {
+    messages: frozen,
+    sections: {
+      type: 'command-freeze',
+      totalMessages: allMessages.length,
+      messageCount: frozen.length,
+      skippedMessages: allMessages.length - frozen.length
+    },
+    estimatedTokensBefore: estimateTokens(allMessages.map(m => m.content).join('\n')),
+    estimatedTokensAfter: estimateTokens(frozen.map(m => m.content).join('\n')),
+    estimatedSavings: 0,
+    savingsPercent: 0
+  };
+}
+
 // ─── Brevity instruction ──────────────────────────────────────────────────────
 
 const BREVITY_INSTRUCTION_BY_MODE = {
@@ -507,5 +648,10 @@ module.exports = {
   getBrevityInstruction,
   buildSummaryRequestMessages,
   createSettingsStatementsFor,
-  parseSettingsRow
+  parseSettingsRow,
+  // New Phase 4 & 5 exports
+  detectListenOnlyMode,
+  buildListenOnlyContext,
+  detectCommandContextFreeze,
+  buildCommandFreezeContext
 };

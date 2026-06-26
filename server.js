@@ -18926,6 +18926,189 @@ app.get('/api/tools/deployed-apps/:appId/logs', requireAuth, (req, res) => {
   });
 });
 
+app.post('/api/tools/terminal-live/stream', requireAuth, (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) {
+    return res.status(400).json({ error: 'user_id inválido' });
+  }
+
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const command = String(body.command || '').trim();
+  if (!command) {
+    return res.status(400).json({ error: 'Comando vacío. Escribe un comando a ejecutar.' });
+  }
+
+  const dangerHits = detectSteamDeckDangerousCommand(command);
+  const confirmDangerous = parseBooleanSetting(body.confirmDangerous, false);
+  if (dangerHits.length > 0 && !confirmDangerous) {
+    return res.status(409).json({
+      error: 'Comando potencialmente peligroso detectado. Confirma explícitamente para continuar.',
+      dangerousDetected: true,
+      warnings: dangerHits
+    });
+  }
+
+  const timeoutMs = normalizeSteamDeckTimeoutMs(body.timeoutMs, 180000);
+
+  res.status(200);
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  req.setTimeout(0);
+  res.setTimeout(0);
+  if (req.socket && typeof req.socket.setTimeout === 'function') {
+    req.socket.setTimeout(0);
+  }
+  if (res.socket && typeof res.socket.setTimeout === 'function') {
+    res.socket.setTimeout(0);
+  }
+  if (req.socket && typeof req.socket.setKeepAlive === 'function') {
+    req.socket.setKeepAlive(true);
+  }
+  if (req.socket && typeof req.socket.setNoDelay === 'function') {
+    req.socket.setNoDelay(true);
+  }
+  if (res.socket && typeof res.socket.setKeepAlive === 'function') {
+    res.socket.setKeepAlive(true);
+  }
+  if (res.socket && typeof res.socket.setNoDelay === 'function') {
+    res.socket.setNoDelay(true);
+  }
+  res.flushHeaders();
+
+  let clientDisconnected = false;
+  let bashProcess = null;
+  let killed = false;
+  let timer = null;
+
+  const sseWrite = (data) => {
+    if (clientDisconnected || res.writableEnded || res.destroyed) return;
+    try {
+      res.write(data);
+    } catch (_error) {
+      // cliente desconectado
+    }
+  };
+
+  const sseEvent = (event, payload) => {
+    const data = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    sseWrite(`event: ${event}\ndata: ${data}\n\n`);
+  };
+
+  const cleanup = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (bashProcess && !killed) {
+      killed = true;
+      try {
+        bashProcess.kill('SIGTERM');
+        setTimeout(() => {
+          if (bashProcess && !bashProcess.killed) {
+            bashProcess.kill('SIGKILL');
+          }
+        }, 2000);
+      } catch (_error) {
+        // no-op
+      }
+    }
+  };
+
+  req.on('close', () => {
+    clientDisconnected = true;
+    cleanup();
+  });
+
+  const sessionId = crypto.randomBytes(12).toString('hex');
+  const startedAt = nowIso();
+  const startedAtMs = Date.now();
+
+  sseEvent('session', {
+    id: sessionId,
+    command,
+    startedAt,
+    cwd: repoRootDir,
+    runAsUser: process.env.USER || 'unknown',
+    timeoutMs,
+    warnings: dangerHits
+  });
+
+  sseEvent('state', { state: 'executing' });
+
+  bashProcess = spawn('bash', ['-c', command], {
+    cwd: repoRootDir,
+    env: { ...process.env },
+    shell: false,
+    timeout: 0
+  });
+
+  let stdoutBuffer = '';
+  let stderrBuffer = '';
+  let exitCode = null;
+  let timedOut = false;
+  const maxOutputChars = 500000;
+
+  bashProcess.stdout.on('data', (chunk) => {
+    const text = chunk.toString('utf8');
+    stdoutBuffer += text;
+    if (stdoutBuffer.length > maxOutputChars) {
+      stdoutBuffer = stdoutBuffer.slice(stdoutBuffer.length - maxOutputChars);
+    }
+    sseEvent('stdout', { text });
+  });
+
+  bashProcess.stderr.on('data', (chunk) => {
+    const text = chunk.toString('utf8');
+    stderrBuffer += text;
+    if (stderrBuffer.length > maxOutputChars) {
+      stderrBuffer = stderrBuffer.slice(stderrBuffer.length - maxOutputChars);
+    }
+    sseEvent('stderr', { text });
+  });
+
+  bashProcess.on('error', (error) => {
+    sseEvent('state', { state: 'error' });
+  });
+
+  bashProcess.on('close', (code, signal) => {
+    cleanup();
+    exitCode = code !== null ? code : (signal ? -1 : 0);
+    const finishedAt = nowIso();
+    const durationMs = Date.now() - startedAtMs;
+    const outputTruncated = stdoutBuffer.length >= maxOutputChars || stderrBuffer.length >= maxOutputChars;
+    const ok = exitCode === 0 && !timedOut;
+
+    sseEvent('done', {
+      ok,
+      timedOut,
+      exitCode,
+      signal: signal || null,
+      finishedAt,
+      durationMs,
+      stdout: stdoutBuffer,
+      stderr: stderrBuffer,
+      outputTruncated
+    });
+
+    if (!clientDisconnected && !res.writableEnded && !res.destroyed) {
+      try {
+        res.end();
+      } catch (_error) {
+        // no-op
+      }
+    }
+  });
+
+  timer = setTimeout(() => {
+    if (!bashProcess || killed) return;
+    timedOut = true;
+    sseEvent('state', { state: 'timeout' });
+    cleanup();
+  }, timeoutMs);
+});
+
 app.get('/api/tools/storage/local/list', requireAuth, (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
   if (!safeUserId) {
@@ -21953,13 +22136,23 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       sendSseComment(res, 'ok');
       sendSse(res, 'conversation', { conversationId });
       if (tsResult) {
+        const tsMode = (tsResult.sections && tsResult.sections.mode) || 'off';
+        const tsType = tsResult.sections && tsResult.sections.type;
         sendSse(res, 'ts_stats', {
           savings: tsResult.estimatedSavings || 0,
           before: tsResult.estimatedTokensBefore || 0,
           after: tsResult.estimatedTokensAfter || 0,
           percent: tsResult.savingsPercent || 0,
-          mode: (tsResult.sections && tsResult.sections.mode) || 'off'
+          mode: tsMode,
+          type: tsType,
+          messagesBefore: (tsResult.sections && tsResult.sections.totalMessages) || 0,
+          messagesAfter: (tsResult.sections && tsResult.sections.messageCount) || 0,
+          skipped: (tsResult.sections && tsResult.sections.skippedMessages) || 0
         });
+        // Log para debugging
+        if (tsMode === 'listen-only' || tsMode === 'command-freeze') {
+          console.log(`[token-saver] ${tsMode} activado: ${tsResult.savingsPercent}% ahorro (${tsResult.estimatedSavings} tokens)`);
+        }
       }
       sendSse(res, 'chat_agent', {
         id: chatRuntime.activeAgentId,
@@ -22579,13 +22772,23 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       sendSseComment(res, 'ok');
       sendSse(res, 'conversation', { conversationId });
       if (tsResult) {
+        const tsMode = (tsResult.sections && tsResult.sections.mode) || 'off';
+        const tsType = tsResult.sections && tsResult.sections.type;
         sendSse(res, 'ts_stats', {
           savings: tsResult.estimatedSavings || 0,
           before: tsResult.estimatedTokensBefore || 0,
           after: tsResult.estimatedTokensAfter || 0,
           percent: tsResult.savingsPercent || 0,
-          mode: (tsResult.sections && tsResult.sections.mode) || 'off'
+          mode: tsMode,
+          type: tsType,
+          messagesBefore: (tsResult.sections && tsResult.sections.totalMessages) || 0,
+          messagesAfter: (tsResult.sections && tsResult.sections.messageCount) || 0,
+          skipped: (tsResult.sections && tsResult.sections.skippedMessages) || 0
         });
+        // Log para debugging
+        if (tsMode === 'listen-only' || tsMode === 'command-freeze') {
+          console.log(`[token-saver] ${tsMode} activado: ${tsResult.savingsPercent}% ahorro (${tsResult.estimatedSavings} tokens)`);
+        }
       }
       sendSse(res, 'chat_agent', {
         id: chatRuntime.activeAgentId,
@@ -23233,13 +23436,23 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       sendSseComment(res, 'ok');
       sendSse(res, 'conversation', { conversationId });
       if (tsResult) {
+        const tsMode = (tsResult.sections && tsResult.sections.mode) || 'off';
+        const tsType = tsResult.sections && tsResult.sections.type;
         sendSse(res, 'ts_stats', {
           savings: tsResult.estimatedSavings || 0,
           before: tsResult.estimatedTokensBefore || 0,
           after: tsResult.estimatedTokensAfter || 0,
           percent: tsResult.savingsPercent || 0,
-          mode: (tsResult.sections && tsResult.sections.mode) || 'off'
+          mode: tsMode,
+          type: tsType,
+          messagesBefore: (tsResult.sections && tsResult.sections.totalMessages) || 0,
+          messagesAfter: (tsResult.sections && tsResult.sections.messageCount) || 0,
+          skipped: (tsResult.sections && tsResult.sections.skippedMessages) || 0
         });
+        // Log para debugging
+        if (tsMode === 'listen-only' || tsMode === 'command-freeze') {
+          console.log(`[token-saver] ${tsMode} activado: ${tsResult.savingsPercent}% ahorro (${tsResult.estimatedSavings} tokens)`);
+        }
       }
       sendSse(res, 'chat_agent', {
         id: chatRuntime.activeAgentId,
