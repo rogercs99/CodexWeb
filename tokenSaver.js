@@ -506,8 +506,8 @@ function detectListenOnlyMode(prompt) {
   if (!prompt || typeof prompt !== 'string') return false;
   const trimmed = prompt.trim().toLowerCase();
   const listenOnlyPatterns = [
-    /^(ok|okay|oks?|vale|bien|entendido|claro|s[íi]|yes|y|adelante|continua|sigue|procede|go|next|siguiente)$/,
-    /^(hazlo|h[áa]zmelo|aplicalo|impl[ée]mentalo|ejecuta)$/,
+    /^(ok|okay|oks?|vale|bien|entendido|claro|s[íi]|yes|y|adelante|contin[uú]a|sigue|procede|go|next|siguiente)$/,
+    /^(hazlo|h[áa]zmelo|apl[íi]calo|impl[ée]mentalo|ejecuta)$/,
     /^(👍|✓|✔️|👌)$/,
     /^(continue|proceed|go ahead)$/i
   ];
