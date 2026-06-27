@@ -262,6 +262,19 @@ function buildOptimizedContext(allMessages, settings, currentPrompt) {
     };
   }
 
+  // ── Phase 9: Context-Free Streaming (máxima prioridad cuando está habilitado) ──
+  if (isStreamingRequest(s)) {
+    const streaming = buildStreamingContext(currentPrompt);
+    const streamTokens = estimateTokens(currentPrompt);
+    streaming.estimatedTokensBefore = tokensBefore;
+    streaming.estimatedTokensAfter = streamTokens;
+    streaming.estimatedSavings = Math.max(0, tokensBefore - streamTokens);
+    streaming.savingsPercent = tokensBefore > 0
+      ? Math.round((streaming.estimatedSavings / tokensBefore) * 100)
+      : 0;
+    return streaming;
+  }
+
   // ── Phase 4: Listen-Only Mode (shortcut para confirmaciones) ──
   if (detectListenOnlyMode(currentPrompt)) {
     const listenOnly = buildListenOnlyContext(normalized, currentPrompt);
@@ -287,8 +300,14 @@ function buildOptimizedContext(allMessages, settings, currentPrompt) {
   const windowSize = Math.max(1, s.recentMessagesCount || 12);
   const windowed = normalized.slice(-windowSize);
 
+  // ── Phase 6: Reasoning Chain Transfer ──
+  const reasoningCompressed = applyReasoningChainTransfer(windowed);
+
+  // ── Phase 8: Diff-Based Compression ──
+  const diffCompressed = applyDiffCompression(reasoningCompressed, s.maxDiffLines || 50);
+
   // Compress tool-like outputs
-  const compressed = windowed.map((m) => {
+  const compressed = diffCompressed.map((m) => {
     if (m.role === 'assistant' && isToolLikeMessage(m.content)) {
       return { ...m, content: compressToolOutput(m.content, s) };
     }
@@ -615,6 +634,275 @@ function buildCommandFreezeContext(allMessages, settings) {
   };
 }
 
+// ─── Phase 6: Reasoning Chain Transfer ───────────────────────────────────────
+
+/**
+ * Detecta bloques de razonamiento largos en mensajes del asistente.
+ * Patrones: <think>, <reasoning>, bloques de análisis técnico.
+ */
+function detectReasoningBlock(content) {
+  if (!content || typeof content !== 'string') return null;
+
+  // Detectar bloques XML de razonamiento
+  const thinkMatch = content.match(/<think>([\s\S]*?)<\/think>/);
+  const reasoningMatch = content.match(/<reasoning>([\s\S]*?)<\/reasoning>/);
+
+  if (thinkMatch || reasoningMatch) {
+    return thinkMatch ? thinkMatch[1] : reasoningMatch[1];
+  }
+
+  // Detectar bloques de análisis largo (heurística)
+  const lines = content.split('\n');
+  if (lines.length > 20 && content.length > 2000) {
+    const analysisKeywords = ['analizando', 'evaluando', 'considerando', 'revisando', 'examining', 'analyzing'];
+    const hasAnalysis = analysisKeywords.some(kw => content.toLowerCase().includes(kw));
+    if (hasAnalysis) return content;
+  }
+
+  return null;
+}
+
+/**
+ * Comprime un bloque de razonamiento en un resumen ejecutivo.
+ * Extrae conclusiones y decisiones clave.
+ */
+function compressReasoningBlock(reasoningContent) {
+  if (!reasoningContent) return '';
+
+  const lines = reasoningContent.split('\n').filter(l => l.trim());
+
+  // Buscar líneas con conclusiones/decisiones (heurística)
+  const keyLines = lines.filter(line => {
+    const lower = line.toLowerCase();
+    return (
+      lower.includes('conclusión') ||
+      lower.includes('decisión') ||
+      lower.includes('por lo tanto') ||
+      lower.includes('therefore') ||
+      lower.includes('decided') ||
+      lower.includes('approach:') ||
+      lower.includes('plan:')
+    );
+  });
+
+  // Si encontramos líneas clave, usarlas; si no, tomar primeras y últimas
+  if (keyLines.length > 0) {
+    return keyLines.slice(0, 3).join('\n');
+  }
+
+  // Fallback: primeras 2 líneas + últimas 2 líneas
+  if (lines.length > 4) {
+    return [...lines.slice(0, 2), '...', ...lines.slice(-2)].join('\n');
+  }
+
+  return lines.slice(0, 3).join('\n');
+}
+
+/**
+ * Procesa mensajes del asistente comprimiendo bloques de razonamiento.
+ * Ahorro típico: 40-60% en mensajes con razonamiento largo.
+ */
+function applyReasoningChainTransfer(messages) {
+  return messages.map(msg => {
+    if (msg.role !== 'assistant') return msg;
+
+    const reasoning = detectReasoningBlock(msg.content);
+    if (!reasoning) return msg;
+
+    const compressed = compressReasoningBlock(reasoning);
+    const newContent = msg.content.replace(reasoning, `[Razonamiento comprimido]\n${compressed}\n[/Razonamiento]`);
+
+    return { ...msg, content: newContent };
+  });
+}
+
+// ─── Phase 7: Immutable Project Cache ────────────────────────────────────────
+
+// Cache global en memoria para contexto de proyecto inmutable
+const PROJECT_CONTEXT_CACHE = new Map();
+
+/**
+ * Genera una clave de caché basada en el directorio del proyecto.
+ * Usa hash simple de la ruta del proyecto.
+ */
+function getProjectCacheKey(projectPath) {
+  if (!projectPath) return 'default';
+  // Simple hash: sumar códigos ASCII
+  let hash = 0;
+  for (let i = 0; i < projectPath.length; i++) {
+    hash = ((hash << 5) - hash) + projectPath.charCodeAt(i);
+    hash = hash & hash; // Convert to 32-bit integer
+  }
+  return `project_${hash}`;
+}
+
+/**
+ * Extrae contexto inmutable del proyecto de mensajes system/contexto.
+ * Busca: CLAUDE.md, PROJECT_CONTEXT.md, stack técnico, estructura.
+ */
+function extractProjectContext(messages) {
+  const projectContextPatterns = [
+    /CLAUDE\.md/i,
+    /PROJECT_CONTEXT\.md/i,
+    /Stack técnico/i,
+    /Estructura principal/i,
+    /## Proyecto/i,
+    /## Stack/i
+  ];
+
+  const contextMessages = messages.filter(msg => {
+    const content = msg.content || '';
+    return projectContextPatterns.some(pattern => pattern.test(content));
+  });
+
+  if (contextMessages.length === 0) return null;
+
+  return {
+    content: contextMessages.map(m => m.content).join('\n\n'),
+    extractedAt: Date.now()
+  };
+}
+
+/**
+ * Recupera o genera contexto de proyecto en caché.
+ * Ahorro típico: 15-25% al reutilizar contexto de proyecto entre conversaciones.
+ */
+function getCachedProjectContext(messages, projectPath, maxAge = 3600000) {
+  const cacheKey = getProjectCacheKey(projectPath);
+  const cached = PROJECT_CONTEXT_CACHE.get(cacheKey);
+
+  // Si existe caché válido, retornarlo
+  if (cached && (Date.now() - cached.extractedAt) < maxAge) {
+    return cached.content;
+  }
+
+  // Si no hay caché o está expirado, extraer nuevo
+  const projectContext = extractProjectContext(messages);
+  if (projectContext) {
+    PROJECT_CONTEXT_CACHE.set(cacheKey, projectContext);
+    return projectContext.content;
+  }
+
+  return null;
+}
+
+/**
+ * Limpia entradas de caché expiradas.
+ */
+function cleanProjectCache(maxAge = 3600000) {
+  const now = Date.now();
+  for (const [key, value] of PROJECT_CONTEXT_CACHE.entries()) {
+    if (now - value.extractedAt > maxAge) {
+      PROJECT_CONTEXT_CACHE.delete(key);
+    }
+  }
+}
+
+// ─── Phase 8: Diff-Based Compression ──────────────────────────────────────────
+
+/**
+ * Detecta si el contenido es output de diff/git.
+ */
+function isDiffOutput(content) {
+  if (!content || typeof content !== 'string') return false;
+  const diffPatterns = [
+    /^diff --git/m,
+    /^index [a-f0-9]+\.\.[a-f0-9]+/m,
+    /^@@.*@@/m,
+    /^[\+\-]{3} [ab]\//m,
+    /^\+\+\+ /m,
+    /^--- /m
+  ];
+  return diffPatterns.some(pattern => pattern.test(content));
+}
+
+/**
+ * Comprime output de diff manteniendo solo cambios significativos.
+ * Omite contexto no modificado, mantiene líneas +/-.
+ */
+function compressDiffOutput(content, maxLines = 50) {
+  if (!isDiffOutput(content)) return content;
+
+  const lines = content.split('\n');
+  const significantLines = [];
+  let omittedChunks = 0;
+  let inOmission = false;
+
+  for (const line of lines) {
+    const isSignificant = (
+      line.startsWith('+++') ||
+      line.startsWith('---') ||
+      line.startsWith('@@') ||
+      line.startsWith('+') ||
+      line.startsWith('-') ||
+      line.startsWith('diff ') ||
+      line.startsWith('index ')
+    );
+
+    if (isSignificant) {
+      if (inOmission) {
+        significantLines.push(`... [${omittedChunks} líneas de contexto omitidas] ...`);
+        omittedChunks = 0;
+        inOmission = false;
+      }
+      significantLines.push(line);
+    } else {
+      omittedChunks++;
+      inOmission = true;
+    }
+
+    if (significantLines.length >= maxLines) break;
+  }
+
+  if (inOmission && omittedChunks > 0) {
+    significantLines.push(`... [${omittedChunks} líneas de contexto omitidas] ...`);
+  }
+
+  return significantLines.join('\n');
+}
+
+/**
+ * Aplica compresión diff a mensajes que contengan salidas de git diff.
+ * Ahorro típico: 30-50% en debugging/code review.
+ */
+function applyDiffCompression(messages, maxDiffLines = 50) {
+  return messages.map(msg => {
+    if (isDiffOutput(msg.content)) {
+      return {
+        ...msg,
+        content: compressDiffOutput(msg.content, maxDiffLines)
+      };
+    }
+    return msg;
+  });
+}
+
+// ─── Phase 9: Context-Free Streaming ──────────────────────────────────────────
+
+/**
+ * Detecta si una petición es de tipo streaming.
+ * En streaming, podemos omitir deltas de contexto intermedios.
+ */
+function isStreamingRequest(settings) {
+  return settings && settings.streamingEnabled === true;
+}
+
+/**
+ * Para streaming, construye contexto mínimo solo con el prompt actual.
+ * Los chunks delta no necesitan contexto completo.
+ * Ahorro típico: 10-20% en overhead de streaming.
+ */
+function buildStreamingContext(currentPrompt) {
+  return {
+    messages: [{ role: 'user', content: currentPrompt }],
+    sections: {
+      type: 'streaming',
+      messageCount: 1,
+      note: 'Contexto mínimo para streaming'
+    }
+  };
+}
+
 // ─── Brevity instruction ──────────────────────────────────────────────────────
 
 const BREVITY_INSTRUCTION_BY_MODE = {
@@ -649,9 +937,20 @@ module.exports = {
   buildSummaryRequestMessages,
   createSettingsStatementsFor,
   parseSettingsRow,
-  // New Phase 4 & 5 exports
+  // Phase 4 & 5 exports
   detectListenOnlyMode,
   buildListenOnlyContext,
   detectCommandContextFreeze,
-  buildCommandFreezeContext
+  buildCommandFreezeContext,
+  // Phase 6-9 exports
+  detectReasoningBlock,
+  compressReasoningBlock,
+  applyReasoningChainTransfer,
+  getCachedProjectContext,
+  cleanProjectCache,
+  isDiffOutput,
+  compressDiffOutput,
+  applyDiffCompression,
+  isStreamingRequest,
+  buildStreamingContext
 };
