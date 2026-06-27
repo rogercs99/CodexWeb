@@ -936,7 +936,32 @@ export default function ChatScreen({
                     ))}
                   </div>
                 ) : null}
-                <p className="text-[10px] text-zinc-500 mt-2">{formatDate(message.created_at)}</p>
+                <p className="text-[10px] text-zinc-500 mt-2">
+                  {formatDate(message.created_at)}
+                  {message.role === 'user' && message.tokens_before != null && message.tokens_after != null ? (
+                    <span className="ml-2 text-zinc-400">
+                      • {message.tokens_before.toLocaleString('es-ES')} → {message.tokens_after.toLocaleString('es-ES')} tokens
+                      {message.savings_percent != null && message.savings_percent > 0 ? (
+                        <span className="text-emerald-400"> (-{message.savings_percent}%)</span>
+                      ) : null}
+                    </span>
+                  ) : null}
+                  {message.input_tokens != null && message.input_tokens > 0 ? (
+                    <span className="ml-2 text-blue-400">
+                      • {message.input_tokens.toLocaleString('es-ES')} in
+                    </span>
+                  ) : null}
+                  {message.output_tokens != null && message.output_tokens > 0 ? (
+                    <span className="ml-2 text-purple-400">
+                      • {message.output_tokens.toLocaleString('es-ES')} out
+                    </span>
+                  ) : null}
+                  {message.total_cost != null && message.total_cost > 0 ? (
+                    <span className="ml-2 text-yellow-400">
+                      • ${message.total_cost.toFixed(4)}
+                    </span>
+                  ) : null}
+                </p>
               </div>
             </div>
           );

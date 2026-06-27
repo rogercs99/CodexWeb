@@ -170,6 +170,13 @@ export interface Message {
   content: string;
   created_at: string;
   attachments?: MessageAttachment[];
+  tokens_before?: number | null;
+  tokens_after?: number | null;
+  tokens_saved?: number | null;
+  savings_percent?: number | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  total_cost?: number | null;
 }
 
 export interface MessagesPagination {

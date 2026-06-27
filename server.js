@@ -1099,6 +1099,32 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// Token estimation and cost calculation (rough estimates based on character count)
+function estimateTokenCount(text) {
+  if (!text) return 0;
+  // Rough estimate: ~4 characters per token for English text
+  return Math.ceil(String(text).length / 4);
+}
+
+function calculateTokenCost(inputTokens, outputTokens, model = 'claude-sonnet-4-5') {
+  // Precios aproximados por 1M tokens (en USD) - actualizar según pricing real
+  const pricing = {
+    'claude-opus-4': { input: 15.00, output: 75.00 },
+    'claude-sonnet-4-5': { input: 3.00, output: 15.00 },
+    'claude-haiku-4-5': { input: 0.80, output: 4.00 },
+    'codex': { input: 0.00, output: 0.00 }, // Codex es gratis
+    'gemini': { input: 0.00, output: 0.00 }
+  };
+
+  const modelKey = Object.keys(pricing).find(k => model && model.includes(k)) || 'claude-sonnet-4-5';
+  const rates = pricing[modelKey];
+
+  const inputCost = (inputTokens / 1000000) * rates.input;
+  const outputCost = (outputTokens / 1000000) * rates.output;
+
+  return inputCost + outputCost;
+}
+
 function resolveCredentialsEncryptionKey() {
   const configured = String(process.env.CREDENTIALS_ENCRYPTION_KEY || '').trim();
   let source = configured;
@@ -11145,6 +11171,13 @@ CREATE TABLE IF NOT EXISTS messages (
   role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
   content TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  tokens_before INTEGER,
+  tokens_after INTEGER,
+  tokens_saved INTEGER,
+  savings_percent INTEGER,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  total_cost REAL,
   FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
@@ -11418,6 +11451,11 @@ function hasUserAgentPermissionsColumn(columnName) {
   return columns.some((column) => String(column && column.name) === columnName);
 }
 
+function hasMessageColumn(columnName) {
+  const columns = db.prepare('PRAGMA table_info(messages)').all();
+  return columns.some((column) => String(column && column.name) === columnName);
+}
+
 if (!hasConversationColumn('model')) {
   db.exec("ALTER TABLE conversations ADD COLUMN model TEXT NOT NULL DEFAULT ''");
 }
@@ -11474,6 +11512,22 @@ if (!hasChatProjectColumn('auto_last_message_id')) {
 
 if (!hasChatProjectColumn('auto_updated_at')) {
   db.exec("ALTER TABLE chat_projects ADD COLUMN auto_updated_at TEXT NOT NULL DEFAULT ''");
+}
+
+if (!hasMessageColumn('tokens_before')) {
+  db.exec('ALTER TABLE messages ADD COLUMN tokens_before INTEGER');
+}
+
+if (!hasMessageColumn('tokens_after')) {
+  db.exec('ALTER TABLE messages ADD COLUMN tokens_after INTEGER');
+}
+
+if (!hasMessageColumn('tokens_saved')) {
+  db.exec('ALTER TABLE messages ADD COLUMN tokens_saved INTEGER');
+}
+
+if (!hasMessageColumn('savings_percent')) {
+  db.exec('ALTER TABLE messages ADD COLUMN savings_percent INTEGER');
 }
 
 db.exec(`
@@ -11698,10 +11752,16 @@ const createConversationStmt = db.prepare(
   'INSERT INTO conversations (user_id, project_id, title, model, reasoning_effort, deck_chat) VALUES (?, ?, ?, ?, ?, ?)'
 );
 const insertMessageStmt = db.prepare(
-  'INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)'
+  'INSERT INTO messages (conversation_id, role, content, tokens_before, tokens_after, tokens_saved, savings_percent, input_tokens, output_tokens, total_cost) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
 );
 const updateMessageContentStmt = db.prepare(
   'UPDATE messages SET content = ? WHERE id = ?'
+);
+const updateMessageTokensStmt = db.prepare(
+  'UPDATE messages SET tokens_before = ?, tokens_after = ?, tokens_saved = ?, savings_percent = ? WHERE id = ?'
+);
+const updateMessageContentAndTokensStmt = db.prepare(
+  'UPDATE messages SET content = ?, input_tokens = ?, output_tokens = ?, total_cost = ? WHERE id = ?'
 );
 const getConversationStmt = db.prepare(`
   SELECT
@@ -12739,20 +12799,20 @@ const listDeployedCloudBackupsForUserAndAppStmt = db.prepare(`
   LIMIT ?
 `);
 const listMessagesStmt = db.prepare(`
-  SELECT id, role, content, created_at
+  SELECT id, role, content, created_at, tokens_before, tokens_after, tokens_saved, savings_percent, input_tokens, output_tokens, total_cost
   FROM messages
   WHERE conversation_id = ?
   ORDER BY created_at ASC, id ASC
 `);
 const listMessagesPageDescStmt = db.prepare(`
-  SELECT id, role, content, created_at
+  SELECT id, role, content, created_at, tokens_before, tokens_after, tokens_saved, savings_percent, input_tokens, output_tokens, total_cost
   FROM messages
   WHERE conversation_id = ?
   ORDER BY created_at DESC, id DESC
   LIMIT ?
 `);
 const listMessagesBeforeIdPageDescStmt = db.prepare(`
-  SELECT id, role, content, created_at
+  SELECT id, role, content, created_at, tokens_before, tokens_after, tokens_saved, savings_percent, input_tokens, output_tokens, total_cost
   FROM messages
   WHERE conversation_id = ?
     AND id < ?
@@ -21971,7 +22031,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       taskRunId = null;
       taskSnapshot = null;
     }
-    const userMessage = insertMessageStmt.run(conversationId, 'user', prompt);
+    const userInputTokens = estimateTokenCount(prompt);
+    const userMessage = insertMessageStmt.run(conversationId, 'user', prompt, null, null, null, null, userInputTokens, 0, 0);
     userMessageId = Number(userMessage.lastInsertRowid);
     updateConversationTitleStmt.run(buildConversationTitle(prompt), conversationId);
     void notify(`Arranca request chat user=${username}`);
@@ -22009,6 +22070,20 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       effectiveTsSettings = getEffectiveTsSettings(req.session.userId, conversationId);
       tsResult = tokenSaver.buildOptimizedContext(conversationMessages, effectiveTsSettings, prompt);
       optimizedMessages = tsResult.messages;
+      // Update user message with token stats
+      if (userMessageId && tsResult) {
+        try {
+          updateMessageTokensStmt.run(
+            tsResult.estimatedTokensBefore || null,
+            tsResult.estimatedTokensAfter || null,
+            tsResult.estimatedSavings || null,
+            tsResult.savingsPercent || null,
+            userMessageId
+          );
+        } catch (error) {
+          void notify(`WARN token_stats_update_failed user=${username} msg=${userMessageId} reason=${error && error.message || 'unknown'}`);
+        }
+      }
       // Phase 3B — Auto-summarization: if there are skipped old messages, compress them
       if (tsResult.summarizeRequest && tsResult.summarizeRequest.oldMessages) {
         try {
@@ -22069,7 +22144,18 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         resolveAiProviderBaseUrl(selectedProviderId, providerIntegration) ||
         httpProviderAdapter.defaultBaseUrl;
 
-      const assistantMessage = insertMessageStmt.run(conversationId, 'assistant', '');
+      const assistantMessage = insertMessageStmt.run(
+        conversationId,
+        'assistant',
+        '',
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      );
       assistantMessageId = Number(assistantMessage.lastInsertRowid);
       const draftCreatedAt = nowIso();
       closeOpenDraftsByConversationStmt.run(draftCreatedAt, req.session.userId, conversationId);
@@ -22234,7 +22320,16 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         if (!assistantMessageId) return;
         if (!isFinal && assistantOutput === lastPersistedAssistantOutput) return;
         try {
-          updateMessageContentStmt.run(assistantOutput, assistantMessageId);
+          if (isFinal && assistantOutput) {
+            const outputTokens = estimateTokenCount(assistantOutput);
+            const conversationRow = getConversationStmt.get(conversationId);
+            const model = conversationRow && conversationRow.model || 'codex';
+            const inputTokens = userInputTokens || estimateTokenCount(prompt);
+            const cost = calculateTokenCost(inputTokens, outputTokens, model);
+            updateMessageContentAndTokensStmt.run(assistantOutput, inputTokens, outputTokens, cost, assistantMessageId);
+          } else {
+            updateMessageContentStmt.run(assistantOutput, assistantMessageId);
+          }
           lastPersistedAssistantOutput = assistantOutput;
           touchTaskRunHeartbeat();
           if (liveDraftId) {
@@ -22274,10 +22369,26 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           clearActiveChatRun(activeRun);
         }
 
+        const finalOutputTokens = estimateTokenCount(safeOutput);
+        const finalConvRow = getConversationStmt.get(conversationId);
+        const finalModel = finalConvRow && finalConvRow.model || 'codex';
+        const finalInputTokens = userInputTokens || estimateTokenCount(prompt);
+        const finalCost = calculateTokenCost(finalInputTokens, finalOutputTokens, finalModel);
         if (assistantMessageId) {
-          updateMessageContentStmt.run(safeOutput, assistantMessageId);
+          updateMessageContentAndTokensStmt.run(safeOutput, finalInputTokens, finalOutputTokens, finalCost, assistantMessageId);
         } else {
-          const fallbackMessage = insertMessageStmt.run(conversationId, 'assistant', safeOutput);
+          const fallbackMessage = insertMessageStmt.run(
+            conversationId,
+            'assistant',
+            safeOutput,
+            null,
+            null,
+            null,
+            null,
+            finalInputTokens,
+            finalOutputTokens,
+            finalCost
+          );
           assistantMessageId = Number(fallbackMessage.lastInsertRowid);
         }
         if (liveDraftId) {
@@ -22726,7 +22837,18 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         })
       };
 
-      const assistantMessageForClaude = insertMessageStmt.run(conversationId, 'assistant', '');
+      const assistantMessageForClaude = insertMessageStmt.run(
+        conversationId,
+        'assistant',
+        '',
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      );
       assistantMessageId = Number(assistantMessageForClaude.lastInsertRowid);
       const draftCreatedAtForClaude = nowIso();
       closeOpenDraftsByConversationStmt.run(draftCreatedAtForClaude, req.session.userId, conversationId);
@@ -22861,7 +22983,16 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         if (!assistantMessageId) return;
         if (!isFinal && claudeAssistantOutput === claudeLastPersisted) return;
         try {
-          updateMessageContentStmt.run(claudeAssistantOutput, assistantMessageId);
+          if (isFinal && claudeAssistantOutput) {
+            const outputTokens = estimateTokenCount(claudeAssistantOutput);
+            const conversationRow = getConversationStmt.get(conversationId);
+            const model = conversationRow && conversationRow.model || 'claude-sonnet-4-5';
+            const inputTokens = userInputTokens || estimateTokenCount(prompt);
+            const cost = calculateTokenCost(inputTokens, outputTokens, model);
+            updateMessageContentAndTokensStmt.run(claudeAssistantOutput, inputTokens, outputTokens, cost, assistantMessageId);
+          } else {
+            updateMessageContentStmt.run(claudeAssistantOutput, assistantMessageId);
+          }
           claudeLastPersisted = claudeAssistantOutput;
           touchTaskRunHeartbeat();
           if (liveDraftId) {
@@ -22893,10 +23024,26 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         const success = Boolean(ok) && !runWasKilled;
         if (claudeActiveRun) clearActiveChatRun(claudeActiveRun);
 
+        const claudeOutputTokens = estimateTokenCount(safeOutput);
+        const claudeConvRow = getConversationStmt.get(conversationId);
+        const claudeModel = claudeConvRow && claudeConvRow.model || 'claude';
+        const claudeInputTokens = userInputTokens || estimateTokenCount(prompt);
+        const claudeCost = calculateTokenCost(claudeInputTokens, claudeOutputTokens, claudeModel);
         if (assistantMessageId) {
-          updateMessageContentStmt.run(safeOutput, assistantMessageId);
+          updateMessageContentAndTokensStmt.run(safeOutput, claudeInputTokens, claudeOutputTokens, claudeCost, assistantMessageId);
         } else {
-          const fallback = insertMessageStmt.run(conversationId, 'assistant', safeOutput);
+          const fallback = insertMessageStmt.run(
+            conversationId,
+            'assistant',
+            safeOutput,
+            null,
+            null,
+            null,
+            null,
+            claudeInputTokens,
+            claudeOutputTokens,
+            claudeCost
+          );
           assistantMessageId = Number(fallback.lastInsertRowid);
         }
         if (liveDraftId) {
@@ -23369,7 +23516,18 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         );
       }
 
-      const assistantMessage = insertMessageStmt.run(conversationId, 'assistant', '');
+      const assistantMessage = insertMessageStmt.run(
+        conversationId,
+        'assistant',
+        '',
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      );
       assistantMessageId = Number(assistantMessage.lastInsertRowid);
       const draftCreatedAt = nowIso();
       closeOpenDraftsByConversationStmt.run(draftCreatedAt, req.session.userId, conversationId);
@@ -23610,10 +23768,26 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           clearActiveChatRun(activeRun);
         }
 
+        const geminiOutputTokens = estimateTokenCount(safeOutput);
+        const geminiConvRow = getConversationStmt.get(conversationId);
+        const geminiModel = geminiConvRow && geminiConvRow.model || 'gemini';
+        const geminiInputTokens = userInputTokens || estimateTokenCount(prompt);
+        const geminiCost = calculateTokenCost(geminiInputTokens, geminiOutputTokens, geminiModel);
         if (assistantMessageId) {
-          updateMessageContentStmt.run(safeOutput, assistantMessageId);
+          updateMessageContentAndTokensStmt.run(safeOutput, geminiInputTokens, geminiOutputTokens, geminiCost, assistantMessageId);
         } else {
-          const fallbackMessage = insertMessageStmt.run(conversationId, 'assistant', safeOutput);
+          const fallbackMessage = insertMessageStmt.run(
+            conversationId,
+            'assistant',
+            safeOutput,
+            null,
+            null,
+            null,
+            null,
+            geminiInputTokens,
+            geminiOutputTokens,
+            geminiCost
+          );
           assistantMessageId = Number(fallbackMessage.lastInsertRowid);
         }
         if (liveDraftId) {
@@ -23881,7 +24055,18 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         ? `${executionPrompt}\n\n[POLITICA]\n${codexPermissionHints.join('\n')}`
         : executionPrompt;
 
-    const assistantMessage = insertMessageStmt.run(conversationId, 'assistant', '');
+    const assistantMessage = insertMessageStmt.run(
+      conversationId,
+      'assistant',
+      '',
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    );
     assistantMessageId = Number(assistantMessage.lastInsertRowid);
     const draftCreatedAt = nowIso();
     closeOpenDraftsByConversationStmt.run(draftCreatedAt, req.session.userId, conversationId);
@@ -25265,7 +25450,18 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         if (assistantMessageId) {
           updateMessageContentStmt.run(historyMessage, assistantMessageId);
         } else {
-          insertMessageStmt.run(conversationId, 'assistant', historyMessage);
+          insertMessageStmt.run(
+            conversationId,
+            'assistant',
+            historyMessage,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          );
         }
         if (liveDraftId) {
           try {
@@ -25354,7 +25550,18 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       if (assistantMessageId) {
         updateMessageContentStmt.run(errorMessage, assistantMessageId);
       } else {
-        insertMessageStmt.run(conversationId, 'assistant', errorMessage);
+        insertMessageStmt.run(
+          conversationId,
+          'assistant',
+          errorMessage,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null
+        );
       }
       if (liveDraftId) {
         try {
