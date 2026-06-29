@@ -665,7 +665,14 @@ export async function listMessages(conversationId: number, options?: ListMessage
               : 'assistant',
             content: String(entry?.content || ''),
             created_at: String(entry?.created_at || ''),
-            attachments: attachments.filter((file) => Boolean(file.id) && Boolean(file.name))
+            attachments: attachments.filter((file) => Boolean(file.id) && Boolean(file.name)),
+            tokens_before: entry?.tokens_before != null ? Number(entry.tokens_before) : null,
+            tokens_after: entry?.tokens_after != null ? Number(entry.tokens_after) : null,
+            tokens_saved: entry?.tokens_saved != null ? Number(entry.tokens_saved) : null,
+            savings_percent: entry?.savings_percent != null ? Number(entry.savings_percent) : null,
+            input_tokens: entry?.input_tokens != null ? Number(entry.input_tokens) : null,
+            output_tokens: entry?.output_tokens != null ? Number(entry.output_tokens) : null,
+            total_cost: entry?.total_cost != null ? Number(entry.total_cost) : null
           } as Message;
         })
       : [],
