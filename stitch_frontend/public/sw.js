@@ -1,5 +1,5 @@
 // CodexWeb Service Worker — shell cache + offline fallback
-const CACHE = 'codexweb-v2-20260625';
+const CACHE = 'codexweb-v3-20260629';
 const SHELL = ['/'];
 
 self.addEventListener('install', (e) => {
