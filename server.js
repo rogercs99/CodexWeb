@@ -4777,6 +4777,24 @@ function notify(msg, options = {}) {
   }
 }
 
+function insertAssistantMessageRow(conversationId, content = '', tokenFields = {}) {
+  const fields = tokenFields && typeof tokenFields === 'object' ? tokenFields : {};
+  return insertMessageStmt.run(
+    conversationId,
+    'assistant',
+    String(content || ''),
+    fields.tokensBefore ?? null,
+    fields.tokensAfter ?? null,
+    fields.tokensSaved ?? null,
+    fields.savingsPercent ?? null,
+    fields.inputTokens ?? null,
+    fields.outputTokens ?? null,
+    fields.totalCost ?? null,
+    fields.strategyType ?? null,
+    fields.strategyName ?? null
+  );
+}
+
 function toBase64Json(value) {
   return Buffer.from(JSON.stringify(value), 'utf8').toString('base64');
 }
@@ -11752,13 +11770,13 @@ const createConversationStmt = db.prepare(
   'INSERT INTO conversations (user_id, project_id, title, model, reasoning_effort, deck_chat) VALUES (?, ?, ?, ?, ?, ?)'
 );
 const insertMessageStmt = db.prepare(
-  'INSERT INTO messages (conversation_id, role, content, tokens_before, tokens_after, tokens_saved, savings_percent, input_tokens, output_tokens, total_cost) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  'INSERT INTO messages (conversation_id, role, content, tokens_before, tokens_after, tokens_saved, savings_percent, input_tokens, output_tokens, total_cost, strategy_type, strategy_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
 );
 const updateMessageContentStmt = db.prepare(
   'UPDATE messages SET content = ? WHERE id = ?'
 );
 const updateMessageTokensStmt = db.prepare(
-  'UPDATE messages SET tokens_before = ?, tokens_after = ?, tokens_saved = ?, savings_percent = ? WHERE id = ?'
+  'UPDATE messages SET tokens_before = ?, tokens_after = ?, tokens_saved = ?, savings_percent = ?, strategy_type = ?, strategy_name = ? WHERE id = ?'
 );
 const updateMessageContentAndTokensStmt = db.prepare(
   'UPDATE messages SET content = ?, input_tokens = ?, output_tokens = ?, total_cost = ? WHERE id = ?'
@@ -12799,20 +12817,20 @@ const listDeployedCloudBackupsForUserAndAppStmt = db.prepare(`
   LIMIT ?
 `);
 const listMessagesStmt = db.prepare(`
-  SELECT id, role, content, created_at, tokens_before, tokens_after, tokens_saved, savings_percent, input_tokens, output_tokens, total_cost
+  SELECT id, role, content, created_at, tokens_before, tokens_after, tokens_saved, savings_percent, input_tokens, output_tokens, total_cost, strategy_type, strategy_name
   FROM messages
   WHERE conversation_id = ?
   ORDER BY created_at ASC, id ASC
 `);
 const listMessagesPageDescStmt = db.prepare(`
-  SELECT id, role, content, created_at, tokens_before, tokens_after, tokens_saved, savings_percent, input_tokens, output_tokens, total_cost
+  SELECT id, role, content, created_at, tokens_before, tokens_after, tokens_saved, savings_percent, input_tokens, output_tokens, total_cost, strategy_type, strategy_name
   FROM messages
   WHERE conversation_id = ?
   ORDER BY created_at DESC, id DESC
   LIMIT ?
 `);
 const listMessagesBeforeIdPageDescStmt = db.prepare(`
-  SELECT id, role, content, created_at, tokens_before, tokens_after, tokens_saved, savings_percent, input_tokens, output_tokens, total_cost
+  SELECT id, role, content, created_at, tokens_before, tokens_after, tokens_saved, savings_percent, input_tokens, output_tokens, total_cost, strategy_type, strategy_name
   FROM messages
   WHERE conversation_id = ?
     AND id < ?
@@ -15300,7 +15318,10 @@ function getAiProviderStaticModelOptions(providerId) {
   const safeProviderId = normalizeSupportedAiAgentId(providerId);
   if (safeProviderId === 'codex-cli') {
     const cachedModels = loadCodexModelsFromCache();
-    return [...chatGptModelOptions, ...cachedModels].filter((slug, index, list) => list.indexOf(slug) === index);
+    if (cachedModels.length > 0) {
+      return cachedModels;
+    }
+    return [...chatGptModelOptions].filter((slug, index, list) => list.indexOf(slug) === index);
   }
   if (safeProviderId === 'gemini-cli') {
     return [...geminiModelOptions];
@@ -16170,6 +16191,12 @@ function getChatAgentModelOptions(agentId, userId = 0) {
 
 function getChatAgentDefaultModel(agentId) {
   const safeAgentId = normalizeSupportedAiAgentId(agentId);
+  if (safeAgentId === 'codex-cli') {
+    const cachedModels = loadCodexModelsFromCache();
+    if (cachedModels.length > 0) {
+      return cachedModels[0];
+    }
+  }
   if (safeAgentId === 'claude-code') {
     return normalizeClaudeCodeModel(claudeCodeConfiguredDefaultModel, 'claude-sonnet-4-5');
   }
@@ -16207,6 +16234,13 @@ function normalizeChatAgentModel(agentId, rawModel) {
   const fallbackModel = getChatAgentDefaultModel(agentId);
   const normalized = sanitizeConversationModel(rawModel);
   if (!normalized) return fallbackModel;
+  if (agentId === 'codex-cli') {
+    const availableModels = getChatAgentModelOptions(agentId);
+    if (availableModels.length > 0 && !availableModels.includes(normalized)) {
+      return fallbackModel;
+    }
+    return normalized;
+  }
   if (agentId === 'claude-code') {
     return normalizeClaudeCodeModel(normalized, fallbackModel);
   }
@@ -22032,7 +22066,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       taskSnapshot = null;
     }
     const userInputTokens = estimateTokenCount(prompt);
-    const userMessage = insertMessageStmt.run(conversationId, 'user', prompt, null, null, null, null, userInputTokens, 0, 0);
+    const userMessage = insertMessageStmt.run(conversationId, 'user', prompt, null, null, null, null, userInputTokens, 0, 0, null, null);
     userMessageId = Number(userMessage.lastInsertRowid);
     updateConversationTitleStmt.run(buildConversationTitle(prompt), conversationId);
     void notify(`Arranca request chat user=${username}`);
@@ -22073,11 +22107,22 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       // Update user message with token stats
       if (userMessageId && tsResult) {
         try {
+          const strategyType = tsResult.sections && tsResult.sections.type ? String(tsResult.sections.type) : null;
+          const strategyNames = {
+            'off': 'Sin optimización',
+            'streaming': 'Streaming sin contexto',
+            'listen-only': 'Modo Solo Escucha',
+            'command-freeze': 'Contexto Congelado',
+            'optimized': 'Optimización Estándar'
+          };
+          const strategyName = strategyType && strategyNames[strategyType] ? strategyNames[strategyType] : null;
           updateMessageTokensStmt.run(
             tsResult.estimatedTokensBefore || null,
             tsResult.estimatedTokensAfter || null,
             tsResult.estimatedSavings || null,
             tsResult.savingsPercent || null,
+            strategyType,
+            strategyName,
             userMessageId
           );
         } catch (error) {
@@ -22144,18 +22189,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         resolveAiProviderBaseUrl(selectedProviderId, providerIntegration) ||
         httpProviderAdapter.defaultBaseUrl;
 
-      const assistantMessage = insertMessageStmt.run(
-        conversationId,
-        'assistant',
-        '',
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null
-      );
+      const assistantMessage = insertAssistantMessageRow(conversationId, '');
       assistantMessageId = Number(assistantMessage.lastInsertRowid);
       const draftCreatedAt = nowIso();
       closeOpenDraftsByConversationStmt.run(draftCreatedAt, req.session.userId, conversationId);
@@ -22377,18 +22411,11 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         if (assistantMessageId) {
           updateMessageContentAndTokensStmt.run(safeOutput, finalInputTokens, finalOutputTokens, finalCost, assistantMessageId);
         } else {
-          const fallbackMessage = insertMessageStmt.run(
-            conversationId,
-            'assistant',
-            safeOutput,
-            null,
-            null,
-            null,
-            null,
-            finalInputTokens,
-            finalOutputTokens,
-            finalCost
-          );
+          const fallbackMessage = insertAssistantMessageRow(conversationId, safeOutput, {
+            inputTokens: finalInputTokens,
+            outputTokens: finalOutputTokens,
+            totalCost: finalCost
+          });
           assistantMessageId = Number(fallbackMessage.lastInsertRowid);
         }
         if (liveDraftId) {
@@ -22837,18 +22864,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         })
       };
 
-      const assistantMessageForClaude = insertMessageStmt.run(
-        conversationId,
-        'assistant',
-        '',
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null
-      );
+      const assistantMessageForClaude = insertAssistantMessageRow(conversationId, '');
       assistantMessageId = Number(assistantMessageForClaude.lastInsertRowid);
       const draftCreatedAtForClaude = nowIso();
       closeOpenDraftsByConversationStmt.run(draftCreatedAtForClaude, req.session.userId, conversationId);
@@ -23032,18 +23048,11 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         if (assistantMessageId) {
           updateMessageContentAndTokensStmt.run(safeOutput, claudeInputTokens, claudeOutputTokens, claudeCost, assistantMessageId);
         } else {
-          const fallback = insertMessageStmt.run(
-            conversationId,
-            'assistant',
-            safeOutput,
-            null,
-            null,
-            null,
-            null,
-            claudeInputTokens,
-            claudeOutputTokens,
-            claudeCost
-          );
+          const fallback = insertAssistantMessageRow(conversationId, safeOutput, {
+            inputTokens: claudeInputTokens,
+            outputTokens: claudeOutputTokens,
+            totalCost: claudeCost
+          });
           assistantMessageId = Number(fallback.lastInsertRowid);
         }
         if (liveDraftId) {
@@ -23516,18 +23525,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         );
       }
 
-      const assistantMessage = insertMessageStmt.run(
-        conversationId,
-        'assistant',
-        '',
-        null,
-        null,
-        null,
-        null,
-        null,
-        null,
-        null
-      );
+      const assistantMessage = insertAssistantMessageRow(conversationId, '');
       assistantMessageId = Number(assistantMessage.lastInsertRowid);
       const draftCreatedAt = nowIso();
       closeOpenDraftsByConversationStmt.run(draftCreatedAt, req.session.userId, conversationId);
@@ -23776,18 +23774,11 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         if (assistantMessageId) {
           updateMessageContentAndTokensStmt.run(safeOutput, geminiInputTokens, geminiOutputTokens, geminiCost, assistantMessageId);
         } else {
-          const fallbackMessage = insertMessageStmt.run(
-            conversationId,
-            'assistant',
-            safeOutput,
-            null,
-            null,
-            null,
-            null,
-            geminiInputTokens,
-            geminiOutputTokens,
-            geminiCost
-          );
+          const fallbackMessage = insertAssistantMessageRow(conversationId, safeOutput, {
+            inputTokens: geminiInputTokens,
+            outputTokens: geminiOutputTokens,
+            totalCost: geminiCost
+          });
           assistantMessageId = Number(fallbackMessage.lastInsertRowid);
         }
         if (liveDraftId) {
@@ -24055,18 +24046,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         ? `${executionPrompt}\n\n[POLITICA]\n${codexPermissionHints.join('\n')}`
         : executionPrompt;
 
-    const assistantMessage = insertMessageStmt.run(
-      conversationId,
-      'assistant',
-      '',
-      null,
-      null,
-      null,
-      null,
-      null,
-      null,
-      null
-    );
+    const assistantMessage = insertAssistantMessageRow(conversationId, '');
     assistantMessageId = Number(assistantMessage.lastInsertRowid);
     const draftCreatedAt = nowIso();
     closeOpenDraftsByConversationStmt.run(draftCreatedAt, req.session.userId, conversationId);
@@ -25288,7 +25268,12 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         command: codexPath,
         args,
         attempt: codexAttempt,
-        reason
+        reason,
+        cwd: codexExecOptions.cwd,
+        runAsUser: runtimePolicy.runAsIdentity ? runtimePolicy.runAsIdentity.user : process.env.USER || 'root',
+        home: codexExecOptions.env && codexExecOptions.env.HOME ? codexExecOptions.env.HOME : '',
+        codexHome: codexExecOptions.env && codexExecOptions.env.CODEX_HOME ? codexExecOptions.env.CODEX_HOME : '',
+        path: codexExecOptions.env && codexExecOptions.env.PATH ? codexExecOptions.env.PATH : ''
       });
       notifyMilestone('execfile_stdio_fixed', 'FIX aplicado: execFile invocado sin opción stdio');
 
@@ -25337,6 +25322,14 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       });
 
       codexProcess.on('error', (error) => {
+        logChatStream('process_error', {
+          source: 'codex_cli',
+          command: codexPath,
+          cwd: codexExecOptions.cwd,
+          runAsUser: runtimePolicy.runAsIdentity ? runtimePolicy.runAsIdentity.user : process.env.USER || 'root',
+          exitCode: Number(codexProcess && codexProcess.exitCode),
+          error: truncateForNotify(error && error.message ? error.message : 'spawn_error', 220)
+        });
         const msg = `No se pudo iniciar codex: ${truncateForNotify(error.message || 'spawn_error', 160)}`;
         pushAssistantMessage(msg);
         finalizeResponse(1, 'error');
@@ -25450,18 +25443,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         if (assistantMessageId) {
           updateMessageContentStmt.run(historyMessage, assistantMessageId);
         } else {
-          insertMessageStmt.run(
-            conversationId,
-            'assistant',
-            historyMessage,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null
-          );
+          insertAssistantMessageRow(conversationId, historyMessage);
         }
         if (liveDraftId) {
           try {
@@ -25550,18 +25532,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       if (assistantMessageId) {
         updateMessageContentStmt.run(errorMessage, assistantMessageId);
       } else {
-        insertMessageStmt.run(
-          conversationId,
-          'assistant',
-          errorMessage,
-          null,
-          null,
-          null,
-          null,
-          null,
-          null,
-          null
-        );
+        insertAssistantMessageRow(conversationId, errorMessage);
       }
       if (liveDraftId) {
         try {
