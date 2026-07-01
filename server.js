@@ -11548,6 +11548,14 @@ if (!hasMessageColumn('savings_percent')) {
   db.exec('ALTER TABLE messages ADD COLUMN savings_percent INTEGER');
 }
 
+if (!hasMessageColumn('strategy_type')) {
+  db.exec("ALTER TABLE messages ADD COLUMN strategy_type TEXT");
+}
+
+if (!hasMessageColumn('strategy_name')) {
+  db.exec("ALTER TABLE messages ADD COLUMN strategy_name TEXT");
+}
+
 db.exec(`
 UPDATE conversations
 SET model = COALESCE(model, '')

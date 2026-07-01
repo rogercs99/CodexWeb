@@ -38,7 +38,7 @@ module.exports = function setupAuthRoutes(app, {
     }
 
     try {
-      const existing = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+      const existing = db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(username);
       if (existing) {
         void notify(`REGISTER failed username=${safeUsername} reason=already_exists`);
         return res.status(409).json({ error: 'Ese usuario ya existe' });
@@ -65,7 +65,9 @@ module.exports = function setupAuthRoutes(app, {
       return res.status(400).json({ error: 'Usuario y contraseña obligatorios' });
     }
 
-    const user = db.prepare('SELECT id, username, password_hash FROM users WHERE username = ?').get(username.trim());
+    const user = db
+      .prepare('SELECT id, username, password_hash FROM users WHERE LOWER(username) = LOWER(?)')
+      .get(username.trim());
     if (!user) {
       void notify(`LOGIN failed username=${requestedUsername} reason=invalid_credentials`);
       return res.status(401).json({ error: 'Credenciales inválidas' });
