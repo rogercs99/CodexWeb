@@ -1,9 +1,23 @@
-import { Check, ChevronLeft, Clipboard, Copy, FolderOpen, Mic, Paperclip, RefreshCw, Send, Settings, Square, X, Zap } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Check, ChevronLeft, Clipboard, Cloud, Copy, FolderOpen, Mic, Paperclip, RefreshCw, Send, Settings, Square, X, Zap, Loader2 } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import BottomNav from './BottomNav';
-import type { AiAgentSettingsItem, ChatOptions, ChatProject, ConversationProjectContext, Message, Screen } from '../lib/types';
+import type { AiAgentSettingsItem, ChatOptions, ChatProject, ConversationProjectContext, Message, Screen, KaggleJobOutput } from '../lib/types';
+import { kaggleSubmit, kaggleListJobs } from '../lib/api';
+import KaggleJobInline from './KaggleJobInline';
+
+interface InlineKaggleJob {
+  jobId: string;
+  code: string;
+  messageIndex: number;
+  completed: boolean;
+  output?: KaggleJobOutput;
+}
+
+function isKaggleTerminalStatus(status: string | null | undefined) {
+  return status === 'complete' || status === 'error' || status === 'cancelled';
+}
 
 const TITLE_MAX_LENGTH = 40;
 const TOP_LOAD_THRESHOLD_PX = 72;
@@ -158,11 +172,12 @@ async function copyTextToClipboard(text: string): Promise<boolean> {
   }
 }
 
-function CodeBlock({ text, language }: { text: string; language: string }) {
+function CodeBlock({ text, language, onSendToKaggle, kaggleSending }: { text: string; language: string; onSendToKaggle?: (code: string) => void; kaggleSending?: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
   const copyTimerRef = useRef<number | null>(null);
   const lines = String(text || '').split('\n');
+  const isPython = /^py(thon)?$/i.test(language || '');
 
   useEffect(() => {
     return () => {
@@ -205,6 +220,26 @@ function CodeBlock({ text, language }: { text: string; language: string }) {
         <span className="text-[11px] uppercase tracking-wide text-zinc-400">{language || 'code'}</span>
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-blue-300">{expanded ? 'Ver menos' : `Abrir (${lines.length} lineas)`}</span>
+          {isPython && onSendToKaggle && (
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                onSendToKaggle(text);
+              }}
+              disabled={kaggleSending}
+              className={`inline-flex h-7 items-center justify-center gap-1 px-2 rounded-full border transition-colors ${
+                kaggleSending
+                  ? 'border-cyan-500/50 bg-cyan-500/10 text-cyan-300 cursor-wait'
+                  : 'border-cyan-700 text-cyan-300 hover:border-cyan-500 hover:bg-cyan-800/30 hover:text-cyan-100'
+              }`}
+              aria-label="Ejecutar en Kaggle"
+              title="Ejecutar en Kaggle"
+            >
+              {kaggleSending ? <Loader2 size={12} className="animate-spin" /> : null}
+              <span className="text-[10px] font-medium">Kaggle</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={(event) => {
@@ -247,7 +282,7 @@ function CodeBlock({ text, language }: { text: string; language: string }) {
   );
 }
 
-function MarkdownMessage({ content }: { content: string }) {
+function MarkdownMessage({ content, onSendToKaggle, kaggleSending }: { content: string; onSendToKaggle?: (code: string) => void; kaggleSending?: boolean }) {
   return (
     <div className="prose prose-invert prose-sm max-w-none break-words [overflow-wrap:anywhere] leading-relaxed">
       <ReactMarkdown
@@ -284,7 +319,7 @@ function MarkdownMessage({ content }: { content: string }) {
                 </code>
               );
             }
-            return <CodeBlock text={raw} language={langMatch ? langMatch[1] : ''} />;
+            return <CodeBlock text={raw} language={langMatch ? langMatch[1] : ''} onSendToKaggle={onSendToKaggle} kaggleSending={kaggleSending} />;
           }
         }}
       >
@@ -329,7 +364,10 @@ export default function ChatScreen({
   onAgentChange,
   tokenSaverOpen,
   onOpenTokenSaver,
-  onOpenProjectChats
+  onOpenProjectChats,
+  kaggleEnabled,
+  onToggleKaggle,
+  onOpenKaggleJobs
 }: {
   chatTitle: string;
   conversationId: number | null;
@@ -379,6 +417,9 @@ export default function ChatScreen({
   tokenSaverOpen: boolean;
   onOpenTokenSaver: () => void;
   onOpenProjectChats: () => void;
+  kaggleEnabled: boolean;
+  onToggleKaggle: () => void;
+  onOpenKaggleJobs: () => void;
 }) {
   const [input, setInput] = useState('');
   const [showReasoning, setShowReasoning] = useState(false);
@@ -386,6 +427,8 @@ export default function ChatScreen({
   const [copiedMessageId, setCopiedMessageId] = useState<number | null>(null);
   const [voiceState, setVoiceState] = useState<'idle' | 'listening' | 'error'>('idle');
   const [voiceFeedback, setVoiceFeedback] = useState('');
+  const [kaggleSending, setKaggleSending] = useState<number | null>(null);
+  const [inlineKaggleJobs, setInlineKaggleJobs] = useState<InlineKaggleJob[]>([]);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const speechRecognitionRef = useRef<any>(null);
   const headerRef = useRef<HTMLElement | null>(null);
@@ -430,6 +473,46 @@ export default function ChatScreen({
     window.addEventListener('keydown', handleEscape);
     return () => window.removeEventListener('keydown', handleEscape);
   }, [showTitleModal]);
+
+  useEffect(() => {
+    if (!conversationId) {
+      setInlineKaggleJobs([]);
+      return;
+    }
+
+    let cancelled = false;
+
+    kaggleListJobs(50, conversationId)
+      .then((jobs) => {
+        if (cancelled) return;
+        const rehydratedJobs = [...jobs]
+          .sort((a, b) => {
+            const aTime = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+            const bTime = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+            if (aTime !== bTime) {
+              return aTime - bTime;
+            }
+            return a.jobId.localeCompare(b.jobId);
+          })
+          .map((job) => ({
+            jobId: job.jobId,
+            code: '',
+            messageIndex: 0,
+            completed: isKaggleTerminalStatus(job.status)
+          }));
+
+        setInlineKaggleJobs(rehydratedJobs);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.error('Failed to load kaggle jobs:', err);
+        setInlineKaggleJobs([]);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId]);
 
   useEffect(() => {
     const node = headerRef.current;
@@ -664,6 +747,44 @@ export default function ChatScreen({
     }, 1600);
   };
 
+  const handleSendToKaggle = async (code: string) => {
+    if (kaggleSending !== null) return;
+    const codeHash = code.split('').reduce((a, c) => a + c.charCodeAt(0), 0) % 100000;
+    setKaggleSending(codeHash);
+    try {
+      const result = await kaggleSubmit(code, conversationId);
+      if (result.ok && result.jobId) {
+        setInlineKaggleJobs(prev => {
+          if (prev.some(job => job.jobId === result.jobId)) {
+            return prev;
+          }
+          return [...prev, {
+            jobId: result.jobId,
+            code,
+            messageIndex: grouped.length,
+            completed: false
+          }];
+        });
+      } else {
+        console.error('Kaggle submit error:', result.error);
+      }
+    } catch (err) {
+      console.error('Kaggle submit failed:', err);
+    } finally {
+      setKaggleSending(null);
+    }
+  };
+
+  const handleKaggleJobComplete = useCallback((jobId: string, output: KaggleJobOutput) => {
+    setInlineKaggleJobs(prev => prev.map(job =>
+      job.jobId === jobId ? { ...job, completed: true, output } : job
+    ));
+  }, []);
+
+  const handleKaggleJobError = useCallback((jobId: string, error: string) => {
+    console.error(`Kaggle job ${jobId} error:`, error);
+  }, []);
+
   const attachmentPhase = attachmentPipeline?.phase || 'idle';
   const canSend = (input.trim().length > 0 || selectedFiles.length > 0) && attachmentPhase !== 'processing';
   const canStop = sending || isRunning;
@@ -800,6 +921,23 @@ export default function ChatScreen({
                 <Zap size={15} />
               </button>
               <button
+                onClick={kaggleEnabled ? onOpenKaggleJobs : onToggleKaggle}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  if (kaggleEnabled) onToggleKaggle();
+                }}
+                className={`w-8 h-8 rounded-full border flex items-center justify-center ${
+                  kaggleEnabled
+                    ? 'border-cyan-500/50 bg-cyan-500/10 text-cyan-300'
+                    : 'border-zinc-700 text-zinc-300 hover:text-white hover:border-zinc-500'
+                }`}
+                type="button"
+                aria-label={kaggleEnabled ? 'Ver jobs de Kaggle (clic derecho para desactivar)' : 'Activar Kaggle en este chat'}
+                title={kaggleEnabled ? 'Ver jobs de Kaggle (clic derecho para desactivar)' : 'Activar Kaggle en este chat'}
+              >
+                <Cloud size={15} />
+              </button>
+              <button
                 onClick={onRefresh}
                 className="w-8 h-8 rounded-full border border-zinc-700 flex items-center justify-center text-zinc-300 hover:text-white hover:border-zinc-500"
                 type="button"
@@ -899,7 +1037,7 @@ export default function ChatScreen({
                     <span className="thinking-dot" />
                   </div>
                 ) : (
-                  <MarkdownMessage content={visibleContent} />
+                  <MarkdownMessage content={visibleContent} onSendToKaggle={handleSendToKaggle} kaggleSending={kaggleSending !== null} />
                 )}
                 {!showThinking && hasVisibleContent ? (
                   <div className="mt-1.5 flex items-center justify-end">
@@ -944,6 +1082,9 @@ export default function ChatScreen({
                       {message.savings_percent != null && message.savings_percent > 0 ? (
                         <span className="text-emerald-400"> (-{message.savings_percent}%)</span>
                       ) : null}
+                      {message.strategy_name ? (
+                        <span className="text-sky-400"> • {message.strategy_name}</span>
+                      ) : null}
                     </span>
                   ) : null}
                   {message.input_tokens != null && message.input_tokens > 0 ? (
@@ -966,6 +1107,21 @@ export default function ChatScreen({
             </div>
           );
         })}
+
+        {/* Inline Kaggle Jobs */}
+        {inlineKaggleJobs.length > 0 && (
+          <div className="space-y-2">
+            {inlineKaggleJobs.map(job => (
+              <KaggleJobInline
+                key={job.jobId}
+                jobId={job.jobId}
+                initialCode={job.code}
+                onComplete={(output) => handleKaggleJobComplete(job.jobId, output)}
+                onError={(error) => handleKaggleJobError(job.jobId, error)}
+              />
+            ))}
+          </div>
+        )}
 
         {showReasoningPanel ? (
           <section className="rounded-2xl border border-zinc-800 bg-zinc-900/50">

@@ -672,7 +672,9 @@ export async function listMessages(conversationId: number, options?: ListMessage
             savings_percent: entry?.savings_percent != null ? Number(entry.savings_percent) : null,
             input_tokens: entry?.input_tokens != null ? Number(entry.input_tokens) : null,
             output_tokens: entry?.output_tokens != null ? Number(entry.output_tokens) : null,
-            total_cost: entry?.total_cost != null ? Number(entry.total_cost) : null
+            total_cost: entry?.total_cost != null ? Number(entry.total_cost) : null,
+            strategy_type: entry?.strategy_type != null ? String(entry.strategy_type) : null,
+            strategy_name: entry?.strategy_name != null ? String(entry.strategy_name) : null
           } as Message;
         })
       : [],
@@ -2569,4 +2571,281 @@ export async function getTokenSaverPreview(chatId: number, currentPrompt: string
 
 export async function clearTokenSaverCache(): Promise<any> {
   return api('/api/token-saver/cache/clear', { method: 'POST' });
+}
+
+// Kaggle API
+import type {
+  KaggleJob,
+  KaggleJobOutput,
+  KaggleSubmitResult,
+  KaggleMultiAgentOptions,
+  KaggleMultiAgentResult
+} from './types';
+
+function normalizeKaggleJobStatus(
+  status: unknown,
+  fallback: KaggleJob['status'] = 'pending'
+): KaggleJob['status'] {
+  const value = String(status || '').trim().toLowerCase();
+  if (
+    value === 'pending' ||
+    value === 'queued' ||
+    value === 'running' ||
+    value === 'complete' ||
+    value === 'error' ||
+    value === 'cancelled'
+  ) {
+    return value;
+  }
+  return fallback;
+}
+
+function normalizeKaggleOutputFiles(
+  jobId: string,
+  files: unknown,
+  outputs: unknown
+): Array<{ name: string; size: number; downloadUrl: string }> {
+  const outputEntries =
+    outputs && typeof outputs === 'object'
+      ? Object.entries(outputs as Record<string, any>)
+      : [];
+  const outputMap = new Map(
+    outputEntries.map(([name, entry]) => [
+      name,
+      {
+        name,
+        size: Number(entry && entry.size) || 0,
+        downloadUrl:
+          typeof entry?.downloadUrl === 'string' && entry.downloadUrl.trim()
+            ? entry.downloadUrl
+            : kaggleGetFileDownloadUrl(jobId, name)
+      }
+    ])
+  );
+
+  if (Array.isArray(files) && files.length > 0) {
+    return files
+      .map((file) => {
+        if (typeof file === 'string') {
+          return (
+            outputMap.get(file) || {
+              name: file,
+              size: 0,
+              downloadUrl: kaggleGetFileDownloadUrl(jobId, file)
+            }
+          );
+        }
+        if (file && typeof file === 'object' && typeof (file as any).name === 'string') {
+          const name = String((file as any).name);
+          const mapped = outputMap.get(name);
+          return {
+            name,
+            size: Number((file as any).size) || mapped?.size || 0,
+            downloadUrl:
+              typeof (file as any).downloadUrl === 'string' && (file as any).downloadUrl.trim()
+                ? String((file as any).downloadUrl)
+                : mapped?.downloadUrl || kaggleGetFileDownloadUrl(jobId, name)
+          };
+        }
+        return null;
+      })
+      .filter((file): file is { name: string; size: number; downloadUrl: string } => Boolean(file));
+  }
+
+  return Array.from(outputMap.values());
+}
+
+function normalizeKaggleLogText(
+  logs: unknown,
+  output: unknown,
+  stderr: unknown
+): string | undefined {
+  const sections: string[] = [];
+
+  if (typeof logs === 'string' && logs.trim()) {
+    sections.push(logs.trim());
+  }
+  if (typeof output === 'string' && output.trim()) {
+    sections.push(`stdout:\n${output.trim()}`);
+  }
+  if (typeof stderr === 'string' && stderr.trim()) {
+    sections.push(`stderr:\n${stderr.trim()}`);
+  }
+
+  return sections.length > 0 ? sections.join('\n\n') : undefined;
+}
+
+export async function kaggleSubmit(code: string, chatId?: number): Promise<KaggleSubmitResult> {
+  return api('/api/kaggle/submit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, chatId })
+  });
+}
+
+export async function kaggleSubmitMultiAgent(
+  code: string,
+  options?: KaggleMultiAgentOptions
+): Promise<KaggleMultiAgentResult> {
+  return api('/api/kaggle/submit-multiagent', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, options })
+  });
+}
+
+export async function kaggleGetStatus(jobId: string): Promise<KaggleJob> {
+  const data = await api<{
+    jobId: string;
+    status: string;
+    kaggleRef?: string;
+    error?: string;
+    logs?: string;
+    executionSeconds?: number;
+  }>(`/api/kaggle/status/${encodeURIComponent(jobId)}`);
+  return {
+    jobId: data.jobId,
+    status: data.status as KaggleJob['status'],
+    kaggleRef: data.kaggleRef,
+    createdAt: '',
+    error: data.error,
+    logs: data.logs,
+    executionSeconds: data.executionSeconds
+  };
+}
+
+export async function kaggleGetOutput(jobId: string): Promise<KaggleJobOutput> {
+  const data = await api<{
+    jobId: string;
+    ok?: boolean;
+    status?: string;
+    files?: Array<{ name: string; size: number; downloadUrl: string }> | string[];
+    outputs?: Record<string, { size?: number; downloadUrl?: string }>;
+    output?: string;
+    stderr?: string;
+    logs?: string;
+    error?: string;
+  }>(`/api/kaggle/output/${encodeURIComponent(jobId)}`);
+  return {
+    jobId: data.jobId,
+    status: normalizeKaggleJobStatus(data.status, data.error ? 'error' : 'complete'),
+    files: normalizeKaggleOutputFiles(data.jobId, data.files, data.outputs),
+    logs: normalizeKaggleLogText(data.logs, data.output, data.stderr),
+    error: data.error
+  };
+}
+
+export async function kaggleListJobs(limit = 20, chatId?: number): Promise<KaggleJob[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (chatId) params.set('chatId', String(chatId));
+  const data = await api<{ jobs: any[] }>(`/api/kaggle/jobs?${params}`);
+  return Array.isArray(data.jobs)
+    ? data.jobs.map((j: any) => ({
+        jobId: j.jobId || j.id,
+        status: j.status,
+        kaggleRef: j.kaggleRef,
+        chatId: j.chatId || null,
+        createdAt: j.createdAt || '',
+        updatedAt: j.updatedAt,
+        finishedAt: j.finishedAt,
+        error: j.error
+      }))
+    : [];
+}
+
+export async function kagglePollComplete(jobId: string): Promise<KaggleJobOutput> {
+  const data = await api<{
+    jobId: string;
+    ok?: boolean;
+    status?: string;
+    files?: Array<{ name: string; size: number; downloadUrl: string }> | string[];
+    outputs?: Record<string, { size?: number; downloadUrl?: string }>;
+    output?: string;
+    stderr?: string;
+    logs?: string;
+    error?: string;
+  }>('/api/kaggle/poll-complete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jobId })
+  });
+  return {
+    jobId: data.jobId,
+    status: normalizeKaggleJobStatus(data.status, data.error ? 'error' : 'complete'),
+    files: normalizeKaggleOutputFiles(data.jobId, data.files, data.outputs),
+    logs: normalizeKaggleLogText(data.logs, data.output, data.stderr),
+    error: data.error
+  };
+}
+
+export async function kaggleDeleteJob(jobId: string): Promise<void> {
+  await api(`/api/kaggle/jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
+}
+
+export async function kaggleDeleteAllJobs(): Promise<{ deletedCount: number }> {
+  return api('/api/kaggle/jobs', { method: 'DELETE' });
+}
+
+export interface KaggleJobDetails {
+  success: boolean;
+  jobId: string;
+  kaggleRef: string;
+  code: string | null;
+  logs: {
+    stdout?: string;
+    stderr?: string;
+    raw?: string;
+  } | null;
+  files: Array<{ name: string; size: number; isLog: boolean }>;
+  status: string;
+  chatId: number | null;
+  createdAt: string | null;
+  error?: string | null;
+  executionSeconds?: number | null;
+}
+
+export async function kaggleGetJobDetails(jobId: string): Promise<KaggleJobDetails> {
+  const data = await api<any>(`/api/kaggle/jobs/${encodeURIComponent(jobId)}/details`);
+  const logs =
+    data && typeof data.logs === 'object' && data.logs !== null
+      ? {
+          stdout: typeof data.logs.stdout === 'string' ? data.logs.stdout : undefined,
+          stderr: typeof data.logs.stderr === 'string' ? data.logs.stderr : undefined,
+          raw: typeof data.logs.raw === 'string' ? data.logs.raw : undefined
+        }
+      : typeof data?.logs === 'string' && data.logs.trim()
+        ? { raw: data.logs }
+        : null;
+
+  return {
+    success: Boolean(data?.success),
+    jobId: String(data?.jobId || jobId),
+    kaggleRef: String(data?.kaggleRef || ''),
+    code: typeof data?.code === 'string' ? data.code : null,
+    logs,
+    files: Array.isArray(data?.files)
+      ? data.files
+          .filter((file: any) => file && typeof file.name === 'string')
+          .map((file: any) => ({
+            name: String(file.name),
+            size: Number(file.size) || 0,
+            isLog: Boolean(file.isLog)
+          }))
+      : [],
+    status: String(data?.status || 'unknown'),
+    chatId: Number.isInteger(Number(data?.chatId)) ? Number(data.chatId) : null,
+    createdAt: typeof data?.createdAt === 'string' ? data.createdAt : null,
+    error: typeof data?.error === 'string' ? data.error : null,
+    executionSeconds: Number.isFinite(Number(data?.executionSeconds))
+      ? Number(data.executionSeconds)
+      : null
+  };
+}
+
+export function kaggleGetOutputDownloadUrl(jobId: string): string {
+  return `/api/kaggle/output/${encodeURIComponent(jobId)}/download`;
+}
+
+export function kaggleGetFileDownloadUrl(jobId: string, fileName: string): string {
+  return `/api/kaggle/output/${encodeURIComponent(jobId)}/files/${encodeURIComponent(fileName)}/download`;
 }

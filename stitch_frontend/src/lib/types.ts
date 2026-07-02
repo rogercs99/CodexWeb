@@ -8,6 +8,7 @@ export type Screen =
   | 'tools'
   | 'settings'
   | 'quetzalRelay'
+  | 'kaggle'
   | 'reboot'
   | 'offline';
 
@@ -177,6 +178,8 @@ export interface Message {
   input_tokens?: number | null;
   output_tokens?: number | null;
   total_cost?: number | null;
+  strategy_type?: string | null;
+  strategy_name?: string | null;
 }
 
 export interface MessagesPagination {
@@ -1053,4 +1056,59 @@ export interface SteamDeckJob {
   updatedAt: string;
   startedAt: string;
   finishedAt: string;
+}
+
+// Kaggle Types
+export type KaggleJobStatus = 'pending' | 'queued' | 'running' | 'complete' | 'error' | 'cancelled';
+
+export interface KaggleJob {
+  jobId: string;
+  status: KaggleJobStatus;
+  kaggleRef?: string;
+  chatId?: number | null;
+  createdAt: string;
+  updatedAt?: string;
+  finishedAt?: string;
+  error?: string;
+  logs?: string;
+  executionSeconds?: number;
+}
+
+export interface KaggleJobOutput {
+  jobId: string;
+  status: KaggleJobStatus;
+  files: KaggleOutputFile[];
+  logs?: string;
+  error?: string;
+}
+
+export interface KaggleOutputFile {
+  name: string;
+  size: number;
+  downloadUrl: string;
+}
+
+export interface KaggleSubmitResult {
+  ok: boolean;
+  jobId: string;
+  status: KaggleJobStatus;
+  kaggleRef?: string;
+  error?: string;
+}
+
+export interface KaggleMultiAgentOptions {
+  primaryAgent?: 'claude' | 'codex';
+  enableClaude?: boolean;
+  enableCodex?: boolean;
+  maxRetries?: number;
+}
+
+export interface KaggleMultiAgentResult extends KaggleSubmitResult {
+  retries?: number;
+  corrections?: Array<{
+    agent: string;
+    attempt: number;
+    error: string;
+    fix: string;
+  }>;
 }

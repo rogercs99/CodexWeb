@@ -7,6 +7,7 @@ import TerminalLogScreen from './components/TerminalLogScreen';
 import AttachmentsScreen from './components/AttachmentsScreen';
 import SettingsScreen from './components/SettingsScreen';
 import QuetzalRelayScreen from './components/QuetzalRelayScreen';
+import KaggleScreen from './components/KaggleScreen';
 import TokenSaverPanel from './components/TokenSaverPanel';
 import TerminalLivePanel from './components/TerminalLivePanel';
 import SystemRebootScreen from './components/SystemRebootScreen';
@@ -667,6 +668,8 @@ export default function App() {
   const [restartBusy, setRestartBusy] = useState(false);
   const [liveReasoning, setLiveReasoning] = useState('');
   const [isTokenSaverOpen, setIsTokenSaverOpen] = useState(false);
+  const [kaggleEnabledChats, setKaggleEnabledChats] = useState<Set<number>>(new Set());
+  const [kaggleFilterChatId, setKaggleFilterChatId] = useState<number | null>(null);
   const [hubViewIntent, setHubViewIntent] = useState<NavigateData['hubView'] | null>(null);
   const [hubViewIntentVersion, setHubViewIntentVersion] = useState(0);
   const [pendingChatDraft, setPendingChatDraft] = useState<{
@@ -2663,6 +2666,18 @@ export default function App() {
               return next;
             });
           },
+          ts_strategy_activated: (payload) => {
+            if (!isCurrentSession()) return;
+            const strategyName = String(payload?.strategyName || payload?.strategy || 'estrategia');
+            const savings = Number(payload?.savings) || 0;
+            const percent = Number(payload?.percent) || 0;
+            const mode = String(payload?.mode || '').toUpperCase();
+            let message = `🎯 Token Saver activó ${strategyName}`;
+            if (savings > 0 && percent > 0) {
+              message += ` (ahorro: ${savings} tokens / ${percent}% · modo: ${mode})`;
+            }
+            appendTerminalNotice(message);
+          },
           done: (payload) => {
             if (!isCurrentSession()) return;
             streamCompleted = true;
@@ -2953,6 +2968,25 @@ export default function App() {
               projectId
             });
           }}
+          kaggleEnabled={activeConversationId !== null && kaggleEnabledChats.has(activeConversationId)}
+          onToggleKaggle={() => {
+            if (activeConversationId === null) return;
+            setKaggleEnabledChats(prev => {
+              const next = new Set(prev);
+              if (next.has(activeConversationId)) {
+                next.delete(activeConversationId);
+              } else {
+                next.add(activeConversationId);
+              }
+              return next;
+            });
+          }}
+          onOpenKaggleJobs={() => {
+            if (activeConversationId !== null) {
+              setKaggleFilterChatId(activeConversationId);
+              navigate('kaggle');
+            }
+          }}
         />
       )}
 
@@ -3027,6 +3061,14 @@ export default function App() {
 
       {screen === 'quetzalRelay' && (
         <QuetzalRelayScreen
+          onNavigate={navigate}
+        />
+      )}
+
+      {screen === 'kaggle' && (
+        <KaggleScreen
+          filterChatId={kaggleFilterChatId}
+          onClearFilter={() => setKaggleFilterChatId(null)}
           onNavigate={navigate}
         />
       )}

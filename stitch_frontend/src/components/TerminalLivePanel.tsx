@@ -494,11 +494,11 @@ export default function TerminalLivePanel({ onClose, onNavigate }: { onClose?: (
 
   const isFloating = Boolean(onClose);
   const rootClassName = isFloating
-    ? 'fixed inset-x-2 bottom-[88px] top-[max(72px,env(safe-area-inset-top)+56px)] z-[190] overflow-y-auto rounded-[28px] border border-zinc-800 bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.12),_transparent_38%),linear-gradient(180deg,rgba(24,24,27,0.96),rgba(9,9,11,0.99))] p-4 shadow-[0_18px_60px_rgba(0,0,0,0.4)] sm:left-auto sm:right-4 sm:top-24 sm:bottom-4 sm:w-[min(560px,calc(100vw-2rem))]'
-    : 'min-h-screen bg-black text-white pb-[max(92px,env(safe-area-inset-bottom)+92px)]';
+    ? 'fixed inset-x-2 bottom-[88px] top-[max(72px,env(safe-area-inset-top)+56px)] z-[190] overflow-y-auto rounded-2xl border border-zinc-800 bg-[radial-gradient(circle_at_top,_rgba(56,189,248,0.12),_transparent_38%),linear-gradient(180deg,rgba(24,24,27,0.96),rgba(9,9,11,0.99))] p-4 shadow-[0_18px_60px_rgba(0,0,0,0.4)] sm:left-auto sm:right-4 sm:top-24 sm:bottom-4 sm:w-[min(560px,calc(100vw-2rem))]'
+    : 'min-h-screen bg-black text-white';
   const contentClassName = isFloating
     ? 'space-y-4'
-    : 'mx-auto flex min-h-screen max-w-5xl flex-col space-y-4 px-4 pb-6 pt-[max(env(safe-area-inset-top)+8px,8px)]';
+    : 'mx-auto flex min-h-screen max-w-5xl flex-col space-y-4 px-4 pb-[max(240px,env(safe-area-inset-bottom)+240px)] pt-[max(env(safe-area-inset-top)+8px,8px)]';
 
   const updateSession = (sessionId: string, updater: (session: TerminalLiveSession) => TerminalLiveSession) => {
     setSessions((prev) =>
@@ -870,7 +870,7 @@ export default function TerminalLivePanel({ onClose, onNavigate }: { onClose?: (
         </div>
 
         {pendingConfirmation ? (
-          <article className="rounded-[28px] border border-amber-500/40 bg-amber-500/10 p-4">
+          <article className="rounded-2xl border border-amber-500/40 bg-amber-500/10 p-4">
             <div className="flex items-start gap-3">
               <ShieldAlert size={18} className="mt-0.5 shrink-0 text-amber-300" />
               <div className="min-w-0">
@@ -878,7 +878,7 @@ export default function TerminalLivePanel({ onClose, onNavigate }: { onClose?: (
                 <p className="mt-1 text-xs text-amber-200/80 break-words">{parseCommandBlock(pendingConfirmation.command).preview}</p>
                 <div className="mt-3 space-y-2">
                   {pendingConfirmation.warnings.map((warning) => (
-                    <div key={`${warning.id}:${warning.label}`} className="rounded-xl border border-amber-500/30 bg-black/20 px-3 py-2 text-xs text-amber-100">
+                    <div key={`${warning.id}:${warning.label}`} className="rounded-2xl border border-amber-500/30 bg-black/20 px-3 py-2 text-xs text-amber-100">
                       <p className="font-medium">{warning.label}</p>
                       {warning.detail ? <p className="mt-1 text-amber-100/80 break-words">{warning.detail}</p> : null}
                     </div>
@@ -893,7 +893,7 @@ export default function TerminalLivePanel({ onClose, onNavigate }: { onClose?: (
                         reuseSessionId: pendingConfirmation.sessionId
                       });
                     }}
-                    className="rounded-xl border border-amber-300/40 bg-amber-300/10 px-3 py-2 text-xs font-medium text-amber-100"
+                    className="rounded-2xl border border-amber-300/40 bg-amber-300/10 px-3 py-2 text-xs font-medium text-amber-100"
                   >
                     Ejecutar igualmente
                   </button>
@@ -910,7 +910,7 @@ export default function TerminalLivePanel({ onClose, onNavigate }: { onClose?: (
                       setScreenState('canceled');
                       setStatusText('Comando cancelado antes de ejecutar.');
                     }}
-                    className="rounded-xl border border-zinc-700 bg-black/35 px-3 py-2 text-xs text-zinc-300"
+                    className="rounded-2xl border border-zinc-700 bg-black/35 px-3 py-2 text-xs text-zinc-300"
                   >
                     Cancelar
                   </button>
@@ -919,85 +919,6 @@ export default function TerminalLivePanel({ onClose, onNavigate }: { onClose?: (
             </div>
           </article>
         ) : null}
-
-        <form
-          className="rounded-2xl border border-zinc-800 bg-zinc-950/60 p-3"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void executeCommand(input);
-          }}
-        >
-          <div className="mb-2">
-            <p className="text-xs font-medium text-zinc-300">Ejecutar comando</p>
-            <p className="mt-0.5 text-[11px] text-zinc-500">Enter para ejecutar, Shift+Enter para nueva línea</p>
-          </div>
-          <div className="flex items-start gap-2">
-            <textarea
-              rows={4}
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                  event.preventDefault();
-                  void executeCommand(input);
-                }
-              }}
-              placeholder={'set -e\necho "== sistema =="\nhostname'}
-              className="min-h-[112px] flex-1 resize-y rounded-2xl border border-zinc-800 bg-black/35 px-3 py-3 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-zinc-600 focus:outline-none"
-            />
-            <div className="flex shrink-0 flex-col gap-2">
-              <button
-                type="button"
-                onClick={async () => {
-                  try {
-                    const text = await navigator.clipboard.readText();
-                    if (!text) return;
-                    setInput((prev) => (prev.trim() ? `${prev}\n${text}` : text));
-                    setScreenState('typing');
-                    setStatusText('Bloque pegado desde el portapapeles.');
-                  } catch (_error) {
-                    setScreenState('error');
-                    setStatusText('No se pudo leer el portapapeles.');
-                  }
-                }}
-                className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-zinc-700 bg-zinc-900/90 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
-                aria-label="Pegar desde portapapeles"
-                title="Pegar"
-              >
-                <Clipboard size={16} />
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setInput('');
-                  setScreenState('idle');
-                  setStatusText('Composer vaciado.');
-                }}
-                className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-zinc-700 bg-zinc-900/90 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
-                aria-label="Vaciar composer"
-                title="Vaciar"
-              >
-                <RefreshCw size={16} />
-              </button>
-              <button
-                type={running ? 'button' : 'submit'}
-                onClick={running ? stopRun : undefined}
-                disabled={!running && !input.trim()}
-                className={`inline-flex h-12 w-12 items-center justify-center rounded-2xl border text-white transition-colors ${
-                  running
-                    ? 'border-red-500/50 bg-red-600'
-                    : input.trim()
-                      ? 'border-sky-400/40 bg-sky-500'
-                      : 'border-zinc-800 bg-zinc-900 text-zinc-500'
-                } disabled:opacity-50`}
-                aria-label={running ? 'Cancelar ejecucion' : 'Ejecutar bloque'}
-                title={running ? 'Cancelar' : 'Ejecutar'}
-              >
-                {running ? <Square size={16} /> : <Play size={16} />}
-              </button>
-            </div>
-          </div>
-        </form>
 
         <div className="space-y-4">
           {sessions.length === 0 ? (
@@ -1196,9 +1117,92 @@ export default function TerminalLivePanel({ onClose, onNavigate }: { onClose?: (
           })}
           <div ref={endRef} />
         </div>
-
-        {!isFloating && onNavigate ? <BottomNav active="terminal" onNavigate={onNavigate} /> : null}
       </div>
+
+      {!isFloating ? (
+        <div className="fixed bottom-[74px] left-0 right-0 p-4 bg-gradient-to-t from-black via-black/90 to-transparent z-[60] pointer-events-none">
+          <form
+            className="mx-auto max-w-5xl rounded-2xl border border-zinc-800 bg-zinc-950/95 backdrop-blur-xl p-3 pointer-events-auto"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void executeCommand(input);
+            }}
+          >
+            <div className="mb-2">
+              <p className="text-xs font-medium text-zinc-300">Ejecutar comando</p>
+              <p className="mt-0.5 text-[11px] text-zinc-500">Enter para ejecutar, Shift+Enter para nueva línea</p>
+            </div>
+            <div className="flex items-start gap-2">
+              <textarea
+                rows={4}
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                    event.preventDefault();
+                    void executeCommand(input);
+                  }
+                }}
+                placeholder={'set -e\necho "== sistema =="\nhostname'}
+                className="min-h-[112px] flex-1 resize-y rounded-2xl border border-zinc-800 bg-black/35 px-3 py-3 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-zinc-600 focus:outline-none"
+              />
+              <div className="flex shrink-0 flex-col gap-2">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const text = await navigator.clipboard.readText();
+                      if (!text) return;
+                      setInput((prev) => (prev.trim() ? `${prev}\n${text}` : text));
+                      setScreenState('typing');
+                      setStatusText('Bloque pegado desde el portapapeles.');
+                    } catch (_error) {
+                      setScreenState('error');
+                      setStatusText('No se pudo leer el portapapeles.');
+                    }
+                  }}
+                  className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-zinc-700 bg-zinc-900/90 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
+                  aria-label="Pegar desde portapapeles"
+                  title="Pegar"
+                >
+                  <Clipboard size={16} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setInput('');
+                    setScreenState('idle');
+                    setStatusText('Composer vaciado.');
+                  }}
+                  className="inline-flex h-10 w-10 items-center justify-center rounded-2xl border border-zinc-700 bg-zinc-900/90 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100"
+                  aria-label="Vaciar composer"
+                  title="Vaciar"
+                >
+                  <RefreshCw size={16} />
+                </button>
+                <button
+                  type={running ? 'button' : 'submit'}
+                  onClick={running ? stopRun : undefined}
+                  disabled={!running && !input.trim()}
+                  className={`inline-flex h-12 w-12 items-center justify-center rounded-2xl border text-white transition-colors ${
+                    running
+                      ? 'border-red-500/50 bg-red-600'
+                      : input.trim()
+                        ? 'border-sky-400/40 bg-sky-500'
+                        : 'border-zinc-800 bg-zinc-900 text-zinc-500'
+                  } disabled:opacity-50`}
+                  aria-label={running ? 'Cancelar ejecucion' : 'Ejecutar bloque'}
+                  title={running ? 'Cancelar' : 'Ejecutar'}
+                >
+                  {running ? <Square size={16} /> : <Play size={16} />}
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      ) : null}
+
+      {!isFloating && onNavigate ? <BottomNav active="terminal" onNavigate={onNavigate} /> : null}
     </section>
   );
 }

@@ -19,6 +19,7 @@ const {
   saveConfig: saveQuetzalRelayConfig
 } = require('./quetzalRelay');
 const tokenSaver = require('./tokenSaver');
+const kaggleService = require('./kaggleService');
 
 const execFileAsync = util.promisify(execFile);
 const pipelineAsync = util.promisify(pipeline);
@@ -13978,6 +13979,69 @@ app.get('/api/frontend/diag-reports/recent', (req, res) => {
   });
 });
 
+// === Endpoints de autenticación de usuario ===
+app.post('/api/register', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ ok: false, error: 'username y password son requeridos' });
+    }
+    const safeUsername = String(username).trim().toLowerCase();
+    if (safeUsername.length < 3 || safeUsername.length > 50) {
+      return res.status(400).json({ ok: false, error: 'username debe tener entre 3 y 50 caracteres' });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ ok: false, error: 'password debe tener al menos 6 caracteres' });
+    }
+    const existing = db.prepare('SELECT id FROM users WHERE LOWER(username) = ?').get(safeUsername);
+    if (existing) {
+      return res.status(409).json({ ok: false, error: 'El usuario ya existe' });
+    }
+    const passwordHash = bcrypt.hashSync(password, 10);
+    const result = db.prepare('INSERT INTO users (username, password_hash) VALUES (?, ?)').run(safeUsername, passwordHash);
+    req.session.userId = result.lastInsertRowid;
+    req.session.username = safeUsername;
+    return res.json({ ok: true, userId: result.lastInsertRowid, username: safeUsername });
+  } catch (err) {
+    console.error('[Register] Error:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ ok: false, error: 'username y password son requeridos' });
+    }
+    const safeUsername = String(username).trim().toLowerCase();
+    const user = db.prepare('SELECT id, username, password_hash FROM users WHERE LOWER(username) = ?').get(safeUsername);
+    if (!user) {
+      return res.status(401).json({ ok: false, error: 'Usuario o contraseña incorrectos' });
+    }
+    const valid = bcrypt.compareSync(password, user.password_hash);
+    if (!valid) {
+      return res.status(401).json({ ok: false, error: 'Usuario o contraseña incorrectos' });
+    }
+    req.session.userId = user.id;
+    req.session.username = user.username;
+    return res.json({ ok: true, userId: user.id, username: user.username });
+  } catch (err) {
+    console.error('[Login] Error:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/logout', (req, res) => {
+  req.session.destroy((err) => {
+    if (err) {
+      return res.status(500).json({ ok: false, error: 'Error al cerrar sesión' });
+    }
+    res.clearCookie('connect.sid');
+    return res.json({ ok: true });
+  });
+});
+
 function requireAuth(req, res, next) {
   if (!req.session.userId) {
     return res.status(401).json({ error: 'No autorizado' });
@@ -20442,6 +20506,496 @@ app.post('/api/tools/deployed-apps/:appId/restore', requireAuth, async (req, res
   }
 });
 
+// ==================== KAGGLE INTEGRATION ====================
+
+function buildKaggleJobDownloadUrl(jobId) {
+  return `/api/kaggle/output/${encodeURIComponent(jobId)}/download`;
+}
+
+function buildKaggleFileDownloadUrl(jobId, fileName) {
+  return `/api/kaggle/output/${encodeURIComponent(jobId)}/files/${encodeURIComponent(fileName)}/download`;
+}
+
+function buildKaggleOutputPayload(result) {
+  const jobId = String(result && result.jobId ? result.jobId : '').trim();
+  const outputs = result && result.outputs && typeof result.outputs === 'object' ? result.outputs : {};
+  const outputsWithDownloads = {};
+
+  Object.entries(outputs).forEach(([fileName, entry]) => {
+    const baseEntry = entry && typeof entry === 'object' ? { ...entry } : { value: entry };
+    outputsWithDownloads[fileName] = {
+      ...baseEntry,
+      downloadUrl: buildKaggleFileDownloadUrl(jobId, fileName)
+    };
+  });
+
+  return {
+    ok: !!(result && result.success),
+    jobId,
+    kaggleRef: result ? result.kaggleRef : undefined,
+    files: Array.isArray(result && result.files) ? result.files : [],
+    outputs: outputsWithDownloads,
+    output: result ? result.output : undefined,
+    stderr: result ? result.stderr : undefined,
+    downloadLog: result ? result.downloadLog : undefined,
+    downloadUrl: jobId ? buildKaggleJobDownloadUrl(jobId) : null,
+    error: result ? result.error : undefined
+  };
+}
+
+/**
+ * POST /api/kaggle/submit - Enviar código a ejecutar en Kaggle
+ * Body: { code: string, title?: string, enableGpu?: boolean, enableInternet?: boolean, chatId?: number }
+ */
+app.post('/api/kaggle/submit', requireAuth, async (req, res) => {
+  try {
+    const { code, title, enableGpu, enableInternet, chatId } = req.body;
+
+    if (!code || typeof code !== 'string' || !code.trim()) {
+      return res.status(400).json({ ok: false, error: 'Se requiere código para ejecutar' });
+    }
+
+    const result = await kaggleService.submitJob(code, {
+      title,
+      enableGpu: !!enableGpu,
+      enableInternet: enableInternet !== false,
+      chatId: chatId ? Number(chatId) : null
+    });
+
+    if (result.success) {
+      return res.json({
+        ok: true,
+        jobId: result.jobId,
+        kaggleRef: result.kaggleRef,
+        chatId: result.chatId || null,
+        message: result.message
+      });
+    } else {
+      return res.status(500).json({ ok: false, error: result.error, details: result.stderr });
+    }
+  } catch (err) {
+    console.error('[Kaggle] Error en submit:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * GET /api/kaggle/status/:jobId - Obtener estado de un job
+ */
+app.get('/api/kaggle/status/:jobId', requireAuth, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+
+    if (!jobId || typeof jobId !== 'string') {
+      return res.status(400).json({ ok: false, error: 'Se requiere jobId' });
+    }
+
+    const result = await kaggleService.getJobStatus(jobId);
+
+    return res.json({
+      ok: result.success,
+      jobId: result.jobId,
+      kaggleRef: result.kaggleRef,
+      status: result.status,
+      raw: result.raw,
+      error: result.error
+    });
+  } catch (err) {
+    console.error('[Kaggle] Error en status:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * GET /api/kaggle/output/:jobId - Obtener output/resultado de un job
+ */
+app.get('/api/kaggle/output/:jobId', requireAuth, async (req, res) => {
+  try {
+    const { jobId } = req.params;
+
+    if (!jobId || typeof jobId !== 'string') {
+      return res.status(400).json({ ok: false, error: 'Se requiere jobId' });
+    }
+
+    const result = await kaggleService.getJobOutput(jobId);
+
+    return res.json(buildKaggleOutputPayload(result));
+  } catch (err) {
+    console.error('[Kaggle] Error en output:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * GET /api/kaggle/output/:jobId/download - Descargar bundle zip de outputs
+ */
+app.get('/api/kaggle/output/:jobId/download', requireAuth, async (req, res) => {
+  let archive = null;
+
+  try {
+    const { jobId } = req.params;
+
+    if (!jobId || typeof jobId !== 'string') {
+      return res.status(400).json({ ok: false, error: 'Se requiere jobId' });
+    }
+
+    const outputResult = await kaggleService.getJobOutput(jobId);
+    if (!outputResult.success) {
+      return res.status(404).json({ ok: false, error: outputResult.error || 'No se pudieron preparar los outputs' });
+    }
+
+    archive = await kaggleService.createJobOutputArchive(jobId);
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', buildAttachmentContentDisposition(archive.fileName, `${jobId}-outputs.zip`));
+
+    return res.sendFile(archive.archivePath, (err) => {
+      archive.cleanup();
+      archive = null;
+      if (err && !res.headersSent) {
+        console.error('[Kaggle] Error enviando bundle:', err);
+        res.status(500).json({ ok: false, error: 'No se pudo descargar el bundle de outputs' });
+      }
+    });
+  } catch (err) {
+    if (archive) {
+      archive.cleanup();
+    }
+    console.error('[Kaggle] Error en download bundle:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * GET /api/kaggle/output/:jobId/files/:fileName/download - Descargar un output específico
+ */
+app.get('/api/kaggle/output/:jobId/files/:fileName/download', requireAuth, async (req, res) => {
+  try {
+    const { jobId, fileName } = req.params;
+
+    if (!jobId || typeof jobId !== 'string') {
+      return res.status(400).json({ ok: false, error: 'Se requiere jobId' });
+    }
+
+    if (!fileName || typeof fileName !== 'string') {
+      return res.status(400).json({ ok: false, error: 'Se requiere fileName' });
+    }
+
+    let resolvedFile = null;
+    try {
+      resolvedFile = kaggleService.resolveJobOutputFile(jobId, fileName);
+    } catch (initialResolveError) {
+      const outputResult = await kaggleService.getJobOutput(jobId);
+      if (!outputResult.success) {
+        return res.status(404).json({ ok: false, error: outputResult.error || 'No se pudo preparar el archivo solicitado' });
+      }
+      resolvedFile = kaggleService.resolveJobOutputFile(jobId, fileName);
+    }
+
+    res.setHeader('Content-Disposition', buildAttachmentContentDisposition(resolvedFile.fileName, resolvedFile.fileName));
+    return res.sendFile(resolvedFile.filePath);
+  } catch (err) {
+    console.error('[Kaggle] Error en file download:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * GET /api/kaggle/jobs - Listar jobs recientes
+ * Query: limit, chatId (optional filter by chat)
+ */
+app.get('/api/kaggle/jobs', requireAuth, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit, 10) || 20;
+    const chatId = req.query.chatId ? Number(req.query.chatId) : null;
+    const result = await kaggleService.listJobs(Math.min(limit, 100), { chatId });
+
+    return res.json({
+      ok: result.success,
+      jobs: result.jobs,
+      total: result.total,
+      error: result.error
+    });
+  } catch (err) {
+    console.error('[Kaggle] Error en listJobs:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * DELETE /api/kaggle/jobs/:jobId - Limpiar archivos temporales de un job
+ */
+app.delete('/api/kaggle/jobs/:jobId', requireAuth, (req, res) => {
+  try {
+    const { jobId } = req.params;
+    kaggleService.cleanupJob(jobId);
+    return res.json({ ok: true, message: 'Job cleanup completed' });
+  } catch (err) {
+    console.error('[Kaggle] Error en cleanup:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * DELETE /api/kaggle/jobs - Eliminar todo el historial de jobs y archivos
+ */
+app.delete('/api/kaggle/jobs', requireAuth, (req, res) => {
+  try {
+    const result = kaggleService.cleanupAllJobs();
+    return res.json({ ok: true, deletedCount: result.deletedCount });
+  } catch (err) {
+    console.error('[Kaggle] Error en cleanup all:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * GET /api/kaggle/jobs/:jobId/details - Obtener detalles completos del job (código, logs, etc)
+ */
+app.get('/api/kaggle/jobs/:jobId/details', requireAuth, (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const details = kaggleService.getJobDetails(jobId);
+    return res.json(details);
+  } catch (err) {
+    console.error('[Kaggle] Error en details:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/kaggle/submit-autoretry - Enviar código con auto-retry y corrección por agente
+ */
+app.post('/api/kaggle/submit-autoretry', requireAuth, async (req, res) => {
+  try {
+    const { code, options = {} } = req.body;
+    const sessionId = req.query.sessionId || req.body.sessionId;
+
+    if (!code) {
+      return res.status(400).json({ ok: false, error: 'code is required' });
+    }
+
+    // Configurar callback del agente usando Claude Code
+    const agentCallback = kaggleService.createClaudeAgentCallback(async (prompt, opts) => {
+      // Usar la infraestructura existente de spawning de Claude Code
+      return new Promise((resolve, reject) => {
+        const args = ['--print', prompt];
+        if (opts.systemPrompt) {
+          args.unshift('--system-prompt', opts.systemPrompt);
+        }
+
+        const claudePath = '/usr/local/bin/claude-codexweb-max';
+        const child = require('child_process').spawn(claudePath, args, {
+          cwd: process.cwd(),
+          env: { ...process.env },
+          stdio: ['pipe', 'pipe', 'pipe']
+        });
+
+        let stdout = '';
+        let stderr = '';
+
+        child.stdout.on('data', (data) => { stdout += data.toString(); });
+        child.stderr.on('data', (data) => { stderr += data.toString(); });
+
+        child.on('close', (code) => {
+          if (code === 0) {
+            resolve({ success: true, output: stdout });
+          } else {
+            resolve({ success: false, error: stderr || `Exit code ${code}` });
+          }
+        });
+
+        child.on('error', (err) => {
+          resolve({ success: false, error: err.message });
+        });
+      });
+    });
+
+    // Status callback para logging
+    const statusCallback = (status) => {
+      console.log(`[Kaggle AutoRetry] ${JSON.stringify(status)}`);
+    };
+
+    // Ejecutar con auto-retry
+    const result = await kaggleService.submitWithAutoRetry(
+      code,
+      {
+        ...options,
+        maxRetries: options.maxRetries || 3
+      },
+      agentCallback,
+      statusCallback
+    );
+
+    return res.json({
+      ok: result.success,
+      ...result
+    });
+  } catch (err) {
+    console.error('[Kaggle AutoRetry] Error:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/kaggle/submit-multiagent - Enviar código con auto-retry usando Claude + Codex
+ * Permite elegir agente primario y habilitar fallback al secundario
+ */
+app.post('/api/kaggle/submit-multiagent', requireAuth, async (req, res) => {
+  try {
+    const { code, options = {} } = req.body;
+
+    if (!code) {
+      return res.status(400).json({ ok: false, error: 'code is required' });
+    }
+
+    const primaryAgent = options.primaryAgent || 'claude';
+    const enableClaude = options.enableClaude !== false;
+    const enableCodex = options.enableCodex !== false;
+
+    const agentCallbacks = {};
+
+    // Configurar callback de Claude
+    if (enableClaude) {
+      agentCallbacks.claude = kaggleService.createClaudeAgentCallback(async (prompt, opts) => {
+        return new Promise((resolve, reject) => {
+          const args = ['--print', prompt];
+          if (opts.systemPrompt) {
+            args.unshift('--system-prompt', opts.systemPrompt);
+          }
+
+          const claudePath = '/usr/local/bin/claude-codexweb-max';
+          const child = require('child_process').spawn(claudePath, args, {
+            cwd: process.cwd(),
+            env: { ...process.env },
+            stdio: ['pipe', 'pipe', 'pipe']
+          });
+
+          let stdout = '';
+          let stderr = '';
+
+          child.stdout.on('data', (data) => { stdout += data.toString(); });
+          child.stderr.on('data', (data) => { stderr += data.toString(); });
+
+          child.on('close', (exitCode) => {
+            if (exitCode === 0) {
+              resolve({ success: true, output: stdout });
+            } else {
+              resolve({ success: false, error: stderr || `Exit code ${exitCode}` });
+            }
+          });
+
+          child.on('error', (err) => {
+            resolve({ success: false, error: err.message });
+          });
+        });
+      });
+    }
+
+    // Configurar callback de Codex
+    if (enableCodex) {
+      agentCallbacks.codex = kaggleService.createCodexAgentCallback(async (prompt, opts) => {
+        return new Promise(async (resolve) => {
+          try {
+            const codexPath = await resolveCodexPath();
+            const args = [
+              '-c', 'shell_environment_policy.inherit=all',
+              'exec',
+              '--skip-git-repo-check',
+              '--sandbox', 'danger-full-access',
+              '--color', 'never',
+              prompt
+            ];
+
+            const child = require('child_process').spawn(codexPath, args, {
+              cwd: process.cwd(),
+              env: { ...process.env },
+              stdio: ['pipe', 'pipe', 'pipe']
+            });
+
+            let stdout = '';
+            let stderr = '';
+
+            child.stdout.on('data', (data) => { stdout += data.toString(); });
+            child.stderr.on('data', (data) => { stderr += data.toString(); });
+
+            child.on('close', (exitCode) => {
+              if (exitCode === 0 || stdout.trim()) {
+                resolve({ success: true, output: stdout || stderr });
+              } else {
+                resolve({ success: false, error: stderr || `Exit code ${exitCode}` });
+              }
+            });
+
+            child.on('error', (err) => {
+              resolve({ success: false, error: err.message });
+            });
+          } catch (err) {
+            resolve({ success: false, error: err.message });
+          }
+        });
+      });
+    }
+
+    const statusCallback = (status) => {
+      console.log(`[Kaggle MultiAgent] ${JSON.stringify(status)}`);
+    };
+
+    const result = await kaggleService.submitWithMultiAgentRetry(
+      code,
+      {
+        ...options,
+        maxRetries: options.maxRetries || 3,
+        agentCallbacks,
+        primaryAgent
+      },
+      statusCallback
+    );
+
+    return res.json({
+      ok: result.success,
+      ...result
+    });
+  } catch (err) {
+    console.error('[Kaggle MultiAgent] Error:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/kaggle/poll-complete - Polling hasta completar (sin retry)
+ */
+app.post('/api/kaggle/poll-complete', requireAuth, async (req, res) => {
+  try {
+    const { jobId } = req.body;
+
+    if (!jobId) {
+      return res.status(400).json({ ok: false, error: 'jobId is required' });
+    }
+
+    const pollResult = await kaggleService.pollUntilComplete(jobId);
+
+    if (pollResult.status === 'complete') {
+      const outputResult = await kaggleService.getJobOutput(jobId);
+      return res.json({
+        ...buildKaggleOutputPayload(outputResult),
+        ok: true,
+        status: 'complete'
+      });
+    }
+
+    return res.json({
+      ok: false,
+      status: pollResult.status,
+      error: pollResult.error
+    });
+  } catch (err) {
+    console.error('[Kaggle Poll] Error:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ==================== END KAGGLE INTEGRATION ====================
+
 app.get('/api/tools/git/repos', requireAuth, (req, res) => {
   const permission = guardRequestPermissionOrRespond(req, res, 'git', {
     requiresGit: true
@@ -22277,9 +22831,22 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           messagesAfter: (tsResult.sections && tsResult.sections.messageCount) || 0,
           skipped: (tsResult.sections && tsResult.sections.skippedMessages) || 0
         });
-        // Log para debugging
-        if (tsMode === 'listen-only' || tsMode === 'command-freeze') {
-          console.log(`[token-saver] ${tsMode} activado: ${tsResult.savingsPercent}% ahorro (${tsResult.estimatedSavings} tokens)`);
+        // Enviar notificación cuando se activa una estrategia específica
+        if (tsType && tsType !== 'off' && tsType !== 'optimized') {
+          const strategyNames = {
+            'listen-only': 'Listen-Only Mode',
+            'command-freeze': 'Command Context Freeze',
+            'streaming': 'Context-Free Streaming'
+          };
+          const strategyName = strategyNames[tsType] || tsType;
+          sendSse(res, 'ts_strategy_activated', {
+            strategy: tsType,
+            strategyName,
+            savings: tsResult.estimatedSavings || 0,
+            percent: tsResult.savingsPercent || 0,
+            mode: tsMode
+          });
+          console.log(`[token-saver] Estrategia ${strategyName} activada: ${tsResult.savingsPercent}% ahorro (${tsResult.estimatedSavings} tokens)`);
         }
       }
       sendSse(res, 'chat_agent', {
@@ -22931,9 +23498,22 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           messagesAfter: (tsResult.sections && tsResult.sections.messageCount) || 0,
           skipped: (tsResult.sections && tsResult.sections.skippedMessages) || 0
         });
-        // Log para debugging
-        if (tsMode === 'listen-only' || tsMode === 'command-freeze') {
-          console.log(`[token-saver] ${tsMode} activado: ${tsResult.savingsPercent}% ahorro (${tsResult.estimatedSavings} tokens)`);
+        // Enviar notificación cuando se activa una estrategia específica
+        if (tsType && tsType !== 'off' && tsType !== 'optimized') {
+          const strategyNames = {
+            'listen-only': 'Listen-Only Mode',
+            'command-freeze': 'Command Context Freeze',
+            'streaming': 'Context-Free Streaming'
+          };
+          const strategyName = strategyNames[tsType] || tsType;
+          sendSse(res, 'ts_strategy_activated', {
+            strategy: tsType,
+            strategyName,
+            savings: tsResult.estimatedSavings || 0,
+            percent: tsResult.savingsPercent || 0,
+            mode: tsMode
+          });
+          console.log(`[token-saver] Estrategia ${strategyName} activada: ${tsResult.savingsPercent}% ahorro (${tsResult.estimatedSavings} tokens)`);
         }
       }
       sendSse(res, 'chat_agent', {
@@ -23613,9 +24193,22 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           messagesAfter: (tsResult.sections && tsResult.sections.messageCount) || 0,
           skipped: (tsResult.sections && tsResult.sections.skippedMessages) || 0
         });
-        // Log para debugging
-        if (tsMode === 'listen-only' || tsMode === 'command-freeze') {
-          console.log(`[token-saver] ${tsMode} activado: ${tsResult.savingsPercent}% ahorro (${tsResult.estimatedSavings} tokens)`);
+        // Enviar notificación cuando se activa una estrategia específica
+        if (tsType && tsType !== 'off' && tsType !== 'optimized') {
+          const strategyNames = {
+            'listen-only': 'Listen-Only Mode',
+            'command-freeze': 'Command Context Freeze',
+            'streaming': 'Context-Free Streaming'
+          };
+          const strategyName = strategyNames[tsType] || tsType;
+          sendSse(res, 'ts_strategy_activated', {
+            strategy: tsType,
+            strategyName,
+            savings: tsResult.estimatedSavings || 0,
+            percent: tsResult.savingsPercent || 0,
+            mode: tsMode
+          });
+          console.log(`[token-saver] Estrategia ${strategyName} activada: ${tsResult.savingsPercent}% ahorro (${tsResult.estimatedSavings} tokens)`);
         }
       }
       sendSse(res, 'chat_agent', {
@@ -25568,6 +26161,24 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     }
     return res.status(500).json({ error: `Error ejecutando ${providerLabel}. ${details}` });
   }
+});
+
+// SPA catch-all: serve index.html for all non-API routes
+app.get('*', (req, res, next) => {
+  // Skip API routes and health check
+  if (req.path.startsWith('/api/') || req.path === '/health') {
+    return next();
+  }
+
+  // Skip if index.html doesn't exist
+  if (!fs.existsSync(frontendIndexHtmlPath)) {
+    return next();
+  }
+
+  // Serve index.html for all other routes (SPA routing)
+  disableConditionalCacheHeaders(req);
+  setFrontendNoStore(res);
+  return res.sendFile(frontendIndexHtmlPath);
 });
 
 app.use((error, _req, res, next) => {

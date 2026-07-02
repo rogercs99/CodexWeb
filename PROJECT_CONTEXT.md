@@ -93,6 +93,20 @@ systemctl status codexweb.service       # Prod (no tocar)
 - `GET  /api/codex/quota` — cuota Codex
 - `POST /api/token-saver/*` — configuración Token Saver
 
+## Integración Kaggle (MVP)
+- Servicio backend: `kaggleService.js`
+- Endpoints base protegidos por `requireAuth`: `POST /api/kaggle/submit`, `GET /api/kaggle/status/:jobId`, `GET /api/kaggle/output/:jobId`, `POST /api/kaggle/poll-complete`, `GET /api/kaggle/jobs`, `DELETE /api/kaggle/jobs/:jobId`
+- La CLI de Kaggle se resuelve desde `KAGGLE_CLI_PATH` o `~/.local/bin/kaggle`; usa `KAGGLE_CONFIG_DIR=~/.kaggle`
+- El flujo Kaggle base (`submit/status/output/poll-complete`) no depende de Claude Code
+- Solo `POST /api/kaggle/submit-autoretry` depende de Claude Code para autocorrección; hoy spawnea el wrapper hardcodeado `/usr/local/bin/claude-codexweb-max`
+- E2E base verificado por HTTP real en dev el **2026-06-30** con usuario temporal registrado: `submit -> queued/running -> complete -> output`
+- El contrato real de `GET /api/kaggle/output/:jobId` devuelve `files`, `outputs`, `output`, `stderr` y `downloadLog`; actualmente **no** expone `downloadUrl`
+- **2026-07-02**: la UI inline del chat (`ChatScreen` + `KaggleJobInline`) fue revalidada en navegador real en dev para el flujo de misma sesión: botón `Kaggle` en bloque Python -> job inline -> `Completado` -> preview de imagen en el chat -> logs inline expandibles -> descargas por archivo y ZIP
+- **2026-07-02**: había un desajuste real frontend/backend en Kaggle (`status/files/logs` de `/api/kaggle/output` y forma de `job/details`) que hacía crashear la vista inline al completar el job; el fix quedó en `stitch_frontend/src/lib/api.ts` y `stitch_frontend/src/components/KaggleJobInline.tsx`
+- `ChatScreen` rehidrata ahora todos los jobs Kaggle asociados al chat, incluidos los terminales, y `KaggleJobInline` carga outputs terminales al montar sin esperar al siguiente polling
+- `kaggleService.js` persiste metadatos mínimos por job en `.runtime/kaggle-kernels/<jobId>/job-state.json` para reconstruir `jobsCache` tras reinicios; jobs antiguos sin ese fichero siguen dependiendo del cache en memoria si no se vuelven a enviar
+- Prompt/guía de prueba: `tests/kaggle-e2e-test.md`; script automatizado: `tests/kaggle-e2e-test.sh`
+
 ## Flujo autenticación Claude Code
 1. UI llama `POST /api/claude-code/auth/start` → backend spawnea `claude auth login` (stdin: pipe)
 2. Backend captura stdout/stderr, extrae URL de autenticación

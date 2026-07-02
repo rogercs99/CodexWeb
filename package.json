@@ -15,5 +15,8 @@
     "express-session": "^1.18.1",
     "googleapis": "^140.0.1",
     "helmet": "^8.0.0"
+  },
+  "devDependencies": {
+    "puppeteer": "^24.43.1"
   }
 }
