@@ -114,3 +114,13 @@ Latest main timing table observed:
 - On VPS/prod, run tests with real `better-sqlite3`, real filesystem, and real CLIs after normal `npm ci` or `npm install`.
 - Do not deploy solely from sandbox mock success. Run the same tests on VPS before git commit/push.
 - The final ZIP intentionally excludes `node_modules` and `.runtime`; install dependencies on the target machine.
+
+## VPS deployment results (2026-07-02)
+- Deployed to VPS at `/root/CodexWeb` on 2026-07-02 22:42 CEST.
+- Applied to `codexwebdev.gamemodai.pro` (DEV environment).
+- Dependencies installed: root 0 vulnerabilities, frontend 0 vulnerabilities.
+- Frontend build: Vite 6.4.3, code-split bundles working (vendor-react 193KB, vendor-icons 27KB, vendor 157KB, main 452KB).
+- Service worker updated to `codexweb-v4-20260702-audit` with fixed asset regex for split bundles.
+- DEV service restarted successfully, serving updated assets from `.runtime/dev/public`.
+- Committed as 3 separate commits: fix (terminal/mobile), test (audit suite), chore (dependencies).
+- Production deployment pending manual validation and explicit user approval.
