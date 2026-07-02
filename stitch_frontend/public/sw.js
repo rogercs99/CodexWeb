@@ -1,5 +1,5 @@
 // CodexWeb Service Worker — shell cache + offline fallback
-const CACHE = 'codexweb-v3-20260629';
+const CACHE = 'codexweb-v4-20260702-audit';
 const SHELL = ['/'];
 
 self.addEventListener('install', (e) => {
@@ -34,7 +34,7 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  if (/\/assets\/index-[A-Za-z0-9_-]+\.(js|css)$/.test(url.pathname)) {
+  if (/\/assets\/[A-Za-z0-9_.-]+\.(js|css)$/.test(url.pathname)) {
     e.respondWith(
       caches.match(e.request).then(
         (cached) =>

@@ -1120,7 +1120,7 @@ export default function TerminalLivePanel({ onClose, onNavigate }: { onClose?: (
       </div>
 
       {!isFloating ? (
-        <div className="fixed bottom-[74px] left-0 right-0 p-4 bg-gradient-to-t from-black via-black/90 to-transparent z-[60] pointer-events-none">
+        <div className="fixed bottom-[96px] left-0 right-0 p-4 bg-gradient-to-t from-black via-black/90 to-transparent z-[60] pointer-events-none">
           <form
             className="mx-auto max-w-5xl rounded-2xl border border-zinc-800 bg-zinc-950/95 backdrop-blur-xl p-3 pointer-events-auto"
             onSubmit={(event) => {

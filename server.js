@@ -3354,7 +3354,7 @@ const steamDeckDangerousCommandPatterns = [
   {
     id: 'rm_root',
     label: 'Borrado total del sistema',
-    pattern: /\brm\s+-rf\s+\/(\s|$)/i
+    pattern: /\brm\s+[^\n;&|]*-(?:[^\n;&|]*r[^\n;&|]*f|[^\n;&|]*f[^\n;&|]*r)[^\n;&|]*(?:--no-preserve-root\s+)?\/(?:\s|$)/i
   },
   {
     id: 'partition_table',
@@ -19182,7 +19182,11 @@ app.post('/api/tools/terminal-live/stream', requireAuth, (req, res) => {
     }
   };
 
-  req.on('close', () => {
+  // In SSE routes the request body can finish before the response stream is done.
+  // Listen to the response lifecycle instead, otherwise short commands can be killed
+  // as soon as the client finishes sending the POST body. Tiny bug, huge facepalm.
+  res.on('close', () => {
+    if (res.writableEnded) return;
     clientDisconnected = true;
     cleanup();
   });
@@ -19239,7 +19243,10 @@ app.post('/api/tools/terminal-live/stream', requireAuth, (req, res) => {
   });
 
   bashProcess.on('close', (code, signal) => {
-    cleanup();
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
     exitCode = code !== null ? code : (signal ? -1 : 0);
     const finishedAt = nowIso();
     const durationMs = Date.now() - startedAtMs;
