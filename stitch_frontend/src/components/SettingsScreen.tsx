@@ -727,7 +727,7 @@ export default function SettingsScreen({
     quotaRows.push({
       id: 'primary',
       label: formatWindowLabel(quota.primary, 'Primary'),
-      remainingPercent: quota.primary.remainingPercent,
+      remainingPercent: quota.primary.remaining,
       resetAt: quota.primary.resetAt,
       windowData: quota.primary
     });
@@ -737,7 +737,7 @@ export default function SettingsScreen({
     quotaRows.push({
       id: 'secondary',
       label: formatWindowLabel(quota.secondary, 'Secondary'),
-      remainingPercent: quota.secondary.remainingPercent,
+      remainingPercent: quota.secondary.remaining,
       resetAt: quota.secondary.resetAt,
       windowData: quota.secondary
     });

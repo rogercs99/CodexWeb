@@ -1325,7 +1325,8 @@ export default function TerminalLogScreen({
         path: storageLocalPath,
         sortBy: storageSortBy,
         sortOrder: storageSortOrder,
-        limit: 260
+        limit: 260,
+        includeDirSize: storageSortBy === 'size'
       });
       setStorageLocalData(payload);
       setStorageSelectedLocalPaths((prev) => {
@@ -2074,27 +2075,29 @@ export default function TerminalLogScreen({
         .map((entry) => entry.path)
         .join(', ');
       const failurePreview = payload.failed.slice(0, 2).map((entry) => `${entry.path}: ${entry.error}`).join(' | ');
-      setResidualHistory((prev) =>
-        [
-          {
-            id: `delete:${Date.now()}:${Math.random().toString(16).slice(2, 8)}`,
-            kind: 'delete',
-            status: failedCount > 0 ? 'error' : 'completed',
-            createdAt: new Date().toISOString(),
-            summary: deleteSummary,
-            details: [
-              freedBytes > 0 ? `espacio liberado: ${formatBytes(freedBytes)}` : '',
-              deletedPreview ? `eliminados: ${deletedPreview}` : '',
-              failurePreview ? `errores: ${failurePreview}` : ''
-            ]
-              .filter(Boolean)
-              .join(' · ')
-          },
+      setResidualHistory((prev) => {
+        const deleteHistoryItem: ResidualCleanupHistoryItem = {
+          id: `delete:${Date.now()}:${Math.random().toString(16).slice(2, 8)}`,
+          kind: 'delete',
+          status: failedCount > 0 ? 'error' : 'completed',
+          createdAt: new Date().toISOString(),
+          summary: deleteSummary,
+          details: [
+            freedBytes > 0 ? `espacio liberado: ${formatBytes(freedBytes)}` : '',
+            deletedPreview ? `eliminados: ${deletedPreview}` : '',
+            failurePreview ? `errores: ${failurePreview}` : ''
+          ]
+            .filter(Boolean)
+            .join(' · ')
+        };
+
+        return [
+          deleteHistoryItem,
           ...prev
         ]
           .sort((a, b) => parseResidualTimeMs(b.createdAt) - parseResidualTimeMs(a.createdAt))
-          .slice(0, 18)
-      );
+          .slice(0, 18);
+      });
       if (failedCount > 0) {
         const firstFailure = payload.failed[0];
         if (firstFailure?.error) {
