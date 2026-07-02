@@ -1,0 +1,45 @@
+{
+  "generatedAt": "2026-07-02T20:06:12.491Z",
+  "rows": [
+    {
+      "endpoint": "GET /api/me",
+      "samples": 8,
+      "medianMs": 2.7,
+      "p95Ms": 5.1,
+      "maxMs": 5.1,
+      "status": "OK"
+    },
+    {
+      "endpoint": "GET /api/chat/options",
+      "samples": 8,
+      "medianMs": 2.7,
+      "p95Ms": 3.6,
+      "maxMs": 3.6,
+      "status": "OK"
+    },
+    {
+      "endpoint": "GET /api/conversations",
+      "samples": 8,
+      "medianMs": 1.4,
+      "p95Ms": 1.5,
+      "maxMs": 1.5,
+      "status": "OK"
+    },
+    {
+      "endpoint": "GET /api/tools/observability",
+      "samples": 8,
+      "medianMs": 25.5,
+      "p95Ms": 32.4,
+      "maxMs": 32.4,
+      "status": "OK"
+    },
+    {
+      "endpoint": "POST /api/tools/terminal-live/stream",
+      "samples": 8,
+      "medianMs": 18,
+      "p95Ms": 19.8,
+      "maxMs": 19.8,
+      "status": "OK"
+    }
+  ]
+}

@@ -1,0 +1,112 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "gaxios": {
+      "name": "gaxios",
+      "severity": "moderate",
+      "isDirect": false,
+      "via": [
+        "uuid"
+      ],
+      "effects": [],
+      "range": "6.4.0 - 6.7.1",
+      "nodes": [
+        "node_modules/gaxios"
+      ],
+      "fixAvailable": true
+    },
+    "googleapis": {
+      "name": "googleapis",
+      "severity": "moderate",
+      "isDirect": true,
+      "via": [
+        "googleapis-common"
+      ],
+      "effects": [],
+      "range": "33.0.0 - 149.0.0",
+      "nodes": [
+        "node_modules/googleapis"
+      ],
+      "fixAvailable": {
+        "name": "googleapis",
+        "version": "173.0.0",
+        "isSemVerMajor": true
+      }
+    },
+    "googleapis-common": {
+      "name": "googleapis-common",
+      "severity": "moderate",
+      "isDirect": false,
+      "via": [
+        "uuid"
+      ],
+      "effects": [
+        "googleapis"
+      ],
+      "range": "<=7.2.0",
+      "nodes": [
+        "node_modules/googleapis-common"
+      ],
+      "fixAvailable": {
+        "name": "googleapis",
+        "version": "173.0.0",
+        "isSemVerMajor": true
+      }
+    },
+    "uuid": {
+      "name": "uuid",
+      "severity": "moderate",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 1119441,
+          "name": "uuid",
+          "dependency": "uuid",
+          "title": "uuid: Missing buffer bounds check in v3/v5/v6 when buf is provided",
+          "url": "https://github.com/advisories/GHSA-w5hq-g745-h8pq",
+          "severity": "moderate",
+          "cwe": [
+            "CWE-787",
+            "CWE-1285"
+          ],
+          "cvss": {
+            "score": 7.5,
+            "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N"
+          },
+          "range": "<11.1.1"
+        }
+      ],
+      "effects": [
+        "gaxios",
+        "googleapis-common"
+      ],
+      "range": "<11.1.1",
+      "nodes": [
+        "node_modules/uuid"
+      ],
+      "fixAvailable": {
+        "name": "googleapis",
+        "version": "173.0.0",
+        "isSemVerMajor": true
+      }
+    }
+  },
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 0,
+      "moderate": 4,
+      "high": 0,
+      "critical": 0,
+      "total": 4
+    },
+    "dependencies": {
+      "prod": 137,
+      "dev": 106,
+      "optional": 4,
+      "peer": 0,
+      "peerOptional": 0,
+      "total": 242
+    }
+  }
+}

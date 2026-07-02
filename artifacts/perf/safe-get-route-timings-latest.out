@@ -1,0 +1,62 @@
+# Safe GET route timings
+
+Generated: 2026-07-02T20:03:52.572Z
+Base: http://127.0.0.1:3099
+Scope: GET routes without path params. Some endpoints are mocked/empty in sandbox; this is still useful to catch startup/runtime explosions, not to pretend it is production physics.
+
+| Route | Samples | Median ms | Max ms | HTTP | Result |
+|---|---:|---:|---:|---:|---|
+| `/diag` | 3 | 3.1 | 4.5 | 200 | OK |
+| `/d` | 3 | 4.7 | 5.7 | 200 | OK |
+| `/dbg` | 3 | 3.4 | 3.7 | 200 | OK |
+| `/sf` | 3 | 2.8 | 3.7 | 200 | OK |
+| `/boot-monitor.js` | 3 | 2.1 | 2.1 | 200 | OK |
+| `/sw.js` | 3 | 1.8 | 2.7 | 200 | OK |
+| `/manifest.json` | 3 | 1.7 | 1.7 | 200 | OK |
+| `/icon.svg` | 3 | 1.6 | 1.8 | 200 | OK |
+| `/` | 3 | 1.8 | 2 | 200 | OK |
+| `/quetzal-relay` | 3 | 2.1 | 2.1 | 200 | OK |
+| `/health` | 3 | 2.2 | 2.3 | 200 | OK |
+| `/ok` | 3 | 1.6 | 2.1 | 200 | OK |
+| `/api/health` | 3 | 1.5 | 1.6 | 200 | OK |
+| `/api/claude/health` | 3 | 13.9 | 17.2 | 200 | OK |
+| `/api/version` | 3 | 1.7 | 1.8 | 200 | OK |
+| `/api/frontend/diag-reports/recent` | 3 | 1.4 | 1.6 | 200 | OK |
+| `/api/quetzal-relay/status` | 3 | 115.3 | 148.9 | 200 | OK |
+| `/api/quetzal-relay/commands` | 3 | 2.1 | 2.1 | 200 | OK |
+| `/api/quetzal-relay/diagnostics` | 3 | 104.7 | 105.5 | 200 | OK |
+| `/api/workspace/file` | 3 | 1.9 | 2.9 | 400 | EXPECTED_400 |
+| `/api/devices/steamdeck/config` | 3 | 2 | 2.3 | 200 | OK |
+| `/api/devices/steamdeck/jobs` | 3 | 1.4 | 1.5 | 403 | EXPECTED_403 |
+| `/api/devices/steamdeck/setup-link` | 3 | 1.4 | 1.6 | 403 | EXPECTED_403 |
+| `/api/settings/ai-agents` | 3 | 1.9 | 2.3 | 200 | OK |
+| `/api/ai/providers` | 3 | 2.9 | 3 | 200 | OK |
+| `/api/projects` | 3 | 1.7 | 1.9 | 200 | OK |
+| `/api/conversations` | 3 | 1.6 | 1.7 | 200 | OK |
+| `/api/chat/options` | 3 | 2.8 | 2.9 | 200 | OK |
+| `/api/codex/quota` | 3 | 1.6 | 1.7 | 200 | OK |
+| `/api/codex/runs` | 3 | 1.5 | 1.6 | 200 | OK |
+| `/api/tasks` | 3 | 1.7 | 1.7 | 200 | OK |
+| `/api/tools/search` | 3 | 2 | 2.5 | 200 | OK |
+| `/api/tools/observability` | 3 | 31.6 | 34.5 | 200 | OK |
+| `/api/tools/deployed-apps` | 3 | 2 | 151.4 | 200 | OK |
+| `/api/tools/storage/local/list` | 3 | 3.7 | 4.9 | 200 | OK |
+| `/api/tools/storage/local/heavy` | 3 | 247.4 | 277.4 | 200 | OK |
+| `/api/tools/storage/overview` | 3 | 18.7 | 18.9 | 200 | OK |
+| `/api/tools/storage/jobs` | 3 | 2.7 | 2.8 | 200 | OK |
+| `/api/kaggle/jobs` | 3 | 1.5 | 1.7 | 200 | OK |
+| `/api/tools/git/repos` | 3 | 2 | 3.1 | 200 | OK |
+| `/api/codex/auth/status` | 3 | 15.5 | 15.8 | 200 | OK |
+| `/api/claude-code/auth/status` | 3 | 13.3 | 13.6 | 200 | OK |
+| `/api/attachments` | 3 | 2 | 2.4 | 200 | OK |
+| `/api/storage/health` | 3 | 15.5 | 16.8 | 200 | OK |
+| `/api/restart/status` | 3 | 1.9 | 2 | 200 | OK |
+| `/api/me` | 3 | 1.4 | 1.4 | 200 | OK |
+| `/api/settings/notifications` | 3 | 1.4 | 1.4 | 200 | OK |
+| `/api/token-saver/presets` | 3 | 1.4 | 1.5 | 200 | OK |
+| `/api/token-saver/settings` | 3 | 1.6 | 2 | 200 | OK |
+| `/api/token-saver/settings/effective` | 3 | 1.5 | 1.8 | 200 | OK |
+| `/api/token-saver/status` | 3 | 1.6 | 1.6 | 200 | OK |
+| `/api/token-saver/usage` | 3 | 1.5 | 1.5 | 200 | OK |
+| `/api/projects/recent` | 3 | 1.5 | 1.6 | 200 | OK |
+

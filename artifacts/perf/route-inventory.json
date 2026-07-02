@@ -1,0 +1,824 @@
+[
+  {
+    "method": "GET",
+    "path": "/diag",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/d",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/dbg",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/sf",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/__clear-site-data",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/boot-monitor.js",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/sw.js",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/manifest.json",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/icon.svg",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/quetzal-relay",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/^/assets/index-[A-Za-z0-9_-]+\\.(js|css)$/",
+    "source": "server.js",
+    "regex": true
+  },
+  {
+    "method": "GET",
+    "path": "/health",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/ok",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/health",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/claude/health",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/version",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/frontend/bootstrap-error",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/frontend/diag-report",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/frontend/diag-reports/recent",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/register",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/login",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/logout",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/quetzal-relay/status",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/quetzal-relay/config",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/quetzal-relay/commands",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/quetzal-relay/diagnostics",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/quetzal-relay/prepare",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/uploads/:conversationId/:storedName",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/^/.*/uploads/([^/]+)/([^/]+)$/",
+    "source": "server.js",
+    "regex": true
+  },
+  {
+    "method": "GET",
+    "path": "/api/workspace/file",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/devices/steamdeck/config",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/devices/steamdeck/config",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/devices/steamdeck/generate-key",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/devices/steamdeck/test",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/devices/steamdeck/detect",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/devices/steamdeck/command",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/devices/steamdeck/codex",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/devices/steamdeck/jobs",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/devices/steamdeck/jobs/:id",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/devices/steamdeck/jobs/:id/cancel",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/devices/steamdeck/setup-link",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/devices/steamdeck/setup-page/:token",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/devices/steamdeck/setup-script/:token",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/devices/steamdeck/register",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/settings/ai-agents",
+    "source": "server.js"
+  },
+  {
+    "method": "PATCH",
+    "path": "/api/settings/ai-agents/active",
+    "source": "server.js"
+  },
+  {
+    "method": "PATCH",
+    "path": "/api/settings/ai-agents/:agentId",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/ai/providers",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/ai/providers/:providerId/models",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/ai/providers/:providerId/capabilities",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/ai/providers/:providerId/availability",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/ai/providers/:providerId/quota",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/ai/providers/:providerId/permissions",
+    "source": "server.js"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/ai/providers/:providerId/permissions",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/ai/providers/:providerId/permissions/grant-full",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/restart",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects",
+    "source": "server.js"
+  },
+  {
+    "method": "PATCH",
+    "path": "/api/projects/:id",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/projects/:id/regenerate-context",
+    "source": "server.js"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/projects/:id",
+    "source": "server.js"
+  },
+  {
+    "method": "PATCH",
+    "path": "/api/conversations/:id/project",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/conversations",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/conversations",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/conversations/:id/messages",
+    "source": "server.js"
+  },
+  {
+    "method": "PATCH",
+    "path": "/api/conversations/:id/title",
+    "source": "server.js"
+  },
+  {
+    "method": "PATCH",
+    "path": "/api/conversations/:id/settings",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/conversations/:id/kill",
+    "source": "server.js"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/conversations/:id",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/chat/options",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/codex/quota",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/codex/runs",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/codex/runs/kill-all",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tasks",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/search",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/observability",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/deployed-apps",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/deployed-apps/describe",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/deployed-apps/describe/:jobId",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/deployed-apps/:appId/action",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/deployed-apps/:appId/logs",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/terminal-live/stream",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/storage/local/list",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/storage/local/heavy",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/storage/local/move",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/storage/local/compress",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/storage/local/delete",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/storage/cleanup/analyze",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/storage/cleanup/quick",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/storage/system/dev-quick-cleanup",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/storage/cleanup/delete",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/storage/overview",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/storage/jobs",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/storage/jobs/:jobId",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/storage/:cloudProvider(drive)/rclone/status",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/storage/:cloudProvider(drive)/rclone/remotes",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/storage/:cloudProvider(drive)/rclone/remotes/:remoteName/validate",
+    "source": "server.js"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/tools/storage/:cloudProvider(drive)/rclone/remotes/:remoteName",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/storage/:cloudProvider(drive)/accounts",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/storage/:cloudProvider(drive)/accounts",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/storage/:cloudProvider(drive)/accounts/:accountId/validate",
+    "source": "server.js"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/tools/storage/:cloudProvider(drive)/accounts/:accountId",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/storage/:cloudProvider(drive)/files",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/storage/:cloudProvider(drive)/files/:fileId/download",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/storage/:cloudProvider(drive)/upload",
+    "source": "server.js"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/tools/storage/:cloudProvider(drive)/files/:fileId",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/deployed-apps/:appId/backups",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/deployed-apps/:appId/backups",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/deployed-apps/:appId/restore",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/kaggle/submit",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/kaggle/status/:jobId",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/kaggle/output/:jobId",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/kaggle/output/:jobId/download",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/kaggle/output/:jobId/files/:fileName/download",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/kaggle/jobs",
+    "source": "server.js"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/kaggle/jobs/:jobId",
+    "source": "server.js"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/kaggle/jobs",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/kaggle/jobs/:jobId/details",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/kaggle/submit-autoretry",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/kaggle/submit-multiagent",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/kaggle/poll-complete",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/git/repos",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/tools/git/repos/:repoId/branches",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/git/repos/:repoId/branches/checkout",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/git/repos/:repoId/merge",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/git/repos/:repoId/push",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tools/git/repos/:repoId/resolve-conflicts",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/tasks/:id/rollback",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/codex/auth/status",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/codex/auth/device/start",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/codex/auth/device/cancel",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/codex/auth/logout",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/claude-code/auth/status",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/claude-code/auth/start",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/claude-code/auth/send-code",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/claude-code/auth/cancel",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/claude-code/auth/logout",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/attachments",
+    "source": "server.js"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/attachments/:id",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/storage/health",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/uploads/preflight",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/uploads/chunked/start",
+    "source": "server.js"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/uploads/chunked/:uploadId/chunk",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/uploads/chunked/:uploadId/complete",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/uploads",
+    "source": "server.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/chat",
+    "source": "server.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/restart/status",
+    "source": "routes/auth.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/me",
+    "source": "routes/auth.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/settings/notifications",
+    "source": "routes/auth.js"
+  },
+  {
+    "method": "PATCH",
+    "path": "/api/settings/notifications",
+    "source": "routes/auth.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/token-saver/presets",
+    "source": "routes/tokenSaver.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/token-saver/settings",
+    "source": "routes/tokenSaver.js"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/token-saver/settings",
+    "source": "routes/tokenSaver.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/token-saver/settings/effective",
+    "source": "routes/tokenSaver.js"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/token-saver/chats/:chatId/settings",
+    "source": "routes/tokenSaver.js"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/token-saver/chats/:chatId/settings",
+    "source": "routes/tokenSaver.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/token-saver/status",
+    "source": "routes/tokenSaver.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/token-saver/usage",
+    "source": "routes/tokenSaver.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/token-saver/chats/:chatId/stats",
+    "source": "routes/tokenSaver.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/token-saver/preview",
+    "source": "routes/tokenSaver.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/token-saver/presets/reset",
+    "source": "routes/tokenSaver.js"
+  },
+  {
+    "method": "POST",
+    "path": "/api/token-saver/cache/clear",
+    "source": "routes/tokenSaver.js"
+  },
+  {
+    "method": "GET",
+    "path": "/api/projects/recent",
+    "source": "routes/tokenSaver.js"
+  }
+]
