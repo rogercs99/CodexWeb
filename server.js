@@ -21,6 +21,24 @@ const {
 const tokenSaver = require('./tokenSaver');
 const kaggleService = require('./kaggleService');
 
+// Kaggle Runtime Adapter — detecta y configura rutas para Kaggle
+let kaggleAdapter = null;
+let claudeCodexAdapter = null;
+try {
+  kaggleAdapter = require('./kaggle-adaptation/runtime-adapters/kaggle-server-adapter');
+  const adapterResult = kaggleAdapter.initializeKaggleAdapter();
+  if (adapterResult.isKaggle) {
+    console.log('[Kaggle] Environment detected and configured');
+
+    // Configurar Claude Code y Codex para Kaggle
+    claudeCodexAdapter = require('./kaggle-adaptation/runtime-adapters/claude-codex-kaggle-adapter');
+    claudeCodexAdapter.configureClaudeCodeForKaggle();
+    claudeCodexAdapter.configureCodexCLIForKaggle();
+  }
+} catch (err) {
+  console.warn('[Kaggle Adapter] Not available:', err.message);
+}
+
 const execFileAsync = util.promisify(execFile);
 const pipelineAsync = util.promisify(pipeline);
 const app = express();
@@ -14066,6 +14084,27 @@ app.get('/ok', (_req, res) => {
 app.get('/api/health', (_req, res) => {
   return res.status(200).json({ ok: true, service: 'codexweb' });
 });
+
+// Kaggle Runtime Endpoints
+if (kaggleAdapter) {
+  const kaggleEndpoints = kaggleAdapter.getKaggleEndpoints(db);
+  for (const endpoint of kaggleEndpoints) {
+    if (endpoint.method === 'GET') {
+      app.get(endpoint.path, endpoint.handler);
+    } else if (endpoint.method === 'POST') {
+      app.post(endpoint.path, endpoint.handler);
+    }
+  }
+  console.log('[Kaggle] Registered', kaggleEndpoints.length, 'runtime endpoints');
+
+  // Kaggle Bundle Download Endpoints (solo si KAGGLE_BUNDLE_ENDPOINT=true)
+  try {
+    const bundleEndpoints = require('./kaggle-adaptation/endpoints/kaggle-bundle-endpoints');
+    bundleEndpoints.registerBundleEndpoints(app);
+  } catch (err) {
+    console.warn('[Kaggle Bundle] Endpoints not available:', err.message);
+  }
+}
 
 app.get('/api/claude/health', requireAuth, async (_req, res) => {
   if (!claudeCodeEnabled) {

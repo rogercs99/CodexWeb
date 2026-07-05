@@ -2860,3 +2860,22 @@ export function downloadSourceCode(): void {
   link.click();
   document.body.removeChild(link);
 }
+
+// ==================== KAGGLE RUNTIME ====================
+export async function getRuntimeKaggleStatus(): Promise<any> {
+  const res = await fetch('/api/runtime/kaggle/status');
+  if (!res.ok) throw new Error(`Failed to get Kaggle status: ${res.statusText}`);
+  return await res.json();
+}
+
+export async function getRuntimeClaudePreflight(): Promise<any> {
+  const res = await fetch('/api/runtime/claude/preflight');
+  if (!res.ok) throw new Error(`Failed to get Claude preflight: ${res.statusText}`);
+  return await res.json();
+}
+
+export async function getRuntimeCodexPreflight(): Promise<any> {
+  const res = await fetch('/api/runtime/codex/preflight');
+  if (!res.ok) throw new Error(`Failed to get Codex preflight: ${res.statusText}`);
+  return await res.json();
+}
