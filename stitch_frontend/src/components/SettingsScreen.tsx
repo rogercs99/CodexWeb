@@ -4,6 +4,7 @@ import BottomNav from './BottomNav';
 import SteamDeckSettingsPanel from './SteamDeckSettingsPanel';
 import {
   cancelClaudeCodeAuth,
+  downloadSourceCode,
   getAiAgentSettings,
   getAiProviderQuota,
   cancelCodexDeviceLogin,
@@ -995,6 +996,22 @@ export default function SettingsScreen({
                     </p>
                   </div>
                   <ChevronRight size={16} className="text-zinc-600" />
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => downloadSourceCode()}
+                className="w-full text-left rounded-xl border border-emerald-500/20 bg-emerald-500/10 p-3 hover:border-emerald-400/40 transition-colors"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-sm text-emerald-50">Descargar código fuente</p>
+                    <p className="text-xs text-emerald-100/70 truncate">
+                      Exporta todo el proyecto en tar.gz (última versión)
+                    </p>
+                  </div>
+                  <ChevronRight size={16} className="text-emerald-200" />
                 </div>
               </button>
             </div>

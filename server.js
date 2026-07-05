@@ -21257,6 +21257,80 @@ app.post('/api/kaggle/poll-complete', requireAuth, async (req, res) => {
 
 // ==================== END KAGGLE INTEGRATION ====================
 
+// ==================== EXPORT SOURCE CODE ====================
+/**
+ * GET /api/export/source - Descarga todo el código fuente del proyecto como tar.gz
+ */
+app.get('/api/export/source', requireAuth, async (req, res) => {
+  try {
+    const projectRoot = '/root/CodexWeb';
+    const tmpDir = '/tmp';
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
+    const filename = `codexweb-source-${timestamp}.tar.gz`;
+    const tmpPath = path.join(tmpDir, filename);
+
+    // Crear archivo tar.gz excluyendo directorios innecesarios
+    const tarArgs = [
+      '-czf',
+      tmpPath,
+      '--exclude=node_modules',
+      '--exclude=.git',
+      '--exclude=.runtime',
+      '--exclude=dist',
+      '--exclude=build',
+      '--exclude=*.db',
+      '--exclude=*.db-shm',
+      '--exclude=*.db-wal',
+      '--exclude=backups',
+      '--exclude=public/downloads',
+      '--exclude=public/uploads',
+      '--exclude=logs',
+      '--exclude=tmp',
+      '--exclude=.env',
+      '--exclude=.env.local',
+      '--exclude=artifacts',
+      '--exclude=audit-output',
+      '-C',
+      path.dirname(projectRoot),
+      path.basename(projectRoot)
+    ];
+
+    await execFileAsync('tar', tarArgs);
+
+    // Configurar headers para descarga
+    res.setHeader('Content-Type', 'application/gzip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    // Stream del archivo al response
+    const fileStream = fs.createReadStream(tmpPath);
+
+    fileStream.on('error', (err) => {
+      console.error('[Export] Error reading archive:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error al leer el archivo' });
+      }
+    });
+
+    fileStream.on('end', () => {
+      // Limpiar archivo temporal
+      fs.unlink(tmpPath, (err) => {
+        if (err) console.error('[Export] Error deleting temp file:', err);
+      });
+    });
+
+    fileStream.pipe(res);
+
+    const stats = fs.statSync(tmpPath);
+    console.log(`[Export] Source code exported: ${filename} (${stats.size} bytes)`);
+  } catch (err) {
+    console.error('[Export] Error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message || 'Error al exportar código fuente' });
+    }
+  }
+});
+// ==================== END EXPORT SOURCE CODE ====================
+
 app.get('/api/tools/git/repos', requireAuth, (req, res) => {
   const permission = guardRequestPermissionOrRespond(req, res, 'git', {
     requiresGit: true

@@ -2849,3 +2849,14 @@ export function kaggleGetOutputDownloadUrl(jobId: string): string {
 export function kaggleGetFileDownloadUrl(jobId: string, fileName: string): string {
   return `/api/kaggle/output/${encodeURIComponent(jobId)}/files/${encodeURIComponent(fileName)}/download`;
 }
+
+// ==================== EXPORT SOURCE CODE ====================
+export function downloadSourceCode(): void {
+  const url = '/api/export/source';
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = '';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
