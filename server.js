@@ -525,21 +525,30 @@ const uploadChunkMaxBytes = 16 * 1024 * 1024;
 const maxJsonBodyBytes = 2 * 1024 * 1024;
 const maxJsonBodyMb = Math.floor(maxJsonBodyBytes / (1024 * 1024));
 const configuredAutoContinuationLimit = Number.parseInt(
-  String(process.env.CHAT_AUTO_CONTINUATIONS || '2'),
+  String(process.env.CHAT_AUTO_CONTINUATIONS || '6'),
   10
 );
 const chatAutoContinuationLimit =
   Number.isInteger(configuredAutoContinuationLimit) && configuredAutoContinuationLimit >= 0
-    ? Math.min(configuredAutoContinuationLimit, 6)
-    : 2;
+    ? Math.min(configuredAutoContinuationLimit, 12)
+    : 6;
 const configuredContinuationTailChars = Number.parseInt(
-  String(process.env.CHAT_CONTINUATION_TAIL_CHARS || '6000'),
+  String(process.env.CHAT_CONTINUATION_TAIL_CHARS || '10000'),
   10
 );
 const chatContinuationTailChars =
   Number.isInteger(configuredContinuationTailChars) && configuredContinuationTailChars >= 500
-    ? Math.min(configuredContinuationTailChars, 20000)
-    : 6000;
+    ? Math.min(configuredContinuationTailChars, 50000)
+    : 10000;
+const configuredMinFinalChars = Number.parseInt(
+  String(process.env.CHAT_MIN_FINAL_CHARS || '10'),
+  10
+);
+const chatMinFinalChars =
+  Number.isInteger(configuredMinFinalChars) && configuredMinFinalChars >= 0
+    ? Math.min(configuredMinFinalChars, 1000)
+    : 10;
+const chatAgentFinalSentinelRequired = String(process.env.CHAT_AGENT_FINAL_SENTINEL_REQUIRED || 'false').toLowerCase() === 'true';
 const configuredChatRequestTimeoutMs = Number.parseInt(
   String(process.env.CHAT_REQUEST_TIMEOUT_MS || String(1000 * 60 * 20)),
   10
@@ -588,6 +597,251 @@ const chatStaleSweepIntervalMs =
   Number.isInteger(configuredChatStaleSweepIntervalMs) && configuredChatStaleSweepIntervalMs >= 10 * 1000
     ? configuredChatStaleSweepIntervalMs
     : 45 * 1000;
+
+// ========== Agent Completion Helper Functions ==========
+// Extrae texto visible de respuesta de agente soportando múltiples formatos
+const extractAgentVisibleText = (payload) => {
+  if (!payload) return '';
+  if (typeof payload === 'string') return payload;
+  if (Array.isArray(payload)) {
+    return payload.map((entry) => extractAgentVisibleText(entry)).filter(Boolean).join('\n');
+  }
+  if (typeof payload === 'object') {
+    // Campos directos de texto
+    const directFields = [
+      payload.text,
+      payload.output,
+      payload.output_text,
+      payload.response,
+      payload.result,
+      payload.completion,
+      payload.final_answer,
+      payload.answer,
+      payload.summary
+    ].filter((entry) => typeof entry === 'string' && entry.trim());
+    if (directFields.length > 0) return directFields.join('\n');
+
+    // Campo content como string/array/objeto
+    if (payload.content) {
+      if (typeof payload.content === 'string') return payload.content;
+      if (Array.isArray(payload.content)) {
+        return payload.content.map((entry) => extractAgentVisibleText(entry)).filter(Boolean).join('\n');
+      }
+      if (typeof payload.content === 'object') {
+        const contentText = extractAgentVisibleText(payload.content);
+        if (contentText) return contentText;
+      }
+    }
+
+    // Campo message como string/objeto
+    if (payload.message) {
+      if (typeof payload.message === 'string') return payload.message;
+      if (typeof payload.message === 'object') {
+        const msgText = extractAgentVisibleText(payload.message);
+        if (msgText) return msgText;
+      }
+    }
+
+    // Bloques tipados
+    if (payload.type) {
+      const textTypes = ['text', 'output_text', 'markdown', 'assistant', 'agent_message'];
+      if (textTypes.includes(payload.type)) {
+        const blockText = extractAgentVisibleText({ ...payload, type: undefined });
+        if (blockText) return blockText;
+      }
+    }
+
+    // Deltas parciales
+    if (payload.delta && typeof payload.delta === 'string') return payload.delta;
+    if (payload.partial && typeof payload.partial === 'string') return payload.partial;
+  }
+  return '';
+};
+
+// Analiza el estado de completitud de una respuesta de agente
+const analyzeAgentCompletionState = (state) => {
+  const {
+    assistantOutput = '',
+    reasoning = '',
+    commandsExecuted = [],
+    stderr = '',
+    notices = [],
+    closeReason = '',
+    hasOpenCommands = false
+  } = state;
+
+  const text = String(assistantOutput || '').trim();
+
+  // Sin salida visible
+  if (!text || text.length < chatMinFinalChars) {
+    return {
+      hasVisibleFinal: false,
+      looksIncomplete: true,
+      reason: 'empty_or_minimal_output',
+      shouldContinue: true
+    };
+  }
+
+  // Solo reasoning sin respuesta final
+  if (!text && reasoning && reasoning.trim()) {
+    return {
+      hasVisibleFinal: false,
+      looksIncomplete: true,
+      reason: 'only_reasoning_no_final',
+      shouldContinue: true
+    };
+  }
+
+  // Comandos abiertos
+  if (hasOpenCommands) {
+    return {
+      hasVisibleFinal: !!text,
+      looksIncomplete: true,
+      reason: 'open_commands',
+      shouldContinue: true
+    };
+  }
+
+  // Verificar marcadores de respuesta final
+  const hasFinalBegin = text.includes('CODEXWEB_FINAL_RESPONSE_BEGIN');
+  const hasFinalEnd = text.includes('CODEXWEB_FINAL_RESPONSE_END');
+  if (hasFinalBegin && hasFinalEnd) {
+    return {
+      hasVisibleFinal: true,
+      looksIncomplete: false,
+      reason: 'final_sentinels_present',
+      shouldContinue: false
+    };
+  }
+  if (hasFinalBegin && !hasFinalEnd) {
+    return {
+      hasVisibleFinal: false,
+      looksIncomplete: true,
+      reason: 'final_begin_without_end',
+      shouldContinue: true
+    };
+  }
+
+  // Si se requieren marcadores y no están presentes
+  if (chatAgentFinalSentinelRequired && !hasFinalBegin) {
+    return {
+      hasVisibleFinal: false,
+      looksIncomplete: true,
+      reason: 'missing_required_sentinels',
+      shouldContinue: true
+    };
+  }
+
+  const tail = text.slice(-360);
+  const tailLower = tail.toLowerCase();
+
+  // Code fence abierto
+  const unfinishedFence = (text.match(/```/g) || []).length % 2 !== 0;
+  if (unfinishedFence) {
+    return {
+      hasVisibleFinal: true,
+      looksIncomplete: true,
+      reason: 'open_code_fence',
+      shouldContinue: true
+    };
+  }
+
+  // Terminación incompleta (puntuación suspensiva)
+  if (/[,:;\-]$/.test(tail)) {
+    return {
+      hasVisibleFinal: true,
+      looksIncomplete: true,
+      reason: 'unfinished_tail_punctuation',
+      shouldContinue: true
+    };
+  }
+  if (/\.\.\.$/.test(tail)) {
+    return {
+      hasVisibleFinal: true,
+      looksIncomplete: true,
+      reason: 'truncated_ellipsis',
+      shouldContinue: true
+    };
+  }
+
+  // Frases de continuación
+  const continuationPhrases = [
+    'continuo',
+    'continuaré',
+    'continuare',
+    'seguir[eé]',
+    'sigo',
+    'pendiente',
+    'por hacer',
+    'falt(a|an)',
+    'todo',
+    'remaining',
+    'wip',
+    'next step',
+    'i will continue',
+    'not finished',
+    'work in progress'
+  ];
+  const continuationRegex = new RegExp(continuationPhrases.join('|'), 'i');
+  if (continuationRegex.test(tailLower)) {
+    return {
+      hasVisibleFinal: true,
+      looksIncomplete: true,
+      reason: 'self_reported_incomplete',
+      shouldContinue: true
+    };
+  }
+
+  // Stderr/notices indicando corte o problemas
+  const problemIndicators = [
+    'timeout',
+    'interrupted',
+    'auth',
+    'authentication',
+    'quota',
+    'rate limit',
+    'connection',
+    'network error'
+  ];
+  const combinedLog = (stderr + ' ' + notices.join(' ')).toLowerCase();
+  const hasProblemIndicator = problemIndicators.some((indicator) => combinedLog.includes(indicator));
+  if (hasProblemIndicator && text.length < 200) {
+    return {
+      hasVisibleFinal: true,
+      looksIncomplete: true,
+      reason: 'stderr_notices_indicate_interruption',
+      shouldContinue: true
+    };
+  }
+
+  // Salida final demasiado corta para tarea larga
+  const hasExtensiveReasoningOrCommands = (reasoning && reasoning.length > 500) || commandsExecuted.length > 2;
+  if (hasExtensiveReasoningOrCommands && text.length < 100) {
+    return {
+      hasVisibleFinal: true,
+      looksIncomplete: true,
+      reason: 'extensive_work_minimal_output',
+      shouldContinue: true
+    };
+  }
+
+  // Parece completo
+  return {
+    hasVisibleFinal: true,
+    looksIncomplete: false,
+    reason: 'appears_complete',
+    shouldContinue: false
+  };
+};
+
+// Elimina marcadores internos de respuesta final
+const stripFinalResponseSentinels = (text) => {
+  if (!text) return text;
+  return String(text)
+    .replace(/CODEXWEB_FINAL_RESPONSE_BEGIN\s*/g, '')
+    .replace(/\s*CODEXWEB_FINAL_RESPONSE_END/g, '');
+};
+
 const geminiIncludeDirectories = (() => {
   const parsed = String(process.env.GEMINI_INCLUDE_DIRECTORIES || '/')
     .split(',')
@@ -754,7 +1008,7 @@ const workspaceFileBlockedExtensions = new Set(['.db', '.sqlite', '.sqlite3', '.
 let repoContextIndexCache = null;
 const contextMdCache = new Map(); // absDir → { content, readAtMs }
 const contextMdCacheTtlMs = 60 * 1000;
-const contextMdFileNames = ['PROJECT_CONTEXT.md', 'CLAUDE.md', 'CONTEXT.md', 'README.md'];
+const contextMdFileNames = ['PROJECT_CONTEXT.md', 'CLAUDE.md', 'KAGGLE_CONTEXT.md', 'CONTEXT.md', 'README.md'];
 const contextMdMaxChars = 2200;
 const taskSnapshotsRootDir = resolveConfiguredPath(
   process.env.TASK_SNAPSHOTS_DIR,
@@ -23417,6 +23671,17 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         'Si el usuario pide estado de procesos/servicios/puertos/sistema, verifica con comandos reales antes de responder.',
         permissionHintsForClaude.length > 0 ? `\n[POLITICA]\n${permissionHintsForClaude.join('\n')}` : '',
         '',
+        '[CONTRATO DE RESPUESTA FINAL]',
+        'IMPORTANTE: Debes completar la tarea de principio a fin.',
+        '- NO termines solo con razonamiento, comandos o pasos parciales.',
+        '- Si necesitas seguir trabajando, continúa automáticamente.',
+        '- Al final, emite una respuesta final visible y completa para el usuario.',
+        '- Marca tu respuesta final con:',
+        '  CODEXWEB_FINAL_RESPONSE_BEGIN',
+        '  [tu respuesta final aquí]',
+        '  CODEXWEB_FINAL_RESPONSE_END',
+        '- Los marcadores son internos y no se mostrarán al usuario.',
+        '',
         String(executionPrompt || '').trim()
       ].filter(Boolean).join('\n');
 
@@ -23583,12 +23848,91 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       let claudeResultWasError = false;
       let claudeReportedError = '';
       let claudeTerminalReason = '';
+      let claudeContinuationCount = 0;
+      let claudeAttempt = 0;
+      let claudeAttemptAssistantStartLength = 0;
+      const claudeReasoningLines = [];
+      const claudeStderrLines = [];
+      const claudeNotices = [];
 
       const claudeTimeoutMessage = `Claude Code no emitió actividad en ${formatDurationMinutes(claudeCodeTimeoutMs)}. La ejecución se canceló por timeout.`;
       const claudeWatchdog = createInactivityWatchdog('claude_code', () => {
         if (claudeActiveRun) terminateActiveChatRun(claudeActiveRun, 'timeout');
         finalizeClaudeRequest({ ok: false, exitCode: 124, closeReason: 'timeout', output: claudeTimeoutMessage });
       });
+
+      const hasOpenClaudeCommands = () => {
+        return Array.from(claudeToolRuns.values()).some((entry) => {
+          return entry && !entry.output; // Tool sin output aún = comando abierto
+        });
+      };
+
+      const buildClaudeContinuationPrompt = (reason) => {
+        const outputTail = String(claudeAssistantOutput || '').slice(-chatContinuationTailChars);
+        const reasoningTail = claudeReasoningLines.slice(-5).map((line) => `  - ${line}`).join('\n');
+        const commandsSummary = Array.from(claudeToolRuns.entries())
+          .slice(-3)
+          .map(([itemId, toolInfo]) => {
+            return `  - ${toolInfo.command || itemId}`;
+          })
+          .join('\n');
+        const stderrTail = claudeStderrLines.slice(-2).map((line) => `  - ${line}`).join('\n');
+        const noticesTail = claudeNotices.slice(-2).map((notice) => `  - ${notice}`).join('\n');
+
+        return [
+          'CONTINUA LA EJECUCION ANTERIOR.',
+          '',
+          `Motivo detectado: ${reason}.`,
+          `Intento de continuación: ${claudeContinuationCount + 1}/${chatAutoContinuationLimit}.`,
+          '',
+          'Objetivo original del usuario:',
+          executionPrompt,
+          '',
+          'Ultimo contexto visible de salida:',
+          '```text',
+          outputTail || '(sin salida visible)',
+          '```',
+          reasoningTail ? `\nÚltimos pasos de razonamiento:\n${reasoningTail}` : '',
+          commandsSummary ? `\nHerramientas ejecutadas recientemente:\n${commandsSummary}` : '',
+          stderrTail ? `\nErrores recientes (stderr):\n${stderrTail}` : '',
+          noticesTail ? `\nNotificaciones del sistema:\n${noticesTail}` : '',
+          '',
+          'Instrucciones:',
+          '- Continúa desde donde se quedó, sin reiniciar trabajo ya hecho.',
+          '- Si detectas pasos pendientes, ejecútalos hasta cerrarlos.',
+          '- Al finalizar, emite una respuesta final visible marcada con CODEXWEB_FINAL_RESPONSE_BEGIN/END.',
+          '- Solo finaliza cuando la tarea quede completada de verdad o falle con causa concreta.',
+          '- No repitas bloques largos ya emitidos; aporta únicamente progreso nuevo.'
+        ].filter(Boolean).join('\n');
+      };
+
+      const shouldClaudeAutoContinue = (exitCode, closeReason) => {
+        if (chatAutoContinuationLimit <= 0) return { continueRun: false, reason: '' };
+        if (claudeContinuationCount >= chatAutoContinuationLimit) return { continueRun: false, reason: '' };
+        if (Number(exitCode) !== 0) return { continueRun: false, reason: '' };
+        if (claudeActiveRun && claudeActiveRun.killRequested) return { continueRun: false, reason: '' };
+        const normalizedCloseReason = String(closeReason || '').trim().toLowerCase();
+        if (normalizedCloseReason && !['completed', 'provider_error'].includes(normalizedCloseReason)) {
+          return { continueRun: false, reason: '' };
+        }
+        if (hasOpenClaudeCommands()) {
+          return { continueRun: true, reason: 'open_commands' };
+        }
+        const attemptOutput = String(claudeAssistantOutput || '').slice(claudeAttemptAssistantStartLength);
+        const analysis = analyzeAgentCompletionState({
+          assistantOutput: attemptOutput,
+          reasoning: claudeReasoningLines.join('\n'),
+          commandsExecuted: Array.from(claudeToolRuns.values()),
+          stderr: claudeStderrLines.join('\n'),
+          notices: claudeNotices,
+          closeReason,
+          hasOpenCommands: hasOpenClaudeCommands()
+        });
+        if (analysis.looksIncomplete) {
+          return { continueRun: true, reason: analysis.reason };
+        }
+        return { continueRun: false, reason: '' };
+      };
 
       const persistClaudeSnapshot = (isFinal = false) => {
         if (!assistantMessageId) return;
@@ -23626,7 +23970,14 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         claudeFinished = true;
         stopClaudeHeartbeat();
         claudeWatchdog.clear();
-        const safeOutput = String(output || '').trim() || '(Sin salida de Claude Code)';
+        let safeOutput = String(output || '').trim();
+        // Eliminar marcadores internos de respuesta final
+        if (safeOutput) {
+          safeOutput = stripFinalResponseSentinels(safeOutput);
+        }
+        if (!safeOutput) {
+          safeOutput = '(Sin salida de Claude Code)';
+        }
         const runWasKilled = Boolean(claudeActiveRun && claudeActiveRun.killRequested);
         const safeExitCode = Number.isInteger(exitCode) ? Number(exitCode) : runWasKilled ? 130 : 1;
         const effectiveCloseReason = runWasKilled
@@ -23775,6 +24126,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         const safeItemId = String(itemId || '').trim() || 'claude_reasoning';
         const delta = diffClaudeSnapshot(claudeReasoningSnapshots, safeItemId, text);
         if (!delta) return;
+        // Registrar para análisis de continuación
+        claudeReasoningLines.push(delta.slice(0, 200));
         sendSse(res, 'reasoning_delta', { itemId: safeItemId, text: delta });
       };
 
@@ -24021,6 +24374,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         if (stripped) {
           const lines = stripped.split(/\r?\n/).filter(Boolean);
           for (const line of lines) {
+            // Registrar stderr para análisis de continuación
+            claudeStderrLines.push(line.slice(0, 200));
             sendSse(res, 'reasoning_delta', { itemId: 'claude_stderr', text: `${line}\n` });
           }
         }
@@ -24094,6 +24449,72 @@ app.post('/api/chat', requireAuth, async (req, res) => {
           }
         } else if (!output && success) {
           output = '(Tarea completada)';
+        }
+
+        // Verificar si necesita auto-continuación antes de finalizar
+        const continuation = shouldClaudeAutoContinue(normalizedExitCode, closeReason);
+        if (continuation.continueRun && !claudeClientDisconnected) {
+          claudeContinuationCount += 1;
+          sendSse(res, 'system_notice', {
+            text: `Claude auto-continuando (${claudeContinuationCount}/${chatAutoContinuationLimit}): ${continuation.reason}`
+          });
+          const continuationPrompt = buildClaudeContinuationPrompt(continuation.reason);
+          // Resetear estado para nuevo intento
+          claudeFinished = false;
+          claudeAttemptAssistantStartLength = claudeAssistantOutput.length;
+          claudeProcess = null;
+          claudeActiveRun = null;
+          claudeResultWasError = false;
+          claudeReportedError = '';
+          claudeTerminalReason = '';
+          claudeStdoutText = '';
+          claudeStderrText = '';
+          // Re-lanzar Claude con el prompt de continuación
+          const claudeArgsForContinuation = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages'];
+          if (claudeCliModel) {
+            claudeArgsForContinuation.push('--model', claudeCliModel);
+          }
+          if (claudeCliEffort) {
+            claudeArgsForContinuation.push('--effort', claudeCliEffort);
+          }
+          claudeArgsForContinuation.push(continuationPrompt);
+          try {
+            const spawnOptions = {
+              cwd: effectiveCwd,
+              env: claudeEnv,
+              stdio: ['ignore', 'pipe', 'pipe']
+            };
+            if (runtimePolicy.runAsIdentity) {
+              spawnOptions.uid = runtimePolicy.runAsIdentity.uid;
+              spawnOptions.gid = runtimePolicy.runAsIdentity.gid;
+            }
+            claudeProcess = spawn(claudeExecPath, claudeArgsForContinuation, spawnOptions);
+            claudeActiveRun = registerActiveChatRun(req.session.userId, conversationId, claudeProcess);
+            claudeWatchdog.touch();
+            touchTaskRunHeartbeat(true);
+            logChatStream('process_spawned', {
+              requestId: liveDraftRequestId,
+              userId: req.session.userId,
+              conversationId,
+              agent: 'claude-code',
+              pid: claudeProcess.pid,
+              command: claudeExecPath,
+              args: claudeArgsForContinuation.slice(0, -1),
+              continuationCount: claudeContinuationCount,
+              reason: continuation.reason
+            });
+            // Los listeners ya están configurados arriba, se reutilizan
+            return;
+          } catch (error) {
+            const reason = truncateForNotify(error && error.message ? error.message : 'claude_continuation_spawn_error', 200);
+            finalizeClaudeRequest({
+              ok: false,
+              exitCode: 1,
+              closeReason: 'continuation_spawn_error',
+              output: `No se pudo continuar Claude Code: ${reason}`
+            });
+            return;
+          }
         }
 
         finalizeClaudeRequest({ ok: success, exitCode: normalizedExitCode, closeReason, output });
@@ -24649,10 +25070,24 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     if (runtimePolicy.deniedPaths.length > 0) {
       codexPermissionHints.push(`Rutas bloqueadas: ${runtimePolicy.deniedPaths.join(', ')}`);
     }
+    const codexFinalContract = [
+      '',
+      '[CONTRATO DE RESPUESTA FINAL]',
+      'IMPORTANTE: Debes completar la tarea de principio a fin.',
+      '- NO termines solo con razonamiento, comandos o pasos parciales.',
+      '- Si necesitas seguir trabajando, continúa automáticamente.',
+      '- Al final, emite una respuesta final visible y completa para el usuario.',
+      '- Marca tu respuesta final con:',
+      '  CODEXWEB_FINAL_RESPONSE_BEGIN',
+      '  [tu respuesta final aquí]',
+      '  CODEXWEB_FINAL_RESPONSE_END',
+      '- Los marcadores son internos y no se mostrarán al usuario.',
+      ''
+    ].join('\n');
     const codexPrompt =
       codexPermissionHints.length > 0
-        ? `${executionPrompt}\n\n[POLITICA]\n${codexPermissionHints.join('\n')}`
-        : executionPrompt;
+        ? `${executionPrompt}${codexFinalContract}\n\n[POLITICA]\n${codexPermissionHints.join('\n')}`
+        : `${executionPrompt}${codexFinalContract}`;
 
     const assistantMessage = insertAssistantMessageRow(conversationId, '');
     assistantMessageId = Number(assistantMessage.lastInsertRowid);
@@ -25631,26 +26066,31 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     };
 
     const looksLikeIncompleteAssistantOutput = (rawText) => {
-      const text = String(rawText || '').trim();
-      if (!text) return 'empty_output';
-      const tail = text.slice(-360);
-      const tailLower = tail.toLowerCase();
-      const unfinishedFence = (text.match(/```/g) || []).length % 2 !== 0;
-      if (unfinishedFence) return 'open_code_fence';
-      if (/[,:;\-]$/.test(tail)) return 'unfinished_tail';
-      if (/\.\.\.$/.test(tail)) return 'truncated_tail';
-      if (
-        /(continuar|continuaré|continuare|seguir[eé]|pendiente|por hacer|falt(a|an)|next step|remaining|to do|wip)/i.test(
-          tailLower
-        )
-      ) {
-        return 'self_reported_incomplete';
-      }
-      return '';
+      const analysis = analyzeAgentCompletionState({
+        assistantOutput: rawText,
+        reasoning: reasoningLines.join('\n'),
+        commandsExecuted: Array.from(commandOutputByItem.values()),
+        stderr: stderrLines.join('\n'),
+        notices: codexNotices,
+        closeReason: '',
+        hasOpenCommands: hasOpenTaskCommands()
+      });
+      return analysis.looksIncomplete ? analysis.reason : '';
     };
 
     const buildContinuationPrompt = (reason) => {
       const outputTail = String(assistantOutput || '').slice(-chatContinuationTailChars);
+      const reasoningTail = reasoningLines.slice(-5).map((line) => `  - ${line}`).join('\n');
+      const commandsSummary = Array.from(commandOutputByItem.entries())
+        .slice(-3)
+        .map(([itemId, cmdInfo]) => {
+          const exitCode = cmdInfo.exitCode !== null ? ` (exit ${cmdInfo.exitCode})` : '';
+          return `  - ${cmdInfo.command || itemId}${exitCode}`;
+        })
+        .join('\n');
+      const stderrTail = stderrLines.slice(-2).map((line) => `  - ${line}`).join('\n');
+      const noticesTail = codexNotices.slice(-2).map((notice) => `  - ${notice}`).join('\n');
+
       return [
         'CONTINUA LA EJECUCION ANTERIOR.',
         '',
@@ -25664,13 +26104,18 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         '```text',
         outputTail || '(sin salida visible)',
         '```',
+        reasoningTail ? `\nÚltimos pasos de razonamiento:\n${reasoningTail}` : '',
+        commandsSummary ? `\nComandos ejecutados recientemente:\n${commandsSummary}` : '',
+        stderrTail ? `\nErrores recientes (stderr):\n${stderrTail}` : '',
+        noticesTail ? `\nNotificaciones del sistema:\n${noticesTail}` : '',
         '',
         'Instrucciones:',
         '- Continúa desde donde se quedó, sin reiniciar trabajo ya hecho.',
         '- Si detectas pasos pendientes, ejecútalos hasta cerrarlos.',
+        '- Al finalizar, emite una respuesta final visible marcada con CODEXWEB_FINAL_RESPONSE_BEGIN/END.',
         '- Solo finaliza cuando la tarea quede completada de verdad o falle con causa concreta.',
         '- No repitas bloques largos ya emitidos; aporta únicamente progreso nuevo.'
-      ].join('\n');
+      ].filter(Boolean).join('\n');
     };
 
     const shouldAutoContinue = (exitCode, closeReason) => {
@@ -25703,6 +26148,10 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       flushStderrPending();
       if (!assistantOutput.trim() && latestAssistantMessage.trim()) {
         assistantOutput = latestAssistantMessage.trim();
+      }
+      // Eliminar marcadores internos de respuesta final
+      if (assistantOutput) {
+        assistantOutput = stripFinalResponseSentinels(assistantOutput);
       }
       if (!assistantOutput.trim()) {
         const latestNotice = codexNotices.length > 0 ? codexNotices[codexNotices.length - 1] : '';
@@ -26168,6 +26617,17 @@ app.post('/api/chat', requireAuth, async (req, res) => {
     }
     return res.status(500).json({ error: `Error ejecutando ${providerLabel}. ${details}` });
   }
+});
+
+// Serve download files explicitly
+app.get('/downloads/*', (req, res, next) => {
+  const safeRelativePath = String(req.path || '').replace(/^\/+/, '');
+  const requestedPath = path.resolve(staticAssetsDir, safeRelativePath);
+  if (fs.existsSync(requestedPath) && fs.statSync(requestedPath).isFile()) {
+    res.set('Content-Disposition', `attachment; filename="${path.basename(requestedPath)}"`);
+    return res.sendFile(requestedPath);
+  }
+  return res.status(404).send('Download not found');
 });
 
 // SPA catch-all: serve index.html for all non-API routes

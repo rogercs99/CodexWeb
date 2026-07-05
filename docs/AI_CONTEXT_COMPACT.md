@@ -1,5 +1,18 @@
 # AI_CONTEXT_COMPACT.md
 
+## Actualizacion 2026-07-05
+
+- **Auto-continuación robusta de agentes**
+  - Claude Code y Codex CLI ahora auto-continúan hasta obtener respuesta final visible
+  - Nuevo sistema de análisis de completitud: `analyzeAgentCompletionState()`
+  - Contrato de respuesta final en prompts con marcadores `CODEXWEB_FINAL_RESPONSE_BEGIN/END`
+  - Configuración: `CHAT_AUTO_CONTINUATIONS` default 6, cap 12; `CHAT_CONTINUATION_TAIL_CHARS` default 10000, cap 50000
+  - Prompts de continuación incluyen: tail de output, reasoning, comandos ejecutados, stderr, notices
+  - Marcadores internos se eliminan antes de mostrar/persistir con `stripFinalResponseSentinels()`
+  - Tests: fake CLIs en `tests/fixtures/`, suite E2E en `tests/e2e/chat-agent-completion.mjs`
+  - Documentación completa: `docs/CONTEXT_AGENT_COMPLETION.md`
+  - Validado: sintaxis OK, tests fake CLI pasando, pendiente validación con agentes reales en DEV
+
 ## Actualizacion 2026-06-25E
 
 - **Servicios reales**
