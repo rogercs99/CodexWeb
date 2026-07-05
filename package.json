@@ -8,10 +8,11 @@
     "dev": "node server.js",
     "test:syntax": "node --check server.js",
     "test:e2e:local": "node tests/e2e/local-smoke.mjs",
+    "test:e2e:agents": "node tests/e2e/chat-agent-completion.mjs",
     "test:frontend:assets": "node tests/frontend/static-assets.mjs",
     "test:frontend:mobile": "node tests/frontend/mobile-layout-bundle.mjs",
     "test:perf": "node tests/perf/timing-table.mjs && npm run test:routes",
-    "test:audit": "npm run test:syntax && npm run test:e2e:local && npm run test:e2e:security && npm run test:frontend:assets && npm run test:frontend:sw && npm run test:frontend:mobile && npm run test:perf",
+    "test:audit": "npm run test:syntax && npm run test:e2e:local && npm run test:e2e:security && npm run test:e2e:agents && npm run test:frontend:assets && npm run test:frontend:sw && npm run test:frontend:mobile && npm run test:perf",
     "test:routes": "node tests/perf/route-inventory.mjs && node tests/perf/safe-get-route-timings.mjs",
     "test:e2e:security": "node tests/e2e/security-guards.mjs",
     "test:frontend:sw": "node tests/frontend/service-worker-cache.mjs"
