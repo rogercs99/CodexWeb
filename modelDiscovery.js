@@ -99,12 +99,14 @@ function discoverCodexModelsViaAppServer(options = {}) {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      try { child.stdin.end(); } catch (_error) {}
       try { child.kill('SIGTERM'); } catch (_error) {}
       if (error) reject(error);
       else resolve(uniqueStrings(models));
     };
 
     const send = (payload) => {
+      if (settled || child.stdin.destroyed || child.stdin.writableEnded) return;
       try {
         child.stdin.write(`${JSON.stringify(payload)}\n`);
       } catch (error) {
@@ -153,6 +155,15 @@ function discoverCodexModelsViaAppServer(options = {}) {
     });
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => { stderrBuffer = `${stderrBuffer}${chunk}`.slice(-4000); });
+    child.stdin.on('error', (error) => {
+      if (settled) return;
+      const code = String(error && error.code || '').trim().toUpperCase();
+      if (code === 'EPIPE' || code === 'ERR_STREAM_DESTROYED') {
+        finish(new Error('codex_app_server_pipe_closed'));
+        return;
+      }
+      finish(error);
+    });
     child.on('error', (error) => finish(error));
     child.on('close', (code) => {
       if (!settled) finish(new Error(`codex_app_server_closed_${code}:${stderrBuffer.slice(-500)}`));
@@ -189,6 +200,7 @@ function refreshCodexAccountViaAppServer(options = {}) {
       else resolve(result && typeof result === 'object' ? result : {});
     };
     const send = (payload) => {
+      if (settled || child.stdin.destroyed || child.stdin.writableEnded) return;
       try { child.stdin.write(`${JSON.stringify(payload)}\n`); } catch (error) { finish(error); }
     };
     const processLine = (line) => {
@@ -220,6 +232,15 @@ function refreshCodexAccountViaAppServer(options = {}) {
     });
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-4000); });
+    child.stdin.on('error', (error) => {
+      if (settled) return;
+      const code = String(error && error.code || '').trim().toUpperCase();
+      if (code === 'EPIPE' || code === 'ERR_STREAM_DESTROYED') {
+        finish(new Error('codex_app_server_pipe_closed'));
+        return;
+      }
+      finish(error);
+    });
     child.on('error', (error) => finish(error));
     child.on('close', (code) => {
       if (!settled) finish(new Error(`codex_app_server_closed_${code}:${stderr.slice(-500)}`));

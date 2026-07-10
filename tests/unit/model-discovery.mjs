@@ -22,6 +22,10 @@ try {
 } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 const dynamicModels = await discoverCodexModelsViaAppServer({ codexPath: fixture, env: process.env, timeoutMs: 5000 });
 assert.deepEqual(dynamicModels, ['latest-codex-test-model', 'second-test-model']);
+await assert.rejects(
+  discoverCodexModelsViaAppServer({ codexPath: '/bin/echo', env: process.env, timeoutMs: 5000 }),
+  /codex_app_server_(pipe_closed|closed_0:)/
+);
 const claudeModels = await discoverClaudeCodeModels({ apiKey: 'test-key', fetchImpl: async () => ({ ok: true, async json() { return { data: [{ id: 'claude-future-test-model' }, { id: 'not-claude-model' }] }; } }) });
 assert.equal(claudeModels[0], CLAUDE_CODE_EVERGREEN_MODELS[0]);
 assert.ok(claudeModels.includes('claude-future-test-model'));
