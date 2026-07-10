@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const publicDir = process.env.STATIC_ASSETS_DIR || path.resolve('.runtime/local/public');
+const publicDir = process.env.STATIC_ASSETS_DIR || path.resolve('public');
 const swPath = path.join(publicDir, 'sw.js');
 const indexPath = path.join(publicDir, 'index.html');
 const sw = fs.readFileSync(swPath, 'utf8');

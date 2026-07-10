@@ -702,7 +702,7 @@ export async function updateConversationSettings(
   return data.conversation;
 }
 
-export async function getChatOptions(): Promise<ChatOptions> {
+export async function getChatOptions(forceRefresh = false): Promise<ChatOptions> {
   const data = await api<ChatOptions & {
     providerId?: string;
     activeAgentId?: string;
@@ -711,7 +711,8 @@ export async function getChatOptions(): Promise<ChatOptions> {
     capabilities?: string[];
     quota?: AiProviderQuota | null;
     permissions?: AiProviderPermissionProfile | null;
-  }>('/api/chat/options');
+    modelCatalog?: { source?: string; fetchedAt?: string | null; error?: string } | null;
+  }>(`/api/chat/options${forceRefresh ? '?refresh=1' : ''}`);
   return {
     models: Array.isArray(data.models) ? data.models.map((item) => String(item || '').trim()).filter(Boolean) : [],
     reasoningEfforts: Array.isArray(data.reasoningEfforts)
@@ -729,7 +730,14 @@ export async function getChatOptions(): Promise<ChatOptions> {
       ? data.capabilities.map((entry) => String(entry || '').trim()).filter(Boolean)
       : [],
     quota: data.quota ? normalizeAiProviderQuota(data.quota) : null,
-    permissions: data.permissions ? normalizeAiProviderPermissionProfile(data.permissions) : null
+    permissions: data.permissions ? normalizeAiProviderPermissionProfile(data.permissions) : null,
+    modelCatalog: data.modelCatalog
+      ? {
+          source: String(data.modelCatalog.source || 'dynamic'),
+          fetchedAt: data.modelCatalog.fetchedAt ? String(data.modelCatalog.fetchedAt) : null,
+          error: String(data.modelCatalog.error || '')
+        }
+      : null
   };
 }
 
@@ -968,6 +976,32 @@ export async function listAiProviders(): Promise<{ activeProviderId: string; pro
   return {
     activeProviderId: String(data?.activeProviderId || ''),
     providers: Array.isArray(data?.providers) ? data.providers.map((entry) => normalizeAiProviderInfo(entry)) : []
+  };
+}
+
+export async function getAiProviderModels(
+  providerId: string,
+  forceRefresh = false
+): Promise<{
+  providerId: string;
+  models: string[];
+  defaultModel: string;
+  metadata: { source: string; fetchedAt: string | null; error: string };
+}> {
+  const safeProviderId = encodeURIComponent(String(providerId || '').trim());
+  const suffix = forceRefresh ? '?refresh=1' : '';
+  const data = await api<any>(`/api/ai/providers/${safeProviderId}/models${suffix}`);
+  return {
+    providerId: String(data?.providerId || providerId || ''),
+    models: Array.isArray(data?.models)
+      ? data.models.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+      : [],
+    defaultModel: String(data?.defaultModel || ''),
+    metadata: {
+      source: String(data?.metadata?.source || 'fallback'),
+      fetchedAt: String(data?.metadata?.fetchedAt || '').trim() || null,
+      error: String(data?.metadata?.error || '')
+    }
   };
 }
 
@@ -2120,8 +2154,26 @@ export async function cancelCodexDeviceLogin(): Promise<{ cancelled: boolean; re
   return api('/api/codex/auth/device/cancel', { method: 'POST' });
 }
 
-export async function logoutCodexAuth(): Promise<void> {
-  await api('/api/codex/auth/logout', { method: 'POST' });
+export async function refreshCodexAuth(): Promise<{
+  refreshed: boolean;
+  reauthRequired: boolean;
+  auth: CodexAuthStatus;
+}> {
+  const data = await api<any>('/api/codex/auth/refresh', { method: 'POST' });
+  return {
+    refreshed: Boolean(data?.refreshed),
+    reauthRequired: Boolean(data?.reauthRequired),
+    auth: data?.auth as CodexAuthStatus
+  };
+}
+
+export async function logoutCodexAuth(): Promise<{ unlinked: boolean; warning: string; auth?: CodexAuthStatus }> {
+  const data = await api<any>('/api/codex/auth/logout', { method: 'POST' });
+  return {
+    unlinked: Boolean(data?.unlinked),
+    warning: String(data?.warning || ''),
+    auth: data?.auth as CodexAuthStatus | undefined
+  };
 }
 
 export async function getClaudeCodeAuthStatus(): Promise<ClaudeCodeAuthStatus> {
@@ -2849,6 +2901,90 @@ export function kaggleGetOutputDownloadUrl(jobId: string): string {
 export function kaggleGetFileDownloadUrl(jobId: string, fileName: string): string {
   return `/api/kaggle/output/${encodeURIComponent(jobId)}/files/${encodeURIComponent(fileName)}/download`;
 }
+
+export type KaggleStudioStatus =
+  | 'launching'
+  | 'queued'
+  | 'pending'
+  | 'running'
+  | 'stopping'
+  | 'stopped'
+  | 'complete'
+  | 'cancelled'
+  | 'error'
+  | 'unknown';
+
+export interface KaggleStudioOptions {
+  title?: string;
+  gpuPreference: 'none' | 't4' | 'p100' | 'any';
+  enableInternet: boolean;
+  persistenceEnabled: boolean;
+  backupIntervalMinutes: number;
+  maxBackupMb: number;
+  maxParallel: number;
+  tunnelProvider: 'pinggy' | 'auto' | 'localhostrun' | 'ngrok' | 'none';
+  datasetSources: string[];
+  publicBaseUrl?: string;
+}
+
+export interface KaggleStudioSession {
+  id: string;
+  status: KaggleStudioStatus;
+  createdAt: string;
+  updatedAt?: string;
+  jobId?: string;
+  kaggleRef?: string;
+  publicUrl?: string;
+  localUrl?: string;
+  tunnelProvider?: string;
+  actualGpu?: string;
+  lastHeartbeatAt?: string;
+  lastCallbackAt?: string;
+  lastBackupAt?: string;
+  backupAvailable?: boolean;
+  backupBytes?: number;
+  uptimeSeconds?: number;
+  stopRequested?: boolean;
+  stopRequestedAt?: string;
+  stoppedAt?: string;
+  error?: string;
+  callbackMessage?: string;
+  options: KaggleStudioOptions;
+}
+
+export async function kaggleStudioStart(options: KaggleStudioOptions): Promise<KaggleStudioSession> {
+  const data = await api<{ ok: boolean; session: KaggleStudioSession; error?: string }>('/api/kaggle/studio/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(options)
+  });
+  if (!data.session) throw new Error(data.error || 'No se pudo iniciar Codex Studio');
+  return data.session;
+}
+
+export async function kaggleStudioList(): Promise<{ active: KaggleStudioSession | null; sessions: KaggleStudioSession[] }> {
+  const data = await api<{ active?: KaggleStudioSession | null; sessions?: KaggleStudioSession[] }>('/api/kaggle/studio/sessions');
+  return {
+    active: data.active || null,
+    sessions: Array.isArray(data.sessions) ? data.sessions : []
+  };
+}
+
+export async function kaggleStudioGet(sessionId: string): Promise<KaggleStudioSession> {
+  const data = await api<{ session: KaggleStudioSession }>(`/api/kaggle/studio/sessions/${encodeURIComponent(sessionId)}`);
+  return data.session;
+}
+
+export async function kaggleStudioStop(sessionId: string): Promise<KaggleStudioSession> {
+  const data = await api<{ session: KaggleStudioSession }>(`/api/kaggle/studio/sessions/${encodeURIComponent(sessionId)}/stop`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason: 'requested_from_codexweb_ui' })
+  });
+  return data.session;
+}
+
+
 
 // ==================== EXPORT SOURCE CODE ====================
 export function downloadSourceCode(): void {

@@ -39,12 +39,21 @@ export async function consumeSse(
     let payload: any = null;
 
     if (rawData) {
-      const decoded = decodeBase64Utf8(rawData);
-      if (decoded) {
-        try {
-          payload = JSON.parse(decoded);
-        } catch (_error) {
-          payload = null;
+      // CodexWeb has two SSE producers in the wild: older endpoints encode JSON as
+      // base64, while Terminal Live emits ordinary JSON as required by SSE. Parse
+      // the standards-compliant form first and keep the legacy decoder as fallback.
+      try {
+        payload = JSON.parse(rawData);
+      } catch (_plainJsonError) {
+        const decoded = decodeBase64Utf8(rawData);
+        if (decoded) {
+          try {
+            payload = JSON.parse(decoded);
+          } catch (_base64JsonError) {
+            payload = decoded;
+          }
+        } else {
+          payload = rawData;
         }
       }
     }

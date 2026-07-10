@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const publicDir = process.env.STATIC_ASSETS_DIR || path.resolve('.runtime/local/public');
+const publicDir = process.env.STATIC_ASSETS_DIR || path.resolve('public');
 const indexPath = path.join(publicDir, 'index.html');
 const html = fs.readFileSync(indexPath, 'utf8');
 const refs = [...html.matchAll(/(?:src|href)=["']\/([^"']+)["']/g)]

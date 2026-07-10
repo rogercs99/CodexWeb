@@ -1,7 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { startTestServer } from '../helpers/test-server.mjs';
 
-const BASE = process.env.BASE_URL || 'http://127.0.0.1:3099';
+const managed = process.env.BASE_URL ? null : await startTestServer({ prefix: 'codexweb-perf-' });
+const BASE = process.env.BASE_URL || managed.baseUrl;
 const OUT = path.resolve('artifacts/perf');
 fs.mkdirSync(OUT, { recursive: true });
 let cookie = '';
@@ -30,33 +32,37 @@ function status(p95) {
   return 'SLOW';
 }
 
-await request('register', '/api/register', {
-  method: 'POST',
-  headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ username: `perf_${Date.now()}`, password: 'audit_password_123' })
-});
+try {
+  await request('register', '/api/register', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: `perf_${Date.now()}`, password: 'audit_password_123' })
+  });
 
-const targets = [
-  { label: 'GET /api/me', run: () => request('me', '/api/me') },
-  { label: 'GET /api/chat/options', run: () => request('options', '/api/chat/options') },
-  { label: 'GET /api/conversations', run: () => request('conversations', '/api/conversations') },
-  { label: 'GET /api/tools/observability', run: () => request('observability', '/api/tools/observability') },
-  { label: 'POST /api/tools/terminal-live/stream', run: () => request('terminal', '/api/tools/terminal-live/stream', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ command: "printf 'timing-ok\\n'", timeoutMs: 10000 }) }) }
-];
+  const targets = [
+    { label: 'GET /api/me', run: () => request('me', '/api/me') },
+    { label: 'GET /api/chat/options', run: () => request('options', '/api/chat/options') },
+    { label: 'GET /api/conversations', run: () => request('conversations', '/api/conversations') },
+    { label: 'GET /api/tools/observability', run: () => request('observability', '/api/tools/observability') },
+    { label: 'POST /api/tools/terminal-live/stream', run: () => request('terminal', '/api/tools/terminal-live/stream', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ command: "printf 'timing-ok\\n'", timeoutMs: 10000 }) }) }
+  ];
 
-const rows = [];
-for (const target of targets) {
-  const samples = [];
-  for (let i = 0; i < 8; i++) samples.push(await target.run());
-  const median = percentile(samples, 50);
-  const p95 = percentile(samples, 95);
-  const max = Math.max(...samples);
-  rows.push({ endpoint: target.label, samples: samples.length, medianMs: Number(median.toFixed(1)), p95Ms: Number(p95.toFixed(1)), maxMs: Number(max.toFixed(1)), status: status(p95) });
+  const rows = [];
+  for (const target of targets) {
+    const samples = [];
+    for (let index = 0; index < 8; index += 1) samples.push(await target.run());
+    const median = percentile(samples, 50);
+    const p95 = percentile(samples, 95);
+    const max = Math.max(...samples);
+    rows.push({ endpoint: target.label, samples: samples.length, medianMs: Number(median.toFixed(1)), p95Ms: Number(p95.toFixed(1)), maxMs: Number(max.toFixed(1)), status: status(p95) });
+  }
+
+  let md = `# CodexWeb timing table\n\nGenerated: ${new Date().toISOString()}\nBase: ${BASE}\nDB/external calls: mocked in sandbox. VPS/pro timings must be measured without mocks, porque si no nos mentimos con bata blanca.\n\n`;
+  md += '| Endpoint | Samples | Median ms | P95 ms | Max ms | Status |\n|---|---:|---:|---:|---:|---|\n';
+  for (const row of rows) md += `| ${row.endpoint} | ${row.samples} | ${row.medianMs} | ${row.p95Ms} | ${row.maxMs} | ${row.status} |\n`;
+  fs.writeFileSync(path.join(OUT, 'timing-table.md'), md);
+  fs.writeFileSync(path.join(OUT, 'timing-table.json'), JSON.stringify({ generatedAt: new Date().toISOString(), rows }, null, 2));
+  console.log(md);
+} finally {
+  if (managed) await managed.stop();
 }
-
-let md = `# CodexWeb timing table\n\nGenerated: ${new Date().toISOString()}\nBase: ${BASE}\nDB/external calls: mocked in sandbox. VPS/pro timings must be measured without mocks, porque si no nos mentimos con bata blanca.\n\n`;
-md += '| Endpoint | Samples | Median ms | P95 ms | Max ms | Status |\n|---|---:|---:|---:|---:|---|\n';
-for (const r of rows) md += `| ${r.endpoint} | ${r.samples} | ${r.medianMs} | ${r.p95Ms} | ${r.maxMs} | ${r.status} |\n`;
-fs.writeFileSync(path.join(OUT, 'timing-table.md'), md);
-fs.writeFileSync(path.join(OUT, 'timing-table.json'), JSON.stringify({ generatedAt: new Date().toISOString(), rows }, null, 2));
-console.log(md);

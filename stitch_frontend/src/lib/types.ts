@@ -9,6 +9,7 @@ export type Screen =
   | 'settings'
   | 'quetzalRelay'
   | 'kaggle'
+  | 'kaggle-runtime'
   | 'reboot'
   | 'offline';
 
@@ -278,6 +279,7 @@ export interface ChatOptions {
   capabilities?: string[];
   quota?: AiProviderQuota | null;
   permissions?: AiProviderPermissionProfile | null;
+  modelCatalog?: { source: string; fetchedAt: string | null; error: string } | null;
 }
 
 export interface NotificationSettings {

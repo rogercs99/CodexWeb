@@ -6,6 +6,7 @@ import {
   cancelClaudeCodeAuth,
   downloadSourceCode,
   getAiAgentSettings,
+  getAiProviderModels,
   getAiProviderQuota,
   cancelCodexDeviceLogin,
   getClaudeCodeAuthStatus,
@@ -16,6 +17,7 @@ import {
   listAiProviders,
   logoutClaudeCodeAuth,
   logoutCodexAuth,
+  refreshCodexAuth,
   sendClaudeCodeAuthCode,
   startClaudeCodeAuth,
   startCodexDeviceLogin,
@@ -182,6 +184,9 @@ export default function SettingsScreen({
   const [providers, setProviders] = useState<AiProviderInfo[]>([]);
   const [providersLoading, setProvidersLoading] = useState(true);
   const [providersError, setProvidersError] = useState('');
+  const [refreshingModelsProviderId, setRefreshingModelsProviderId] = useState('');
+  const [modelsRefreshMessage, setModelsRefreshMessage] = useState('');
+  const [authActionMessage, setAuthActionMessage] = useState('');
   const [permissionDrafts, setPermissionDrafts] = useState<Record<string, AiProviderPermissionProfile>>({});
   const [savingPermissionProviderId, setSavingPermissionProviderId] = useState('');
   const [grantingPermissionProviderId, setGrantingPermissionProviderId] = useState('');
@@ -301,15 +306,19 @@ export default function SettingsScreen({
       const nextProviders = await Promise.all(
         listedProviders.map(async (provider) => {
           if (!provider?.id) return provider;
-          if (!provider.integration?.enabled || !provider.integration?.configured) {
-            return provider;
-          }
-          try {
-            const quota = await getAiProviderQuota(provider.id);
-            return { ...provider, quota };
-          } catch (_error) {
-            return provider;
-          }
+          if (!provider.integration?.enabled || !provider.integration?.configured) return provider;
+          const [quotaResult, modelsResult] = await Promise.allSettled([
+            getAiProviderQuota(provider.id),
+            getAiProviderModels(provider.id, false)
+          ]);
+          const quota = quotaResult.status === 'fulfilled' ? quotaResult.value : provider.quota;
+          const modelPayload = modelsResult.status === 'fulfilled' ? modelsResult.value : null;
+          return {
+            ...provider,
+            quota,
+            models: modelPayload?.models?.length ? modelPayload.models : provider.models,
+            defaults: { ...provider.defaults, model: modelPayload?.defaultModel || provider.defaults.model }
+          };
         })
       );
       setProviders(nextProviders);
@@ -327,6 +336,25 @@ export default function SettingsScreen({
       setProvidersError(error instanceof Error ? error.message : 'No se pudo cargar catálogo de providers');
     } finally {
       setProvidersLoading(false);
+    }
+  }, []);
+
+  const refreshProviderModels = useCallback(async (providerId: string) => {
+    const safeProviderId = String(providerId || '').trim();
+    if (!safeProviderId) return;
+    setRefreshingModelsProviderId(safeProviderId);
+    setModelsRefreshMessage('');
+    setProvidersError('');
+    try {
+      const payload = await getAiProviderModels(safeProviderId, true);
+      setProviders((current) => current.map((provider) => provider.id === safeProviderId
+        ? { ...provider, models: payload.models, defaults: { ...provider.defaults, model: payload.defaultModel || provider.defaults.model } }
+        : provider));
+      setModelsRefreshMessage(`${safeProviderId === 'codex-cli' ? 'Codex' : safeProviderId === 'claude-code' ? 'Claude' : safeProviderId}: ${payload.models.length} modelos actualizados`);
+    } catch (error) {
+      setProvidersError(error instanceof Error ? error.message : 'No se pudieron actualizar los modelos');
+    } finally {
+      setRefreshingModelsProviderId('');
     }
   }, []);
 
@@ -571,6 +599,7 @@ export default function SettingsScreen({
   const startDeviceAuth = async () => {
     setAuthActionBusy(true);
     setAuthError('');
+    setAuthActionMessage('');
     try {
       const login = await startCodexDeviceLogin();
       setAuth((prev) => ({
@@ -593,6 +622,7 @@ export default function SettingsScreen({
   const cancelDeviceAuth = async () => {
     setAuthActionBusy(true);
     setAuthError('');
+    setAuthActionMessage('');
     try {
       await cancelCodexDeviceLogin();
       await loadAuth(true);
@@ -603,15 +633,51 @@ export default function SettingsScreen({
     }
   };
 
+  const refreshDeviceAuth = async () => {
+    setAuthActionBusy(true);
+    setAuthError('');
+    setAuthActionMessage('');
+    try {
+      const result = await refreshCodexAuth();
+      if (result.auth) setAuth(result.auth);
+      setAuthActionMessage('Token de Codex renovado correctamente.');
+      await Promise.all([loadAuth(true), loadAiAgents(), loadQuota(), loadProviders()]);
+      await refreshProviderModels('codex-cli');
+    } catch (error) {
+      const data = (error as { data?: { reauthRequired?: boolean } })?.data;
+      if (data?.reauthRequired) {
+        try {
+          await logoutCodexAuth();
+          const login = await startCodexDeviceLogin();
+          setAuth((prev) => ({
+            loggedIn: false,
+            statusText: 'El token había expirado. Completa la nueva vinculación.',
+            details: prev?.details || null,
+            loginInProgress: Boolean(login?.inProgress),
+            login: login || null
+          }));
+          setAuthActionMessage('El token no era renovable. Se ha iniciado una nueva vinculación segura.');
+          await loadAuth(true);
+        } catch (reauthError) {
+          setAuthError(reauthError instanceof Error ? reauthError.message : 'No se pudo reiniciar la vinculación de Codex');
+        }
+      } else {
+        setAuthError(error instanceof Error ? error.message : 'No se pudo renovar el token de Codex');
+      }
+    } finally {
+      setAuthActionBusy(false);
+    }
+  };
+
   const logoutDeviceAuth = async () => {
     setAuthActionBusy(true);
     setAuthError('');
+    setAuthActionMessage('');
     try {
-      await logoutCodexAuth();
-      await loadAuth(true);
-      await loadAiAgents();
-      await loadQuota();
-      await loadProviders();
+      const result = await logoutCodexAuth();
+      if (result.auth) setAuth(result.auth);
+      setAuthActionMessage(result.warning ? `Cuenta desvinculada. Aviso CLI: ${result.warning}` : 'Cuenta Codex desvinculada.');
+      await Promise.all([loadAuth(true), loadAiAgents(), loadQuota(), loadProviders()]);
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : 'No se pudo cerrar sesión de Codex');
     } finally {
@@ -1123,6 +1189,8 @@ export default function SettingsScreen({
 
             {agentsError ? <p className="text-xs text-red-300">{agentsError}</p> : null}
             {authError ? <p className="text-xs text-red-300">{authError}</p> : null}
+            {authActionMessage ? <p className="text-xs text-emerald-300">{authActionMessage}</p> : null}
+            {modelsRefreshMessage ? <p className="text-xs text-emerald-300">{modelsRefreshMessage}</p> : null}
 
             {agentsLoading ? <p className="text-sm text-zinc-400">Cargando agentes...</p> : null}
             {!agentsLoading && agents.length === 0 ? (
@@ -1142,6 +1210,7 @@ export default function SettingsScreen({
                   const isExpanded = Boolean(expandedAgentIds[agent.id]);
                   const isCodexAgent = agent.id === 'codex-cli';
                   const isClaudeCodeAgent = agent.id === 'claude-code';
+                  const providerCatalogEntry = providers.find((provider) => provider.id === agent.id);
                   const showApiKey = agent.integrationType === 'api_key';
                   const enabledChanged = draft.enabled !== agent.integration.enabled;
                   const baseUrlChanged = (draft.baseUrl || '').trim() !== (agent.integration.baseUrl || '').trim();
@@ -1234,6 +1303,26 @@ export default function SettingsScreen({
                       {isExpanded ? (
                         <>
                           <p className="text-xs text-zinc-400">{agent.description}</p>
+
+                          {(isCodexAgent || isClaudeCodeAgent) ? (
+                            <div className="rounded-lg border border-zinc-800 bg-black/40 p-3 space-y-2">
+                              <div className="flex items-center justify-between gap-2">
+                                <div>
+                                  <p className="text-xs text-zinc-300">Modelos detectados automáticamente</p>
+                                  <p className="text-[11px] text-zinc-500">{providerCatalogEntry?.models?.length || 0} disponibles · caché máxima 5 minutos</p>
+                                </div>
+                                <button type="button" onClick={() => void refreshProviderModels(agent.id)} disabled={refreshingModelsProviderId === agent.id} className="text-[11px] px-2 py-1 rounded border border-zinc-700 text-zinc-300 hover:text-white disabled:opacity-50">
+                                  {refreshingModelsProviderId === agent.id ? 'Actualizando...' : 'Actualizar modelos'}
+                                </button>
+                              </div>
+                              {providerCatalogEntry?.models?.length ? (
+                                <p className="text-[11px] text-zinc-400 break-words">
+                                  {providerCatalogEntry.models.slice(0, 8).join(' · ')}
+                                  {providerCatalogEntry.models.length > 8 ? ` · +${providerCatalogEntry.models.length - 8}` : ''}
+                                </p>
+                              ) : <p className="text-[11px] text-zinc-500">Se usa el fallback seguro hasta que el CLI/API responda.</p>}
+                            </div>
+                          ) : null}
 
                           <div className="flex items-center justify-between text-sm">
                             <span>Activar integracion</span>
@@ -1369,14 +1458,14 @@ export default function SettingsScreen({
                                     Iniciar sesion con ChatGPT
                                   </button>
                                 ) : (
-                                  <button
-                                    type="button"
-                                    onClick={logoutDeviceAuth}
-                                    disabled={authActionBusy || authLoading}
-                                    className="text-xs px-3 py-1.5 rounded-lg border border-red-500/40 bg-red-600/20 text-red-200 hover:bg-red-600/30 disabled:opacity-50"
-                                  >
-                                    Desvincular cuenta
-                                  </button>
+                                  <>
+                                    <button type="button" onClick={refreshDeviceAuth} disabled={authActionBusy || authLoading} className="text-xs px-3 py-1.5 rounded-lg border border-emerald-500/40 bg-emerald-600/20 text-emerald-200 hover:bg-emerald-600/30 disabled:opacity-50">
+                                      Renovar token
+                                    </button>
+                                    <button type="button" onClick={logoutDeviceAuth} disabled={authActionBusy || authLoading} className="text-xs px-3 py-1.5 rounded-lg border border-red-500/40 bg-red-600/20 text-red-200 hover:bg-red-600/30 disabled:opacity-50">
+                                      Desvincular cuenta
+                                    </button>
+                                  </>
                                 )}
 
                                 {auth?.loginInProgress ? (

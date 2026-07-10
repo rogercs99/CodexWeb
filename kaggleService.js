@@ -15,7 +15,34 @@ const execFileAsync = util.promisify(execFile);
 const DEFAULT_KAGGLE_CONFIG_DIR = String(
   process.env.KAGGLE_CONFIG_DIR || path.join(os.homedir(), '.kaggle')
 ).trim() || path.join(os.homedir(), '.kaggle');
-const KAGGLE_USERNAME = String(process.env.KAGGLE_USERNAME || 'rogercs').trim() || 'rogercs';
+
+function readKaggleConfig() {
+  const kaggleJsonPath = path.join(DEFAULT_KAGGLE_CONFIG_DIR, 'kaggle.json');
+  try {
+    if (!fs.existsSync(kaggleJsonPath)) return null;
+    const raw = fs.readFileSync(kaggleJsonPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function resolveKaggleUsername() {
+  const fromEnv = String(process.env.KAGGLE_USERNAME || '').trim();
+  if (fromEnv) return fromEnv;
+  const config = readKaggleConfig();
+  const fromConfig = String(config && config.username ? config.username : '').trim();
+  return fromConfig;
+}
+
+const KAGGLE_USERNAME = resolveKaggleUsername();
+
+function buildKaggleRef(kernelId) {
+  const safeKernelId = String(kernelId || '').trim();
+  if (!safeKernelId) return '';
+  return KAGGLE_USERNAME ? `${KAGGLE_USERNAME}/${safeKernelId}` : safeKernelId;
+}
 
 function resolveKaggleCli() {
   const candidates = [
@@ -63,11 +90,15 @@ function getKagglePreflightError() {
     return `Kaggle credentials not found at ${kaggleJsonPath}. Set KAGGLE_CONFIG_DIR or provide KAGGLE_USERNAME/KAGGLE_KEY.`;
   }
 
+  if (!KAGGLE_USERNAME) {
+    return `Kaggle credentials found at ${kaggleJsonPath}, but username is missing. Set KAGGLE_USERNAME or ensure kaggle.json includes "username".`;
+  }
+
   return null;
 }
 
 // Directorio temporal para kernels
-const KERNELS_DIR = path.join(__dirname, '.runtime', 'kaggle-kernels');
+const KERNELS_DIR = path.resolve(process.env.KAGGLE_KERNELS_DIR || path.join(__dirname, '.runtime', 'kaggle-kernels'));
 
 // Asegurar que existe el directorio
 if (!fs.existsSync(KERNELS_DIR)) {
@@ -100,7 +131,7 @@ function sanitizeJobState(rawJob) {
 
   return {
     id,
-    kaggleRef: String(rawJob.kaggleRef || `${KAGGLE_USERNAME}/${id}`).trim() || `${KAGGLE_USERNAME}/${id}`,
+    kaggleRef: String(rawJob.kaggleRef || buildKaggleRef(id)).trim() || buildKaggleRef(id),
     status: String(rawJob.status || 'unknown').trim() || 'unknown',
     code: typeof rawJob.code === 'string' ? rawJob.code : undefined,
     options: rawJob.options && typeof rawJob.options === 'object' ? rawJob.options : {},
@@ -162,7 +193,7 @@ function hydrateJobFromDisk(jobDirName) {
   }
 
   const metadataPath = path.join(kernelDir, 'kernel-metadata.json');
-  let kaggleRef = `${KAGGLE_USERNAME}/${jobDirName}`;
+  let kaggleRef = buildKaggleRef(jobDirName);
   if (fs.existsSync(metadataPath)) {
     try {
       const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
@@ -235,20 +266,33 @@ function generateKernelId() {
 /**
  * Crear metadata del kernel para Kaggle
  */
-function createKernelMetadata(kernelId, title, enableGpu = false, enableInternet = true) {
-  // Title MUST match kernelId for Kaggle API to accept it (slug resolution)
+function normalizeKaggleSourceList(value) {
+  const list = Array.isArray(value)
+    ? value
+    : String(value || '')
+        .split(/[\n,]+/)
+        .map((entry) => entry.trim())
+        .filter(Boolean);
+  return [...new Set(list)]
+    .filter((entry) => /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(entry))
+    .slice(0, 20);
+}
+
+function createKernelMetadata(kernelId, title, enableGpu = false, enableInternet = true, sources = {}) {
+  // Kaggle resolves the slug from id/title. Hardware model is assigned by Kaggle;
+  // CodexWeb can request GPU, then reports the actual model from nvidia-smi.
   return {
-    id: `${KAGGLE_USERNAME}/${kernelId}`,
-    title: kernelId,
+    id: buildKaggleRef(kernelId),
+    title: String(title || kernelId).slice(0, 80),
     code_file: 'script.py',
     language: 'python',
     kernel_type: 'script',
     is_private: true,
     enable_gpu: enableGpu,
     enable_internet: enableInternet,
-    dataset_sources: [],
-    competition_sources: [],
-    kernel_sources: []
+    dataset_sources: normalizeKaggleSourceList(sources.datasetSources),
+    competition_sources: normalizeKaggleSourceList(sources.competitionSources),
+    kernel_sources: normalizeKaggleSourceList(sources.kernelSources)
   };
 }
 
@@ -282,7 +326,8 @@ async function submitJob(code, options = {}) {
     kernelId,
     options.title || `CodexWeb Job ${kernelId}`,
     options.enableGpu || false,
-    options.enableInternet !== false
+    options.enableInternet !== false,
+    options
   );
 
   const metadataPath = path.join(kernelDir, 'kernel-metadata.json');
@@ -297,7 +342,7 @@ async function submitJob(code, options = {}) {
 
     const job = {
       id: kernelId,
-      kaggleRef: `${KAGGLE_USERNAME}/${kernelId}`,
+      kaggleRef: buildKaggleRef(kernelId),
       status: 'queued',
       code,
       options,
@@ -344,7 +389,7 @@ async function getJobStatus(jobId) {
     };
   }
 
-  const kaggleRef = `${KAGGLE_USERNAME}/${jobId}`;
+  const kaggleRef = buildKaggleRef(jobId);
 
   try {
     const { stdout } = await execFileAsync(KAGGLE_CLI, ['kernels', 'status', kaggleRef], {
@@ -353,7 +398,7 @@ async function getJobStatus(jobId) {
     });
 
     // Parsear estado de la salida
-    // Formato: 'rogercs/codexweb-abc123 has status "KernelWorkerStatus.COMPLETE"'
+    // Formato: '<username>/codexweb-abc123 has status "KernelWorkerStatus.COMPLETE"'
     let status = 'unknown';
     const statusMatch = stdout.match(/has status "(?:KernelWorkerStatus\.)?(\w+)"/i);
     if (statusMatch) {
@@ -412,7 +457,7 @@ async function getJobOutput(jobId) {
   }
 
   const normalizedJobId = assertValidJobId(jobId);
-  const kaggleRef = `${KAGGLE_USERNAME}/${normalizedJobId}`;
+  const kaggleRef = buildKaggleRef(normalizedJobId);
   const outputDir = buildJobOutputDir(normalizedJobId);
 
   // Crear directorio de output si no existe
@@ -769,7 +814,7 @@ function getJobDetails(jobId) {
   return {
     success: true,
     jobId: normalizedJobId,
-    kaggleRef: cached?.kaggleRef || `${KAGGLE_USERNAME}/${normalizedJobId}`,
+    kaggleRef: cached?.kaggleRef || buildKaggleRef(normalizedJobId),
     code,
     logs,
     files,

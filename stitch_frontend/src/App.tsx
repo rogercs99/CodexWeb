@@ -8,6 +8,7 @@ import AttachmentsScreen from './components/AttachmentsScreen';
 import SettingsScreen from './components/SettingsScreen';
 import QuetzalRelayScreen from './components/QuetzalRelayScreen';
 import KaggleScreen from './components/KaggleScreen';
+import KaggleRuntimeScreen from './components/KaggleRuntimeScreen';
 import TokenSaverPanel from './components/TokenSaverPanel';
 import TerminalLivePanel from './components/TerminalLivePanel';
 import SystemRebootScreen from './components/SystemRebootScreen';
@@ -22,6 +23,7 @@ import {
   getCodexRuns,
   getMe,
   getRestartStatus,
+  getRuntimeKaggleStatus,
   getStorageHealth,
   getToolsStorageJobs,
   killConversationSession,
@@ -1405,6 +1407,18 @@ export default function App() {
         }
 
         await loadConversationsAndPick(undefined, me.user.username);
+
+        // Detectar entorno Kaggle y redirigir a Kaggle Runtime Screen
+        try {
+          const kaggleStatus = await getRuntimeKaggleStatus();
+          if (kaggleStatus?.isKaggle) {
+            setScreen('kaggle-runtime');
+            return;
+          }
+        } catch (_error) {
+          // Kaggle detection failed, continue to hub
+        }
+
         setScreen('hub');
       } catch (error: any) {
         setOfflineMessage(error?.message || 'No se pudo cargar la sesión.');
@@ -1776,7 +1790,7 @@ export default function App() {
   const handleRefresh = useCallback(async () => {
     try {
       const [latestOptions, latestAttachments] = await Promise.all([
-        getChatOptions().catch(() => options),
+        getChatOptions(true).catch(() => options),
         listAttachments(200)
       ]);
       setOptions(latestOptions);
@@ -2144,7 +2158,7 @@ export default function App() {
         setStatus('Cambiando agente activo...');
         const result = await updateActiveAiAgentSetting(agentId);
         const [updatedOptions, agentSettings] = await Promise.all([
-          getChatOptions(),
+          getChatOptions(true),
           getAiAgentSettings().catch(() => ({ agents: [], activeAgentId: agentId }))
         ]);
         setOptions(updatedOptions);
@@ -3071,6 +3085,10 @@ export default function App() {
           onClearFilter={() => setKaggleFilterChatId(null)}
           onNavigate={navigate}
         />
+      )}
+
+      {screen === 'kaggle-runtime' && (
+        <KaggleRuntimeScreen />
       )}
 
       {screen === 'reboot' && (

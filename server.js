@@ -20,6 +20,18 @@ const {
 } = require('./quetzalRelay');
 const tokenSaver = require('./tokenSaver');
 const kaggleService = require('./kaggleService');
+const kaggleStudioService = require('./kaggleStudioService');
+const {
+  CLAUDE_CODE_EVERGREEN_MODELS,
+  CLAUDE_CODE_PINNED_FALLBACK_MODELS,
+  CODEX_STATIC_FALLBACK_MODELS,
+  uniqueStrings: uniqueModelStrings,
+  readCodexModelsCache,
+  discoverCodexModelsViaAppServer,
+  refreshCodexAccountViaAppServer,
+  discoverClaudeCodeModels,
+  isRecognizedClaudeCodeModel
+} = require('./modelDiscovery');
 
 // Kaggle Runtime Adapter — detecta y configura rutas para Kaggle
 let kaggleAdapter = null;
@@ -52,7 +64,7 @@ const sentMilestones = new Set();
 const claudeCodeEnabled = parseEnvBoolean(process.env.CLAUDE_CODE_ENABLED, true);
 const claudeCodeBin = String(process.env.CLAUDE_CODE_BIN || 'claude').trim() || 'claude';
 const claudeCodeDefaultCwd = String(process.env.CLAUDE_CODE_DEFAULT_CWD || '/root/CodexWeb').trim() || '/root/CodexWeb';
-const claudeCodeConfiguredDefaultModel = String(process.env.CLAUDE_CODE_DEFAULT_MODEL || 'claude-sonnet-4-5').trim() || 'claude-sonnet-4-5';
+const claudeCodeConfiguredDefaultModel = String(process.env.CLAUDE_CODE_DEFAULT_MODEL || 'sonnet').trim() || 'sonnet';
 const claudeCodeConfiguredDefaultReasoningEffort = String(process.env.CLAUDE_CODE_DEFAULT_REASONING_EFFORT || 'low').trim().toLowerCase() || 'low';
 const claudeCodeTimeoutMs = (() => {
   const parsed = Number.parseInt(String(process.env.CLAUDE_CODE_TIMEOUT_MS || '900000'), 10);
@@ -63,7 +75,7 @@ const claudeCodeAllowedCwds = (() => {
   const parsed = raw.split(',').map((entry) => entry.trim()).filter(Boolean);
   return parsed.length > 0 ? parsed : ['/root/CodexWeb'];
 })();
-const DEFAULT_CHAT_MODEL = 'gpt-5.3-codex';
+const DEFAULT_CHAT_MODEL = String(process.env.CODEX_DEFAULT_MODEL || 'gpt-5').trim() || 'gpt-5';
 const DEFAULT_REASONING_EFFORT = 'xhigh';
 const DISCORD_WEBHOOK_PREFIXES = [
   'https://discord.com/api/webhooks/',
@@ -77,7 +89,7 @@ const OPENROUTER_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 const OLLAMA_DEFAULT_BASE_URL = 'http://127.0.0.1:11434';
 const GROQ_DEFAULT_BASE_URL = 'https://api.groq.com/openai/v1';
 const LMSTUDIO_DEFAULT_BASE_URL = 'http://127.0.0.1:1234/v1';
-const claudeCodeModelOptions = Object.freeze(['claude-sonnet-4-5', 'claude-opus-4-5', 'claude-haiku-4-5']);
+const claudeCodeModelOptions = Object.freeze(uniqueModelStrings([...CLAUDE_CODE_EVERGREEN_MODELS]));
 
 // Phase 3 — Auto-summarization: in-memory cache to avoid re-summarizing the same context
 // Key: `${conversationId}:${oldMessageCount}:${lastOldMessageFingerprint}`
@@ -128,20 +140,10 @@ async function callTsSummarizer(conversationId, oldMessages, apiKey, baseUrl) {
     return null;
   }
 }
-const chatGptModelOptions = [
+const chatGptModelOptions = uniqueModelStrings([
   DEFAULT_CHAT_MODEL,
-  'gpt-5',
-  'gpt-5.5',
-  'gpt-5-mini',
-  'gpt-5-nano',
-  'gpt-4.1',
-  'gpt-4.1-mini',
-  'gpt-4.1-nano',
-  'gpt-4o',
-  'gpt-4o-mini',
-  'o3',
-  'o4-mini'
-];
+  ...CODEX_STATIC_FALLBACK_MODELS
+]);
 const geminiModelOptions = [
   'gemini-2.5-flash',
   'gemini-2.5-pro',
@@ -878,7 +880,7 @@ const geminiIncludeDirectories = (() => {
   return parsed.filter((value, index, list) => list.indexOf(value) === index);
 })();
 const codexQuotaCacheTtlMs = 15000;
-const aiProviderModelCacheTtlMs = 1000 * 60;
+const aiProviderModelCacheTtlMs = 1000 * 60 * 5;
 const aiProviderQuotaCacheTtlMs = 1000 * 60;
 const adminUsers = new Set(
   String(process.env.ADMIN_USERS || '')
@@ -895,6 +897,7 @@ let restartScheduled = false;
 let restartState = null;
 const codexQuotaStateByUser = new Map();
 const aiProviderModelsCache = new Map();
+const aiProviderModelsMetadataCache = new Map();
 const aiProviderQuotaCache = new Map();
 const activeChatRuns = new Map();
 const activeCodexLoginFlows = new Map();
@@ -3904,6 +3907,40 @@ function chownRecursiveSync(targetPath, uid, gid) {
   }
 }
 
+const CODEX_AUTH_UNLINK_MARKER = '.codexweb-auth-unlinked';
+
+function getCodexAuthUnlinkMarkerPath(codexHome) {
+  return path.join(String(codexHome || ''), CODEX_AUTH_UNLINK_MARKER);
+}
+
+function isCodexAuthExplicitlyUnlinked(codexHome) {
+  const home = String(codexHome || '').trim();
+  return Boolean(home && fs.existsSync(getCodexAuthUnlinkMarkerPath(home)));
+}
+
+function markCodexAuthExplicitlyUnlinked(codexHome, reason = 'user_requested') {
+  const home = String(codexHome || '').trim();
+  if (!home) return;
+  try {
+    ensureDirectoryWithMode(home, 0o700);
+    fs.writeFileSync(getCodexAuthUnlinkMarkerPath(home), `${JSON.stringify({ reason: String(reason || 'user_requested'), at: nowIso() })}\n`, { mode: 0o600 });
+  } catch (_error) {}
+}
+
+function clearCodexAuthExplicitlyUnlinked(codexHome) {
+  const home = String(codexHome || '').trim();
+  if (!home) return;
+  try { fs.rmSync(getCodexAuthUnlinkMarkerPath(home), { force: true }); } catch (_error) {}
+}
+
+function removeCodexAuthFiles(codexHome) {
+  const home = String(codexHome || '').trim();
+  if (!home) return;
+  ['auth.json', 'credentials.json', path.join('.credentials', 'auth.json')].forEach((relativePath) => {
+    try { fs.rmSync(path.join(home, relativePath), { recursive: true, force: true }); } catch (_error) {}
+  });
+}
+
 function ensureCodexHome(userId, options = {}) {
   const safeUserId = getSafeUserId(userId);
   if (!safeUserId) {
@@ -3969,7 +4006,9 @@ function seedCodexHomeFromTemplateIfNeeded(targetCodexHome, options = {}) {
   const templateAuthPath = path.join(templateDir, 'auth.json');
   if (!fs.existsSync(templateAuthPath)) return;
 
-  const filesToSeed = ['auth.json', 'models_cache.json', 'config.toml'];
+  const filesToSeed = isCodexAuthExplicitlyUnlinked(target)
+    ? ['models_cache.json', 'config.toml']
+    : ['auth.json', 'models_cache.json', 'config.toml'];
   let copiedAny = false;
   for (const filename of filesToSeed) {
     const source = path.join(templateDir, filename);
@@ -4325,6 +4364,11 @@ function getActiveCodexLoginFlow(userId) {
 async function getCodexAuthStatusForUser(userId, options = {}) {
   const codexPath = await resolveCodexPath();
   const env = getCodexEnvForUser(userId, options);
+  const codexHome = String(env.CODEX_HOME || '');
+  const authPath = path.join(codexHome, 'auth.json');
+  if (isCodexAuthExplicitlyUnlinked(codexHome) && !fs.existsSync(authPath)) {
+    return { loggedIn: false, statusText: 'Cuenta desvinculada. Inicia sesión de nuevo para usar Codex.', details: getCodexAuthDetailsForUser(userId, 'Not logged in') };
+  }
   try {
     const result = await execFileAsync(codexPath, ['login', 'status'], {
       env,
@@ -4333,6 +4377,7 @@ async function getCodexAuthStatusForUser(userId, options = {}) {
       maxBuffer: 128 * 1024
     });
     const statusText = normalizeCodexStatusText(result && result.stdout, 'Logged in using ChatGPT');
+    clearCodexAuthExplicitlyUnlinked(codexHome);
     return {
       loggedIn: true,
       statusText,
@@ -13724,7 +13769,8 @@ app.use(
     cookie: {
       httpOnly: true,
       sameSite: 'lax',
-      secure: true,
+      // HTTPS-only by default; local tests can explicitly disable it.
+      secure: String(process.env.SESSION_COOKIE_SECURE || 'true').trim().toLowerCase() !== 'false',
       maxAge: 1000 * 60 * 60 * 12
     }
   })
@@ -15326,20 +15372,37 @@ function readCachedAiProviderModels(userId, providerId) {
   return Array.isArray(cached.models) ? cached.models.slice() : null;
 }
 
-function cacheAiProviderModels(userId, providerId, models) {
+function cacheAiProviderModels(userId, providerId, models, metadata = {}) {
   const key = buildAiProviderCacheKey(userId, providerId);
   if (!key) return;
-  const safeModels = Array.isArray(models)
-    ? models
-        .map((entry) => String(entry || '').trim())
-        .filter(Boolean)
-        .filter((entry, index, list) => list.indexOf(entry) === index)
-        .slice(0, 120)
-    : [];
-  aiProviderModelsCache.set(key, {
-    fetchedAtMs: Date.now(),
-    models: safeModels
+  const safeModels = uniqueModelStrings(models, 160);
+  const fetchedAtMs = Date.now();
+  aiProviderModelsCache.set(key, { fetchedAtMs, models: safeModels });
+  aiProviderModelsMetadataCache.set(key, {
+    source: String(metadata.source || 'dynamic').trim() || 'dynamic',
+    fetchedAtMs,
+    error: String(metadata.error || '').trim()
   });
+}
+
+function getAiProviderModelsMetadata(userId, providerId) {
+  const key = buildAiProviderCacheKey(userId, providerId);
+  const cached = key ? aiProviderModelsMetadataCache.get(key) : null;
+  if (!cached) return { source: 'fallback', fetchedAt: null, error: '' };
+  return {
+    source: String(cached.source || 'dynamic'),
+    fetchedAt: Number.isFinite(Number(cached.fetchedAtMs))
+      ? new Date(Number(cached.fetchedAtMs)).toISOString()
+      : null,
+    error: String(cached.error || '')
+  };
+}
+
+function clearAiProviderModelsCache(userId, providerId) {
+  const key = buildAiProviderCacheKey(userId, providerId);
+  if (!key) return;
+  aiProviderModelsCache.delete(key);
+  aiProviderModelsMetadataCache.delete(key);
 }
 
 function readCachedAiProviderQuota(userId, providerId) {
@@ -15713,25 +15776,60 @@ function isAiAgentConfiguredForUser(agentId, integrationRow, options = {}) {
 
 async function listAiProviderModelsFromRemote(userId, providerId, integrationRow) {
   const safeProviderId = normalizeSupportedAiAgentId(providerId);
+  const safeUserId = getSafeUserId(userId);
   const normalizedIntegration = normalizeUserAgentIntegrationRow(integrationRow);
-  if (!safeProviderId) {
-    return [];
+  if (!safeProviderId || !safeUserId) return { models: [], source: 'static' };
+
+  if (safeProviderId === 'codex-cli') {
+    const codexPath = await resolveCodexPath();
+    const codexEnv = getCodexEnvForUser(safeUserId);
+    try {
+      const models = await discoverCodexModelsViaAppServer({ codexPath, env: codexEnv, timeoutMs: 10000 });
+      if (models.length > 0) return { models, source: 'codex-app-server' };
+    } catch (error) {
+      const cachedModels = readCodexModelsCache(codexEnv.CODEX_HOME);
+      if (cachedModels.length > 0) {
+        return {
+          models: cachedModels,
+          source: 'codex-models-cache',
+          error: truncateForNotify(error && error.message ? error.message : 'codex_model_discovery_failed', 220)
+        };
+      }
+      throw error;
+    }
+    return { models: [], source: 'codex-app-server' };
   }
+
+  if (safeProviderId === 'claude-code') {
+    const models = await discoverClaudeCodeModels({
+      apiKey: normalizedIntegration.apiKey || process.env.ANTHROPIC_API_KEY || '',
+      baseUrl: normalizedIntegration.baseUrl || process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com',
+      timeoutMs: 8000
+    });
+    return {
+      models,
+      source: normalizedIntegration.apiKey || process.env.ANTHROPIC_API_KEY
+        ? 'anthropic-models-api+aliases'
+        : 'claude-evergreen-aliases'
+    };
+  }
+
   const providerAdapter = getAiProviderAdapter(safeProviderId);
   if (providerAdapter && typeof providerAdapter.listModels === 'function') {
-    return providerAdapter.listModels({
-      userId: getSafeUserId(userId),
+    const models = await providerAdapter.listModels({
+      userId: safeUserId,
       integration: normalizedIntegration,
       allowRemoteFetch: true
     });
+    return { models, source: 'provider-api' };
   }
-  return [];
+  return { models: [], source: 'static' };
 }
 
-function getAiProviderStaticModelOptions(providerId) {
+function getAiProviderStaticModelOptions(providerId, userId = 0) {
   const safeProviderId = normalizeSupportedAiAgentId(providerId);
   if (safeProviderId === 'codex-cli') {
-    const cachedModels = loadCodexModelsFromCache();
+    const cachedModels = loadCodexModelsFromCache(userId);
     if (cachedModels.length > 0) {
       return cachedModels;
     }
@@ -15762,23 +15860,36 @@ async function listAiProviderModelsForUser(userId, providerId, options = {}) {
   const safeProviderId = normalizeSupportedAiAgentId(providerId);
   if (!safeProviderId) return [];
   const allowRemote = options && options.allowRemoteFetch === true;
+  const forceRefresh = options && options.forceRefresh === true;
+  if (forceRefresh) clearAiProviderModelsCache(userId, safeProviderId);
+  if (!forceRefresh) {
+    const cached = readCachedAiProviderModels(userId, safeProviderId);
+    if (cached && cached.length > 0) return cached;
+  }
   if (allowRemote) {
     const integrationRow = getUserAiAgentIntegration(userId, safeProviderId);
     try {
       const remote = await listAiProviderModelsFromRemote(userId, safeProviderId, integrationRow);
-      if (remote.length > 0) {
-        cacheAiProviderModels(userId, safeProviderId, remote);
-        return remote;
+      const remoteModels = Array.isArray(remote && remote.models) ? remote.models : [];
+      if (remoteModels.length > 0) {
+        cacheAiProviderModels(userId, safeProviderId, remoteModels, {
+          source: remote.source,
+          error: remote.error
+        });
+        return remoteModels;
       }
-    } catch (_error) {
-      // fallback to cached/static model list
+    } catch (error) {
+      const fallback = getAiProviderStaticModelOptions(safeProviderId, userId);
+      cacheAiProviderModels(userId, safeProviderId, fallback, {
+        source: 'fallback-after-error',
+        error: truncateForNotify(error && error.message ? error.message : 'model_discovery_failed', 220)
+      });
+      return fallback;
     }
   }
   const cached = readCachedAiProviderModels(userId, safeProviderId);
-  if (cached && cached.length > 0) {
-    return cached;
-  }
-  return getAiProviderStaticModelOptions(safeProviderId);
+  if (cached && cached.length > 0) return cached;
+  return getAiProviderStaticModelOptions(safeProviderId, userId);
 }
 
 function normalizeAiPermissionPathList(rawValue, fallback = [], options = null) {
@@ -16351,7 +16462,7 @@ function serializeAiProviderInfoForUser(userId, agentId, options = null) {
     capabilities: getAiProviderCapabilities(safeAgentId),
     models,
     defaults: {
-      model: getChatAgentDefaultModel(safeAgentId),
+      model: getChatAgentDefaultModel(safeAgentId, userId),
       reasoningEffort: DEFAULT_REASONING_EFFORT
     },
     quota: getAiProviderQuotaForUser(userId, safeAgentId),
@@ -16609,33 +16720,30 @@ function getChatAgentModelOptions(agentId, userId = 0) {
   if (cached && cached.length > 0) {
     return cached;
   }
-  return getAiProviderStaticModelOptions(safeAgentId);
+  return getAiProviderStaticModelOptions(safeAgentId, userId);
 }
 
-function getChatAgentDefaultModel(agentId) {
+function getChatAgentDefaultModel(agentId, userId = 0) {
   const safeAgentId = normalizeSupportedAiAgentId(agentId);
   if (safeAgentId === 'codex-cli') {
-    const cachedModels = loadCodexModelsFromCache();
+    const cachedModels = loadCodexModelsFromCache(userId);
     if (cachedModels.length > 0) {
       return cachedModels[0];
     }
   }
   if (safeAgentId === 'claude-code') {
-    return normalizeClaudeCodeModel(claudeCodeConfiguredDefaultModel, 'claude-sonnet-4-5');
+    return normalizeClaudeCodeModel(claudeCodeConfiguredDefaultModel, 'sonnet');
   }
   const provider = getAiProviderDefinition(safeAgentId);
   return String((provider && provider.defaultModel) || DEFAULT_CHAT_MODEL).trim() || DEFAULT_CHAT_MODEL;
 }
 
-function normalizeClaudeCodeModel(rawModel, fallback = 'claude-sonnet-4-5') {
+function normalizeClaudeCodeModel(rawModel, fallback = 'sonnet') {
   const normalized = sanitizeConversationModel(rawModel);
-  if (claudeCodeModelOptions.includes(normalized)) {
-    return normalized;
-  }
-  if (claudeCodeModelOptions.includes(fallback)) {
-    return fallback;
-  }
-  return 'claude-sonnet-4-5';
+  if (normalized && isRecognizedClaudeCodeModel(normalized)) return normalized;
+  const safeFallback = sanitizeConversationModel(fallback);
+  if (safeFallback && isRecognizedClaudeCodeModel(safeFallback)) return safeFallback;
+  return 'sonnet';
 }
 
 function getChatAgentDefaultReasoningEffort(agentId) {
@@ -16653,15 +16761,12 @@ function mapReasoningEffortToClaudeCli(rawValue) {
   return normalized;
 }
 
-function normalizeChatAgentModel(agentId, rawModel) {
-  const fallbackModel = getChatAgentDefaultModel(agentId);
+function normalizeChatAgentModel(agentId, rawModel, userId = 0) {
+  const fallbackModel = getChatAgentDefaultModel(agentId, userId);
   const normalized = sanitizeConversationModel(rawModel);
   if (!normalized) return fallbackModel;
   if (agentId === 'codex-cli') {
-    const availableModels = getChatAgentModelOptions(agentId);
-    if (availableModels.length > 0 && !availableModels.includes(normalized)) {
-      return fallbackModel;
-    }
+    // Accept newly released models immediately; the Codex CLI remains the authority.
     return normalized;
   }
   if (agentId === 'claude-code') {
@@ -16700,7 +16805,7 @@ function resolveChatAgentRuntimeForUser(userId) {
   const effectiveAgent = supportedAiAgentsById.get(effectiveAgentId);
   const providerDefinition = getAiProviderDefinition(effectiveAgentId);
   const models = getChatAgentModelOptions(effectiveAgentId, userId);
-  const defaultModel = getChatAgentDefaultModel(effectiveAgentId);
+  const defaultModel = getChatAgentDefaultModel(effectiveAgentId, userId);
   const permissionProfile = getAiAgentPermissionProfileForUser(userId, effectiveAgentId);
   const capabilities = getAiProviderCapabilities(effectiveAgentId);
   return {
@@ -17250,22 +17355,22 @@ function sanitizeModelForChatGptAccount(rawValue) {
   return value;
 }
 
-function loadCodexModelsFromCache() {
+function loadCodexModelsFromCache(userId = 0) {
+  const candidateHomes = [];
   try {
-    const cachePath = path.join(os.homedir(), '.codex', 'models_cache.json');
-    if (!fs.existsSync(cachePath)) return [];
-    const raw = fs.readFileSync(cachePath, 'utf8');
-    const parsed = JSON.parse(raw);
-    const models = Array.isArray(parsed && parsed.models) ? parsed.models : [];
-
-    return models
-      .map((model) => String((model && model.slug) || '').trim())
-      .filter(Boolean)
-      .filter((slug, index, list) => list.indexOf(slug) === index)
-      .slice(0, 30);
+    const safeUserId = getSafeUserId(userId);
+    if (safeUserId) candidateHomes.push(getUserCodexHome(safeUserId));
+    const explicitCodexHome = String(process.env.CODEX_HOME || '').trim();
+    if (explicitCodexHome) candidateHomes.push(explicitCodexHome);
+    candidateHomes.push(path.join(os.homedir(), '.codex'));
+    for (const codexHome of candidateHomes) {
+      const models = readCodexModelsCache(codexHome);
+      if (models.length > 0) return models;
+    }
   } catch (_error) {
-    return [];
+    // Static fallback keeps chat options available if the cache is damaged.
   }
+  return [];
 }
 
 function extractTextFromProviderPayload(value) {
@@ -18108,14 +18213,11 @@ app.get('/api/ai/providers', requireAuth, (req, res) => {
 
 app.get('/api/ai/providers/:providerId/models', requireAuth, async (req, res) => {
   const providerId = normalizeSupportedAiAgentId(req.params && req.params.providerId);
-  if (!providerId) {
-    return res.status(404).json({ error: 'Provider no soportado' });
-  }
+  if (!providerId) return res.status(404).json({ error: 'Provider no soportado' });
+  const forceRefresh = ['1', 'true', 'yes'].includes(String(req.query && req.query.refresh || '').trim().toLowerCase());
   let models = [];
   try {
-    models = await listAiProviderModelsForUser(req.session.userId, providerId, {
-      allowRemoteFetch: true
-    });
+    models = await listAiProviderModelsForUser(req.session.userId, providerId, { allowRemoteFetch: true, forceRefresh });
   } catch (_error) {
     models = getChatAgentModelOptions(providerId, req.session.userId);
   }
@@ -18123,7 +18225,8 @@ app.get('/api/ai/providers/:providerId/models', requireAuth, async (req, res) =>
     ok: true,
     providerId,
     models,
-    defaultModel: getChatAgentDefaultModel(providerId)
+    defaultModel: getChatAgentDefaultModel(providerId, req.session.userId),
+    metadata: getAiProviderModelsMetadata(req.session.userId, providerId)
   });
 });
 
@@ -18954,12 +19057,14 @@ app.delete('/api/conversations/:id', requireAuth, (req, res) => {
 });
 
 app.get('/api/chat/options', requireAuth, async (req, res) => {
+  const forceRefresh = ['1', 'true', 'yes'].includes(String(req.query && req.query.refresh || '').trim().toLowerCase());
   const runtime = resolveChatAgentRuntimeForUser(req.session.userId);
   let models = Array.isArray(runtime.models) ? runtime.models.slice() : [];
   let quota = runtime.quota;
   try {
     const remoteModels = await listAiProviderModelsForUser(req.session.userId, runtime.activeAgentId, {
-      allowRemoteFetch: true
+      allowRemoteFetch: true,
+      forceRefresh
     });
     if (remoteModels.length > 0) {
       models = remoteModels;
@@ -18989,7 +19094,8 @@ app.get('/api/chat/options', requireAuth, async (req, res) => {
     defaults: {
       ...runtime.defaults,
       model: normalizedDefaultModel
-    }
+    },
+    modelCatalog: getAiProviderModelsMetadata(req.session.userId, runtime.activeAgentId)
   });
 });
 
@@ -20866,6 +20972,132 @@ app.post('/api/tools/deployed-apps/:appId/restore', requireAuth, async (req, res
 
 // ==================== KAGGLE INTEGRATION ====================
 
+function getKaggleStudioBearerToken(req) {
+  const authorization = String(req.get('authorization') || '').trim();
+  if (/^Bearer\s+/i.test(authorization)) {
+    return authorization.replace(/^Bearer\s+/i, '').trim();
+  }
+  return '';
+}
+
+function getKaggleStudioPublicBaseUrl(req, requestedUrl = '') {
+  const configured = String(requestedUrl || process.env.CODEXWEB_PUBLIC_URL || '').trim().replace(/\/+$/, '');
+  if (/^https?:\/\//i.test(configured)) return configured;
+  const forwardedProto = String(req.get('x-forwarded-proto') || '').split(',')[0].trim();
+  const protocol = forwardedProto || req.protocol || 'https';
+  const forwardedHost = String(req.get('x-forwarded-host') || '').split(',')[0].trim();
+  const host = forwardedHost || String(req.get('host') || '').trim();
+  return host ? `${protocol}://${host}` : '';
+}
+
+function sendKaggleStudioError(res, error) {
+  const statusCode = Number(error?.statusCode) || 500;
+  return res.status(statusCode).json({ ok: false, error: String(error?.message || error || 'Kaggle Studio error') });
+}
+
+function requireKaggleStudioToken(req, res, next) {
+  try {
+    const token = getKaggleStudioBearerToken(req);
+    kaggleStudioService.requireToken(req.params.sessionId, token);
+    req.kaggleStudioToken = token;
+    return next();
+  } catch (error) {
+    return sendKaggleStudioError(res, error);
+  }
+}
+
+app.post('/api/kaggle/studio/start', requireAuth, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const publicBaseUrl = getKaggleStudioPublicBaseUrl(req, body.publicBaseUrl);
+    const session = await kaggleStudioService.startSession({ ...body, publicBaseUrl }, publicBaseUrl, req.session.userId);
+    return res.status(session.status === 'error' ? 500 : 201).json({ ok: session.status !== 'error', session });
+  } catch (error) {
+    console.error('[Kaggle Studio] start failed:', error);
+    return sendKaggleStudioError(res, error);
+  }
+});
+
+app.get('/api/kaggle/studio/sessions', requireAuth, async (req, res) => {
+  try {
+    const sessions = kaggleStudioService.listSessions(req.session.userId);
+    const active = sessions.find((entry) => ['launching', 'queued', 'pending', 'running', 'stopping'].includes(entry.status)) || null;
+    return res.json({ ok: true, active, sessions });
+  } catch (error) {
+    return sendKaggleStudioError(res, error);
+  }
+});
+
+app.get('/api/kaggle/studio/sessions/:sessionId', requireAuth, async (req, res) => {
+  try {
+    const session = await kaggleStudioService.refreshSession(req.params.sessionId, req.session.userId);
+    if (!session) return res.status(404).json({ ok: false, error: 'Sesión de Codex Studio no encontrada' });
+    return res.json({ ok: true, session });
+  } catch (error) {
+    return sendKaggleStudioError(res, error);
+  }
+});
+
+app.post('/api/kaggle/studio/sessions/:sessionId/stop', requireAuth, (req, res) => {
+  try {
+    const reason = String(req.body?.reason || 'requested_from_codexweb').trim();
+    const session = kaggleStudioService.requestStop(req.params.sessionId, reason, req.session.userId);
+    if (!session) return res.status(404).json({ ok: false, error: 'Sesión de Codex Studio no encontrada' });
+    return res.json({ ok: true, session, message: 'Parada solicitada. Kaggle la recogerá en el siguiente heartbeat.' });
+  } catch (error) {
+    return sendKaggleStudioError(res, error);
+  }
+});
+
+// Token-protected callbacks used by the Kaggle kernel. They deliberately do not use
+// the browser session cookie because the remote kernel is not a browser, shocking nobody.
+app.post('/api/kaggle/studio/callback/:sessionId', requireKaggleStudioToken, (req, res) => {
+  try {
+    const token = req.kaggleStudioToken;
+    const session = kaggleStudioService.applyCallback(req.params.sessionId, token, req.body || {});
+    return res.json({ ok: true, session });
+  } catch (error) {
+    return sendKaggleStudioError(res, error);
+  }
+});
+
+app.get('/api/kaggle/studio/control/:sessionId', requireKaggleStudioToken, (req, res) => {
+  try {
+    const token = req.kaggleStudioToken;
+    return res.json(kaggleStudioService.getControl(req.params.sessionId, token));
+  } catch (error) {
+    return sendKaggleStudioError(res, error);
+  }
+});
+
+app.get('/api/kaggle/studio/backup/:sessionId', requireKaggleStudioToken, (req, res) => {
+  try {
+    const token = req.kaggleStudioToken;
+    const backupFile = kaggleStudioService.getBackup(req.params.sessionId, token);
+    if (!backupFile) return res.status(404).json({ ok: false, error: 'No hay backup persistente todavía' });
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.sendFile(backupFile);
+  } catch (error) {
+    return sendKaggleStudioError(res, error);
+  }
+});
+
+app.post(
+  '/api/kaggle/studio/backup/:sessionId',
+  requireKaggleStudioToken,
+  express.raw({ type: ['application/zip', 'application/octet-stream'], limit: process.env.KAGGLE_STUDIO_BACKUP_BODY_LIMIT || '1024mb' }),
+  (req, res) => {
+    try {
+      const token = req.kaggleStudioToken;
+      const result = kaggleStudioService.saveBackup(req.params.sessionId, token, req.body);
+      return res.json(result);
+    } catch (error) {
+      return sendKaggleStudioError(res, error);
+    }
+  }
+);
+
 function buildKaggleJobDownloadUrl(jobId) {
   return `/api/kaggle/output/${encodeURIComponent(jobId)}/download`;
 }
@@ -21370,7 +21602,7 @@ app.post('/api/kaggle/poll-complete', requireAuth, async (req, res) => {
  */
 app.get('/api/export/source', requireAuth, async (req, res) => {
   try {
-    const projectRoot = '/root/CodexWeb';
+    const projectRoot = repoRootDir;
     const tmpDir = '/tmp';
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5);
     const filename = `codexweb-source-${timestamp}.tar.gz`;
@@ -21961,6 +22193,8 @@ app.post('/api/codex/auth/device/start', requireAuth, async (req, res) => {
       } else if (Number.isInteger(code) && code === 0) {
         loginFlow.inProgress = false;
         loginFlow.completed = true;
+        clearCodexAuthExplicitlyUnlinked(loginFlow.codexHome);
+        clearAiProviderModelsCache(safeUserId, 'codex-cli');
         loginFlow.statusText = loginFlow.statusText || 'Sesión iniciada en Codex CLI.';
       } else {
         loginFlow.inProgress = false;
@@ -21997,40 +22231,53 @@ app.post('/api/codex/auth/device/cancel', requireAuth, (req, res) => {
   });
 });
 
-app.post('/api/codex/auth/logout', requireAuth, async (req, res) => {
+app.post('/api/codex/auth/refresh', requireAuth, async (req, res) => {
   const safeUserId = getSafeUserId(req.session.userId);
-  if (!safeUserId) {
-    return res.status(400).json({ error: 'user_id inválido' });
+  if (!safeUserId) return res.status(400).json({ error: 'user_id inválido' });
+  const username = req.session && typeof req.session.username === 'string' ? req.session.username : '';
+  const env = getCodexEnvForUser(safeUserId, { username });
+  const codexHome = String(env.CODEX_HOME || '');
+  if (isCodexAuthExplicitlyUnlinked(codexHome) && !fs.existsSync(path.join(codexHome, 'auth.json'))) {
+    return res.status(409).json({ error: 'La cuenta Codex está desvinculada. Inicia sesión de nuevo.', reauthRequired: true });
   }
-
-  const activeFlow = getActiveCodexLoginFlow(safeUserId);
-  if (activeFlow) {
-    terminateCodexLoginFlow(activeFlow, 'cancelled_by_logout');
-  }
-
   try {
     const codexPath = await resolveCodexPath();
-    await execFileAsync(codexPath, ['logout'], {
-      env: getCodexEnvForUser(safeUserId, {
-        username: req.session && typeof req.session.username === 'string' ? req.session.username : ''
-      }),
-      cwd: process.cwd(),
-      timeout: 15000,
-      maxBuffer: 128 * 1024
-    });
+    await refreshCodexAccountViaAppServer({ codexPath, env, timeoutMs: 15000 });
+    const auth = await getCodexAuthStatusForUser(safeUserId, { username });
+    if (!auth.loggedIn) return res.status(409).json({ error: auth.statusText || 'Es necesario iniciar sesión de nuevo.', reauthRequired: true, auth });
+    clearCodexAuthExplicitlyUnlinked(codexHome);
+    clearAiProviderModelsCache(safeUserId, 'codex-cli');
+    codexQuotaStateByUser.delete(safeUserId);
+    return res.json({ ok: true, refreshed: true, reauthRequired: false, auth });
   } catch (error) {
-    const detail = normalizeCodexStatusText(
-      `${error && error.stdout ? error.stdout : ''}\n${error && error.stderr ? error.stderr : ''}`
-    );
-    const notLogged = detail.toLowerCase().includes('not logged in');
-    if (!notLogged) {
-      const reason = truncateForNotify(detail || (error && error.message ? error.message : 'logout_error'), 180);
-      return res.status(500).json({ error: `No se pudo cerrar sesión de Codex: ${reason}` });
-    }
+    const reason = truncateForNotify(error && error.message ? error.message : 'codex_refresh_error', 220);
+    return res.status(409).json({ error: `No se pudo renovar la sesión de Codex: ${reason}`, reauthRequired: true });
   }
+});
 
+app.post('/api/codex/auth/logout', requireAuth, async (req, res) => {
+  const safeUserId = getSafeUserId(req.session.userId);
+  if (!safeUserId) return res.status(400).json({ error: 'user_id inválido' });
+  const activeFlow = getActiveCodexLoginFlow(safeUserId);
+  if (activeFlow) terminateCodexLoginFlow(activeFlow, 'cancelled_by_logout');
+  const username = req.session && typeof req.session.username === 'string' ? req.session.username : '';
+  const env = getCodexEnvForUser(safeUserId, { username });
+  const codexHome = String(env.CODEX_HOME || '');
+  markCodexAuthExplicitlyUnlinked(codexHome, 'user_requested_logout');
+  let warning = '';
+  try {
+    const codexPath = await resolveCodexPath();
+    await execFileAsync(codexPath, ['logout'], { env, cwd: process.cwd(), timeout: 15000, maxBuffer: 128 * 1024 });
+  } catch (error) {
+    const detail = normalizeCodexStatusText(`${error && error.stdout ? error.stdout : ''}\n${error && error.stderr ? error.stderr : ''}`);
+    if (!detail.toLowerCase().includes('not logged in')) warning = truncateForNotify(detail || (error && error.message ? error.message : 'logout_error'), 180);
+  } finally {
+    removeCodexAuthFiles(codexHome);
+  }
   codexQuotaStateByUser.delete(safeUserId);
-  return res.json({ ok: true });
+  clearAiProviderModelsCache(safeUserId, 'codex-cli');
+  const auth = await getCodexAuthStatusForUser(safeUserId, { username });
+  return res.json({ ok: true, unlinked: true, warning, auth });
 });
 
 // ─── Claude Code auth flow ────────────────────────────────────────────────────
@@ -22750,7 +22997,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
   }
   let selectedModel = normalizeChatAgentModel(
     chatRuntime.activeAgentId,
-    requestedModel || chatRuntime.defaults.model
+    requestedModel || chatRuntime.defaults.model,
+    req.session.userId
   );
   let selectedReasoningEffort = sanitizeReasoningEffort(
     requestedReasoningEffort,
@@ -22985,8 +23233,8 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       chatRuntime.defaults.reasoningEffort
     );
     selectedModel = modelWasProvided
-      ? normalizeChatAgentModel(chatRuntime.activeAgentId, requestedModel || chatRuntime.defaults.model)
-      : normalizeChatAgentModel(chatRuntime.activeAgentId, storedConversationModel);
+      ? normalizeChatAgentModel(chatRuntime.activeAgentId, requestedModel || chatRuntime.defaults.model, req.session.userId)
+      : normalizeChatAgentModel(chatRuntime.activeAgentId, storedConversationModel, req.session.userId);
     selectedReasoningEffort = reasoningWasProvided
       ? sanitizeReasoningEffort(
           requestedReasoningEffort,
@@ -23867,7 +24115,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
       ].filter(Boolean).join('\n');
 
       const claudeArgs = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages'];
-      const claudeCliModel = normalizeClaudeCodeModel(selectedModel, getChatAgentDefaultModel('claude-code'));
+      const claudeCliModel = normalizeClaudeCodeModel(selectedModel, getChatAgentDefaultModel('claude-code', req.session.userId));
       const claudeCliEffort = mapReasoningEffortToClaudeCli(selectedReasoningEffort);
       if (claudeCliModel) {
         claudeArgs.push('--model', claudeCliModel);

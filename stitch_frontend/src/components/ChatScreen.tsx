@@ -992,6 +992,26 @@ export default function ChatScreen({
                 ))}
               </select>
             </div>
+            {options.modelCatalog ? (
+              <div
+                className={`flex items-center justify-between gap-2 text-[10px] ${
+                  options.modelCatalog.error ? 'text-amber-300' : 'text-zinc-500'
+                }`}
+                title={options.modelCatalog.error || `Catálogo: ${options.modelCatalog.source}`}
+              >
+                <span className="truncate">
+                  Modelos: {options.modelCatalog.source || 'fallback'}
+                  {options.modelCatalog.error ? ' · usando respaldo' : ''}
+                </span>
+                {options.modelCatalog.fetchedAt ? (
+                  <span className="shrink-0">
+                    {new Date(options.modelCatalog.fetchedAt).toLocaleTimeString('es-ES', {
+                      hour: '2-digit', minute: '2-digit'
+                    })}
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </div>
       </header>

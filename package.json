@@ -6,16 +6,21 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test:syntax": "node --check server.js",
+    "test:syntax": "node --check server.js && node --check kaggleService.js && node --check kaggleStudioService.js && python3 -m py_compile scripts/kaggle_codex_studio_v21.py",
     "test:e2e:local": "node tests/e2e/local-smoke.mjs",
     "test:e2e:agents": "node tests/e2e/chat-agent-completion.mjs",
     "test:frontend:assets": "node tests/frontend/static-assets.mjs",
     "test:frontend:mobile": "node tests/frontend/mobile-layout-bundle.mjs",
     "test:perf": "node tests/perf/timing-table.mjs && npm run test:routes",
-    "test:audit": "npm run test:syntax && npm run test:e2e:local && npm run test:e2e:security && npm run test:e2e:agents && npm run test:frontend:assets && npm run test:frontend:sw && npm run test:frontend:mobile && npm run test:perf",
+    "test:audit": "npm run test:syntax && npm run test:models && npm run test:kaggle:studio && npm run test:e2e:kaggle-studio && npm run test:e2e:local && npm run test:e2e:auth && npm run test:e2e:security && npm run test:e2e:agents && npm run test:frontend:assets && npm run test:frontend:sw && npm run test:frontend:mobile && npm run test:perf && npm run test:e2e:browser-proof",
     "test:routes": "node tests/perf/route-inventory.mjs && node tests/perf/safe-get-route-timings.mjs",
     "test:e2e:security": "node tests/e2e/security-guards.mjs",
-    "test:frontend:sw": "node tests/frontend/service-worker-cache.mjs"
+    "test:frontend:sw": "node tests/frontend/service-worker-cache.mjs",
+    "test:kaggle:studio": "node tests/unit/kaggle-studio-service.mjs",
+    "test:e2e:kaggle-studio": "node tests/e2e/kaggle-studio-http.mjs",
+    "test:e2e:browser-proof": "node tests/e2e/terminal-kaggle-browser-proof.mjs",
+    "test:models": "node tests/unit/model-discovery.mjs",
+    "test:e2e:auth": "node tests/e2e/codex-auth-refresh.mjs"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

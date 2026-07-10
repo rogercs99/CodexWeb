@@ -15,7 +15,7 @@ function json(body, status = 200) {
     headers: {
       'Access-Control-Allow-Origin': 'null',
       'Access-Control-Allow-Credentials': 'true',
-      'Access-Control-Allow-Headers': '*',
+      'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization',
       'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
       'Content-Type': 'application/json'
     },
@@ -48,9 +48,19 @@ function mockApi(url, method) {
   if (p === '/api/restart/status') return json({ ok: true, restart: { active: false, phase: 'idle' }, pid: 123 });
   if (p === '/api/tools/terminal-live/stream') return {
     status: 200,
-    headers: { 'Access-Control-Allow-Origin': 'null', 'Content-Type': 'text/event-stream' },
-    body: 'event: session\ndata: {"id":"mock","command":"echo ok"}\n\nevent: stdout\ndata: {"text":"ok\\n"}\n\nevent: done\ndata: {"ok":true,"exitCode":0}\n\n'
+    headers: { 'Access-Control-Allow-Origin': 'null', 'Access-Control-Allow-Credentials': 'true', 'Content-Type': 'text/event-stream' },
+    body: 'event: session\ndata: {"id":"mock","command":"echo ok","cwd":"/root/CodexWeb"}\n\nevent: state\ndata: {"state":"streaming"}\n\nevent: stdout\ndata: {"text":"ok\\n"}\n\nevent: done\ndata: {"ok":true,"exitCode":0,"stdout":"ok\\n","durationMs":17}\n\n'
   };
+  if (p === '/api/kaggle/jobs') return json({ ok: true, jobs: [] });
+  if (p === '/api/kaggle/studio/sessions') return json({ ok: true, active: null, sessions: [] });
+  if (p === '/api/kaggle/studio/start' && method === 'POST') return json({
+    ok: true,
+    session: {
+      id: 'studio-aabbccddeeff', status: 'queued', createdAt: new Date().toISOString(),
+      jobId: 'mock-studio-job', kaggleRef: 'audit/mock-studio-job', publicUrl: '', actualGpu: '',
+      options: { gpuPreference: 't4', enableInternet: true, persistenceEnabled: true, backupIntervalMinutes: 10, maxBackupMb: 300, maxParallel: 1, tunnelProvider: 'pinggy', datasetSources: [] }
+    }
+  }, 201);
   if (p.startsWith('/api/')) return json({ ok: true, conversations: [], projects: [], attachments: [], runs: [], tasks: [] });
   return null;
 }
@@ -77,7 +87,7 @@ async function snapshot(page, label) {
   }, label);
 }
 
-const browser = await puppeteer.launch({ executablePath: '/usr/bin/chromium', headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process'] });
+const browser = await puppeteer.launch({ executablePath: '/usr/bin/chromium', headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] });
 const page = await browser.newPage();
 await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 3 });
 await page.setRequestInterception(true);
@@ -106,15 +116,88 @@ await page.setContent(`<!doctype html><html lang="es"><head><meta charset="UTF-8
 await new Promise((resolve) => setTimeout(resolve, 2500));
 const home = await snapshot(page, 'mobile-home-390x844');
 await page.evaluate(() => {
-  const terminalButton = [...document.querySelectorAll('button')].find((button) => /terminal/i.test(button.textContent || ''));
+  const terminalButton = [...document.querySelectorAll('button')].find((button) => /^terminal$/i.test((button.textContent || '').trim()));
   terminalButton?.click();
 });
-await new Promise((resolve) => setTimeout(resolve, 1500));
+await page.waitForSelector('[data-testid="terminal-command-input"]', { timeout: 8000 });
+const input = await page.$('[data-testid="terminal-command-input"]');
+await input.type('echo ok');
+await input.press('Enter');
+await page.waitForFunction(() => /Comando completado/i.test(document.body.textContent || ''), { timeout: 8000 });
+await new Promise((resolve) => setTimeout(resolve, 600));
 const terminal = await snapshot(page, 'mobile-terminal-390x844');
+const terminalChecks = await page.evaluate(() => {
+  const input = document.querySelector('[data-testid="terminal-command-input"]');
+  const composer = document.querySelector('[data-testid="terminal-composer-shell"]');
+  const cards = [...document.querySelectorAll('article')].filter((entry) => /echo ok/i.test(entry.textContent || ''));
+  const lastCard = cards.at(-1) || null;
+  const inputRect = input?.getBoundingClientRect();
+  const composerRect = composer?.getBoundingClientRect();
+  const cardRect = lastCard?.getBoundingClientRect();
+  return {
+    input: input ? {
+      rows: Number(input.getAttribute('rows')),
+      autoCapitalize: input.getAttribute('autocapitalize'),
+      autoCorrect: input.getAttribute('autocorrect'),
+      autoComplete: input.getAttribute('autocomplete'),
+      spellCheck: input.getAttribute('spellcheck'),
+      height: inputRect?.height || 0
+    } : null,
+    composer: composerRect ? { top: composerRect.top, bottom: composerRect.bottom, height: composerRect.height } : null,
+    lastCard: cardRect ? { top: cardRect.top, bottom: cardRect.bottom, height: cardRect.height } : null,
+    overlapPx: composerRect && cardRect ? Math.max(0, cardRect.bottom - composerRect.top) : null,
+    bodyText: (document.body.textContent || '').replace(/\s+/g, ' ').trim()
+  };
+});
+
+await page.evaluate(() => {
+  const kaggleButton = [...document.querySelectorAll('button')].find((button) => /^kaggle$/i.test((button.textContent || '').trim()));
+  kaggleButton?.click();
+});
+await page.waitForFunction(() => /Enviar Codigo/i.test(document.body.textContent || ''), { timeout: 8000 });
+await page.evaluate(() => {
+  const studioTab = [...document.querySelectorAll('button')].find((button) => /^Codex Studio$/i.test((button.textContent || '').trim()));
+  studioTab?.click();
+});
+await page.waitForFunction(() => /Codex Studio en Kaggle/i.test(document.body.textContent || ''), { timeout: 8000 });
+await new Promise((resolve) => setTimeout(resolve, 500));
+const kaggleStudio = await snapshot(page, 'mobile-kaggle-studio-390x844');
+const kaggleChecks = await page.evaluate(() => ({
+  hasLaunch: /Lanzar Codex Studio/i.test(document.body.textContent || ''),
+  hasGpu: /GPU/i.test(document.body.textContent || ''),
+  hasInternet: /Internet/i.test(document.body.textContent || ''),
+  hasPersistence: /Persistir workspace/i.test(document.body.textContent || ''),
+  hasPinggy: /Pinggy/i.test(document.body.textContent || '')
+}));
+
 await browser.close();
 assert.equal(browserErrors.length, 0, browserErrors.join('\n'));
 assert.match(home.sample, /CodexWeb|Chats|Terminal/i, JSON.stringify(home));
-assert.match(terminal.sample, /Terminal|Ejecutar comando/i, JSON.stringify(terminal));
+assert.match(terminal.sample, /Terminal|Comando completado/i, JSON.stringify(terminal));
+assert.match(terminalChecks.bodyText, /echo ok/i, JSON.stringify(terminalChecks));
+assert.match(terminalChecks.bodyText, /ok/i, JSON.stringify(terminalChecks));
+assert.equal(terminalChecks.input?.rows, 1, JSON.stringify(terminalChecks));
+assert.equal(terminalChecks.input?.autoCapitalize, 'none', JSON.stringify(terminalChecks));
+assert.equal(terminalChecks.input?.autoCorrect, 'off', JSON.stringify(terminalChecks));
+assert.equal(terminalChecks.input?.autoComplete, 'off', JSON.stringify(terminalChecks));
+assert.ok((terminalChecks.input?.height || 999) <= 56, JSON.stringify(terminalChecks));
+assert.equal(terminalChecks.overlapPx, 0, JSON.stringify(terminalChecks));
+assert.equal(kaggleChecks.hasLaunch, true, JSON.stringify(kaggleChecks));
+assert.equal(kaggleChecks.hasGpu, true, JSON.stringify(kaggleChecks));
+assert.equal(kaggleChecks.hasInternet, true, JSON.stringify(kaggleChecks));
+assert.equal(kaggleChecks.hasPersistence, true, JSON.stringify(kaggleChecks));
+assert.equal(kaggleChecks.hasPinggy, true, JSON.stringify(kaggleChecks));
 assert.equal(home.horizontalOverflow, false, JSON.stringify(home));
 assert.equal(terminal.horizontalOverflow, false, JSON.stringify(terminal));
-console.log(JSON.stringify({ ok: true, jsFile, cssFile, screenshots: ['mobile-home-390x844.png', 'mobile-terminal-390x844.png'], home, terminal }, null, 2));
+assert.equal(kaggleStudio.horizontalOverflow, false, JSON.stringify(kaggleStudio));
+console.log(JSON.stringify({
+  ok: true,
+  jsFile,
+  cssFile,
+  screenshots: ['mobile-home-390x844.png', 'mobile-terminal-390x844.png', 'mobile-kaggle-studio-390x844.png'],
+  terminalChecks,
+  kaggleChecks,
+  home,
+  terminal,
+  kaggleStudio
+}, null, 2));

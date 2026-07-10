@@ -1,0 +1,128 @@
+Objetivo: aplicar el ZIP de cambios parciales de CodexWeb, validar Terminal/Kaggle/modelos/auth Codex en el VPS y desplegar únicamente DEV.
+
+Ahorro de tokens:
+- Lee primero `docs/CONTEXT_TERMINAL_KAGGLE_MODELS_AUTH_2026-07-10.md`, `docs/CONTEXT_CODEXWEBDEV_RUNTIME.md` y `docs/AI_CONTEXT_COMPACT.md`.
+- No repitas contexto largo en mensajes. Actualiza esos MD con hallazgos reales del VPS.
+- Resume logs; guarda trazas largas en `artifacts/deploy-dev-2026-07-10/`.
+
+Entrada:
+- El ZIP contiene solo ficheros nuevos/modificados respecto al source entregado y `DELETED_FILES.txt` para assets obsoletos.
+- El ZIP debe extraerse preservando su estructura relativa sobre `/root/CodexWeb`.
+
+Restricciones críticas:
+- DEV únicamente. No desplegar ni reiniciar PRO.
+- No sobrescribir `.env`, `deploy/codexwebdev.env`, bases de datos, uploads, snapshots, `.runtime`, secretos, `CODEX_HOME_ROOT`, credenciales Kaggle ni backups.
+- No copiar `node_modules` del ZIP.
+- Antes de cambios: backup y `git status`.
+- No borrar `auth.json` global de `/root/.codex`; la desvinculación debe afectar al home aislado del usuario DEV.
+
+Pasos:
+
+1. Preparación segura
+   - `cd /root/CodexWeb`
+   - `git status --short`
+   - crea rama `fix/dev-terminal-kaggle-models-auth-20260710` desde la rama DEV adecuada;
+   - guarda diff y backup de ficheros que se van a sustituir;
+   - extrae el ZIP en `/tmp/codexweb-dev-fixes` y revisa `MANIFEST.json` y `DELETED_FILES.txt`.
+
+2. Aplicar overlay
+   - copia los ficheros del directorio `overlay/` a `/root/CodexWeb` manteniendo rutas;
+   - elimina únicamente las rutas enumeradas en `DELETED_FILES.txt`;
+   - no uses `rsync --delete` sobre el repo completo;
+   - verifica que `scripts/kaggle_codex_studio_v21.py`, `kaggleStudioService.js`, `modelDiscovery.js` y los tests nuevos existen.
+
+3. Dependencias y build
+   - raíz: `npm install`;
+   - frontend: `cd /root/CodexWeb/stitch_frontend && npm install && npm run lint && npm run build`;
+   - despliega frontend con el workflow existente: `cd /root/CodexWeb && ./deploy/deploy-dev-frontend.sh`;
+   - no copies assets manualmente si el script ya lo hace.
+
+4. Configuración DEV, sin imprimir secretos
+   - conserva valores actuales y añade solo si faltan:
+     - `CODEXWEB_PUBLIC_URL=https://codexwebdev.gamemodai.pro` o la URL HTTPS DEV real;
+     - `KAGGLE_CLI_PATH` apuntando al CLI instalado;
+     - `KAGGLE_CONFIG_DIR=/root/.kaggle` o ubicación real;
+     - `KAGGLE_USERNAME`;
+     - credencial en `kaggle.json` con permisos 600 o `KAGGLE_KEY` sin mostrarla;
+     - `KAGGLE_KERNELS_DIR=/root/CodexWeb/.runtime/dev/kaggle-kernels`;
+     - `KAGGLE_STUDIO_RUNTIME_DIR=/root/CodexWeb/.runtime/dev/kaggle-studio`;
+     - `KAGGLE_STUDIO_TEMPLATE_PATH=/root/CodexWeb/scripts/kaggle_codex_studio_v21.py`;
+     - mantener `CODEX_HOME_ROOT=/var/lib/codexweb/codex_users_dev` y `CODEX_AUTH_TEMPLATE_DIR=/root/.codex`;
+     - `ANTHROPIC_API_KEY` es opcional: no crearla si no existe; Claude seguirá usando aliases evergreen.
+   - valida que el callback de Kaggle sea accesible desde Internet por HTTPS y llegue al backend DEV.
+
+5. Suite antes de reiniciar
+   - `cd /root/CodexWeb`
+   - `node --check server.js`
+   - `npm run test:audit`
+   - `npm audit --audit-level=low`
+   - `cd stitch_frontend && npm audit --audit-level=low`
+   - si falla algo, diagnostica y corrige el mínimo necesario; añade test de regresión.
+   - documenta que `tests/e2e/chat-agent-completion.mjs` conserva 5 escenarios SKIP salvo que los conviertas realmente a E2E.
+
+6. Reiniciar DEV
+   - usa `./deploy/full-deploy-dev.sh` si no requiere interacción o ejecuta build/deploy y `systemctl restart codexwebdev.service`;
+   - comprueba `systemctl status codexwebdev.service --no-pager`;
+   - revisa `journalctl -u codexwebdev.service -n 200 --no-pager`;
+   - no reiniciar `codexweb.service` de PRO.
+
+7. Validación real Terminal
+   - endpoint autenticado `/api/tools/terminal-live/status`;
+   - desde navegador móvil/iPhone: el textarea comienza en una línea, sin autocapitalización y no tapa el último mensaje;
+   - ejecuta `printf 'terminal-dev-ok\n'`, `pwd` y un comando con stderr;
+   - valida que `done` se interpreta tanto con JSON SSE normal como con fallback Base64;
+   - desde el VPS o una sesión autenticada, usa `curl -N` contra DEV para confirmar streaming sin buffering;
+   - si Cloudflare/nginx corta SSE, corrige proxy timeout/buffering en DEV y añade la configuración al contexto.
+
+8. Validación real Kaggle
+   - `kaggle --version` y credenciales sin imprimir token;
+   - abre Kaggle > Codex Studio;
+   - lanza un kernel privado pequeño con Internet y GPU;
+   - confirma estados queued/running, heartbeat, GPU real y URL Pinggy clicable;
+   - confirma que la preferencia T4/P100 es orientativa y muestra el hardware realmente asignado;
+   - pulsa Parar y comprueba estado stopped;
+   - prueba backup/restore con un archivo inocuo;
+   - elimina el kernel de prueba si queda abandonado.
+
+9. Validación modelos
+   - en Integraciones IA, pulsa `Actualizar modelos` para Codex;
+   - confirma que usa `codex app-server` + `model/list` y no una lista inventada;
+   - confirma fallback a caché o `gpt-5` si el App Server no responde;
+   - para Claude, confirma aliases evergreen y, solo si existe API key, catálogo remoto;
+   - no hardcodear nombres nuevos basándose en memoria.
+
+10. Validación autenticación Codex
+   - con cuenta DEV vinculada, pulsa `Renovar token` y confirma nuevo estado;
+   - pulsa `Desvincular cuenta` y confirma que queda desconectada después de refrescar la página;
+   - verifica que existe el marcador `.codexweb-auth-unlinked` en el home aislado correspondiente y que `auth.json` no se vuelve a sembrar automáticamente;
+   - inicia device login desde GUI y confirma `relinked`;
+   - no mostrar códigos ni tokens en logs/commit.
+
+11. Git
+   - actualiza `docs/CONTEXT_TERMINAL_KAGGLE_MODELS_AUTH_2026-07-10.md` con resultados reales;
+   - commits sugeridos:
+     1. `fix: repair terminal live SSE and mobile composer`
+     2. `feat: add managed Kaggle Codex Studio sessions`
+     3. `feat: refresh provider models dynamically`
+     4. `fix: support Codex token refresh and persistent unlink`
+     5. `test: cover terminal Kaggle models and Codex auth`
+   - push de la rama y PR/MR contra DEV según workflow del repo;
+   - no mergear ni desplegar PRO.
+
+Criterios de aceptación:
+- Terminal DEV ejecuta un comando real y muestra exit code correcto.
+- Solape medido 0 px en 390x844 y comprobado en iPhone si está disponible.
+- Kaggle devuelve enlace Pinggy real y permite parada cooperativa.
+- Catálogo Codex se obtiene dinámicamente o usa fallback explícito, nunca IDs inventados.
+- Renovar token funciona o deriva automáticamente a reautenticación.
+- Desvincular sigue desconectado tras recargar.
+- `npm run test:audit`, lint, build y audits pasan.
+- Solo DEV reiniciado y validado.
+
+Respuesta final compacta:
+- rama y commits;
+- tests OK/FAIL;
+- URL DEV y comprobaciones realizadas;
+- resultado Terminal, Kaggle, modelos y auth;
+- ficheros de logs/contexto actualizados;
+- cualquier limitación real pendiente, sin ocultarla.

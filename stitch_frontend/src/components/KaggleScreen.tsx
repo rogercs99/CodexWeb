@@ -15,9 +15,10 @@ import {
   type KaggleJobDetails
 } from '../lib/api';
 import BottomNav from './BottomNav';
+import KaggleStudioPanel from './KaggleStudioPanel';
 
 type SubmitMode = 'simple' | 'autoretry';
-type KaggleTab = 'submit' | 'jobs';
+type KaggleTab = 'submit' | 'studio' | 'jobs';
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
@@ -293,6 +294,17 @@ export default function KaggleScreen({
         </button>
         <button
           type="button"
+          onClick={() => setTab('studio')}
+          className={`flex-1 py-3 text-sm font-medium transition-colors ${
+            tab === 'studio'
+              ? 'text-cyan-400 border-b-2 border-cyan-400'
+              : 'text-zinc-400 hover:text-white'
+          }`}
+        >
+          Codex Studio
+        </button>
+        <button
+          type="button"
           onClick={() => { setTab('jobs'); loadRecentJobs(); }}
           className={`flex-1 py-3 text-sm font-medium transition-colors ${
             tab === 'jobs'
@@ -491,6 +503,8 @@ export default function KaggleScreen({
               </div>
             )}
           </div>
+        ) : tab === 'studio' ? (
+          <KaggleStudioPanel />
         ) : (
           /* Jobs Tab */
           <div className="space-y-2">
