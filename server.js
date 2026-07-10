@@ -485,6 +485,12 @@ const isDevDeployment =
   /\/\.runtime\/dev(?:\/|$)/.test(staticAssetsDirNormalized) ||
   /\/\.runtime\/dev(?:\/|$)/.test(String(process.env.DB_PATH || '').replace(/\\/g, '/')) ||
   Number.parseInt(String(process.env.PORT || ''), 10) === 3060;
+const isKaggleRuntime =
+  parseEnvBoolean(process.env.KAGGLE_RUNTIME_MODE, false) ||
+  ['ENVIRONMENT', 'APP_ENV', 'CODEXWEB_ENV'].some((key) => {
+    const value = String(process.env[key] || '').trim().toLowerCase();
+    return value === 'kaggle';
+  });
 const frontendIndexHtmlPath = path.join(staticAssetsDir, 'index.html');
 const frontendDiagHtmlPath = path.join(staticAssetsDir, 'diag.html');
 const frontendDiagScriptPath = path.join(staticAssetsDir, 'diag.js');
@@ -1344,6 +1350,14 @@ try {
   // best effort
 }
 console.info(`Codex home root configurado en ${codexUsersRootDir}`);
+console.info(
+  `[AuthRuntime] startup env=${isDevDeployment ? 'dev' : 'prod'} ` +
+    `kaggle=${isKaggleRuntime ? 'true' : 'false'} ` +
+    `db=${dbAbsolutePath} static=${staticAssetsDir}`
+);
+if (!fs.existsSync(dbAbsolutePath)) {
+  console.warn(`[AuthRuntime] users_db_missing path=${dbAbsolutePath}`);
+}
 fs.mkdirSync(taskSnapshotsRootDir, { recursive: true });
 fs.mkdirSync(storageJobsRootDir, { recursive: true });
 
@@ -11217,8 +11231,9 @@ async function resolveCodexPath() {
   if (resolvedCodexPath) {
     return resolvedCodexPath;
   }
-  if (process.env.CODEX_CMD && process.env.CODEX_CMD.trim()) {
-    resolvedCodexPath = process.env.CODEX_CMD.trim();
+  const configuredCodexBin = String(process.env.CODEX_CMD || process.env.CODEX_BIN || '').trim();
+  if (configuredCodexBin) {
+    resolvedCodexPath = configuredCodexBin;
     return resolvedCodexPath;
   }
   let discovered = null;
@@ -13709,7 +13724,7 @@ app.use(
     cookie: {
       httpOnly: true,
       sameSite: 'lax',
-      secure: 'auto',
+      secure: true,
       maxAge: 1000 * 60 * 60 * 12
     }
   })
@@ -14305,22 +14320,49 @@ app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     if (!username || !password) {
+      console.warn(
+        `[AuthRuntime] login_missing_fields env=${isDevDeployment ? 'dev' : 'prod'} db=${dbAbsolutePath}`
+      );
       return res.status(400).json({ ok: false, error: 'username y password son requeridos' });
     }
     const safeUsername = String(username).trim().toLowerCase();
+    if (!fs.existsSync(dbAbsolutePath)) {
+      console.error(
+        `[AuthRuntime] login_users_db_missing env=${isDevDeployment ? 'dev' : 'prod'} username=${truncateForNotify(
+          safeUsername,
+          80
+        )} db=${dbAbsolutePath}`
+      );
+      return res.status(503).json({ ok: false, error: 'Base de usuarios no disponible' });
+    }
     const user = db.prepare('SELECT id, username, password_hash FROM users WHERE LOWER(username) = ?').get(safeUsername);
     if (!user) {
+      console.warn(
+        `[AuthRuntime] login_user_not_found env=${isDevDeployment ? 'dev' : 'prod'} ` +
+          `username=${truncateForNotify(safeUsername, 80)} db=${dbAbsolutePath}`
+      );
       return res.status(401).json({ ok: false, error: 'Usuario o contraseña incorrectos' });
     }
     const valid = bcrypt.compareSync(password, user.password_hash);
     if (!valid) {
+      console.warn(
+        `[AuthRuntime] login_password_mismatch env=${isDevDeployment ? 'dev' : 'prod'} ` +
+          `username=${truncateForNotify(safeUsername, 80)} userId=${Number(user.id) || 0} db=${dbAbsolutePath}`
+      );
       return res.status(401).json({ ok: false, error: 'Usuario o contraseña incorrectos' });
     }
     req.session.userId = user.id;
     req.session.username = user.username;
+    console.info(
+      `[AuthRuntime] login_ok env=${isDevDeployment ? 'dev' : 'prod'} ` +
+        `username=${truncateForNotify(user.username, 80)} userId=${Number(user.id) || 0} db=${dbAbsolutePath}`
+    );
     return res.json({ ok: true, userId: user.id, username: user.username });
   } catch (err) {
-    console.error('[Login] Error:', err);
+    console.error(
+      `[AuthRuntime] login_error env=${isDevDeployment ? 'dev' : 'prod'} db=${dbAbsolutePath}`,
+      err
+    );
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -15643,10 +15685,17 @@ function isAiAgentConfiguredForUser(agentId, integrationRow, options = {}) {
   if (!provider) return false;
   const normalized = normalizeUserAgentIntegrationRow(integrationRow);
   const codexLinked = Boolean(options && options.codexLinked);
+  const kaggleRuntime = Boolean(options && options.isKaggleRuntime);
   if (safeAgentId === 'codex-cli') {
+    if (kaggleRuntime) {
+      return Boolean(String(process.env.CODEX_CMD || process.env.CODEX_BIN || '').trim());
+    }
     return codexLinked;
   }
   if (safeAgentId === 'claude-code') {
+    if (kaggleRuntime) {
+      return claudeCodeEnabled && Boolean(String(process.env.CLAUDE_CODE_BIN || '').trim());
+    }
     return claudeCodeEnabled;
   }
   const httpAdapter = getAiHttpProviderAdapter(safeAgentId);
@@ -16429,12 +16478,16 @@ function isCodexCliLinkedWithChatGptForUser(userId) {
 function getAiAgentSerializationOptionsForUser(userId) {
   const codexLinked = isCodexCliLinkedWithChatGptForUser(userId);
   const forceEnabledAgentIds = new Set();
-  if (codexLinked) {
+  if (isKaggleRuntime) {
+    forceEnabledAgentIds.add('codex-cli');
+    forceEnabledAgentIds.add('claude-code');
+  } else if (codexLinked) {
     forceEnabledAgentIds.add('codex-cli');
   }
   return {
     forceEnabledAgentIds,
-    codexLinked
+    codexLinked,
+    isKaggleRuntime
   };
 }
 
@@ -16461,6 +16514,7 @@ function serializeAiAgentSetting(agent, integrationRow, options = {}) {
     typeof options.forceEnabledAgentIds.has === 'function' &&
     options.forceEnabledAgentIds.has(agent.id);
   const codexLinked = Boolean(options && options.codexLinked);
+  const kaggleRuntime = Boolean(options && options.isKaggleRuntime);
   return {
     id: agent.id,
     name: agent.name,
@@ -16473,7 +16527,11 @@ function serializeAiAgentSetting(agent, integrationRow, options = {}) {
     docsUrl: agent.docsUrl,
     supportsBaseUrl: Boolean(agent.supportsBaseUrl),
     capabilities: getAiProviderCapabilities(agent.id),
-    integration: serializeAiAgentIntegration(agent, integrationRow, { forceEnabled, codexLinked }),
+    integration: serializeAiAgentIntegration(agent, integrationRow, {
+      forceEnabled,
+      codexLinked,
+      isKaggleRuntime: kaggleRuntime
+    }),
     tutorial: buildAiAgentTutorial(agent)
   };
 }
@@ -21077,15 +21135,20 @@ app.post('/api/kaggle/submit-autoretry', requireAuth, async (req, res) => {
     // Configurar callback del agente usando Claude Code
     const agentCallback = kaggleService.createClaudeAgentCallback(async (prompt, opts) => {
       // Usar la infraestructura existente de spawning de Claude Code
-      return new Promise((resolve, reject) => {
+      return new Promise(async (resolve) => {
+        let claudePath = '';
+        try {
+          claudePath = await resolveClaudeCodePath();
+        } catch (err) {
+          resolve({ success: false, error: err.message || 'CLAUDE_CODE_NOT_FOUND' });
+          return;
+        }
         const args = ['--print', prompt];
         if (opts.systemPrompt) {
           args.unshift('--system-prompt', opts.systemPrompt);
         }
-
-        const claudePath = '/usr/local/bin/claude-codexweb-max';
         const child = require('child_process').spawn(claudePath, args, {
-          cwd: process.cwd(),
+          cwd: String(process.env.CLAUDE_CODE_DEFAULT_CWD || process.cwd()).trim() || process.cwd(),
           env: { ...process.env },
           stdio: ['pipe', 'pipe', 'pipe']
         });
@@ -21157,15 +21220,20 @@ app.post('/api/kaggle/submit-multiagent', requireAuth, async (req, res) => {
     // Configurar callback de Claude
     if (enableClaude) {
       agentCallbacks.claude = kaggleService.createClaudeAgentCallback(async (prompt, opts) => {
-        return new Promise((resolve, reject) => {
+        return new Promise(async (resolve) => {
+          let claudePath = '';
+          try {
+            claudePath = await resolveClaudeCodePath();
+          } catch (err) {
+            resolve({ success: false, error: err.message || 'CLAUDE_CODE_NOT_FOUND' });
+            return;
+          }
           const args = ['--print', prompt];
           if (opts.systemPrompt) {
             args.unshift('--system-prompt', opts.systemPrompt);
           }
-
-          const claudePath = '/usr/local/bin/claude-codexweb-max';
           const child = require('child_process').spawn(claudePath, args, {
-            cwd: process.cwd(),
+            cwd: String(process.env.CLAUDE_CODE_DEFAULT_CWD || process.cwd()).trim() || process.cwd(),
             env: { ...process.env },
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -21207,7 +21275,7 @@ app.post('/api/kaggle/submit-multiagent', requireAuth, async (req, res) => {
             ];
 
             const child = require('child_process').spawn(codexPath, args, {
-              cwd: process.cwd(),
+              cwd: String(process.env.CLAUDE_CODE_DEFAULT_CWD || process.cwd()).trim() || process.cwd(),
               env: { ...process.env },
               stdio: ['pipe', 'pipe', 'pipe']
             });
