@@ -56,16 +56,10 @@ cd "$REPO_ROOT"
 "$REPO_ROOT/deploy/deploy-dev-frontend.sh"
 echo ""
 
-# Paso 5: Reiniciar servicio
-echo "🔄 Paso 5/5: Reiniciando servicio..."
-if command -v sudo &>/dev/null; then
-  sudo systemctl restart codexwebdev.service
-  sleep 2
-  sudo systemctl status codexwebdev.service --no-pager -l | head -20
-else
-  echo "⚠️  No se pudo reiniciar automáticamente (requiere sudo)"
-  echo "Ejecuta manualmente: sudo systemctl restart codexwebdev.service"
-fi
+# Paso 5: Encolar reinicio seguro. No matar el chat que ejecuta este despliegue.
+echo "🔄 Paso 5/5: Encolando reinicio seguro del servicio..."
+"$REPO_ROOT/deploy/request-dev-restart.sh"
+echo "   El helper esperará a que task_runs no tenga ejecuciones activas antes de reiniciar."
 echo ""
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

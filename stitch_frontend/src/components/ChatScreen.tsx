@@ -1339,7 +1339,7 @@ export default function ChatScreen({
               }
             }}
             placeholder="Message Codex..."
-            className="min-w-0 flex-1 bg-transparent border-none p-2 text-white placeholder:text-zinc-500 focus:outline-none resize-none max-h-28"
+            className="min-w-0 flex-1 bg-transparent border-none p-2 text-base text-white placeholder:text-zinc-500 focus:outline-none resize-none max-h-28"
           />
 
           <button

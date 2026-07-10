@@ -15,7 +15,7 @@ import {
   Square,
   TerminalSquare
 } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { startTerminalLiveStream } from '../lib/api';
 import { consumeSse } from '../lib/sse';
 import {
@@ -428,6 +428,7 @@ export default function TerminalLivePanel({ onClose, onNavigate }: { onClose?: (
   const [copiedUrl, setCopiedUrl] = useState('');
   const [composerHeight, setComposerHeight] = useState(72);
   const endRef = useRef<HTMLDivElement | null>(null);
+  const scrollFrameRef = useRef<number | null>(null);
   const composerRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const copyTimerRef = useRef<number | null>(null);
@@ -462,19 +463,49 @@ export default function TerminalLivePanel({ onClose, onNavigate }: { onClose?: (
     }
   }, [sessions]);
 
+  const scrollToLatest = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    if (scrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(scrollFrameRef.current);
+    }
+    scrollFrameRef.current = window.requestAnimationFrame(() => {
+      scrollFrameRef.current = window.requestAnimationFrame(() => {
+        const scrollingElement = document.scrollingElement || document.documentElement;
+        const maxTop = Math.max(0, scrollingElement.scrollHeight - window.innerHeight);
+        window.scrollTo({ top: maxTop, behavior });
+        scrollFrameRef.current = null;
+      });
+    });
+  }, []);
+
   useEffect(() => {
-    endRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' });
-  }, [sessions.length, sessions[sessions.length - 1]?.stdout.length, sessions[sessions.length - 1]?.stderr.length]);
+    scrollToLatest('smooth');
+  }, [sessions.length, sessions[sessions.length - 1]?.stdout.length, sessions[sessions.length - 1]?.stderr.length, scrollToLatest]);
+
+  useEffect(() => {
+    scrollToLatest('auto');
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+    const handleViewportChange = () => scrollToLatest('auto');
+    viewport.addEventListener('resize', handleViewportChange);
+    viewport.addEventListener('scroll', handleViewportChange);
+    return () => {
+      viewport.removeEventListener('resize', handleViewportChange);
+      viewport.removeEventListener('scroll', handleViewportChange);
+    };
+  }, [scrollToLatest]);
 
   useEffect(() => {
     const composer = composerRef.current;
     if (!composer || typeof ResizeObserver === 'undefined') return;
-    const updateHeight = () => setComposerHeight(Math.ceil(composer.getBoundingClientRect().height));
+    const updateHeight = () => {
+      setComposerHeight(Math.ceil(composer.getBoundingClientRect().height));
+      scrollToLatest('auto');
+    };
     updateHeight();
     const observer = new ResizeObserver(updateHeight);
     observer.observe(composer);
     return () => observer.disconnect();
-  }, []);
+  }, [scrollToLatest]);
 
   useEffect(() => {
     const textarea = textareaRef.current;
@@ -487,6 +518,9 @@ export default function TerminalLivePanel({ onClose, onNavigate }: { onClose?: (
     return () => {
       if (copyTimerRef.current !== null) {
         window.clearTimeout(copyTimerRef.current);
+      }
+      if (scrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(scrollFrameRef.current);
       }
       if (activeRunRef.current) {
         activeRunRef.current.expectedCancel = true;
@@ -1175,7 +1209,7 @@ export default function TerminalLivePanel({ onClose, onNavigate }: { onClose?: (
               spellCheck={false}
               enterKeyHint="send"
               data-testid="terminal-command-input"
-              className="min-h-10 max-h-28 flex-1 resize-none overflow-y-auto rounded-xl border border-zinc-800 bg-black/35 px-3 py-2.5 font-mono text-sm leading-5 text-zinc-100 placeholder:text-zinc-500 focus:border-zinc-600 focus:outline-none"
+              className="min-h-10 max-h-28 flex-1 resize-none overflow-y-auto rounded-xl border border-zinc-800 bg-black/35 px-3 py-2.5 font-mono text-base leading-5 text-zinc-100 placeholder:text-zinc-500 focus:border-zinc-600 focus:outline-none"
             />
             <button
               type="button"

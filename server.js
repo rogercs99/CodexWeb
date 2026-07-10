@@ -24341,7 +24341,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
         if (Number(exitCode) !== 0) return { continueRun: false, reason: '' };
         if (claudeActiveRun && claudeActiveRun.killRequested) return { continueRun: false, reason: '' };
         const normalizedCloseReason = String(closeReason || '').trim().toLowerCase();
-        if (normalizedCloseReason && !['completed', 'provider_error'].includes(normalizedCloseReason)) {
+        if (normalizedCloseReason && !['completed', 'provider_error', 'client_closed'].includes(normalizedCloseReason)) {
           return { continueRun: false, reason: '' };
         }
         if (hasOpenClaudeCommands()) {
@@ -24882,7 +24882,7 @@ app.post('/api/chat', requireAuth, async (req, res) => {
 
         // Verificar si necesita auto-continuación antes de finalizar
         const continuation = shouldClaudeAutoContinue(normalizedExitCode, closeReason);
-        if (continuation.continueRun && !claudeClientDisconnected) {
+        if (continuation.continueRun) {
           claudeContinuationCount += 1;
           sendSse(res, 'system_notice', {
             text: `Claude auto-continuando (${claudeContinuationCount}/${chatAutoContinuationLimit}): ${continuation.reason}`
