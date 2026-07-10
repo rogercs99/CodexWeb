@@ -11,20 +11,24 @@ const path = require('path');
  * @returns {boolean}
  */
 function isKaggleEnvironment() {
-  // 1. Verificar existencia de /kaggle/working
-  const kaggleWorkingExists = fs.existsSync('/kaggle/working');
+  // IMPORTANTE: Para evitar activación accidental del modo Kaggle cuando /kaggle/working
+  // existe pero NO estamos en un kernel real de Kaggle, requerimos opt-in explícito
+  // vía KAGGLE_RUNTIME_MODE=true en el entorno.
 
-  // 2. Verificar variables de entorno típicas de Kaggle
+  // 1. Verificar opt-in explícito
+  if (process.env.KAGGLE_RUNTIME_MODE === 'true') {
+    return true;
+  }
+
+  // 2. Verificar variables de entorno típicas de Kaggle (kernels reales)
   const hasKaggleEnvVars = !!(
     process.env.KAGGLE_KERNEL_RUN_TYPE ||
     process.env.KAGGLE_URL_BASE ||
     process.env.KAGGLE_KERNEL_INTEGRATIONS
   );
 
-  // 3. Verificar archivo /kaggle/input (típico en kernels)
-  const kaggleInputExists = fs.existsSync('/kaggle/input');
-
-  return kaggleWorkingExists || hasKaggleEnvVars || kaggleInputExists;
+  // Solo activar si hay variables de entorno de Kaggle real
+  return hasKaggleEnvVars;
 }
 
 /**
